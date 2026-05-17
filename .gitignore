@@ -1,0 +1,75 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+
+# Keep the runnable React bundle, but ignore generated frontend dependencies and caches
+webui/node_modules/
+webui/tsconfig.tsbuildinfo
+webui/.vite/
+webui/.cache/
+webui/coverage/
+webui/.turbo/
+!webui/dist/
+!webui/dist/**
+
+# Local archives, databases, exports, and logs
+archive/
+exports/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.zip
+chatgpt_export*.zip
+chatgpt_export*.json
+conversations*.json
+acceptance_logs/
+logs/
+*.log
+*.ndjson
+*.jsonl
+
+# OS and editor files
+.DS_Store
+**/.DS_Store
+__MACOSX/
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Frontend/browser test output
+playwright-report/
+test-results/
+
+# Project-specific delivery pollutants
+.gitignore.md
