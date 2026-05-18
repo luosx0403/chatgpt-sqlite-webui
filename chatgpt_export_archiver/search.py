@@ -238,6 +238,7 @@ def search_messages(
     order: str = "relevance",
     max_page_limit: int = MAX_API_LIMIT,
     candidate_limit: int | None = None,
+    count_total: bool = True,
 ) -> dict[str, Any]:
     limit = _bounded_limit(limit, max_page_limit)
     offset = max(0, offset)
@@ -247,9 +248,9 @@ def search_messages(
     if not has_message_text and (parsed.title or parsed.source) and not parsed.role:
         return _page_payload([], 0, limit, offset)
     try:
-        rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order)
+        rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, count_total=count_total)
     except sqlite3.OperationalError:
-        rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, use_trigram=False)
+        rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, use_trigram=False, count_total=count_total)
     items = [
         _message_search_payload(row, parsed, row["match_reason"] or ("exact phrase" if parsed.phrases else "substring"), row["bm25_score"])
         for row in rows
@@ -478,10 +479,13 @@ def _message_search_page_rows(
     order: str,
     *,
     use_trigram: bool = True,
+    count_total: bool = True,
 ) -> tuple[list[sqlite3.Row], int]:
     base_sql, params = _message_search_base_select(conn, parsed, conversation_id, use_trigram=use_trigram)
-    total = conn.execute(f"SELECT COUNT(*) AS c FROM ({base_sql})", params).fetchone()["c"]
+    query_limit = limit if count_total else limit + 1
+    total = conn.execute(f"SELECT COUNT(*) AS c FROM ({base_sql})", params).fetchone()["c"] if count_total else 0
     order_clause = _message_search_order_clause(order, conversation_id, parsed.path)
+    order_sql = f"ORDER BY {order_clause}" if count_total else ""
     if order == "display" and conversation_id and parsed.path == "current":
         rows = conn.execute(
             f"""
@@ -513,21 +517,25 @@ def _message_search_page_rows(
             SELECT matched.*, p.depth AS display_depth
             FROM matched
             LEFT JOIN path_nodes p ON p.node_id = matched.node_id
-            ORDER BY {order_clause}
+            {order_sql}
             LIMIT ? OFFSET ?
             """,
-            [conversation_id] + params + [limit, offset],
+            [conversation_id] + params + [query_limit, offset],
         ).fetchall()
     else:
         rows = conn.execute(
             f"""
             SELECT *
             FROM ({base_sql}) matched
-            ORDER BY {order_clause}
+            {order_sql}
             LIMIT ? OFFSET ?
             """,
-            params + [limit, offset],
+            params + [query_limit, offset],
         ).fetchall()
+    if not count_total:
+        has_extra = len(rows) > limit
+        rows = rows[:limit]
+        total = offset + len(rows) + (1 if has_extra else 0)
     return rows, int(total or 0)
 
 

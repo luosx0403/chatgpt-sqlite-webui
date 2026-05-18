@@ -1466,15 +1466,15 @@ class ArchiverTests(unittest.TestCase):
             calls: list[tuple[int, int, str]] = []
             original_page_rows = search_module._message_search_page_rows
 
-            def wrapped_page_rows(conn, parsed, conversation_id, limit, offset, order, *, use_trigram=True):
-                calls.append((limit, offset, order))
-                return original_page_rows(conn, parsed, conversation_id, limit, offset, order, use_trigram=use_trigram)
+            def wrapped_page_rows(conn, parsed, conversation_id, limit, offset, order, *, use_trigram=True, count_total=True):
+                calls.append((limit, offset, order, count_total))
+                return original_page_rows(conn, parsed, conversation_id, limit, offset, order, use_trigram=use_trigram, count_total=count_total)
 
             with mock.patch.object(search_module, "_message_search_page_rows", wrapped_page_rows):
                 code, output = run_cli(["--db", str(db), "search", "common", "--limit", "5"])
             self.assertEqual(code, 0, output)
             self.assertTrue(calls)
-            self.assertTrue(all(limit == 5 and offset == 0 and order == "relevance" for limit, offset, order in calls))
+            self.assertTrue(all(limit == 5 and offset == 0 and order == "relevance" and count_total is False for limit, offset, order, count_total in calls))
 
     def test_limited_fts_message_rows_are_rank_ordered(self):
         import chatgpt_export_archiver.search as search_module

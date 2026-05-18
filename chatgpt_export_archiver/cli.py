@@ -624,7 +624,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         print("invalid_query true")
         conn.close()
         return 2
-    page = search_messages(conn, parsed, limit=args.limit, candidate_limit=MAX_CANDIDATES)
+    page = search_messages(conn, parsed, limit=args.limit, candidate_limit=MAX_CANDIDATES, count_total=False)
     for row in page["items"]:
         print(f"conversation_id {row['conversation_id']} node_id {row['node_id']} role {row['role'] or ''}")
     print(f"matches {len(page['items'])}")
