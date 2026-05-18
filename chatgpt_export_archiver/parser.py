@@ -33,6 +33,9 @@ class ParsedNode:
     metadata_json: str | None
     is_on_current_path: int
     raw_message_json: str | None
+    children_for_hash: Any | None = None
+    metadata_for_hash: Any | None = None
+    raw_message_for_hash: Any | None = None
 
 
 @dataclass
@@ -137,12 +140,13 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
             "message_metadata": metadata_value,
             "content_notes": metadata,
         }
+        children_value = node.get("children") if isinstance(node.get("children"), list) else []
         nodes.append(
             ParsedNode(
                 node_id=node_key,
                 conversation_id=conversation_id,
                 parent_node_id=str(node.get("parent")) if node.get("parent") is not None else None,
-                children_json=compact_json(node.get("children") if isinstance(node.get("children"), list) else []),
+                children_json=compact_json(children_value),
                 message_id=message_id,
                 role=role,
                 author_name=author_name,
@@ -154,6 +158,9 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
                 metadata_json=compact_json(combined_metadata),
                 is_on_current_path=1 if node_key in current_set else 0,
                 raw_message_json=compact_json(message_dict) if message_dict is not None else None,
+                children_for_hash=children_value,
+                metadata_for_hash=combined_metadata,
+                raw_message_for_hash=message_dict,
             )
         )
 
@@ -333,7 +340,7 @@ def compute_aggregate_hash(current_node: str | None, nodes: list[ParsedNode]) ->
             {
                 "node_id": n.node_id,
                 "parent_node_id": n.parent_node_id,
-                "children_json": json.loads(n.children_json or "[]"),
+                "children_json": n.children_for_hash if n.children_for_hash is not None else json.loads(n.children_json or "[]"),
                 "message_id": n.message_id,
                 "role": n.role,
                 "author_name": n.author_name,
@@ -342,9 +349,13 @@ def compute_aggregate_hash(current_node: str | None, nodes: list[ParsedNode]) ->
                 "content_type": n.content_type,
                 "content_text": n.content_text,
                 "content_hash": n.content_hash,
-                "metadata_json": json.loads(n.metadata_json or "{}"),
+                "metadata_json": n.metadata_for_hash if n.metadata_for_hash is not None else json.loads(n.metadata_json or "{}"),
                 "is_on_current_path": n.is_on_current_path,
-                "raw_message_json": json.loads(n.raw_message_json or "null"),
+                "raw_message_json": (
+                    n.raw_message_for_hash
+                    if n.raw_message_for_hash is not None
+                    else json.loads(n.raw_message_json or "null")
+                ),
             }
             for n in sorted(nodes, key=lambda item: item.node_id)
         ],

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .db import _drop_table_with_shadows
+from .db import _drop_table_with_shadows, configure_bulk_write_connection
 from .search import normalize_search_text
 
 
@@ -90,6 +90,7 @@ def detect_trigram(conn: sqlite3.Connection) -> bool:
 def create_web_indexes(db_path: Path) -> dict[str, Any]:
     """Build optional Web search indexes without changing archive source tables."""
     conn = connect_writable(db_path)
+    configure_bulk_write_connection(conn)
     try:
         trigram_available = detect_trigram(conn)
         drop_failures: list[dict[str, str]] = []
@@ -102,10 +103,8 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE web_message_trigram USING fts5(
-                    conversation_id UNINDEXED,
-                    node_id UNINDEXED,
-                    role UNINDEXED,
                     content_text,
+                    content='',
                     tokenize='trigram'
                 )
                 """
@@ -113,24 +112,44 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE web_title_trigram USING fts5(
-                    conversation_id UNINDEXED,
                     title,
+                    content='',
                     tokenize='trigram'
                 )
                 """
             )
             conn.execute(
                 """
-                INSERT INTO web_message_trigram(conversation_id, node_id, role, content_text)
-                SELECT conversation_id, node_id, role, content_text
+                INSERT INTO web_message_trigram(web_message_trigram, rank) VALUES('automerge', 0)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO web_title_trigram(web_title_trigram, rank) VALUES('automerge', 0)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO web_message_trigram(web_message_trigram, rank) VALUES('crisismerge', 64)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO web_title_trigram(web_title_trigram, rank) VALUES('crisismerge', 64)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO web_message_trigram(rowid, content_text)
+                SELECT rowid, content_text
                 FROM conversation_nodes
                 WHERE content_text IS NOT NULL AND content_text <> ''
                 """
             )
             conn.execute(
                 """
-                INSERT INTO web_title_trigram(conversation_id, title)
-                SELECT conversation_id, COALESCE(title, '')
+                INSERT INTO web_title_trigram(rowid, title)
+                SELECT rowid, COALESCE(title, '')
                 FROM conversations
                 """
             )

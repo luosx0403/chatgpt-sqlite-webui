@@ -21,7 +21,7 @@ from chatgpt_export_archiver.cli import build_parser, main
 from chatgpt_export_archiver.db import connect, init_db, verify_database, drop_optional_web_indexes, _drop_table_with_shadows, _integrity_failure_is_web_index_only, _run_integrity_check, _line_names_web_index_table, _insert_fts_batch, _delete_fts_for_conversation
 from chatgpt_export_archiver.logging_utils import configure_logging, get_logger, parse_log_level
 from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
-from chatgpt_export_archiver.parser import _to_int_bool, parse_conversation, validate_conversation_element
+from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
 from chatgpt_export_archiver.scanner import list_source_entries, resolve_input
 from chatgpt_export_archiver.search import parse_query
 from chatgpt_export_archiver.utils import parse_date_boundary
@@ -237,6 +237,15 @@ class ArchiverTests(unittest.TestCase):
         self.assertEqual(_to_int_bool("1"), 1)
         self.assertEqual(_to_int_bool("0"), 0)
         self.assertIsNone(_to_int_bool(""))
+
+    def test_aggregate_hash_native_values_match_stored_json_fallback(self):
+        parsed = parse_conversation(conversation("hash-native"), "conversations.json", 0)
+        fast_hash = parsed.aggregate_hash
+        for node in parsed.nodes:
+            node.children_for_hash = None
+            node.metadata_for_hash = None
+            node.raw_message_for_hash = None
+        self.assertEqual(compute_aggregate_hash(parsed.current_node, parsed.nodes), fast_hash)
 
     def test_readonly_sqlite_uri_handles_special_path_characters(self):
         with tempfile.TemporaryDirectory(prefix="db path # 中文 ") as td:
@@ -829,6 +838,19 @@ class ArchiverTests(unittest.TestCase):
             self.assertNotIn(db.name, output)
             self.assertFalse(db.exists())
 
+    def test_web_index_uses_bulk_write_connection_pragmas(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "archive.db"
+            conn = connect(db)
+            try:
+                init_db(conn)
+            finally:
+                conn.close()
+            with mock.patch("chatgpt_export_archiver.web_db.configure_bulk_write_connection") as configure:
+                create_web_indexes(db)
+            configure.assert_called_once()
+
     def test_legacy_single_file_imports(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -840,6 +862,29 @@ class ArchiverTests(unittest.TestCase):
             conn = sqlite3.connect(db)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 1)
             conn.close()
+
+    def test_import_recreates_rebuildable_node_index_and_reimport_stays_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            z = base / "export.zip"
+            db = base / "archive.db"
+            write_zip(z, {"conversations.json": [conversation("index-rebuild")]})
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256", "--rebuild-fts"]), 0)
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256", "--rebuild-fts"]), 0)
+            conn = sqlite3.connect(db)
+            try:
+                index_sql = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_nodes_conversation_path'"
+                ).fetchone()
+                self.assertIsNotNone(index_sql)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversation_nodes").fetchone()[0], 5)
+                statuses = conn.execute(
+                    "SELECT summary_json FROM import_runs ORDER BY id"
+                ).fetchall()
+                self.assertIn('"unchanged_conversations":1', statuses[-1][0])
+            finally:
+                conn.close()
 
     def test_shards_skip_only_bad_elements(self):
         with tempfile.TemporaryDirectory() as td:

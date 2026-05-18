@@ -572,15 +572,29 @@ def _message_search_base_select(
 def _message_match_source(conn: sqlite3.Connection, parsed: ParsedQuery, *, use_trigram: bool) -> tuple[str, list[Any], str, str]:
     trigram_query = _trigram_query(parsed.phrases + parsed.terms, parsed.or_mode)
     if use_trigram and trigram_query and _table_exists(conn, "web_message_trigram"):
+        if _table_has_columns(conn, "web_message_trigram", {"conversation_id", "node_id"}):
+            return (
+                """
+                (
+                    SELECT conversation_id, node_id, rank AS fts_rank
+                    FROM web_message_trigram
+                    WHERE web_message_trigram MATCH ?
+                ) mk
+                JOIN conversation_nodes n
+                  ON n.conversation_id = mk.conversation_id AND n.node_id = mk.node_id
+                """,
+                [trigram_query],
+                "mk.fts_rank",
+                "exact phrase" if parsed.phrases else "substring",
+            )
         return (
             """
             (
-                SELECT conversation_id, node_id, rank AS fts_rank
+                SELECT rowid AS node_rowid, rank AS fts_rank
                 FROM web_message_trigram
                 WHERE web_message_trigram MATCH ?
             ) mk
-            JOIN conversation_nodes n
-              ON n.conversation_id = mk.conversation_id AND n.node_id = mk.node_id
+            JOIN conversation_nodes n ON n.rowid = mk.node_rowid
             """,
             [trigram_query],
             "mk.fts_rank",
@@ -810,14 +824,24 @@ def _title_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, *,
     source_params: list[Any] = []
     trigram_query = _trigram_query(([parsed.title] if parsed.title else []) + parsed.phrases + parsed.terms, parsed.or_mode)
     if use_trigram and trigram_query and _table_exists(conn, "web_title_trigram"):
-        source_sql = """
-            (
-                SELECT conversation_id, rank AS title_rank
-                FROM web_title_trigram
-                WHERE web_title_trigram MATCH ?
-            ) tk
-            JOIN conversations c ON c.conversation_id = tk.conversation_id
-        """
+        if _table_has_columns(conn, "web_title_trigram", {"conversation_id"}):
+            source_sql = """
+                (
+                    SELECT conversation_id, rank AS title_rank
+                    FROM web_title_trigram
+                    WHERE web_title_trigram MATCH ?
+                ) tk
+                JOIN conversations c ON c.conversation_id = tk.conversation_id
+            """
+        else:
+            source_sql = """
+                (
+                    SELECT rowid AS conversation_rowid, rank AS title_rank
+                    FROM web_title_trigram
+                    WHERE web_title_trigram MATCH ?
+                ) tk
+                JOIN conversations c ON c.rowid = tk.conversation_rowid
+            """
         source_params.append(trigram_query)
     if conversation_id:
         clauses.append("c.conversation_id = ?")
@@ -987,12 +1011,24 @@ def _title_trigram_clause(conn: sqlite3.Connection, parsed: ParsedQuery, use_tri
     query = _trigram_query(fragments, parsed.or_mode)
     if not use_trigram or not query or not _table_exists(conn, "web_title_trigram"):
         return "", []
+    if _table_has_columns(conn, "web_title_trigram", {"conversation_id"}):
+        return (
+            """
+            EXISTS (
+                SELECT 1
+                FROM web_title_trigram
+                WHERE web_title_trigram.conversation_id = c.conversation_id
+                  AND web_title_trigram MATCH ?
+            )
+            """,
+            [query],
+        )
     return (
         """
         EXISTS (
             SELECT 1
             FROM web_title_trigram
-            WHERE web_title_trigram.conversation_id = c.conversation_id
+            WHERE web_title_trigram.rowid = c.rowid
               AND web_title_trigram MATCH ?
         )
         """,
@@ -1373,6 +1409,12 @@ def _bounded_limit(limit: int, maximum: int = 100) -> int:
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     row = conn.execute("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1", (name,)).fetchone()
     return row is not None
+
+
+def _table_has_columns(conn: sqlite3.Connection, name: str, columns: set[str]) -> bool:
+    rows = conn.execute(f'PRAGMA table_xinfo("{name}")').fetchall()
+    found = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
+    return columns.issubset(found)
 
 
 def _limit_clause(limit: int | None) -> tuple[str, list[int]]:

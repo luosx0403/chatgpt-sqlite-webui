@@ -12,6 +12,15 @@ from .utils import compact_json, utc_now_iso
 
 SQLITE_VARIABLE_CHUNK = 500
 INSERT_ROW_CHUNK = 5000
+IMPORT_REBUILDABLE_INDEXES = (
+    (
+        "idx_nodes_conversation_path",
+        """
+        CREATE INDEX IF NOT EXISTS idx_nodes_conversation_path
+            ON conversation_nodes(conversation_id, is_on_current_path)
+        """,
+    ),
+)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -45,8 +54,8 @@ def connect_existing(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def configure_import_connection(conn: sqlite3.Connection) -> None:
-    """Apply conservative write-time tuning for the import command only."""
+def configure_bulk_write_connection(conn: sqlite3.Connection) -> None:
+    """Apply conservative write-time tuning for large local SQLite writes."""
     pragmas = (
         "PRAGMA foreign_keys = ON",
         "PRAGMA journal_mode = WAL",
@@ -63,6 +72,23 @@ def configure_import_connection(conn: sqlite3.Connection) -> None:
             # Some SQLite builds or filesystems may reject a tuning pragma.
             # Keep import functional and let the default setting apply.
             pass
+
+
+def configure_import_connection(conn: sqlite3.Connection) -> None:
+    """Apply conservative write-time tuning for the import command."""
+    configure_bulk_write_connection(conn)
+
+
+def drop_import_rebuildable_indexes(conn: sqlite3.Connection) -> None:
+    """Drop ordinary indexes that are cheaper to rebuild after bulk node writes."""
+    for index_name, _sql in IMPORT_REBUILDABLE_INDEXES:
+        conn.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+
+
+def recreate_import_rebuildable_indexes(conn: sqlite3.Connection) -> None:
+    """Restore indexes dropped by drop_import_rebuildable_indexes."""
+    for _index_name, sql in IMPORT_REBUILDABLE_INDEXES:
+        conn.execute(sql)
 
 
 def init_db(conn: sqlite3.Connection) -> bool:

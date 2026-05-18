@@ -687,6 +687,65 @@ class WebApiTests(unittest.TestCase):
         health = client.get("/api/health").json()
         self.assertTrue(health["web_normalized_indexed"])
         self.assertEqual(client.get("/api/search?q=%EF%BD%87%EF%BD%90%EF%BD%94%EF%BC%8D%EF%BC%95%EF%BC%8E%EF%BC%95").json()["items"][0]["conversation_id"], "web-1")
+        conn = connect_readonly(db)
+        try:
+            message_columns = {row["name"] for row in conn.execute('PRAGMA table_xinfo("web_message_trigram")')}
+            title_columns = {row["name"] for row in conn.execute('PRAGMA table_xinfo("web_title_trigram")')}
+        finally:
+            conn.close()
+        self.assertIn("content_text", message_columns)
+        self.assertIn("title", title_columns)
+        self.assertNotIn("conversation_id", message_columns)
+        self.assertNotIn("node_id", message_columns)
+        self.assertNotIn("conversation_id", title_columns)
+
+    def test_search_remains_compatible_with_legacy_contentful_web_trigram(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("CREATE VIRTUAL TABLE web_message_trigram USING fts5(conversation_id UNINDEXED, node_id UNINDEXED, role UNINDEXED, content_text, tokenize='trigram')")
+            conn.execute("CREATE VIRTUAL TABLE web_title_trigram USING fts5(conversation_id UNINDEXED, title, tokenize='trigram')")
+            conn.execute(
+                """
+                INSERT INTO web_message_trigram(conversation_id, node_id, role, content_text)
+                SELECT conversation_id, node_id, role, content_text
+                FROM conversation_nodes
+                WHERE content_text IS NOT NULL AND content_text <> ''
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO web_title_trigram(conversation_id, title)
+                SELECT conversation_id, COALESCE(title, '')
+                FROM conversations
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE web_message_norm(
+                    conversation_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    content_norm TEXT NOT NULL,
+                    PRIMARY KEY(conversation_id, node_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO web_message_norm(conversation_id, node_id, content_norm)
+                SELECT conversation_id, node_id, lower(content_text)
+                FROM conversation_nodes
+                WHERE content_text IS NOT NULL AND content_text <> ''
+                """
+            )
+            conn.execute("CREATE TABLE web_title_norm(conversation_id TEXT PRIMARY KEY, title_norm TEXT NOT NULL)")
+            conn.execute("INSERT INTO web_title_norm(conversation_id, title_norm) SELECT conversation_id, lower(COALESCE(title, '')) FROM conversations")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(client.get("/api/search/messages?q=python&limit=5").json()["total"], 2)
+        self.assertEqual(client.get("/api/conversations?q=title:Python&limit=5").json()["total"], 1)
 
     def test_web_search_uses_trigram_candidates_and_preserves_filtering(self):
         from chatgpt_export_archiver.search import parse_query, search_conversations

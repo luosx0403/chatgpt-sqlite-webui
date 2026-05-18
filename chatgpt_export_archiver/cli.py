@@ -16,10 +16,12 @@ from .db import (
     connect_existing,
     connect_existing_readonly,
     drop_optional_web_indexes,
+    drop_import_rebuildable_indexes,
     finish_import_run,
     get_stats,
     init_db,
     optimize_after_import,
+    recreate_import_rebuildable_indexes,
     record_source_entries,
     record_warning,
     record_warnings,
@@ -263,6 +265,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         "source_scan_seconds",
         "parse_and_upsert_seconds",
         "fts_rebuild_seconds",
+        "import_index_rebuild_seconds",
         "pragma_optimize_seconds",
         "finalize_commit_seconds",
         "close_seconds",
@@ -330,6 +333,7 @@ def run_import_pipeline(
         "source_scan_seconds": 0.0,
         "parse_and_upsert_seconds": 0.0,
         "fts_rebuild_seconds": 0.0,
+        "import_index_rebuild_seconds": 0.0,
         "pragma_optimize_seconds": 0.0,
         "finalize_commit_seconds": 0.0,
         "close_seconds": 0.0,
@@ -385,8 +389,9 @@ def run_import_pipeline(
                         compact_json({"table": failure["table"], "error_type": failure["error_type"]}),
                         None,
                     ),
-                )
+            )
             summary["warnings"] += len(optional_drop_failures)
+        drop_import_rebuildable_indexes(conn)
         source_scan_started = time.perf_counter()
         entries = list_source_entries(source)
         selected = select_conversation_sources(entries)
@@ -444,6 +449,10 @@ def run_import_pipeline(
             summary["fts_rebuild_seconds"] = _elapsed(fts_started)
             summary["optimize_fts_after_import"] = bool(optimize_fts_after_import)
             notify("fts_rebuild_complete")
+        index_started = time.perf_counter()
+        recreate_import_rebuildable_indexes(conn)
+        summary["import_index_rebuild_seconds"] = _elapsed(index_started)
+        notify("import_index_rebuild_complete")
         if optimize_after_import_flag:
             pragma_started = time.perf_counter()
             summary["optimize_after_import"] = optimize_after_import(conn)
