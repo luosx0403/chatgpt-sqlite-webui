@@ -1,0 +1,26 @@
+{
+  "name": "chatgpt-export-archiver-webui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc --noEmit",
+    "test:dom": "node tests/dom-smoke.mjs",
+    "test:python-resolution": "node tests/dom-smoke.mjs --self-test-python-resolution"
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.13.12",
+    "@vitejs/plugin-react": "^5.1.1",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "playwright-core": "^1.60.0"
+  }
+}

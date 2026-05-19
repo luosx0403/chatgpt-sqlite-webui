@@ -1,0 +1,38 @@
+# Project Rules For Codex
+
+- Use only the Python standard library and SQLite through `sqlite3`.
+- Do not call external APIs, add telemetry/CDN resources, or add Docker/database-server components. The existing optional local Web UI is allowed; keep it local-only.
+- Treat original OpenAI/ChatGPT export ZIP files as read-only. Never delete, move, overwrite, or modify them, except when a CLI user explicitly passes `--delete-input-on-success`; in that case, delete only the input target the user specified. If that explicit target is a symlink, delete the symlink itself, not the file it points to. Web uploads may only delete the server-side temporary copy.
+- Do not print real exported conversation titles, messages, JSON snippets, HTML, image names, or attachment contents to the terminal.
+- Test behavior first with synthetic fixtures. Do not copy real chat content into fixtures.
+- Before importing a real export, run `inspect` and review shard counts and warnings.
+- Support sharded `conversations-*.json` natively. Do not merge shards into one large JSON file.
+- Use file-level strictness and element-level tolerance: a conversations file must have a list top level, but bad elements inside the list are warnings, not fatal errors.
+- Archive all mapping nodes in SQLite. Export only the current UI path by default.
+- Default Markdown/TXT/manifest exports must be deterministic: do not include current time, run IDs, absolute output paths, random values, or temporary paths in exported file contents.
+- Export writes must compare final bytes first and avoid rewriting unchanged files. Use atomic replacement for changed files.
+- Import warnings are per import run. Reimporting the same ZIP may add warning rows for the new run without duplicating conversations or nodes.
+- Incremental import must be non-destructive by default: unchanged conversations stay unchanged, changed conversations replace their own nodes/FTS rows, new conversations are inserted, and conversations missing from a newer ZIP are retained unless a future explicit prune/mirror feature is requested.
+- Post-commit summary updates (timing fields added after the main commit succeeds) and connection close are best-effort. If they fail, the import is still successful — `import_runs.status` stays `finished` and the command exits 0. Structured warnings (`summary_update_after_commit_failed`, `import_connection_close_failed`, `summary_update_after_close_failed`) are emitted but the import is not rolled back or marked failed.
+- Default export updates current manifest files and skips unchanged files, but does not prune historical leftover files from an output directory.
+- Web UI work must stay local-first: bind to `127.0.0.1` by default, do not add analytics, telemetry, CDN scripts, remote fonts, remote images, or external API calls.
+- The Web UI may start without an existing DB and may import a user-selected ZIP through local multipart upload. The uploaded copy is temporary; never delete the user's original ZIP unless the explicit CLI `--delete-input-on-success` option was used.
+- Web import jobs must use the shared import pipeline, run at most one writer job per process, and automatically verify/stats/web-index after success.
+- Optional Web FTS5 trigram indexes (`web_message_trigram`, `web_title_trigram`) include automatic shadow-table cleanup on drop and recreate. `web-index` must be able to recover from corrupted FTS5 indexes by dropping all known shadow tables and recreating the index from scratch.
+- `verify` reports `optional_web_index_error` and a recovery hint when `PRAGMA integrity_check` fails only on optional Web search indexes. Core conversation data is not falsely reported as corrupt in this case.
+- Project logs use Python `logging` levels debug/info/warning/error/none. Logs must not include chat titles, message text, snippets, raw JSON, or parser warning payloads.
+- Ordinary Web list/message APIs must not expose `raw_message_json`, `raw_json`, or full parser warning payloads. They may return normalized message text and bounded `raw_preview` for the selected local browser view. Full raw JSON may only be exposed through an explicit per-message local endpoint and UI action.
+- Search code must parameterize SQL and build FTS `MATCH` expressions through a query builder; never concatenate raw user input into SQL.
+- Frontend code must render chat text as text nodes, not unsanitized HTML.
+- Web list and message APIs must remain paginated. Do not add endpoints that load every conversation or every node into the browser.
+- Web search must preserve exact substring fallback for Chinese, code symbols, file names, command flags, and quoted phrases even when FTS tokenization fails.
+- Imports must invalidate or maintain optional Web search indexes (`web_message_norm`, `web_title_norm`, trigram tables). Never leave stale Web index rows after an incremental import.
+- Frontend request handlers must guard against stale async responses with `AbortController`, request IDs, or equivalent logic.
+- Web UI preferences are local-only `localStorage` state. Keep i18n/settings code lightweight and do not translate archived chat content.
+- Keep the left conversation list and right message reader independently scrollable inside a fixed-height app shell; preserve pagination and avoid loading the whole database into the browser.
+- DOM/browser tests must use synthetic databases and must not depend on or print real chat content.
+- Prefer `npm ci` for frontend dependency installation when `webui/package-lock.json` exists; do not treat `node_modules` as a deliverable.
+- Keep All `README_*.md` functionally synchronized when Web install, startup, or acceptance commands change.
+- Keep JSON logs under ignored paths such as `logs/`; `*.jsonl` is treated as a local log artifact and must not be included in delivery.
+- `compileall`, unit tests, `npm ci`, typecheck, and build may generate Python cache, bytecode, `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, coverage/typecheck caches, and browser test output; run `python tools/clean_generated_artifacts.py --fail-on-blocked` before final delivery clean, while keeping `webui/dist`. The cleaner must not delete user data such as databases, ZIP files, SQLite sidecars, `archive/`, `exports/`, or `logs/`; it reports those as blocked sensitive paths for manual handling. Prefer cross-platform Python cleanup over POSIX-only `find` or `rm` commands in shared docs.
+- Search examples should work on macOS, Windows, and Linux. Use double quotes for search queries with spaces so PowerShell/cmd users can copy the command directly.
