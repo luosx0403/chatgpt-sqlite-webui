@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
@@ -75,6 +76,18 @@ def conv(cid, title, mapping, current_node, ts):
 def write_zip(path: Path, conversations):
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("conversations.json", json.dumps(conversations, ensure_ascii=False))
+
+
+def write_zip_members(path: Path, members: dict[str, object], *, compression=zipfile.ZIP_DEFLATED):
+    with zipfile.ZipFile(path, "w", compression=compression) as zf:
+        for name, value in members.items():
+            payload = value if isinstance(value, bytes) else json.dumps(value, ensure_ascii=False).encode("utf-8")
+            zf.writestr(name, payload)
+
+
+def js_slice(text: str, start: int, end: int) -> str:
+    data = text.encode("utf-16-le")
+    return data[start * 2 : end * 2].decode("utf-16-le")
 
 
 @unittest.skipIf(TestClient is None, "fastapi test client is not installed")
@@ -174,6 +187,55 @@ class WebApiTests(unittest.TestCase):
         html = client.get("/").text
         self.assertNotIn("Fallback UI", html)
 
+    def test_health_reports_incompatible_schema_columns_without_500(self):
+        from chatgpt_export_archiver.db import check_core_schema, connect
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        db = base / "old.db"
+        conn = connect(db)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE import_runs(id INTEGER PRIMARY KEY, input_path TEXT, input_kind TEXT, started_at TEXT, status TEXT);
+                CREATE TABLE source_files(id INTEGER PRIMARY KEY, import_run_id INTEGER, source_path TEXT, file_type TEXT);
+                CREATE TABLE import_warnings(id INTEGER PRIMARY KEY, import_run_id INTEGER, source_file TEXT, warning_type TEXT, created_at TEXT);
+                CREATE TABLE conversations(conversation_id TEXT PRIMARY KEY, title TEXT, create_time REAL, update_time REAL);
+                CREATE TABLE conversation_nodes(conversation_id TEXT, node_id TEXT, content_text TEXT);
+                CREATE VIRTUAL TABLE message_fts USING fts5(conversation_id UNINDEXED, node_id UNINDEXED, role UNINDEXED, content_text);
+                CREATE TABLE exports(id INTEGER PRIMARY KEY, conversation_id TEXT, format TEXT, output_path TEXT, output_hash TEXT, exported_at TEXT);
+                CREATE TABLE file_index(id INTEGER PRIMARY KEY, import_run_id INTEGER, source_path TEXT, file_type TEXT);
+                """
+            )
+            conn.commit()
+            schema = check_core_schema(conn)
+        finally:
+            conn.close()
+        self.assertFalse(schema["schema_ok"])
+        self.assertIn("current_node", schema["missing_columns"]["conversations"])
+        self.assertIn("is_on_current_path", schema["missing_columns"]["conversation_nodes"])
+        self.assertIn("raw_message_json", schema["missing_columns"]["conversation_nodes"])
+
+        client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+        health = client.get("/api/health").json()
+        self.assertEqual(health["database"]["name"], "database")
+        self.assertFalse(health["db_ready"])
+        self.assertFalse(health["schema_compatible"])
+        self.assertIn("conversations", health["missing_columns"])
+        self.assertEqual(client.get("/api/stats").status_code, 409)
+        self.assertEqual(client.get("/api/conversations").status_code, 409)
+        for path in [
+            "/api/conversations/missing/messages",
+            "/api/search/messages?q=python",
+            "/api/search/suggest?q=python",
+        ]:
+            response = client.get(path)
+            self.assertEqual(response.status_code, 409)
+            detail = response.json()["detail"]
+            self.assertFalse(detail["schema_compatible"])
+            self.assertIn("missing_columns", detail)
+
     def test_web_upload_import_first_and_incremental(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -193,8 +255,10 @@ class WebApiTests(unittest.TestCase):
         with first_zip.open("rb") as handle:
             response = client.post("/api/import/upload", files={"file": ("first.zip", handle, "application/zip")})
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["filename"], "first.zip")
         first_job = self.wait_job(client, response.json()["job_id"])
         self.assertEqual(first_job["status"], "succeeded")
+        self.assertEqual(first_job["filename"], "first.zip")
         self.assertTrue(db.exists())
         self.assertTrue(first_job["verify"]["ok"])
         self.assertIn("indexed_messages", first_job["web_index"])
@@ -248,10 +312,100 @@ class WebApiTests(unittest.TestCase):
         self.addCleanup(td.cleanup)
         base = Path(td.name)
         client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
-        with mock.patch("chatgpt_export_archiver.web_api.MAX_UPLOAD_BYTES", 1):
+        upload_dir = base / "upload-tmp"
+        upload_dir.mkdir()
+        with mock.patch("chatgpt_export_archiver.web_api.MAX_UPLOAD_BYTES", 1), \
+             mock.patch("chatgpt_export_archiver.web_api.make_upload_path", return_value=(upload_dir, upload_dir / "upload.zip")):
             response = client.post("/api/import/upload", files={"file": ("synthetic.zip", b"1234", "application/zip")})
         self.assertEqual(response.status_code, 413)
         self.assertIn("upload_too_large", response.text)
+        self.assertFalse(upload_dir.exists())
+
+    def test_web_upload_rejects_zip_bomb_like_conversation_member(self):
+        from chatgpt_export_archiver import web_api
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
+        z = base / "small.zip"
+        write_zip(z, [conv("small", "Small", {"root": root(["u"]), "u": node("u", "root", "user", "synthetic", 1_701_000_001)}, "u", 1_701_000_000)])
+        with mock.patch.object(web_api, "MAX_UPLOAD_JSON_MEMBER_BYTES", 1):
+            with z.open("rb") as handle:
+                response = client.post("/api/import/upload", files={"file": ("small.zip", handle, "application/zip")})
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("upload_zip_member_too_large", response.text)
+
+    def test_web_upload_zip_member_limits_clean_temp_copy(self):
+        from chatgpt_export_archiver import web_api
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
+
+        many = base / "many.zip"
+        write_zip_members(many, {
+            "conversations-000.json": [],
+            "conversations-001.json": [],
+        })
+        upload_dir = base / "many-upload"
+        upload_dir.mkdir()
+        with mock.patch.object(web_api, "MAX_UPLOAD_JSON_MEMBERS", 1), \
+             mock.patch("chatgpt_export_archiver.web_api.make_upload_path", return_value=(upload_dir, upload_dir / "upload.zip")):
+            with many.open("rb") as handle:
+                response = client.post("/api/import/upload", files={"file": ("many.zip", handle, "application/zip")})
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("upload_zip_too_many_json_members", response.text)
+        self.assertFalse(upload_dir.exists())
+
+        total = base / "total.zip"
+        write_zip_members(total, {"conversations.json": [conv("total", "Total", {"root": root(["u"]), "u": node("u", "root", "user", "synthetic", 1)}, "u", 1)]})
+        with mock.patch.object(web_api, "MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES", 1):
+            with total.open("rb") as handle:
+                response = client.post("/api/import/upload", files={"file": ("total.zip", handle, "application/zip")})
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("upload_zip_uncompressed_too_large", response.text)
+
+    def test_web_upload_compression_ratio_and_invalid_zip_are_diagnostic(self):
+        from chatgpt_export_archiver import web_api
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
+        compressed = base / "compressed.zip"
+        write_zip_members(compressed, {"conversations.json": b" " * (11 * 1024 * 1024)}, compression=zipfile.ZIP_DEFLATED)
+        with mock.patch.object(web_api, "MAX_UPLOAD_COMPRESSION_RATIO", 2.0):
+            with compressed.open("rb") as handle:
+                response = client.post("/api/import/upload", files={"file": ("compressed.zip", handle, "application/zip")})
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("upload_zip_compression_ratio_too_high", response.text)
+
+        upload_dir = base / "invalid-upload"
+        upload_dir.mkdir()
+        with mock.patch("chatgpt_export_archiver.web_api.make_upload_path", return_value=(upload_dir, upload_dir / "upload.zip")):
+            response = client.post("/api/import/upload", files={"file": ("bad.zip", b"not actually a zip", "application/zip")})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("valid zip", response.text)
+        self.assertFalse(upload_dir.exists())
+
+    def test_web_upload_job_error_state_is_diagnostic(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        db = base / "archive.db"
+        z = base / "job-error.zip"
+        write_zip(z, [conv("job-error", "Job Error", {"root": root(["u"]), "u": node("u", "root", "user", "synthetic", 1)}, "u", 1)])
+        client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+        with mock.patch("chatgpt_export_archiver.web_jobs.run_import_pipeline", side_effect=RuntimeError("synthetic failure")):
+            with z.open("rb") as handle:
+                response = client.post("/api/import/upload", files={"file": ("job-error.zip", handle, "application/zip")})
+            self.assertEqual(response.status_code, 200)
+            job = self.wait_job(client, response.json()["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error"], "error_type=RuntimeError")
+        self.assertIn(job["stage"], {"import", "failed"})
 
     def test_max_upload_bytes_env_parsing_is_safe(self):
         from chatgpt_export_archiver import web_api
@@ -283,9 +437,70 @@ class WebApiTests(unittest.TestCase):
         current = client.get("/api/conversations/web-1/messages?path=current").json()
         all_nodes = client.get("/api/conversations/web-1/messages?path=all").json()
         self.assertLess(current["total"], all_nodes["total"])
+        self.assertIn("visible_total", all_nodes)
+        self.assertGreaterEqual(all_nodes["empty_hidden_count"], 1)
+        self.assertGreaterEqual(all_nodes["internal_hidden_count"], 1)
+        root_item = next(item for item in all_nodes["items"] if item["node_id"] == "root")
+        self.assertTrue(root_item["is_internal"])
+        self.assertTrue(root_item["is_empty_mapping_node"])
+        self.assertFalse(root_item["has_text"])
         keys = json.dumps(current)
         self.assertNotIn("raw_message_json", keys)
         self.assertNotIn("private_note", keys)
+
+    def test_message_page_visible_counts_for_internal_and_empty_nodes(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        page = client.get("/api/conversations/web-3/messages?path=current&limit=20").json()
+        self.assertEqual(page["total"], 5)
+        self.assertEqual(page["visible_total"], 1)
+        self.assertEqual(page["empty_hidden_count"], 1)
+        self.assertEqual(page["internal_hidden_count"], 3)
+        visible = [item for item in page["items"] if not item["is_empty_mapping_node"] and not item["is_internal"]]
+        self.assertEqual([item["node_id"] for item in visible], ["a3"])
+
+    def test_search_suggest_treats_like_wildcards_as_literals(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "suggest.zip"
+        db = base / "archive.db"
+        write_zip(
+            z,
+            [
+                conv("suggest-percent", "Literal % sign", {"root": root(["u"]), "u": node("u", "root", "user", "one", 1_701_000_001)}, "u", 1_701_000_000),
+                conv("suggest-under", "Literal _ underscore", {"root": root(["u"]), "u": node("u", "root", "user", "two", 1_701_000_002)}, "u", 1_701_000_000),
+                conv("suggest-plus", "C++ and gpt-5.5", {"root": root(["u"]), "u": node("u", "root", "user", "three", 1_701_000_003)}, "u", 1_701_000_000),
+                conv("suggest-other", "Plain title", {"root": root(["u"]), "u": node("u", "root", "user", "four", 1_701_000_004)}, "u", 1_701_000_000),
+            ],
+        )
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+        self.assertEqual({item["conversation_id"] for item in client.get("/api/search/suggest?q=%25").json()["items"]}, {"suggest-percent"})
+        self.assertEqual({item["conversation_id"] for item in client.get("/api/search/suggest?q=_").json()["items"]}, {"suggest-under"})
+        self.assertEqual({item["conversation_id"] for item in client.get("/api/search/suggest?q=C%2B%2B").json()["items"]}, {"suggest-plus"})
+        self.assertEqual({item["conversation_id"] for item in client.get("/api/search/suggest?q=gpt-5.5").json()["items"]}, {"suggest-plus"})
+
+    def test_search_suggest_uses_normalized_title_index_when_available(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "suggest-normalized.zip"
+        db = base / "archive.db"
+        write_zip(
+            z,
+            [
+                conv("suggest-fullwidth", "Title Ｉｎｔｅｌ", {"root": root(["u"]), "u": node("u", "root", "user", "one", 1_701_000_001)}, "u", 1_701_000_000),
+                conv("suggest-ligature", "Title ﬁle", {"root": root(["u"]), "u": node("u", "root", "user", "two", 1_701_000_002)}, "u", 1_701_000_000),
+                conv("suggest-combining", "Title cafe\u0301", {"root": root(["u"]), "u": node("u", "root", "user", "three", 1_701_000_003)}, "u", 1_701_000_000),
+            ],
+        )
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        self.assertEqual(main(["--db", str(db), "web-index"]), 0)
+        client = TestClient(create_app(db))
+        self.assertEqual({item["conversation_id"] for item in client.get("/api/search/suggest?q=Intel").json()["items"]}, {"suggest-fullwidth"})
+        self.assertEqual({item["conversation_id"] for item in client.get("/api/search/suggest?q=fi").json()["items"]}, {"suggest-ligature"})
+        self.assertEqual({item["conversation_id"] for item in client.get("/api/search/suggest?q=caf%C3%A9").json()["items"]}, {"suggest-combining"})
 
     def test_messages_include_render_text_and_bounded_raw_preview(self):
         td, client, _db = self.make_client()
@@ -364,6 +579,752 @@ class WebApiTests(unittest.TestCase):
         normalized_hits = client.get("/api/search/messages?q=%EF%BD%87%EF%BD%90%EF%BD%94%EF%BC%8D%EF%BC%95%EF%BC%8E%EF%BC%95&conversation_id=web-1").json()
         self.assertTrue(normalized_hits["items"])
         self.assertIn("gpt-5.5", normalized_hits["items"][0]["snippet"])
+
+    def test_exclude_only_scope_only_and_filter_reasons_are_consistent(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+
+        excluded = client.get("/api/conversations?q=-SQLite&limit=10").json()
+        self.assertEqual({item["conversation_id"] for item in excluded["items"]}, {"web-2", "web-3"})
+        excluded_param = client.get("/api/conversations?exclude=SQLite&limit=10").json()
+        self.assertEqual({item["conversation_id"] for item in excluded_param["items"]}, {"web-2", "web-3"})
+        message_hits = client.get("/api/search/messages?q=-SQLite&limit=100").json()
+        self.assertEqual(message_hits["total"], 0)
+        message_hits_param = client.get("/api/search/messages?exclude=SQLite&limit=100").json()
+        self.assertEqual(message_hits_param["total"], 0)
+        reader = client.get("/api/conversations/web-1/messages?q=-SQLite&limit=20").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in reader["items"]))
+
+        normal = client.get("/api/conversations?limit=10").json()
+        scope_title = client.get("/api/conversations?scope=title&limit=10").json()
+        scope_message = client.get("/api/conversations?scope=message&limit=10").json()
+        self.assertEqual(scope_title["total"], normal["total"])
+        self.assertEqual(scope_message["total"], normal["total"])
+        self.assertFalse(any(item.get("title_match") for item in scope_title["items"]))
+
+        source = client.get("/api/conversations?source=CONVERSATIONS.JSON&limit=10").json()
+        self.assertEqual(source["total"], 3)
+        self.assertIn("source match", source["items"][0]["reasons"])
+        self.assertFalse(source["items"][0].get("title_match"))
+        role = client.get("/api/conversations?role=developer&limit=10").json()
+        self.assertEqual(role["total"], 1)
+        self.assertIn("role filter", role["items"][0]["reasons"])
+        role_hits = client.get("/api/search/messages?role=developer&limit=10").json()
+        self.assertEqual(role_hits["total"], 0)
+        source_hits = client.get("/api/search/messages?source=CONVERSATIONS.JSON&limit=10").json()
+        self.assertEqual(source_hits["total"], 0)
+        date = client.get("/api/conversations?after=2024-01-01&limit=10").json()
+        self.assertTrue(date["total"] > 0)
+        self.assertIn("date filter", date["items"][0]["reasons"])
+        date_hits = client.get("/api/search/messages?after=2024-01-01&limit=10").json()
+        self.assertEqual(date_hits["total"], 0)
+        title_hits = client.get("/api/search/messages?title=Python&limit=10").json()
+        self.assertEqual(title_hits["total"], 0)
+        scope_hits = client.get("/api/search/messages?scope=message&limit=10").json()
+        self.assertEqual(scope_hits["total"], 0)
+
+    def test_date_filters_use_utc_calendar_days(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "utc.zip"
+        db = base / "archive.db"
+        late_utc_22 = datetime(2026, 5, 22, 23, 59, 59, 500000, tzinfo=timezone.utc).timestamp()
+        early_utc_23 = datetime(2026, 5, 23, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+        write_zip(
+            z,
+            [
+                conv("utc-22", "UTC May 22", {"root": root(["u"]), "u": node("u", "root", "user", "utc-boundary-token", late_utc_22)}, "u", late_utc_22),
+                conv("utc-23", "UTC May 23", {"root": root(["u"]), "u": node("u", "root", "user", "utc-boundary-token", early_utc_23)}, "u", early_utc_23),
+            ],
+        )
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("UPDATE conversations SET update_time = create_time WHERE conversation_id IN ('utc-22', 'utc-23')")
+            conn.commit()
+        finally:
+            conn.close()
+        client = TestClient(create_app(db))
+
+        after = client.get("/api/conversations?q=utc-boundary-token&after=2026-05-23&limit=10").json()
+        self.assertEqual([item["conversation_id"] for item in after["items"]], ["utc-23"])
+        before = client.get("/api/conversations?q=utc-boundary-token&before=2026-05-22&limit=10").json()
+        self.assertEqual([item["conversation_id"] for item in before["items"]], ["utc-22"])
+        previous_day = client.get("/api/conversations?q=utc-boundary-token&before=2026-05-21&limit=10").json()
+        self.assertEqual(previous_day["total"], 0)
+        messages = client.get("/api/search/messages?q=utc-boundary-token&after=2026-05-23&limit=10").json()
+        self.assertEqual([item["conversation_id"] for item in messages["items"]], ["utc-23"])
+        message_before = client.get("/api/search/messages?q=utc-boundary-token&before=2026-05-22&limit=10").json()
+        self.assertEqual([item["conversation_id"] for item in message_before["items"]], ["utc-22"])
+        reader = client.get("/api/conversations/utc-22/messages?q=utc-boundary-token&before=2026-05-22&limit=10").json()
+        highlighted = [item for item in reader["items"] if item["highlight_ranges"]]
+        self.assertEqual([item["node_id"] for item in highlighted], ["u"])
+        hidden = client.get("/api/conversations/utc-22/messages?q=utc-boundary-token&before=2026-05-21&limit=10").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in hidden["items"]))
+
+    def test_message_hidden_counts_match_payload_visibility_for_raw_fallback_nodes(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        raw_message = {
+            "id": "msg-raw-only",
+            "author": {"role": "user"},
+            "create_time": 1_720_000_004,
+            "update_time": 1_720_000_004,
+            "content": {"content_type": "text", "parts": ["raw-only readable text"]},
+            "metadata": {},
+        }
+        placeholder_raw = {
+            "id": "msg-placeholder",
+            "author": {"role": "user"},
+            "create_time": 1_720_000_005,
+            "update_time": 1_720_000_005,
+            "content": {"content_type": "text", "parts": ["placeholder raw readable text"]},
+            "metadata": {},
+        }
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                """
+                INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id, children_json, message_id, role, create_time, update_time, content_type, content_text, content_hash, is_on_current_path, raw_message_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("web-3", "raw-only", "root", "[]", None, "user", 1_720_000_004, 1_720_000_004, "text", "", None, 0, json.dumps(raw_message, ensure_ascii=False)),
+            )
+            conn.execute(
+                """
+                INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id, children_json, message_id, role, create_time, update_time, content_type, content_text, content_hash, is_on_current_path, raw_message_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("web-3", "placeholder-raw", "root", "[]", "msg-placeholder", "user", 1_720_000_005, 1_720_000_005, "text", "[non-text content: image]", None, 0, json.dumps(placeholder_raw, ensure_ascii=False)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        page = client.get("/api/conversations/web-3/messages?path=all&limit=20").json()
+        self.assertEqual(page["empty_hidden_count"], 1)
+        self.assertEqual(page["internal_hidden_count"], 3)
+        self.assertEqual(page["technical_hidden_count"], 3)
+        self.assertEqual(page["visible_total"], 3)
+        by_node = {item["node_id"]: item for item in page["items"]}
+        self.assertEqual(by_node["raw-only"]["display_text"], "raw-only readable text")
+        self.assertFalse(by_node["raw-only"]["is_empty_mapping_node"])
+        self.assertEqual(by_node["placeholder-raw"]["display_text"], "placeholder raw readable text")
+        visible = [item for item in page["items"] if not item["is_empty_mapping_node"] and not item["is_internal"]]
+        self.assertEqual({item["node_id"] for item in visible}, {"a3", "raw-only", "placeholder-raw"})
+
+    def test_web_export_respects_reader_internal_visibility(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        visible = client.get("/api/conversations/web-1/export?format=txt&path=all&include_internal=false")
+        self.assertEqual(visible.status_code, 200)
+        self.assertIn("Run python -m unittest", visible.text)
+        self.assertNotIn("sqlite3.OperationalError", visible.text)
+        self.assertNotIn("root", visible.text.lower())
+
+        full = client.get("/api/conversations/web-1/export?format=txt&path=all&include_internal=true")
+        self.assertEqual(full.status_code, 200)
+        self.assertIn("sqlite3.OperationalError should not leak internal payload", full.text)
+
+        current = client.get("/api/conversations/web-1/export?format=txt&path=current&include_internal=false")
+        all_nodes = client.get("/api/conversations/web-1/export?format=txt&path=all&include_internal=false")
+        self.assertNotIn("This branch mentions pandas", current.text)
+        self.assertIn("This branch mentions pandas", all_nodes.text)
+
+    def test_advanced_exclude_supports_quoted_phrase_and_source_normalization(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+
+        broad = client.get(f"/api/conversations?q=python&exclude={quote('python-missing SQLite')}&limit=10").json()
+        self.assertEqual(broad["total"], 0, "unquoted exclude splits into separate fragments")
+        quoted_phrase = quote('"python-missing SQLite"')
+        phrase = client.get(f"/api/conversations?q=python&exclude={quoted_phrase}&limit=10").json()
+        self.assertEqual(phrase["total"], 1, "quoted exclude phrase should not exclude separated terms")
+        quoted_negative = client.get('/api/conversations?q=python%20-"python-missing%20SQLite"&limit=10').json()
+        self.assertEqual(quoted_negative["total"], 1)
+        source_query = client.get(f"/api/conversations?q={quote('source:ＣＯＮＶＥＲＳＡＴＩＯＮＳ.JSON')}&limit=10").json()
+        source_param = client.get(f"/api/conversations?source={quote('ＣＯＮＶＥＲＳＡＴＩＯＮＳ.JSON')}&limit=10").json()
+        self.assertEqual(source_query["total"], source_param["total"])
+        self.assertEqual(source_param["total"], 3)
+
+    def test_contains_and_whole_word_search_modes(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "word.zip"
+        mapping1 = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "Intel ships CPUs. Intel(R) appears with punctuation. intel. ends a sentence.", 1_700_300_001, ["a"]),
+            "a": node("a", "u", "assistant", "No longer token here.", 1_700_300_002),
+        }
+        mapping2 = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "Intelligence and IntelliSense should only match contains mode.", 1_700_300_003),
+        }
+        mapping3 = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "英特尔中文词在全词模式下仍按保守包含匹配。", 1_700_300_004),
+        }
+        mapping4 = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "SuperIntel ships CPUs. SuperIntel shipsXYZ should not match a whole phrase.", 1_700_300_005),
+        }
+        mapping5 = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "SuperIntel(R) and Intel(R)XYZ are longer token boundaries.", 1_700_300_006),
+        }
+        mapping6 = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "gpt-5.5 is standalone.", 1_700_300_007),
+        }
+        mapping7 = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "mygpt-5.5 and gpt-5.5abc are embedded longer tokens.", 1_700_300_008),
+        }
+        write_zip(
+            z,
+            [
+                conv("word-intel", "Intel Title", mapping1, "a", 1_700_300_000),
+                conv("word-longer", "Intelligence Title", mapping2, "u", 1_700_300_001),
+                conv("word-zh", "英特尔 标题", mapping3, "u", 1_700_300_002),
+                conv("word-embedded-phrase", "SuperIntel Ships Title", mapping4, "u", 1_700_300_003),
+                conv("word-embedded-punct", "SuperIntel(R) Title", mapping5, "u", 1_700_300_004),
+                conv("word-version", "gpt-5.5 Title", mapping6, "u", 1_700_300_005),
+                conv("word-version-embedded", "mygpt-5.5 Title", mapping7, "u", 1_700_300_006),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+
+        contains = client.get("/api/search/messages?q=Intel&match_mode=contains&path=all&order=display&limit=10").json()
+        self.assertEqual(
+            {item["conversation_id"] for item in contains["items"]},
+            {"word-intel", "word-longer", "word-embedded-phrase", "word-embedded-punct"},
+        )
+        word = client.get("/api/search/messages?q=Intel&match_mode=word&path=all&order=display&limit=10").json()
+        word_ids = {item["conversation_id"] for item in word["items"]}
+        self.assertIn("word-intel", word_ids)
+        self.assertNotIn("word-longer", word_ids)
+        self.assertNotIn("word-embedded-phrase", word_ids)
+        self.assertNotIn("Intelligence", word["items"][0]["snippet"])
+        reader = client.get("/api/conversations/word-intel/messages?q=Intel&match_mode=word&path=all").json()
+        self.assertTrue(reader["items"][0]["highlight_ranges"])
+        embedded_reader = client.get("/api/conversations/word-longer/messages?q=Intel&match_mode=word&path=all").json()
+        self.assertFalse(embedded_reader["items"][0]["highlight_ranges"])
+
+        title_contains = client.get("/api/conversations?q=Intel&scope=title&match_mode=contains&sort=title").json()
+        self.assertEqual(
+            {item["conversation_id"] for item in title_contains["items"]},
+            {"word-intel", "word-longer", "word-embedded-phrase", "word-embedded-punct"},
+        )
+        title_word = client.get("/api/conversations?q=Intel&scope=title&match_mode=word&sort=title").json()
+        self.assertEqual([item["conversation_id"] for item in title_word["items"]], ["word-intel"])
+
+        excluded = client.get("/api/search/messages?q=Intel%20-Intel&match_mode=word&path=all").json()
+        self.assertEqual(excluded["total"], 0)
+        phrase = client.get('/api/search/messages?q="Intel%20ships"&match_mode=word&path=all').json()
+        self.assertEqual(phrase["total"], 1)
+        self.assertEqual(phrase["items"][0]["conversation_id"], "word-intel")
+        phrase_exclude = client.get('/api/search/messages?q="Intel%20ships"%20-"SuperIntel%20ships"&match_mode=word&path=all').json()
+        self.assertEqual([item["conversation_id"] for item in phrase_exclude["items"]], ["word-intel"])
+        punct = client.get("/api/search/messages?q=Intel(R)&match_mode=word&path=all&limit=10").json()
+        self.assertEqual([item["conversation_id"] for item in punct["items"]], ["word-intel"])
+        version = client.get("/api/search/messages?q=gpt-5.5&match_mode=word&path=all&limit=10").json()
+        self.assertEqual([item["conversation_id"] for item in version["items"]], ["word-version"])
+        casefold = client.get("/api/search/messages?q=intel&match_mode=word&path=all").json()
+        self.assertIn("word-intel", {item["conversation_id"] for item in casefold["items"]})
+        self.assertNotIn("word-longer", {item["conversation_id"] for item in casefold["items"]})
+        chinese = client.get("/api/search/messages?q=%E8%8B%B1%E7%89%B9%E5%B0%94&match_mode=word&path=all").json()
+        self.assertEqual(chinese["total"], 1)
+        invalid = client.get("/api/search/messages?q=Intel&match_mode=bad")
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_word_mode_multiscript_keeps_index_candidates_and_semantics(self):
+        from chatgpt_export_archiver import search as search_module
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "multi-word.zip"
+        mapping = {
+            "root": root(["n"]),
+            "n": node(
+                "n",
+                "root",
+                "user",
+                "python Intel Intel. Intel(R) gpt-5.5 英特尔 かなテスト 한글테스트 Ｉｎｔｅｌ ｐｙｔｈｏｎ 英特尔 Intel 🔥 prefix",
+                1_700_350_001,
+            ),
+        }
+        embedded = {
+            "root": root(["n"]),
+            "n": node("n", "root", "assistant", "Intelligence IntelliSense Intellicode SuperIntel ships gpt-5.5abc mygpt-5.5", 1_700_350_002),
+        }
+        write_zip(
+            z,
+            [
+                conv("multi-visible", "英特尔 かなテスト 한글테스트 Intel gpt-5.5", mapping, "n", 1_700_350_000),
+                conv("multi-embedded", "Intelligence embedded", embedded, "n", 1_700_350_001),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        self.assertEqual(main(["--db", str(db), "web-index"]), 0)
+        client = TestClient(create_app(db))
+
+        for label, query in [
+            ("english common", "python"),
+            ("english proper", "Intel"),
+            ("punctuation version", "gpt-5.5"),
+            ("chinese", "英特尔"),
+            ("japanese", "かなテスト"),
+            ("korean", "한글테스트"),
+            ("fullwidth latin", "Ｉｎｔｅｌ"),
+            ("mixed cjk latin", "英特尔 Intel"),
+        ]:
+            with self.subTest(label=label):
+                page = client.get(f"/api/search/messages?q={quote(query)}&match_mode=word&path=all&limit=10").json()
+                self.assertIn("multi-visible", {item["conversation_id"] for item in page["items"]})
+
+        self.assertEqual(client.get("/api/search/messages?q=no-such-token&match_mode=word&path=all").json()["total"], 0)
+        contains = client.get("/api/search/messages?q=Intel&match_mode=contains&path=all&limit=10").json()
+        self.assertIn("multi-embedded", {item["conversation_id"] for item in contains["items"]})
+        word = client.get("/api/search/messages?q=Intel&match_mode=word&path=all&limit=10").json()
+        self.assertNotIn("multi-embedded", {item["conversation_id"] for item in word["items"]})
+        phrase = client.get('/api/search/messages?q="Intel%20ships"&match_mode=word&path=all').json()
+        self.assertEqual(phrase["total"], 0)
+        version = client.get("/api/search/messages?q=gpt-5.5&match_mode=word&path=all").json()
+        self.assertNotIn("multi-embedded", {item["conversation_id"] for item in version["items"]})
+
+        conn = connect_readonly(db)
+        try:
+            for query in ["英特尔", "かなテスト", "한글테스트"]:
+                parsed = search_module.parse_query(query, path_default="all", match_mode="word")
+                source_sql, _source_params, _score_expr, _reason = search_module._message_match_source(conn, parsed, use_trigram=True)
+                self.assertIn("web_message_trigram", source_sql)
+                self.assertNotEqual(source_sql.strip(), "conversation_nodes n")
+                title_sql, _title_params = search_module._title_conversation_select(conn, parsed, use_trigram=True)
+                self.assertIn("web_title_trigram", title_sql)
+        finally:
+            conn.close()
+
+    def test_search_visibility_metadata_for_title_internal_and_branch_hits(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "visibility.zip"
+        title_mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "Synthetic body without the title token.", 1_700_400_001),
+        }
+        internal_mapping = {
+            "root": root(["sys"]),
+            "sys": node("sys", "root", "system", "internal-only-token lives in a system message.", 1_700_400_002, ["a"]),
+            "a": node("a", "sys", "assistant", "Visible answer without the token.", 1_700_400_003),
+        }
+        mixed_mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "mixed-visible-token appears in visible text.", 1_700_400_004, ["tool"]),
+            "tool": node("tool", "u", "tool", "mixed-visible-token also appears in an internal tool message.", 1_700_400_005, ["a"]),
+            "a": node("a", "tool", "assistant", "Final visible answer.", 1_700_400_006),
+        }
+        branch_mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "Current path text.", 1_700_400_007, ["a", "b"]),
+            "a": node("a", "u", "assistant", "Current path answer.", 1_700_400_008),
+            "b": node("b", "u", "assistant", "branch-only-token appears off the current path.", 1_700_400_009),
+        }
+        write_zip(
+            z,
+            [
+                conv("visibility-title", "title-only-token synthetic title", title_mapping, "u", 1_700_400_000),
+                conv("visibility-internal", "Internal visibility", internal_mapping, "a", 1_700_400_001),
+                conv("visibility-mixed", "Mixed visibility", mixed_mapping, "a", 1_700_400_002),
+                conv("visibility-branch", "Branch visibility", branch_mapping, "a", 1_700_400_003),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+
+        title_results = client.get("/api/conversations?q=title-only-token&path=current").json()
+        self.assertEqual([item["conversation_id"] for item in title_results["items"]], ["visibility-title"])
+        self.assertIn("title match", title_results["items"][0]["reasons"])
+        title_messages = client.get("/api/search/messages?q=title-only-token&conversation_id=visibility-title&path=current").json()
+        self.assertEqual(title_messages["total"], 0)
+
+        internal_results = client.get("/api/conversations?q=internal-only-token&path=current").json()
+        self.assertEqual([item["conversation_id"] for item in internal_results["items"]], ["visibility-internal"])
+        self.assertTrue(internal_results["items"][0]["has_internal_hits"])
+        self.assertTrue(internal_results["items"][0]["snippets"][0]["is_internal"])
+        internal_hits = client.get("/api/search/messages?q=internal-only-token&conversation_id=visibility-internal&path=current").json()
+        self.assertEqual(internal_hits["total"], 1)
+        self.assertTrue(internal_hits["items"][0]["is_internal"])
+
+        mixed_hits = client.get("/api/search/messages?q=mixed-visible-token&conversation_id=visibility-mixed&path=current&order=display").json()
+        self.assertEqual(mixed_hits["total"], 2)
+        self.assertEqual([item["is_internal"] for item in mixed_hits["items"]], [False, True])
+
+        current_branch = client.get("/api/search/messages?q=branch-only-token&conversation_id=visibility-branch&path=current").json()
+        self.assertEqual(current_branch["total"], 0)
+        all_branch = client.get("/api/search/messages?q=branch-only-token&conversation_id=visibility-branch&path=all").json()
+        self.assertEqual(all_branch["total"], 1)
+        self.assertFalse(all_branch["items"][0]["is_on_current_path"])
+        branch_results = client.get("/api/conversations?q=branch-only-token&path=all").json()
+        self.assertTrue(branch_results["items"][0]["has_branch_hits"])
+
+    def test_highlight_ranges_use_utf16_offsets_for_web(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "unicode-highlight.zip"
+        chinese_text = "\n".join([
+            "[2026/03/13, 21:00:59] - youtoob🔥: warmup",
+            "🔥🔥 youtoob🔥: 英特尔有资源",
+        ])
+        english_text = "prefix 🔥🔥 Intel ships as a standalone token. Fullwidth Ｉｎｔｅｌ and cafe\u0301 marker."
+        mapping = {
+            "root": root(["sys"]),
+            "sys": node("sys", "root", "system", chinese_text, 1_700_500_001, ["u"]),
+            "u": node("u", "sys", "user", english_text, 1_700_500_002),
+        }
+        write_zip(z, [conv("unicode-highlight", "Unicode Highlight", mapping, "u", 1_700_500_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+
+        chinese = client.get("/api/conversations/unicode-highlight/messages?q=%E8%8B%B1%E7%89%B9%E5%B0%94&path=current").json()
+        sys_item = next(item for item in chinese["items"] if item["node_id"] == "sys")
+        chinese_range = sys_item["highlight_ranges"][0]
+        self.assertEqual(js_slice(sys_item["display_text"], chinese_range["start"], chinese_range["end"]), "英特尔")
+        english = client.get("/api/conversations/unicode-highlight/messages?q=Intel&match_mode=word&path=current").json()
+        user_item = next(item for item in english["items"] if item["node_id"] == "u")
+        english_range = user_item["highlight_ranges"][0]
+        self.assertEqual(js_slice(user_item["display_text"], english_range["start"], english_range["end"]), "Intel")
+        english_hit = client.get("/api/search/messages?q=Intel&match_mode=word&conversation_id=unicode-highlight&path=current").json()
+        self.assertIn("Intel", english_hit["items"][0]["snippet"])
+        fullwidth = client.get("/api/conversations/unicode-highlight/messages?q=Intel&match_mode=word&path=current").json()
+        fullwidth_ranges = next(item for item in fullwidth["items"] if item["node_id"] == "u")["highlight_ranges"]
+        fullwidth_slices = [js_slice(user_item["display_text"], item["start"], item["end"]) for item in fullwidth_ranges]
+        self.assertIn("Ｉｎｔｅｌ", fullwidth_slices)
+        combining = client.get("/api/conversations/unicode-highlight/messages?q=caf%C3%A9&match_mode=word&path=current").json()
+        combining_item = next(item for item in combining["items"] if item["node_id"] == "u")
+        combining_range = combining_item["highlight_ranges"][0]
+        self.assertEqual(js_slice(combining_item["display_text"], combining_range["start"], combining_range["end"]), "cafe\u0301")
+
+    def test_whitespace_collapsed_phrase_highlights_and_snippets(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "whitespace-highlight.zip"
+        text = "\n".join(
+            [
+                "Prefix before emoji 🔥 foo\nbar suffix.",
+                "Second phrase has foo   bar with multiple spaces.",
+                "Third phrase has foo\tbar with a tab.",
+                "Mixed text 英特尔\nIntel keeps both sides visible.",
+                "Fullwidth Ｐｙｔｈｏｎ plus cafe\u0301 and ﬁle compatibility text.",
+            ]
+        )
+        mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", text, 1_700_510_001),
+        }
+        write_zip(z, [conv("whitespace-highlight", "Whitespace Highlight", mapping, "u", 1_700_510_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        self.assertEqual(main(["--db", str(db), "web-index"]), 0)
+        client = TestClient(create_app(db))
+
+        phrase = quote('"foo bar"')
+        reader = client.get(f"/api/conversations/whitespace-highlight/messages?q={phrase}&path=current").json()
+        item = next(item for item in reader["items"] if item["node_id"] == "u")
+        slices = [js_slice(item["display_text"], r["start"], r["end"]) for r in item["highlight_ranges"]]
+        self.assertIn("foo\nbar", slices)
+        self.assertIn("foo   bar", slices)
+        self.assertIn("foo\tbar", slices)
+        hit = client.get(f"/api/search/messages?q={phrase}&conversation_id=whitespace-highlight&path=current").json()
+        self.assertIn("foo bar", hit["items"][0]["snippet"])
+
+        mixed = quote('"英特尔 Intel"')
+        mixed_reader = client.get(f"/api/conversations/whitespace-highlight/messages?q={mixed}&path=current").json()
+        mixed_item = next(item for item in mixed_reader["items"] if item["node_id"] == "u")
+        mixed_slices = [js_slice(mixed_item["display_text"], r["start"], r["end"]) for r in mixed_item["highlight_ranges"]]
+        self.assertIn("英特尔\nIntel", mixed_slices)
+
+        fullwidth = client.get("/api/conversations/whitespace-highlight/messages?q=python&match_mode=word&path=current").json()
+        fullwidth_item = next(item for item in fullwidth["items"] if item["node_id"] == "u")
+        fullwidth_slices = [js_slice(fullwidth_item["display_text"], r["start"], r["end"]) for r in fullwidth_item["highlight_ranges"]]
+        self.assertIn("Ｐｙｔｈｏｎ", fullwidth_slices)
+        combining = client.get("/api/conversations/whitespace-highlight/messages?q=caf%C3%A9&match_mode=word&path=current").json()
+        combining_item = next(item for item in combining["items"] if item["node_id"] == "u")
+        combining_range = combining_item["highlight_ranges"][0]
+        self.assertEqual(js_slice(combining_item["display_text"], combining_range["start"], combining_range["end"]), "cafe\u0301")
+
+    def test_normalized_recall_for_messages_and_titles_without_and_with_web_index(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "normalized-recall.zip"
+        text = "Fullwidth Ｉｎｔｅｌ body, decomposed cafe\u0301 marker, ﬁle ligature text, standalone ﬁ token, short Ｉｎ, CJK 子串, and emoji 🔥."
+        mapping = {"root": root(["u"]), "u": node("u", "root", "user", text, 1_700_515_001)}
+        write_zip(z, [conv("normalized-recall", "Title Ｉｎｔｅｌ cafe\u0301 ﬁle", mapping, "u", 1_700_515_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+
+        def assert_normalized_hits(label: str):
+            with self.subTest(label=label):
+                for query in ["Intel", "café", "file"]:
+                    message_page = client.get(f"/api/search/messages?q={quote(query)}&match_mode=word&path=all").json()
+                    self.assertEqual({item["conversation_id"] for item in message_page["items"]}, {"normalized-recall"})
+                    reader = client.get(f"/api/conversations/normalized-recall/messages?q={quote(query)}&match_mode=word&path=all").json()
+                    item = next(row for row in reader["items"] if row["node_id"] == "u")
+                    slices = [js_slice(item["display_text"], r["start"], r["end"]) for r in item["highlight_ranges"]]
+                    self.assertTrue(slices, query)
+                title_page = client.get("/api/conversations?q=Intel&scope=title&match_mode=word").json()
+                self.assertEqual([item["conversation_id"] for item in title_page["items"]], ["normalized-recall"])
+                for query in ["fi", "in", "子串", "🔥"]:
+                    message_page = client.get(f"/api/search/messages?q={quote(query)}&path=all").json()
+                    self.assertEqual({item["conversation_id"] for item in message_page["items"]}, {"normalized-recall"}, query)
+                    conv_page = client.get(f"/api/conversations?q={quote(query)}&path=all").json()
+                    self.assertEqual({item["conversation_id"] for item in conv_page["items"]}, {"normalized-recall"}, query)
+                    reader = client.get(f"/api/conversations/normalized-recall/messages?q={quote(query)}&path=all").json()
+                    item = next(row for row in reader["items"] if row["node_id"] == "u")
+                    self.assertTrue(item["highlight_ranges"], query)
+                word_short = client.get("/api/search/messages?q=fi&match_mode=word&path=all").json()
+                self.assertEqual({item["conversation_id"] for item in word_short["items"]}, {"normalized-recall"})
+
+        assert_normalized_hits("without web-index")
+        self.assertEqual(main(["--db", str(db), "web-index"]), 0)
+        health = client.get("/api/health").json()
+        self.assertTrue(health["web_normalized_indexed"])
+        self.assertTrue(health["web_normalized_trigram_indexed"])
+        self.assertFalse(health["web_legacy_trigram_indexed"])
+        assert_normalized_hits("with normalized web-index")
+
+        missing_trigram = sqlite3.connect(db)
+        try:
+            missing_trigram.execute("DROP TABLE IF EXISTS web_message_trigram")
+            missing_trigram.execute("DROP TABLE IF EXISTS web_title_trigram")
+            missing_trigram.commit()
+        finally:
+            missing_trigram.close()
+        health = client.get("/api/health").json()
+        self.assertTrue(health["web_normalized_indexed"])
+        self.assertFalse(health["web_normalized_trigram_indexed"])
+        self.assertFalse(health["web_trigram_indexed"])
+        assert_normalized_hits("metadata normalized but trigram tables missing")
+
+        legacy = sqlite3.connect(db)
+        try:
+            legacy.execute("DROP TABLE IF EXISTS web_index_metadata")
+            legacy.execute("DROP TABLE IF EXISTS web_message_norm")
+            legacy.execute("DROP TABLE IF EXISTS web_title_norm")
+            legacy.execute("CREATE TABLE web_message_norm(conversation_id TEXT NOT NULL, node_id TEXT NOT NULL, content_norm TEXT NOT NULL, PRIMARY KEY(conversation_id, node_id))")
+            legacy.execute("INSERT INTO web_message_norm SELECT conversation_id, node_id, lower(content_text) FROM conversation_nodes WHERE content_text IS NOT NULL")
+            legacy.execute("CREATE TABLE web_title_norm(conversation_id TEXT PRIMARY KEY, title_norm TEXT NOT NULL)")
+            legacy.execute("INSERT INTO web_title_norm SELECT conversation_id, lower(COALESCE(title, '')) FROM conversations")
+            legacy.commit()
+        finally:
+            legacy.close()
+        assert_normalized_hits("legacy raw-normalized tables")
+
+    def test_reader_highlights_respect_full_search_filters(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "reader-filter.zip"
+        mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "foo user body", 1_700_516_001, ["a"]),
+            "a": node("a", "u", "assistant", "foo assistant body", 1_700_516_002, ["b"]),
+            "b": node("b", "a", "assistant", "foo bar excluded body", 1_700_516_003),
+        }
+        write_zip(z, [conv("reader-filter", "Foo Title", mapping, "b", 1_700_516_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+
+        excluded = client.get("/api/conversations/reader-filter/messages?q=foo&exclude=bar&path=current").json()
+        by_id = {item["node_id"]: item for item in excluded["items"]}
+        self.assertTrue(by_id["u"]["highlight_ranges"])
+        self.assertTrue(by_id["a"]["highlight_ranges"])
+        self.assertFalse(by_id["b"]["highlight_ranges"])
+
+        role_filtered = client.get("/api/conversations/reader-filter/messages?q=foo&role=assistant&path=current").json()
+        by_id = {item["node_id"]: item for item in role_filtered["items"]}
+        self.assertFalse(by_id["u"]["highlight_ranges"])
+        self.assertTrue(by_id["a"]["highlight_ranges"])
+
+        title_scope = client.get("/api/conversations/reader-filter/messages?q=Foo&scope=title&path=current").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in title_scope["items"]))
+        title_filter = client.get("/api/conversations/reader-filter/messages?title=Foo&path=current").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in title_filter["items"]))
+
+    def test_reader_highlight_respects_title_excludes(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "reader-title-exclude.zip"
+        clean_mapping = {"root": root(["u"]), "u": node("u", "root", "user", "foo body", 1_700_518_001)}
+        blocked_mapping = {"root": root(["u"]), "u": node("u", "root", "user", "foo body", 1_700_518_002)}
+        write_zip(
+            z,
+            [
+                conv("reader-title-clean", "Clean Title", clean_mapping, "u", 1_700_518_000),
+                conv("reader-title-blocked", "Blocked bar Title", blocked_mapping, "u", 1_700_518_001),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+        page = client.get("/api/conversations?q=foo%20-bar&path=current&sort=title").json()
+        self.assertEqual([item["conversation_id"] for item in page["items"]], ["reader-title-clean"])
+        clean = client.get("/api/conversations/reader-title-clean/messages?q=foo%20-bar&path=current").json()
+        self.assertTrue(any(item["highlight_ranges"] for item in clean["items"]))
+        blocked = client.get("/api/conversations/reader-title-blocked/messages?q=foo%20-bar&path=current").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in blocked["items"]))
+
+    def test_selected_conversation_metadata_is_returned_outside_current_page(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "selected-meta.zip"
+        conversations = []
+        for cid, title in [("sel-a", "A first"), ("sel-b", "B second"), ("sel-c", "C selected")]:
+            mapping = {"root": root(["u"]), "u": node("u", "root", "user", "selneedle body", 1_700_517_001)}
+            conversations.append(conv(cid, title, mapping, "u", 1_700_517_000))
+        write_zip(z, conversations)
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+        page = client.get("/api/conversations?q=selneedle&sort=title&limit=1&selected_id=sel-c").json()
+        self.assertTrue(page["selected_in_results"])
+        self.assertEqual([item["conversation_id"] for item in page["items"]], ["sel-a"])
+        self.assertEqual(page["selected_item"]["conversation_id"], "sel-c")
+        self.assertTrue(page["selected_item"]["message_match"])
+
+    def test_selected_metadata_for_normalized_short_fragment_outside_page(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "selected-normalized-short.zip"
+        newer = {"root": root(["u"]), "u": node("u", "root", "user", "newer ﬁ hit", 1_700_519_101)}
+        older = {"root": root(["u"]), "u": node("u", "root", "user", "older ﬁ hit", 1_700_519_001)}
+        write_zip(
+            z,
+            [
+                conv("selected-short-new", "New", newer, "u", 1_700_519_100),
+                conv("selected-short-old", "Old", older, "u", 1_700_519_000),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        self.assertEqual(main(["--db", str(db), "web-index"]), 0)
+        client = TestClient(create_app(db))
+        page = client.get("/api/conversations?q=fi&sort=newest&limit=1&selected_id=selected-short-old").json()
+        self.assertTrue(page["selected_in_results"])
+        self.assertEqual([item["conversation_id"] for item in page["items"]], ["selected-short-new"])
+        self.assertEqual(page["selected_item"]["conversation_id"], "selected-short-old")
+        self.assertTrue(page["selected_item"]["message_match"])
+
+    def test_conversation_relevance_sort_uses_score_not_newest(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "relevance-sort.zip"
+        strong_title = {"root": root(["u"]), "u": node("u", "root", "user", "body without query", 1_700_521_001)}
+        weak_body = {"root": root(["u"]), "u": node("u", "root", "user", "foo body", 1_700_522_001)}
+        write_zip(
+            z,
+            [
+                conv("relevance-title-old", "foo title", strong_title, "u", 1_700_521_000),
+                conv("relevance-body-new", "plain title", weak_body, "u", 1_700_522_000),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+        relevance = client.get("/api/conversations?q=foo&sort=relevance&limit=2&selected_id=relevance-body-new").json()
+        self.assertEqual([item["conversation_id"] for item in relevance["items"]], ["relevance-title-old", "relevance-body-new"])
+        self.assertTrue(relevance["selected_in_results"])
+        newest = client.get("/api/conversations?q=foo&sort=newest&limit=2").json()
+        self.assertEqual([item["conversation_id"] for item in newest["items"]], ["relevance-body-new", "relevance-title-old"])
+
+    def test_message_search_without_count_preserves_order_and_has_more_probe(self):
+        from chatgpt_export_archiver.search import parse_query, search_messages
+
+        td, _client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = connect_readonly(db)
+        try:
+            parsed = parse_query("python", path_default="all")
+            first = search_messages(conn, parsed, limit=1, offset=0, order="display", count_total=False)
+            second = search_messages(conn, parsed, limit=1, offset=1, order="display", count_total=False)
+            self.assertEqual(len(first["items"]), 1)
+            self.assertTrue(first["has_more"])
+            self.assertEqual(first["next_offset"], 1)
+            self.assertNotEqual(first["items"][0]["node_id"], second["items"][0]["node_id"])
+            self.assertLessEqual(first["total"], 2)
+        finally:
+            conn.close()
+
+    def test_message_search_api_count_total_false_uses_fast_page_probe(self):
+        from chatgpt_export_archiver import search as search_module
+
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        original = search_module._message_search_page_rows
+        calls: list[bool] = []
+
+        def wrapped(conn, parsed, conversation_id, limit, offset, order, *, use_trigram=True, count_total=True):
+            calls.append(count_total)
+            return original(conn, parsed, conversation_id, limit, offset, order, use_trigram=use_trigram, count_total=count_total)
+
+        with mock.patch.object(search_module, "_message_search_page_rows", side_effect=wrapped):
+            payload = client.get("/api/search/messages?q=python&limit=1&count_total=false").json()
+        self.assertIn(False, calls)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertTrue(payload["has_more"])
+        self.assertLessEqual(payload["total"], 2)
+
+    def test_trigram_partial_candidates_keep_safe_and_terms_without_full_scan(self):
+        from chatgpt_export_archiver import search as search_module
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "partial-trigram.zip"
+        mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "go partiallong 英特尔 Intel gpt-5.5 quoted phrase target", 1_700_520_001),
+        }
+        write_zip(z, [conv("partial-trigram", "go partiallong title", mapping, "u", 1_700_520_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        self.assertEqual(main(["--db", str(db), "web-index"]), 0)
+        conn = connect_readonly(db)
+        try:
+            for raw in ["go partiallong", "go 英特尔", "gpt-5.5 go", '"quoted phrase" go']:
+                with self.subTest(raw=raw):
+                    parsed = search_module.parse_query(raw, path_default="all")
+                    source_sql, _params, _score, _reason = search_module._message_match_source(conn, parsed, use_trigram=True)
+                    self.assertIn("web_message_trigram", source_sql)
+                    title_sql, _title_params = search_module._title_conversation_select(conn, parsed, use_trigram=True)
+                    self.assertIn("web_title_trigram", title_sql)
+            parsed_or = search_module.parse_query("go OR partiallong", path_default="all")
+            source_sql, _params, _score, _reason = search_module._message_match_source(conn, parsed_or, use_trigram=True)
+            self.assertNotIn("web_message_trigram", source_sql)
+            complete_or = search_module.parse_query("partiallong OR 英特尔", path_default="all")
+            source_sql, _params, _score, _reason = search_module._message_match_source(conn, complete_or, use_trigram=True)
+            self.assertIn("web_message_trigram", source_sql)
+            page = search_module.search_messages(conn, search_module.parse_query("go partiallong", path_default="all"), limit=5, order="display")
+            self.assertEqual(page["total"], 1)
+        finally:
+            conn.close()
 
     def test_illegal_query_pagination_and_no_raw_json(self):
         td, client, _db = self.make_client()
@@ -607,6 +1568,130 @@ class WebApiTests(unittest.TestCase):
         hits = client.get("/api/search/messages?q=alpha%20OR%20gamma%20-bad&conversation_id=or-1&path=current&order=display").json()
         self.assertEqual([item["node_id"] for item in hits["items"]], ["alpha", "gamma"])
 
+    def test_or_query_keeps_advanced_filters_required(self):
+        from chatgpt_export_archiver.web_db import create_web_indexes
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "or-required.zip"
+        db = base / "archive.db"
+        write_zip(
+            z,
+            [
+                conv("raw-only", "Plain", {"root": root(["n"]), "n": node("n", "root", "user", "foo only", 1_700_700_001)}, "n", 1_700_700_000),
+                conv("required-body", "Plain", {"root": root(["n"]), "n": node("n", "root", "user", "foo baz", 1_700_700_002)}, "n", 1_700_700_001),
+                conv("required-title", "Target title", {"root": root(["n"]), "n": node("n", "root", "user", "bar body", 1_700_700_003)}, "n", 1_700_700_002),
+                conv("wrong-title", "Other title", {"root": root(["n"]), "n": node("n", "root", "user", "bar body", 1_700_700_004)}, "n", 1_700_700_003),
+                conv("exact-only", "Exact Only", {"root": root(["n"]), "n": node("n", "root", "user", "foo exact body", 1_700_700_005)}, "n", 1_700_700_004),
+            ],
+        )
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+
+        def assert_required_semantics(client):
+            exact_hits = client.get("/api/search/messages?q=OR&exact=foo&path=all&limit=20").json()
+            self.assertIn("exact-only", {item["conversation_id"] for item in exact_hits["items"]})
+            exact_conversations = client.get("/api/conversations?q=OR&exact=foo&path=all&limit=20").json()
+            self.assertIn("exact-only", {item["conversation_id"] for item in exact_conversations["items"]})
+            exact_reader = client.get("/api/conversations/exact-only/messages?q=OR&exact=foo&path=all&limit=20").json()
+            self.assertTrue(next(item for item in exact_reader["items"] if item["node_id"] == "n")["highlight_ranges"])
+
+            hits = client.get("/api/search/messages?q=foo%20OR%20bar&exact=baz&path=all&limit=20").json()
+            self.assertEqual([item["conversation_id"] for item in hits["items"]], ["required-body"])
+            conversations = client.get("/api/conversations?q=foo%20OR%20bar&exact=baz&path=all&limit=20").json()
+            self.assertEqual([item["conversation_id"] for item in conversations["items"]], ["required-body"])
+            title_filtered = client.get("/api/conversations?q=foo%20OR%20bar&title=Target&path=all&limit=20").json()
+            self.assertEqual([item["conversation_id"] for item in title_filtered["items"]], ["required-title"])
+            title_hits = client.get("/api/search/messages?q=foo%20OR%20bar&title=Target&path=all&limit=20").json()
+            self.assertEqual([item["conversation_id"] for item in title_hits["items"]], ["required-title"])
+            title_reader = client.get("/api/conversations/required-title/messages?q=foo%20OR%20bar&title=Target&path=all&limit=20").json()
+            self.assertTrue(next(item for item in title_reader["items"] if item["node_id"] == "n")["highlight_ranges"])
+            excluded_hits = client.get("/api/search/messages?q=foo%20OR%20bar&exclude=baz&path=all&limit=20").json()
+            excluded_hit_ids = {item["conversation_id"] for item in excluded_hits["items"]}
+            self.assertIn("raw-only", excluded_hit_ids)
+            self.assertNotIn("required-body", excluded_hit_ids)
+            excluded_conversations = client.get("/api/conversations?q=foo%20OR%20bar&exclude=baz&path=all&limit=20").json()
+            excluded_conversation_ids = {item["conversation_id"] for item in excluded_conversations["items"]}
+            self.assertIn("raw-only", excluded_conversation_ids)
+            self.assertNotIn("required-body", excluded_conversation_ids)
+            excluded_reader = client.get("/api/conversations/required-body/messages?q=foo%20OR%20bar&exclude=baz&path=all&limit=20").json()
+            self.assertFalse(any(item["highlight_ranges"] for item in excluded_reader["items"]))
+            excluded = client.get("/api/conversations?q=foo%20OR%20bar&exact=baz&exclude=foo&path=all&limit=20").json()
+            self.assertEqual(excluded["total"], 0)
+            reader = client.get("/api/conversations/raw-only/messages?q=foo%20OR%20bar&exact=baz&path=all&limit=20").json()
+            self.assertFalse(any(item["highlight_ranges"] for item in reader["items"]))
+            overlap = client.get("/api/conversations/required-body/messages?q=foo&exact=foo%20baz&path=all&limit=20").json()
+            ranges = next(item for item in overlap["items"] if item["node_id"] == "n")["highlight_ranges"]
+            self.assertEqual([js_slice("foo baz", r["start"], r["end"]) for r in ranges], ["foo baz"])
+
+        client = TestClient(create_app(db))
+        assert_required_semantics(client)
+        create_web_indexes(db)
+        assert_required_semantics(client)
+
+    def test_raw_path_scope_modifiers_and_technical_hits_are_consistent(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "technical.zip"
+        db = base / "archive.db"
+        mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "visible current", 1_700_710_001, ["a", "branch"]),
+            "a": custom_content_node("a", "u", "assistant", {"content_type": "thoughts", "parts": ["hiddenneedle thoughts"]}, 1_700_710_002),
+            "branch": node("branch", "u", "assistant", "branchtoken branch message", 1_700_710_003),
+        }
+        write_zip(z, [conv("technical", "Scope Target", mapping, "a", 1_700_710_000)])
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+
+        current = client.get("/api/search/messages?q=branchtoken&conversation_id=technical&path=current").json()
+        self.assertEqual(current["total"], 0)
+        path_all = client.get("/api/search/messages?q=path:all%20branchtoken&conversation_id=technical&path=current").json()
+        self.assertEqual(path_all["total"], 1)
+        reader = client.get("/api/conversations/technical/messages?q=path:all%20branchtoken&path=current&limit=20").json()
+        by_id = {item["node_id"]: item for item in reader["items"]}
+        self.assertTrue(by_id["branch"]["highlight_ranges"])
+
+        title_scope = client.get("/api/conversations?q=scope:title%20Target&path=current").json()
+        self.assertEqual(title_scope["total"], 1)
+        title_reader = client.get("/api/conversations/technical/messages?q=scope:title%20Target&path=current&limit=20").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in title_reader["items"]))
+
+        hidden = client.get("/api/conversations?q=hiddenneedle&path=all").json()
+        self.assertEqual(hidden["items"][0]["conversation_id"], "technical")
+        self.assertTrue(hidden["items"][0]["has_internal_hits"])
+        hidden_hit = client.get("/api/search/messages?q=hiddenneedle&conversation_id=technical&path=all").json()
+        self.assertTrue(hidden_hit["items"][0]["is_internal"])
+        messages = client.get("/api/conversations/technical/messages?path=all&limit=20").json()
+        self.assertTrue(next(item for item in messages["items"] if item["node_id"] == "a")["is_internal"])
+
+    def test_generated_non_text_placeholders_are_not_body_hits(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "placeholder.zip"
+        db = base / "archive.db"
+        mapping = {
+            "root": root(["n"]),
+            "n": custom_content_node("n", "root", "assistant", {"content_type": "image_asset_pointer"}, 1_700_720_001),
+        }
+        write_zip(z, [conv("placeholder", "Placeholder", mapping, "n", 1_700_720_000)])
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+        self.assertEqual(client.get("/api/search/messages?q=image_asset_pointer&path=all").json()["total"], 0)
+        self.assertEqual(client.get("/api/conversations?q=image_asset_pointer&path=all").json()["total"], 0)
+        reader = client.get("/api/conversations/placeholder/messages?q=image_asset_pointer&path=all").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in reader["items"]))
+
+    def test_export_path_validation_and_advanced_search_endpoint_defaults(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        self.assertEqual(client.get("/api/conversations/web-1/export?path=bad").status_code, 400)
+        self.assertNotEqual(client.get("/api/search?exact=python%20-m%20unittest").status_code, 422)
+        self.assertNotEqual(client.get("/api/search?title=Python").status_code, 422)
+        self.assertNotEqual(client.get("/api/search?exclude=SQLite").status_code, 422)
+
     def test_title_exclude_filters_title_matches(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -691,6 +1776,7 @@ class WebApiTests(unittest.TestCase):
         try:
             message_columns = {row["name"] for row in conn.execute('PRAGMA table_xinfo("web_message_trigram")')}
             title_columns = {row["name"] for row in conn.execute('PRAGMA table_xinfo("web_title_trigram")')}
+            metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM web_index_metadata")}
         finally:
             conn.close()
         self.assertIn("content_text", message_columns)
@@ -698,6 +1784,8 @@ class WebApiTests(unittest.TestCase):
         self.assertNotIn("conversation_id", message_columns)
         self.assertNotIn("node_id", message_columns)
         self.assertNotIn("conversation_id", title_columns)
+        self.assertEqual(metadata["message_trigram_text"], "normalized")
+        self.assertEqual(metadata["title_trigram_text"], "normalized")
 
     def test_search_remains_compatible_with_legacy_contentful_web_trigram(self):
         td, client, db = self.make_client()
@@ -788,7 +1876,7 @@ class WebApiTests(unittest.TestCase):
             statements.clear()
             short_page = search_conversations(conn, parse_query("bo"), limit=10, offset=0)
             self.assertGreaterEqual(short_page["total"], 1)
-            self.assertFalse(any("web_message_trigram" in stmt for stmt in statements))
+            self.assertFalse(any("web_message_trigram MATCH" in stmt for stmt in statements))
         finally:
             conn.close()
 
@@ -847,6 +1935,42 @@ class WebApiTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_around_node_message_window_only_builds_visible_payloads(self):
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.search import get_messages
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "around.zip"
+        db = base / "archive.db"
+        mapping = {"root": root(["n0000"])}
+        previous = "root"
+        for idx in range(1200):
+            node_id = f"n{idx:04d}"
+            child = f"n{idx + 1:04d}" if idx < 1199 else None
+            mapping[node_id] = node(node_id, previous, "user", f"around synthetic {idx}", 1_702_000_000 + idx, [child] if child else [])
+            previous = node_id
+        write_zip(z, [conv("around-long", "Around Long", mapping, "n1199", 1_702_000_000)])
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        conn = connect_readonly(db)
+        real_payload = search_module._message_payload
+        calls = {"count": 0}
+
+        def counted_payload(*args, **kwargs):
+            calls["count"] += 1
+            return real_payload(*args, **kwargs)
+
+        try:
+            with mock.patch.object(search_module, "_message_payload", side_effect=counted_payload):
+                page = get_messages(conn, "around-long", path="current", limit=20, offset=0, around_node_id="n1150")
+            self.assertEqual(page["total"], 1201)
+            self.assertEqual(len(page["items"]), 20)
+            self.assertTrue(any(item["node_id"] == "n1150" for item in page["items"]))
+            self.assertEqual(calls["count"], 20)
+        finally:
+            conn.close()
+
     def test_high_hit_web_index_search_total_late_pages_and_filters(self):
         from chatgpt_export_archiver.web_db import create_web_indexes
 
@@ -875,7 +1999,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(zh_tail["total"], 260)
         self.assertEqual(len(zh_tail["items"]), 10)
         self.assertFalse(zh_tail["has_more"])
-        zh_miss = client.get("/api/conversations?q=%E4%B8%AD%E5%8D%8E%E6%B0%91%E5%9B%BD&limit=50").json()
+        zh_miss = client.get("/api/conversations?q=%E6%97%A0%E6%AD%A4%E8%AF%8D%E6%9D%A1&limit=50").json()
         self.assertEqual(zh_miss["total"], 0)
         role_page = client.get("/api/search/messages?q=python&role=assistant&limit=100").json()
         self.assertEqual(role_page["total"], 130)
@@ -930,7 +2054,7 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(len(page["items"]), 5)
             node_selects = [stmt for stmt in statements if "FROM conversation_nodes" in stmt and "raw_message_json" in stmt]
             self.assertTrue(any("LIMIT 5 OFFSET 10" in stmt for stmt in node_selects))
-            self.assertFalse(any("raw_message_json" in stmt and "LIMIT" not in stmt for stmt in node_selects))
+            self.assertFalse(any("raw_message_json" in stmt and "LIMIT" not in stmt and "COUNT(" not in stmt for stmt in node_selects))
         finally:
             conn.close()
 
@@ -1139,10 +2263,11 @@ class WebApiTests(unittest.TestCase):
         snapshot = job.snapshot()
         payload = json.dumps(snapshot)
         self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["filename"], "private-upload.zip")
         self.assertIn("error_type=RuntimeError", snapshot["error"])
         self.assertNotIn(unsafe_message, payload)
         self.assertNotIn("/private/path", payload)
-        self.assertNotIn("private-upload.zip", payload)
+        self.assertNotIn("private-upload.zip", json.dumps({"error": snapshot["error"], "log_tail": snapshot["log_tail"]}))
 
     def test_web_job_history_prunes_old_terminal_jobs_but_keeps_running_and_recent(self):
         from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager

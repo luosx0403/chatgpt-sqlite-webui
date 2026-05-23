@@ -5,7 +5,7 @@ import json
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -122,5 +122,5 @@ def parse_date_boundary(value: str | None, end_of_day: bool = False) -> float | 
         return None
     dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     if end_of_day:
-        dt = dt.replace(hour=23, minute=59, second=59)
+        dt = dt + timedelta(days=1)
     return dt.timestamp()

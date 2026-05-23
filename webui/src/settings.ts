@@ -45,7 +45,7 @@ export function clampSettings(input: Partial<Settings>): Settings {
     messageMaxWidth: clampNumber(input.messageMaxWidth, 640, 1280, DEFAULT_SETTINGS.messageMaxWidth),
     listPageSize: clampNumber(input.listPageSize, 20, 100, DEFAULT_SETTINGS.listPageSize),
     messagePageSize: clampNumber(input.messagePageSize, 50, 300, DEFAULT_SETTINGS.messagePageSize),
-    language: ["system", "en", "zh-Hans", "zh-Hant"].includes(String(input.language)) ? input.language as Settings["language"] : DEFAULT_SETTINGS.language,
+    language: ["system", "en", "zh-Hans", "zh-Hant", "ja", "es"].includes(String(input.language)) ? input.language as Settings["language"] : DEFAULT_SETTINGS.language,
     theme: ["system", "light", "dark"].includes(String(input.theme)) ? input.theme as Settings["theme"] : DEFAULT_SETTINGS.theme,
     density: input.density === "compact" ? "compact" : "comfortable",
     messageLayout: input.messageLayout === "classic" ? "classic" : "chat",

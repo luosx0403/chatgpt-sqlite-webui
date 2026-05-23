@@ -18,11 +18,11 @@ from pathlib import Path
 from unittest import mock
 
 from chatgpt_export_archiver.cli import build_parser, main
-from chatgpt_export_archiver.db import connect, init_db, verify_database, drop_optional_web_indexes, _drop_table_with_shadows, _integrity_failure_is_web_index_only, _run_integrity_check, _line_names_web_index_table, _insert_fts_batch, _delete_fts_for_conversation
+from chatgpt_export_archiver.db import connect, export_query, init_db, verify_database, drop_optional_web_indexes, _drop_table_with_shadows, _integrity_failure_is_web_index_only, _run_integrity_check, _line_names_web_index_table, _insert_fts_batch, _delete_fts_for_conversation
 from chatgpt_export_archiver.logging_utils import configure_logging, get_logger, parse_log_level
 from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
-from chatgpt_export_archiver.scanner import list_source_entries, resolve_input
+from chatgpt_export_archiver.scanner import list_source_entries, load_json_from_source, resolve_input
 from chatgpt_export_archiver.search import parse_query
 from chatgpt_export_archiver.utils import parse_date_boundary
 from chatgpt_export_archiver.web_db import connect_readonly, create_web_indexes
@@ -225,9 +225,53 @@ class ArchiverTests(unittest.TestCase):
 
     def test_date_boundaries_use_utc_days(self):
         self.assertEqual(parse_date_boundary("1970-01-02"), 86400)
-        self.assertEqual(parse_date_boundary("1970-01-02", end_of_day=True), 172799)
+        self.assertEqual(parse_date_boundary("1970-01-02", end_of_day=True), 172800)
         self.assertEqual(parse_query("", after="1970-01-02").after, 86400)
-        self.assertEqual(parse_query("", before="1970-01-02").before, 172799)
+        self.assertEqual(parse_query("", before="1970-01-02").before, 172800)
+
+    def test_query_parser_keeps_quoted_modifier_values_and_escaped_phrases(self):
+        parsed = parse_query('title:"foo bar" source:"conversations 1.json" role:"assistant" path:"all" scope:"title"')
+        self.assertEqual(parsed.title, "foo bar")
+        self.assertEqual(parsed.source, "conversations 1.json")
+        self.assertEqual(parsed.role, "assistant")
+        self.assertEqual(parsed.path, "all")
+        self.assertEqual(parsed.scope, "title")
+        excluded = parse_query('-"foo bar" "foo \\"bar\\"" -"baz \\"qux\\""')
+        self.assertEqual(excluded.exclude, ["foo bar", 'baz "qux"'])
+        self.assertEqual(excluded.phrases, ['foo "bar"'])
+        self.assertEqual(parse_query('"foo bar"').phrases, ["foo bar"])
+        self.assertEqual(parse_query("--no-input-sha256").terms, ["--no-input-sha256"])
+
+    def test_export_date_to_includes_fractional_utc_day_end(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        db = base / "archive.db"
+        out = base / "out"
+        conn = connect(db)
+        try:
+            init_db(conn)
+            conn.execute(
+                """
+                INSERT INTO conversations(conversation_id, title, create_time, update_time, current_node, source_file, aggregate_hash)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("fractional-date", "Fractional Date", 1_779_494_399.5, 1_779_494_399.5, "n1", "synthetic.json", "hash"),
+            )
+            conn.execute(
+                """
+                INSERT INTO conversation_nodes(conversation_id, node_id, message_id, role, create_time, update_time, content_type, content_text, content_hash, is_on_current_path)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("fractional-date", "n1", "msg-n1", "user", 1_779_494_399.5, 1_779_494_399.5, "text", "fractional export body", "nodehash", 1),
+            )
+            conn.commit()
+            self.assertEqual([row["conversation_id"] for row in export_query(conn, None, parse_date_boundary("2026-05-22", end_of_day=True))], ["fractional-date"])
+            self.assertEqual([row["conversation_id"] for row in export_query(conn, None, parse_date_boundary("2026-05-21", end_of_day=True))], [])
+        finally:
+            conn.close()
+        self.assertEqual(main(["--db", str(db), "export", "--out", str(out), "--format", "md", "--to", "2026-05-22"]), 0)
+        self.assertTrue(any("fractional export body" in path.read_text(encoding="utf-8") for path in out.glob("*.md")))
 
     def test_string_boolean_metadata_parses_false_values(self):
         self.assertEqual(_to_int_bool(True), 1)
@@ -810,6 +854,43 @@ class ArchiverTests(unittest.TestCase):
                 after_conn.close()
             self.assertEqual(before_tables, after_tables)
 
+    def test_cli_verify_reports_missing_columns_without_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "private-half-old.db"
+            conn = sqlite3.connect(db)
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE conversations(
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        create_time REAL,
+                        update_time REAL,
+                        current_node TEXT
+                    );
+                    CREATE TABLE conversation_nodes(
+                        conversation_id TEXT,
+                        node_id TEXT,
+                        parent_node_id TEXT,
+                        message_id TEXT
+                    );
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            code, output = run_cli(["--db", str(db), "verify"])
+            self.assertEqual(code, 1, output)
+            self.assertIn("schema_ok false", output)
+            self.assertIn("missing_columns", output)
+            self.assertIn("conversations.source_file", output)
+            self.assertIn("conversation_nodes.content_text", output)
+            self.assertNotIn(str(db), output)
+            self.assertNotIn(db.name, output)
+            self.assertNotIn("raw_json", output)
+
     def test_verify_requires_source_tracking_tables(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -1042,6 +1123,25 @@ class ArchiverTests(unittest.TestCase):
             conn = sqlite3.connect(db)
             try:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 2)
+            finally:
+                conn.close()
+
+    def test_standalone_conversations_json_is_detected_and_imported(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source_json = base / "conversations.json"
+            source_json.write_text(json.dumps([conversation("standalone-json")]), encoding="utf-8")
+            source = resolve_input(str(source_json), Path.cwd())
+            self.assertEqual(source.kind, "json")
+            entries = list_source_entries(source)
+            self.assertEqual([entry.source_path for entry in entries if entry.is_selected_conversation_source], ["conversations.json"])
+            self.assertEqual(load_json_from_source(source, "conversations.json")[0]["id"], "standalone-json")
+            db = base / "archive.db"
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(source_json), "--no-input-sha256"]), 0)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT input_kind FROM import_runs").fetchone()[0], "json")
             finally:
                 conn.close()
 

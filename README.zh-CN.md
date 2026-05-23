@@ -33,7 +33,7 @@ ChatGPT Export Archiver 可以直接导入 OpenAI / ChatGPT 官方 export ZIP，
 
 ## 项目功能
 
-- 从 OpenAI / ChatGPT 导出的 ZIP 或解压后的导出目录中导入 `conversations.json` 和 sharded `conversations-*.json`。
+- 从 OpenAI / ChatGPT 导出的 ZIP、单个 `conversations.json` 文件或解压后的导出目录中导入 `conversations.json` 和 sharded `conversations-*.json`。
 - 保存会话元数据、mapping nodes、消息角色、正文文本、时间戳、父节点关系、来源跟踪和导入警告。
 - 支持增量导入。把较新的导出文件再次导入同一个数据库时，会更新发生变化的会话，而不是有意重复写入未变化的数据。
 - 建立可选的 FTS5 消息索引，供命令行搜索使用。
@@ -230,6 +230,8 @@ Web UI 有两种使用方式。如果数据库已经存在，可以显式传入�
 
 Web 上传导入成功后，后端使用与 CLI 相同的核心 import pipeline，然后运行 `verify`、`stats` 和 `web-index`。上传 ZIP 是服务端临时副本，会独立于你磁盘上的原始文件进行清理。
 
+Web 上传在导入 job 启动前还会执行应用层安全限制：`CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` 控制上传 ZIP 总大小，默认 20 GiB；conversation JSON member 默认最多 5,000 个、单个最多 64 GiB、总未压缩数据最多 128 GiB，大型 JSON member 的压缩比限制为 1000:1。如果真实 ChatGPT 归档超过默认值，可以在启动 Web UI 前设置更大的环境变量，但只应对可信本机文件这样做，因为更高限制会增加 ZIP bomb 和磁盘压力风险。
+
 
 ## Web UI 验收清单
 
@@ -246,6 +248,8 @@ runnable 交付包中的 Web 路径不应依赖 `webui/node_modules`，因为构
 ## 搜索语法
 
 CLI 搜索使用项目统一的安全查询语法，不直接使用 SQLite 查询文本。可以使用普通关键词、带引号的短语、`-term` 排除、`OR`，以及 `role:user`、`source:zip`、`path:current`、`path:all`、`scope:title`、`scope:message` 等过滤条件。输出只包含 conversation ID、node ID 和角色，不包含 snippet。
+
+日期筛选（例如 `after:2026-05-01`、`before:2026-05-13`、`--from`、`--to`）使用 UTC 自然日，而不是你本地时区的自然日。起始日期包含当天 `00:00:00Z`；结束日期会用次日 `00:00:00Z` 作为排他上界，因此 `23:59:59.5Z` 这类小数秒时间戳仍包含在当天内。Web 搜索框最多 500 个字符；更长的结构化条件请使用高级筛选。
 
 ```bash
 python chatgpt_archive.py search --db archive/chatgpt_archive.db "python sqlite"
@@ -357,7 +361,7 @@ tools/                             交付检查和辅助脚本
 
 主数据库保存 conversations、mapping nodes、import runs 和 warnings。CLI FTS 表是 `message_fts`。可选 Web 搜索辅助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-除非已经明确规划并记录 migration，否则项目不会在小型健壮性修复中修改数据库 schema。
+除非已经明确规划并记录 migration，否则项目不会在小型健壮性修复中修改数据库 schema。缺少新列的旧数据库会通过 `verify` 或 Web health 的 `missing_columns` 诊断被明确拒绝，而不会静默迁移；遇到这种情况请先备份旧库，再用原始导出重新导入到新数据库。
 
 ## 已知限制
 

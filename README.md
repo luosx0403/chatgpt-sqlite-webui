@@ -33,7 +33,7 @@ These are example observations from one local machine, not a universal guarantee
 
 ## What This Project Does
 
-- Imports `conversations.json` and sharded `conversations-*.json` files from an OpenAI / ChatGPT export ZIP or extracted export directory into SQLite.
+- Imports `conversations.json` and sharded `conversations-*.json` files from an OpenAI / ChatGPT export ZIP, a standalone `conversations.json` file, or an extracted export directory into SQLite.
 - Preserves conversation metadata, mapping nodes, message roles, text content, timestamps, parent links, source tracking, and import warnings.
 - Supports incremental imports. Re-importing a newer export updates changed conversations without intentionally duplicating unchanged data.
 - Builds an optional FTS5 message index for CLI search.
@@ -230,6 +230,8 @@ The Web UI can be used in two ways. If the database already exists, pass it expl
 
 After a successful Web upload import, the backend runs the same core import pipeline as the CLI, then runs `verify`, `stats`, and `web-index`. The uploaded ZIP is a temporary server-side copy and is cleaned up independently from the original file on your disk.
 
+Web uploads also enforce application-level safety limits before the import job starts: `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` controls the total uploaded ZIP size and defaults to 20 GiB; conversation JSON members are limited to 5,000 files, 64 GiB per member, 128 GiB total uncompressed data, and a 1000:1 compression ratio for large JSON members. If a legitimate ChatGPT archive exceeds the defaults, set a larger environment variable before starting the Web UI, but only for trusted local files because higher limits increase ZIP bomb and disk-pressure risk.
+
 
 ## Web UI acceptance checklist
 
@@ -246,6 +248,8 @@ The Web path should not require `webui/node_modules` in a runnable delivery beca
 ## Search syntax
 
 CLI search uses the project's safe query syntax, not raw SQLite query text. Use plain keywords, quoted phrases, `-term` exclusions, `OR`, and filters such as `role:user`, `source:zip`, `path:current`, `path:all`, `scope:title`, and `scope:message`. It prints conversation IDs, node IDs, and roles, not snippets.
+
+Date filters such as `after:2026-05-01`, `before:2026-05-13`, `--from`, and `--to` use UTC calendar days, not your local time zone's calendar day. Start dates are inclusive at `00:00:00Z`; end dates include the full UTC day by using the next day's `00:00:00Z` as an exclusive upper bound, so fractional timestamps like `23:59:59.5Z` are included. The Web search box is limited to 500 characters; use advanced filters for longer structured queries.
 
 ```bash
 python chatgpt_archive.py search --db archive/chatgpt_archive.db "python sqlite"
@@ -357,7 +361,7 @@ tools/                             Delivery and support scripts
 
 The main database stores conversations, mapping nodes, import runs, and warnings. The CLI FTS table is `message_fts`. Optional Web search helper tables include `web_message_norm`, `web_title_norm`, `web_message_trigram`, and `web_title_trigram` plus SQLite FTS5 shadow tables.
 
-The project intentionally does not change the database schema during small robustness fixes unless a migration is explicitly planned and documented.
+The project intentionally does not change the database schema during small robustness fixes unless a migration is explicitly planned and documented. Older databases with missing columns are rejected with `verify`/Web health `missing_columns` diagnostics instead of being silently migrated; back up the old database and re-import the original export into a new database when this happens.
 
 ## Known limits
 

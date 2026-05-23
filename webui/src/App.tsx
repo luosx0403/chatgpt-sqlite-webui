@@ -6,7 +6,7 @@ import SettingsPanel from "./components/SettingsPanel";
 import { getConversation, getConversations, getHealth, getImportJob, getStats, uploadImportZip } from "./api/client";
 import { applySettings, clampSettings, loadSettings, saveSettings, type Settings } from "./settings";
 import { createTranslator } from "./i18n";
-import type { ConversationSummary, Health, ImportJob, PathMode, SearchFilters, SortMode, Stats } from "./types";
+import type { ConversationSummary, Health, ImportJob, MatchMode, PathMode, SearchFilters, SortMode, Stats } from "./types";
 
 const DEFAULT_FILTERS: SearchFilters = {
   role: "",
@@ -18,12 +18,90 @@ const DEFAULT_FILTERS: SearchFilters = {
   before: "",
   source: ""
 };
+const MATCH_MODE_KEY = "chatgptArchiveWeb.searchMatchMode.v1";
+
+function mergeConversationSearchMeta(detail: ConversationSummary, meta?: ConversationSummary | null): ConversationSummary {
+  if (!meta || meta.conversation_id !== detail.conversation_id) return detail;
+  return {
+    ...detail,
+    hit_count: meta.hit_count,
+    snippets: meta.snippets,
+    reasons: meta.reasons,
+    score: meta.score,
+    message_match: meta.message_match,
+    title_match: meta.title_match,
+    has_title_hits: meta.has_title_hits,
+    has_internal_hits: meta.has_internal_hits,
+    has_branch_hits: meta.has_branch_hits,
+  };
+}
+
+function clearConversationSearchMeta(item: ConversationSummary): ConversationSummary {
+  const {
+    hit_count,
+    snippets,
+    reasons,
+    score,
+    message_match,
+    title_match,
+    has_title_hits,
+    has_internal_hits,
+    has_branch_hits,
+    ...detail
+  } = item;
+  void hit_count;
+  void snippets;
+  void reasons;
+  void score;
+  void message_match;
+  void title_match;
+  void has_title_hits;
+  void has_internal_hits;
+  void has_branch_hits;
+  return detail;
+}
+
+function loadMatchMode(): MatchMode {
+  const params = new URLSearchParams(window.location.search);
+  const urlMode = params.get("match_mode") || params.get("matchMode");
+  if (urlMode === "word" || urlMode === "contains") return urlMode;
+  try {
+    return localStorage.getItem(MATCH_MODE_KEY) === "word" ? "word" : "contains";
+  } catch {
+    return "contains";
+  }
+}
+
+function importStageLabel(t: (key: string) => string, stage: string): string {
+  const normalized = stage.toLowerCase().replace(/[-\s]+/g, "_");
+  const labels: Record<string, string> = {
+    queued: t("stageQueued"),
+    inspect: t("stageInspect"),
+    inspecting: t("stageInspect"),
+    validating_upload: t("stageInspect"),
+    import: t("stageImport"),
+    importing: t("stageImport"),
+    verify: t("stageVerify"),
+    verifying: t("stageVerify"),
+    stats: t("stageStats"),
+    web_index: t("stageWebIndex"),
+    web_indexing: t("stageWebIndex"),
+    webindex: t("stageWebIndex"),
+    web_index_recovery: t("stageWebIndexRecovery"),
+    webindex_recovery: t("stageWebIndexRecovery"),
+    finished: t("stageFinished"),
+    succeeded: t("stageFinished"),
+    postcheck_failed: t("stagePostcheckFailed"),
+  };
+  return labels[normalized] || t("stageUnknown");
+}
 
 export default function App() {
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [sort, setSort] = useState<SortMode>("relevance");
   const [path, setPath] = useState<PathMode>("current");
+  const [matchMode, setMatchModeState] = useState<MatchMode>(() => loadMatchMode());
   const [filters, setFilters] = useState<SearchFilters>(DEFAULT_FILTERS);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("conversation"));
@@ -52,6 +130,15 @@ export default function App() {
   const selectedRef = useRef<ConversationSummary | null>(null);
   const filtersKey = JSON.stringify(filters);
   const { t } = useMemo(() => createTranslator(settings.language), [settings.language]);
+
+  const setMatchMode = useCallback((value: MatchMode) => {
+    setMatchModeState(value);
+    try {
+      localStorage.setItem(MATCH_MODE_KEY, value);
+    } catch {
+      // Search preference is best-effort local UI state.
+    }
+  }, []);
 
   const updateSettings = useCallback((next: Settings) => {
     const clamped = clampSettings(next);
@@ -129,7 +216,9 @@ export default function App() {
     const requestId = ++detailRequestRef.current;
     getConversation(id, controller.signal)
       .then((detail) => {
-        if (requestId === detailRequestRef.current) setSelected(detail);
+        if (requestId === detailRequestRef.current) {
+          setSelected(mergeConversationSearchMeta(detail, local || null));
+        }
       })
       .catch((err: Error) => {
         if (err.name !== "AbortError" && requestId === detailRequestRef.current) setError(err.message);
@@ -147,6 +236,7 @@ export default function App() {
       sort,
       path,
       filters,
+      matchMode,
       offset,
       limit: settings.listPageSize,
       selectedId: selectedIdRef.current,
@@ -170,11 +260,13 @@ export default function App() {
         const currentSelectedId = selectedIdRef.current;
         const selectedStillMatches = currentSelectedId ? page.selected_in_results !== false : false;
         if (selectedStillMatches && currentSelectedId) {
-          const localSelected = page.items.find((item) => item.conversation_id === currentSelectedId);
+          const localSelected = page.items.find((item) => item.conversation_id === currentSelectedId) || page.selected_item;
           if (!selectedRef.current || selectedRef.current.conversation_id !== currentSelectedId) {
             loadConversationDetail(currentSelectedId, localSelected);
           } else if (localSelected) {
             setSelected((current) => current?.conversation_id === currentSelectedId ? { ...current, ...localSelected } : current);
+          } else {
+            setSelected((current) => current?.conversation_id === currentSelectedId ? clearConversationSearchMeta(current) : current);
           }
         } else {
           const first = page.items[0] ?? null;
@@ -193,7 +285,7 @@ export default function App() {
         }
       });
     return controller;
-  }, [debouncedQuery, sort, path, filtersKey, loadConversationDetail, settings.listPageSize]);
+  }, [debouncedQuery, sort, path, matchMode, filtersKey, loadConversationDetail, settings.listPageSize]);
 
   useEffect(() => {
     const controller = loadConversationPage(0, false);
@@ -251,6 +343,8 @@ export default function App() {
         setSort={setSort}
         path={path}
         setPath={setPath}
+        matchMode={matchMode}
+        setMatchMode={setMatchMode}
         filters={filters}
         setFilters={setFilters}
         conversations={conversations}
@@ -265,6 +359,7 @@ export default function App() {
         total={total}
         hasMore={hasMore}
         autoLoadMore={settings.autoLoadMore}
+        health={health}
       />
       <div
         className="sidebar-resizer"
@@ -314,10 +409,11 @@ export default function App() {
             {importJob && (
               <div data-testid="import-status">
                 <span>{importJob.status === "succeeded" ? t("importSucceeded") : importJob.status === "postcheck_failed" ? t("importPostcheckFailed") : importJob.status === "failed" ? t("importFailed") : t("importRunning")}</span>
-                <span>{t("jobStage")}: {importJob.stage}</span>
+                <span>{t("jobStage")}: {importStageLabel(t, importJob.stage)}</span>
                 <span>{t("jobElapsed")}: {importJob.elapsed_seconds.toFixed(1)}s</span>
                 {importJob.summary && <span>{String(importJob.summary.valid_conversations ?? 0)} {t("conversations")}</span>}
-                {importJob.web_index && <span>web-index ok</span>}
+                {importJob.web_index && <span>{t("webIndexOk")}</span>}
+                {["queued", "running"].includes(importJob.status) && <span>{t("importProgressVolatile")}</span>}
               </div>
             )}
             {importError && <span className="error-text">{importError}</span>}
@@ -328,6 +424,7 @@ export default function App() {
           conversation={selected}
           query={debouncedQuery}
           filters={filters}
+          matchMode={matchMode}
           path={path}
           setPath={setPath}
           settings={settings}

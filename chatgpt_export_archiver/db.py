@@ -209,7 +209,8 @@ def init_db(conn: sqlite3.Connection) -> bool:
 
 OPTIONAL_WEB_TRIGRAM_TABLES = ("web_message_trigram", "web_title_trigram")
 OPTIONAL_WEB_NORM_TABLES = ("web_message_norm", "web_title_norm")
-OPTIONAL_WEB_INDEX_TABLES = OPTIONAL_WEB_TRIGRAM_TABLES + OPTIONAL_WEB_NORM_TABLES
+OPTIONAL_WEB_METADATA_TABLES = ("web_index_metadata",)
+OPTIONAL_WEB_INDEX_TABLES = OPTIONAL_WEB_TRIGRAM_TABLES + OPTIONAL_WEB_NORM_TABLES + OPTIONAL_WEB_METADATA_TABLES
 
 
 def _fts5_shadow_suffixes() -> list[str]:
@@ -248,6 +249,11 @@ def drop_optional_web_indexes(conn: sqlite3.Connection) -> list[dict[str, str]]:
     for table in OPTIONAL_WEB_TRIGRAM_TABLES:
         failures.extend(_drop_table_with_shadows(conn, table))
     for table in OPTIONAL_WEB_NORM_TABLES:
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        except sqlite3.Error as exc:
+            failures.append({"table": table, "error_type": type(exc).__name__})
+    for table in OPTIONAL_WEB_METADATA_TABLES:
         try:
             conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         except sqlite3.Error as exc:
@@ -796,12 +802,60 @@ CORE_SCHEMA_TABLES = frozenset({
     "exports",
 })
 
+CORE_SCHEMA_COLUMNS = {
+    "import_runs": frozenset({
+        "id", "input_path", "input_kind", "input_sha256", "input_size",
+        "started_at", "finished_at", "status", "summary_json",
+    }),
+    "source_files": frozenset({
+        "id", "import_run_id", "source_path", "file_type", "size", "sha256",
+        "is_conversation_json", "is_selected_conversation_source",
+    }),
+    "import_warnings": frozenset({
+        "id", "import_run_id", "source_file", "array_index", "warning_type",
+        "keys_json", "raw_json", "created_at",
+    }),
+    "conversations": frozenset({
+        "conversation_id", "exported_id", "title", "create_time", "update_time",
+        "current_node", "source_file", "source_array_index", "aggregate_hash",
+        "last_import_run_id", "is_archived", "is_starred", "default_model_slug",
+        "metadata_json",
+    }),
+    "conversation_nodes": frozenset({
+        "conversation_id", "node_id", "parent_node_id", "children_json",
+        "message_id", "role", "author_name", "create_time", "update_time",
+        "content_type", "content_text", "content_hash", "metadata_json",
+        "is_on_current_path", "raw_message_json", "last_import_run_id",
+    }),
+    "exports": frozenset({
+        "id", "conversation_id", "format", "output_path", "output_hash",
+        "exported_at", "export_options_json",
+    }),
+    "file_index": frozenset({
+        "id", "import_run_id", "source_path", "file_type", "extension", "size",
+        "sha256", "related_conversation_id", "related_message_id",
+    }),
+    "message_fts": frozenset({"conversation_id", "node_id", "role", "content_text"}),
+}
+
 
 def check_core_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')").fetchall()
     found = {row["name"] if isinstance(row, sqlite3.Row) else row[0] for row in rows}
     missing = sorted(CORE_SCHEMA_TABLES - found)
-    return {"schema_ok": not missing, "missing_tables": missing}
+    missing_columns: dict[str, list[str]] = {}
+    for table, required_columns in CORE_SCHEMA_COLUMNS.items():
+        if table not in found:
+            continue
+        try:
+            columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
+        except sqlite3.Error:
+            missing_columns[table] = sorted(required_columns)
+            continue
+        missing_for_table = sorted(required_columns - columns)
+        if missing_for_table:
+            missing_columns[table] = missing_for_table
+    return {"schema_ok": not missing and not missing_columns, "missing_tables": missing, "missing_columns": missing_columns}
 
 
 def _run_integrity_check(conn: sqlite3.Connection) -> list[str]:
@@ -864,6 +918,7 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         return {
             "schema_ok": False,
             "missing_tables": schema["missing_tables"],
+            "missing_columns": schema.get("missing_columns", {}),
             "latest_import_run_id": None,
             "latest_run_warnings": 0,
             "total_warnings": 0,
@@ -995,7 +1050,7 @@ def export_query(conn: sqlite3.Connection, start_ts: float | None, end_ts: float
         where.append("COALESCE(update_time, create_time, 0) >= ?")
         params.append(start_ts)
     if end_ts is not None:
-        where.append("COALESCE(update_time, create_time, 0) <= ?")
+        where.append("COALESCE(update_time, create_time, 0) < ?")
         params.append(end_ts)
     clause = "WHERE " + " AND ".join(where) if where else ""
     return conn.execute(

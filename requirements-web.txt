@@ -1,3 +1,6 @@
+# For reproducible local installs, create your own constraints file for the
+# target Python version, for example with `python -m pip freeze > constraints.txt`,
+# then install with `python -m pip install -r requirements-web.txt -c constraints.txt`.
 fastapi[standard]
 pydantic
 python-multipart

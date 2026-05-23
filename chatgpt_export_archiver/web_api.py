@@ -11,9 +11,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, Up
 
 from .exporter import render_markdown, render_txt
 from .logging_utils import get_logger
-from .search import get_conversation, get_messages, list_conversations, parse_query, search_conversations, search_messages
+from .search import get_conversation, get_messages, list_conversations, normalize_search_text, parse_query, search_conversations, search_messages
 from .utils import safe_filename_part
-from .web_db import check_schema, connect_readonly, detect_fts5, detect_trigram
+from .web_db import check_schema, connect_readonly, detect_fts5, detect_trigram, web_index_status
 from .web_jobs import ImportJobManager, cleanup_upload_dir, make_upload_path
 
 LOGGER = get_logger("web_api")
@@ -23,8 +23,13 @@ ALLOWED_SCOPES = {"all", "title", "message"}
 ALLOWED_ROLES = {"", "user", "assistant", "tool", "system", "developer", "tool/system"}
 ALLOWED_PATHS = {"current", "all"}
 ALLOWED_MESSAGE_ORDERS = {"relevance", "display"}
+ALLOWED_MATCH_MODES = {"contains", "word"}
 DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024
 MAX_UPLOAD_ENV = "CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES"
+MAX_UPLOAD_JSON_MEMBER_BYTES = 64 * 1024 * 1024 * 1024
+MAX_UPLOAD_JSON_MEMBERS = 5000
+MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024 * 1024
+MAX_UPLOAD_COMPRESSION_RATIO = 1000.0
 
 
 def _get_max_upload_bytes(environ: Mapping[str, str] = os.environ) -> int:
@@ -59,7 +64,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         schema = check_schema(conn)
         if not schema["ok"]:
             conn.close()
-            raise HTTPException(status_code=409, detail="database schema is not ready")
+            raise HTTPException(status_code=409, detail=_schema_error_detail(schema))
         try:
             yield conn
         finally:
@@ -77,8 +82,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         schema = check_schema(conn)
         if not schema["ok"]:
             conn.close()
-            yield None
-            return
+            raise HTTPException(status_code=409, detail=_schema_error_detail(schema))
         try:
             yield conn
         finally:
@@ -97,6 +101,9 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
                 "trigram_available": False,
                 "web_trigram_indexed": False,
                 "web_normalized_indexed": False,
+                "web_normalized_trigram_indexed": False,
+                "web_legacy_trigram_indexed": False,
+                "schema_compatible": False,
             }
         try:
             conn = connect_readonly(db_path)
@@ -104,6 +111,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             return {"ok": True, "db_ready": False, "database": {"name": "database", "exists": db_path.exists()}, "schema_version": 1}
         try:
             schema = check_schema(conn)
+            web_status = web_index_status(conn)
             fts5 = detect_fts5(conn)
             trigram = detect_trigram(conn)
         finally:
@@ -111,13 +119,15 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         return {
             "ok": schema["ok"],
             "db_ready": schema["ok"],
+            "schema_compatible": schema["schema_compatible"],
+            "missing_tables": schema["missing_tables"],
+            "missing_columns": schema["missing_columns"],
             "database": {"name": "database", "exists": db_path.exists()},
             "schema_version": 1,
             "fts5_available": fts5,
             "message_fts_available": schema["message_fts"],
             "trigram_available": trigram,
-            "web_trigram_indexed": schema["web_message_trigram"] and schema["web_title_trigram"],
-            "web_normalized_indexed": schema["web_message_norm"] and schema["web_title_norm"],
+            **web_status,
         }
 
     @router.get("/stats")
@@ -131,7 +141,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         schema = check_schema(conn)
         if not schema["ok"]:
             conn.close()
-            return _empty_stats(db_ready=False)
+            raise HTTPException(status_code=409, detail=_schema_error_detail(schema))
         row = conn.execute(
             """
             SELECT COUNT(*) AS conversations,
@@ -163,8 +173,8 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
     def schema_docs():
         return {
             "pagination": {"fields": ["items", "total", "limit", "offset", "has_more", "next_offset"]},
-            "conversations": {"filters": ["q", "sort", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "path"]},
-            "messages": {"path": ["current", "all"], "raw": "message pages return raw_preview only; full raw is available per message endpoint"},
+            "conversations": {"filters": ["q", "sort", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "path", "match_mode"]},
+            "messages": {"path": ["current", "all"], "filters": ["q", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "match_mode"], "raw": "message pages return raw_preview only; full raw is available per message endpoint"},
             "raw": {"endpoint": "/api/conversations/{conversation_id}/messages/{node_id}/raw"},
         }
 
@@ -183,12 +193,13 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         exclude: str | None = None,
         source: str | None = None,
         path: str = "current",
+        match_mode: str = "contains",
         selected_id: str | None = None,
         conn=Depends(get_optional_conn),
     ):
         if conn is None:
             return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
-        _validate_common(sort=sort, scope=scope, role=role, path=path)
+        _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
         parsed = parse_query(
             q,
             path_default=path,
@@ -200,9 +211,10 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             after=after,
             before=before,
             source=source,
+            match_mode=match_mode,
         )
         _raise_query_errors(parsed)
-        if parsed.has_search_text() or parsed.has_non_time_filters():
+        if parsed.has_search_context():
             return search_conversations(conn, parsed, limit=limit, offset=offset, sort=sort, selected_id=selected_id)
         return list_conversations(conn, limit=limit, offset=offset, sort=sort, after=parsed.after, before=parsed.before, selected_id=selected_id)
 
@@ -227,6 +239,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
                     out.write(chunk)
             if not zipfile.is_zipfile(upload_path):
                 raise HTTPException(status_code=400, detail="uploaded file is not a valid zip")
+            _validate_upload_zip_members(upload_path)
             try:
                 job = manager.start_import(upload_path, filename=Path(filename.replace("\\", "/")).name, size=size)
             except RuntimeError as exc:
@@ -259,15 +272,48 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         conversation_id: str,
         path: str = "current",
         q: str = "",
+        match_mode: str = "contains",
+        role: str | None = None,
+        title: str | None = None,
+        scope: str = "all",
+        exact: str | None = None,
+        exclude: str | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        source: str | None = None,
         limit: Annotated[int, Query(ge=1, le=300)] = 300,
         offset: Annotated[int, Query(ge=0)] = 0,
         around_node_id: str | None = None,
         conn=Depends(get_conn),
     ):
-        _validate_common(path=path)
+        _validate_common(scope=scope, role=role, path=path, match_mode=match_mode)
+        parsed = parse_query(
+            q,
+            path_default=path,
+            role=role,
+            title=title,
+            scope=scope,
+            exact=exact,
+            exclude=exclude,
+            after=after,
+            before=before,
+            source=source,
+            match_mode=match_mode,
+        )
+        _raise_query_errors(parsed)
         if not get_conversation(conn, conversation_id):
             raise HTTPException(status_code=404, detail="conversation not found")
-        return get_messages(conn, conversation_id, path=path, limit=limit, offset=offset, highlight_query=q, around_node_id=around_node_id)
+        return get_messages(
+            conn,
+            conversation_id,
+            path=parsed.path,
+            limit=limit,
+            offset=offset,
+            highlight_query=q,
+            highlight_parsed=parsed,
+            match_mode=match_mode,
+            around_node_id=around_node_id,
+        )
 
     @router.get("/conversations/{conversation_id}/messages/{node_id}/raw")
     def conversation_message_raw(conversation_id: str, node_id: str, conn=Depends(get_conn)):
@@ -290,7 +336,8 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         return {"conversation_id": conversation_id, "node_id": node_id, "raw_message": raw}
 
     @router.get("/conversations/{conversation_id}/export")
-    def conversation_export(conversation_id: str, format: str = "md", path: str = "current", conn=Depends(get_conn)):
+    def conversation_export(conversation_id: str, format: str = "md", path: str = "current", include_internal: bool = False, conn=Depends(get_conn)):
+        _validate_common(path=path)
         if format not in {"md", "txt"}:
             raise HTTPException(status_code=400, detail="format must be md or txt")
         conv = conn.execute("SELECT * FROM conversations WHERE conversation_id = ?", (conversation_id,)).fetchone()
@@ -304,7 +351,11 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             offset += page["limit"]
             if offset >= page["total"]:
                 break
-        rows = [_dict_row_to_mapping(row) for row in messages]
+        visible_messages = [
+            row for row in messages
+            if not row.get("is_empty_mapping_node") and (include_internal or not row.get("is_internal"))
+        ]
+        rows = [_dict_row_to_mapping(_export_message_row(row)) for row in visible_messages]
         text = render_markdown(conv, rows) if format == "md" else render_txt(conv, rows)
         media_type = "text/markdown; charset=utf-8" if format == "md" else "text/plain; charset=utf-8"
         filename = _download_filename(conversation_id, format)
@@ -316,7 +367,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
 
     @router.get("/search")
     def search(
-        q: str,
+        q: str = "",
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
         sort: str = "relevance",
@@ -329,19 +380,20 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         after: str | None = None,
         before: str | None = None,
         source: str | None = None,
+        match_mode: str = "contains",
         selected_id: str | None = None,
         conn=Depends(get_optional_conn),
     ):
         if conn is None:
             return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
-        _validate_common(sort=sort, scope=scope, role=role, path=path)
-        parsed = parse_query(q, path_default=path, role=role, title=title, scope=scope, exact=exact, exclude=exclude, after=after, before=before, source=source)
+        _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
+        parsed = parse_query(q, path_default=path, role=role, title=title, scope=scope, exact=exact, exclude=exclude, after=after, before=before, source=source, match_mode=match_mode)
         _raise_query_errors(parsed)
         return search_conversations(conn, parsed, limit=limit, offset=offset, sort=sort, selected_id=selected_id)
 
     @router.get("/search/messages")
     def search_message_endpoint(
-        q: str,
+        q: str = "",
         conversation_id: str | None = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -355,30 +407,46 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         after: str | None = None,
         before: str | None = None,
         source: str | None = None,
+        match_mode: str = "contains",
+        count_total: bool = True,
         conn=Depends(get_optional_conn),
     ):
         if conn is None:
             return _empty_page(limit, offset, selected_id=None, db_ready=False)
-        _validate_common(role=role, path=path, scope=scope)
+        _validate_common(role=role, path=path, scope=scope, match_mode=match_mode)
         if order not in ALLOWED_MESSAGE_ORDERS:
             raise HTTPException(status_code=400, detail="invalid message order")
-        parsed = parse_query(q, path_default=path, role=role, title=title, scope=scope, exact=exact, exclude=exclude, after=after, before=before, source=source)
+        parsed = parse_query(q, path_default=path, role=role, title=title, scope=scope, exact=exact, exclude=exclude, after=after, before=before, source=source, match_mode=match_mode)
         _raise_query_errors(parsed)
-        return search_messages(conn, parsed, limit=limit, offset=offset, conversation_id=conversation_id, order=order)
+        return search_messages(conn, parsed, limit=limit, offset=offset, conversation_id=conversation_id, order=order, count_total=count_total)
 
     @router.get("/search/suggest")
     def suggest(q: str = "", limit: Annotated[int, Query(ge=1, le=20)] = 10, conn=Depends(get_conn)):
-        needle = f"%{q[:100]}%"
-        rows = conn.execute(
-            """
-            SELECT conversation_id, title
-            FROM conversations
-            WHERE ? = '%%' OR title LIKE ?
-            ORDER BY COALESCE(update_time, create_time, 0) DESC
-            LIMIT ?
-            """,
-            (needle, needle, limit),
-        ).fetchall()
+        normalized = normalize_search_text(q[:100])
+        if _table_exists(conn, "web_title_norm") and normalized:
+            rows = conn.execute(
+                """
+                SELECT c.conversation_id, c.title
+                FROM web_title_norm tn
+                JOIN conversations c ON c.conversation_id = tn.conversation_id
+                WHERE instr(tn.title_norm, ?) > 0
+                ORDER BY COALESCE(c.update_time, c.create_time, 0) DESC
+                LIMIT ?
+                """,
+                (normalized, limit),
+            ).fetchall()
+        else:
+            needle = _like_pattern(q[:100])
+            rows = conn.execute(
+                """
+                SELECT conversation_id, title
+                FROM conversations
+                WHERE ? = '%%' OR title LIKE ? ESCAPE '\\'
+                ORDER BY COALESCE(update_time, create_time, 0) DESC
+                LIMIT ?
+                """,
+                (needle, needle, limit),
+            ).fetchall()
         return {"items": [dict(row) for row in rows]}
 
     return router
@@ -398,6 +466,44 @@ def _empty_stats(*, db_ready: bool) -> dict[str, object]:
     }
 
 
+def _validate_upload_zip_members(path: Path) -> None:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            candidates = [_info for _info in zf.infolist() if _is_conversation_json_member(_info.filename)]
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="uploaded file is not a valid zip") from exc
+    if len(candidates) > MAX_UPLOAD_JSON_MEMBERS:
+        raise HTTPException(status_code=413, detail="upload_zip_too_many_json_members")
+    total_uncompressed = 0
+    total_compressed = 0
+    for info in candidates:
+        total_uncompressed += int(info.file_size or 0)
+        total_compressed += max(1, int(info.compress_size or 0))
+        if info.file_size > MAX_UPLOAD_JSON_MEMBER_BYTES:
+            raise HTTPException(status_code=413, detail="upload_zip_member_too_large")
+        if info.file_size >= 10 * 1024 * 1024 and (info.file_size / max(1, info.compress_size)) > MAX_UPLOAD_COMPRESSION_RATIO:
+            raise HTTPException(status_code=413, detail="upload_zip_compression_ratio_too_high")
+    if total_uncompressed > MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES:
+        raise HTTPException(status_code=413, detail="upload_zip_uncompressed_too_large")
+    if total_uncompressed >= 10 * 1024 * 1024 and (total_uncompressed / max(1, total_compressed)) > MAX_UPLOAD_COMPRESSION_RATIO:
+        raise HTTPException(status_code=413, detail="upload_zip_compression_ratio_too_high")
+
+
+def _is_conversation_json_member(name: str) -> bool:
+    basename = Path(name.replace("\\", "/")).name
+    return basename == "conversations.json" or (basename.startswith("conversations-") and basename.endswith(".json"))
+
+
+def _like_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _table_exists(conn, name: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1", (name,)).fetchone()
+    return row is not None
+
+
 def _empty_page(limit: int, offset: int, *, selected_id: str | None, db_ready: bool) -> dict[str, object]:
     return {
         "db_ready": db_ready,
@@ -411,12 +517,28 @@ def _empty_page(limit: int, offset: int, *, selected_id: str | None, db_ready: b
     }
 
 
+def _schema_error_detail(schema: dict[str, object]) -> dict[str, object]:
+    return {
+        "error": "database schema is not compatible",
+        "schema_compatible": False,
+        "missing_tables": schema.get("missing_tables", []),
+        "missing_columns": schema.get("missing_columns", {}),
+    }
+
+
 def _dict_row_to_mapping(row: dict):
     class MappingRow(dict):
         def __getitem__(self, key):
             return dict.get(self, key)
 
     return MappingRow(row)
+
+
+def _export_message_row(row: dict) -> dict:
+    output = dict(row)
+    display_text = output.get("display_text") or output.get("render_text") or output.get("content_text") or ""
+    output["content_text"] = display_text
+    return output
 
 
 def _download_filename(conversation_id: str, fmt: str) -> str:
@@ -438,6 +560,7 @@ def _validate_common(
     scope: str | None = None,
     role: str | None = None,
     path: str | None = None,
+    match_mode: str | None = None,
 ) -> None:
     if sort is not None and sort not in ALLOWED_SORTS:
         raise HTTPException(status_code=400, detail="invalid sort")
@@ -447,6 +570,8 @@ def _validate_common(
         raise HTTPException(status_code=400, detail="invalid role")
     if path is not None and path not in ALLOWED_PATHS:
         raise HTTPException(status_code=400, detail="path must be current or all")
+    if match_mode is not None and match_mode not in ALLOWED_MATCH_MODES:
+        raise HTTPException(status_code=400, detail="invalid match mode")
 
 
 def _raise_query_errors(parsed) -> None:

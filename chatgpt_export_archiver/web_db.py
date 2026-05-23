@@ -4,8 +4,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .db import _drop_table_with_shadows, configure_bulk_write_connection
-from .search import normalize_search_text
+from .db import CORE_SCHEMA_COLUMNS, _drop_table_with_shadows, configure_bulk_write_connection
+from .search import normalize_search_text, search_fragment_match
 
 
 REQUIRED_TABLES = {
@@ -14,6 +14,10 @@ REQUIRED_TABLES = {
     "import_runs",
     "import_warnings",
     "source_files",
+}
+REQUIRED_COLUMNS = {
+    table: CORE_SCHEMA_COLUMNS[table]
+    for table in REQUIRED_TABLES
 }
 
 
@@ -26,6 +30,7 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
+    conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
     return conn
 
 
@@ -36,6 +41,7 @@ def connect_writable(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
+    conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
     return conn
 
 
@@ -47,14 +53,58 @@ def check_schema(conn: sqlite3.Connection) -> dict[str, Any]:
         ).fetchall()
     }
     missing = sorted(REQUIRED_TABLES - tables)
+    missing_columns: dict[str, list[str]] = {}
+    for table, required_columns in REQUIRED_COLUMNS.items():
+        if table not in tables:
+            continue
+        try:
+            columns = {row["name"] for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
+        except sqlite3.Error:
+            missing_columns[table] = sorted(required_columns)
+            continue
+        missing_for_table = sorted(required_columns - columns)
+        if missing_for_table:
+            missing_columns[table] = missing_for_table
     return {
-        "ok": not missing,
+        "ok": not missing and not missing_columns,
         "missing_tables": missing,
+        "missing_columns": missing_columns,
+        "schema_compatible": not missing and not missing_columns,
         "message_fts": "message_fts" in tables,
         "web_message_trigram": "web_message_trigram" in tables,
         "web_title_trigram": "web_title_trigram" in tables,
         "web_message_norm": "web_message_norm" in tables,
         "web_title_norm": "web_title_norm" in tables,
+        "web_index_metadata": "web_index_metadata" in tables,
+    }
+
+
+def web_index_status(conn: sqlite3.Connection) -> dict[str, Any]:
+    schema = check_schema(conn)
+    metadata: dict[str, str] = {}
+    if schema["web_index_metadata"]:
+        try:
+            metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM web_index_metadata")}
+        except sqlite3.Error:
+            metadata = {}
+    message_norm_normalized = schema["web_message_norm"] and (
+        metadata.get("message_norm_text") == "normalized" or metadata.get("message_trigram_text") == "normalized"
+    )
+    title_norm_normalized = schema["web_title_norm"] and (
+        metadata.get("title_norm_text") == "normalized" or metadata.get("title_trigram_text") == "normalized"
+    )
+    message_trigram_normalized = schema["web_message_trigram"] and metadata.get("message_trigram_text") == "normalized"
+    title_trigram_normalized = schema["web_title_trigram"] and metadata.get("title_trigram_text") == "normalized"
+    return {
+        "web_normalized_indexed": bool(message_norm_normalized and title_norm_normalized),
+        "web_normalized_trigram_indexed": bool(message_trigram_normalized and title_trigram_normalized),
+        "web_legacy_trigram_indexed": bool(
+            schema["web_message_trigram"]
+            and schema["web_title_trigram"]
+            and not (message_trigram_normalized and title_trigram_normalized)
+        ),
+        "web_trigram_indexed": bool(schema["web_message_trigram"] and schema["web_title_trigram"]),
+        "web_index_metadata": bool(schema["web_index_metadata"]),
     }
 
 
@@ -65,7 +115,13 @@ def require_compatible_schema(db_path: Path) -> dict[str, Any]:
     finally:
         conn.close()
     if not status["ok"]:
-        raise ValueError(f"Database is missing required tables: {', '.join(status['missing_tables'])}")
+        details = []
+        if status["missing_tables"]:
+            details.append(f"missing required tables: {', '.join(status['missing_tables'])}")
+        if status["missing_columns"]:
+            columns = "; ".join(f"{table}: {', '.join(cols)}" for table, cols in status["missing_columns"].items())
+            details.append(f"missing required columns: {columns}")
+        raise ValueError(f"Database schema is not compatible ({'; '.join(details)})")
     return status
 
 
@@ -99,6 +155,7 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
         drop_failures.extend(_drop_table_with_shadows(conn, "web_title_trigram"))
         conn.execute("DROP TABLE IF EXISTS web_message_norm")
         conn.execute("DROP TABLE IF EXISTS web_title_norm")
+        conn.execute("DROP TABLE IF EXISTS web_index_metadata")
         if trigram_available:
             conn.execute(
                 """
@@ -141,7 +198,7 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             conn.execute(
                 """
                 INSERT INTO web_message_trigram(rowid, content_text)
-                SELECT rowid, content_text
+                SELECT rowid, web_norm(content_text)
                 FROM conversation_nodes
                 WHERE content_text IS NOT NULL AND content_text <> ''
                 """
@@ -149,7 +206,7 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             conn.execute(
                 """
                 INSERT INTO web_title_trigram(rowid, title)
-                SELECT rowid, COALESCE(title, '')
+                SELECT rowid, web_norm(COALESCE(title, ''))
                 FROM conversations
                 """
             )
@@ -173,6 +230,14 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
         )
         conn.execute(
             """
+            CREATE TABLE web_index_metadata(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             INSERT INTO web_message_norm(conversation_id, node_id, content_norm)
             SELECT conversation_id, node_id, web_norm(content_text)
             FROM conversation_nodes
@@ -186,6 +251,18 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             FROM conversations
             """
         )
+        metadata = [
+            ("message_norm_text", "normalized"),
+            ("title_norm_text", "normalized"),
+        ]
+        if trigram_available:
+            metadata.extend(
+                [
+                    ("message_trigram_text", "normalized"),
+                    ("title_trigram_text", "normalized"),
+                ]
+            )
+        conn.executemany("INSERT INTO web_index_metadata(key, value) VALUES(?, ?)", metadata)
         indexed_messages = conn.execute("SELECT COUNT(*) AS c FROM web_message_norm").fetchone()["c"]
         indexed_titles = conn.execute("SELECT COUNT(*) AS c FROM web_title_norm").fetchone()["c"]
         conn.commit()

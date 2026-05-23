@@ -11,7 +11,7 @@ interface Props {
   layout: MessageLayout;
   showRawDefault: boolean;
   t: (key: string) => string;
-  onCopy: (text: string) => void;
+  onCopy: (text: string) => Promise<boolean>;
   onSizeMayChange: () => void;
 }
 
@@ -19,11 +19,26 @@ function pieces(text: string, ranges: HighlightRange[]) {
   if (!ranges.length) return [text];
   const out: Array<string | { text: string; mark: true }> = [];
   let cursor = 0;
-  for (const range of ranges) {
-    if (range.start < cursor || range.start >= text.length) continue;
-    if (range.start > cursor) out.push(text.slice(cursor, range.start));
-    out.push({ text: text.slice(range.start, Math.min(range.end, text.length)), mark: true });
-    cursor = Math.min(range.end, text.length);
+  const normalizedRanges = ranges
+    .map((range) => ({
+      start: Math.max(0, Math.floor(range.start)),
+      end: Math.min(text.length, Math.floor(range.end))
+    }))
+    .filter((range) => range.end > range.start && range.start < text.length)
+    .sort((a, b) => a.start - b.start || b.end - a.end)
+    .reduce<Array<{ start: number; end: number }>>((merged, range) => {
+      const previous = merged[merged.length - 1];
+      if (!previous || range.start > previous.end) merged.push({ ...range });
+      else previous.end = Math.max(previous.end, range.end);
+      return merged;
+    }, []);
+  for (const range of normalizedRanges) {
+    const start = Math.max(0, Math.floor(range.start));
+    const end = Math.min(text.length, Math.floor(range.end));
+    if (start < cursor || start >= text.length || end <= start) continue;
+    if (start > cursor) out.push(text.slice(cursor, start));
+    out.push({ text: text.slice(start, end), mark: true });
+    cursor = end;
   }
   if (cursor < text.length) out.push(text.slice(cursor));
   return out;
@@ -78,7 +93,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   const measureFrameRef = useRef<number | null>(null);
   const rawControllerRef = useRef<AbortController | null>(null);
   const rawRequestIdRef = useRef(0);
-  const role = roleLabel(message.role);
+  const role = roleLabel(message.role, t);
   const text = message.display_text || message.render_text || message.content_text || "";
   const placeholder = `[non-text content: ${message.content_type || "empty"}]`;
   const timestamp = formatDate(message.create_time || message.update_time);
@@ -90,7 +105,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   const messageIdentity = `${conversationId}:${message.node_id}:${message.message_id || ""}:${message.content_hash || ""}`;
   const messageIdentityRef = useRef(messageIdentity);
   messageIdentityRef.current = messageIdentity;
-  const copy = () => onCopy(text || message.raw_preview || "");
+  const copy = () => { void onCopy(text || message.raw_preview || ""); };
   const notifySizeMayChange = () => {
     if (measureFrameRef.current !== null) return;
     measureFrameRef.current = window.requestAnimationFrame(() => {

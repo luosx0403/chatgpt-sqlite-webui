@@ -33,7 +33,7 @@ ChatGPT Export Archiver は、OpenAI / ChatGPT の公式 export ZIP を直接 SQ
 
 ## このプロジェクトでできること
 
-- OpenAI / ChatGPT のエクスポート ZIP、または展開済みのエクスポートディレクトリから `conversations.json` と sharded `conversations-*.json` を SQLite に取り込みます。
+- OpenAI / ChatGPT のエクスポート ZIP、単体の `conversations.json` ファイル、または展開済みのエクスポートディレクトリから `conversations.json` と sharded `conversations-*.json` を SQLite に取り込みます。
 - 会話メタデータ、mapping nodes、メッセージの role、本文テキスト、タイムスタンプ、親ノード関係、ソース追跡、インポート警告を保存します。
 - 増分インポートに対応します。新しいエクスポートを同じデータベースへ再インポートすると、変更された会話を更新し、未変更データを意図的に重複させません。
 - CLI 検索用に任意の FTS5 メッセージインデックスを作成します。
@@ -230,6 +230,8 @@ python chatgpt_archive.py web --port 8787
 
 Web アップロードインポートが成功すると、バックエンドは CLI と同じコア import pipeline を使い、その後 `verify`、`stats`、`web-index` を実行します。アップロードされた ZIP はサーバー側の一時コピーであり、ディスク上の元ファイルとは独立して削除されます。
 
+Web アップロードでは、インポート job を開始する前にアプリケーションレベルの安全制限も適用されます。`CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` はアップロード ZIP 全体のサイズを制御し、既定は 20 GiB です。conversation JSON member は既定で最大 5,000 ファイル、1 member あたり 64 GiB、合計未圧縮データ 128 GiB、大きな JSON member の圧縮率 1000:1 に制限されます。正規の ChatGPT アーカイブが既定値を超える場合は、Web UI 起動前により大きい環境変数を設定できますが、ZIP bomb やディスク圧迫のリスクが増えるため、信頼できるローカルファイルだけに使ってください。
+
 
 ## Web UI 受け入れチェックリスト
 
@@ -246,6 +248,8 @@ runnable delivery の Web 経路は `webui/node_modules` を必要としない�
 ## 検索構文
 
 CLI 検索は、SQLite のクエリ文字列を直接渡すのではなく、プロジェクト共通の安全な検索構文を使います。通常のキーワード、引用符付きフレーズ、`-term` による除外、`OR`、`role:user`、`source:zip`、`path:current`、`path:all`、`scope:title`、`scope:message` などのフィルターを使えます。表示されるのは conversation ID、node ID、role で、snippet は表示されません。
+
+`after:2026-05-01`、`before:2026-05-13`、`--from`、`--to` などの日付フィルターは、ローカルタイムゾーンの日付ではなく UTC のカレンダー日を使います。開始日はその日の `00:00:00Z` を含み、終了日は翌日の `00:00:00Z` を排他的な上限として扱うため、`23:59:59.5Z` のような小数秒 timestamp もその日に含まれます。Web 検索欄は 500 文字までです。より長い構造化条件には詳細フィルターを使ってください。
 
 ```bash
 python chatgpt_archive.py search --db archive/chatgpt_archive.db "python sqlite"
@@ -357,7 +361,7 @@ tools/                             Delivery and support scripts
 
 メインデータベースは conversations、mapping nodes、import runs、warnings を保存します。CLI FTS テーブルは `message_fts` です。任意 Web 検索用の補助テーブルには `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram` と SQLite FTS5 shadow tables が含まれます。
 
-明示的に計画され文書化された migration がない限り、小さな堅牢性修正でデータベース schema を変更することはありません。
+明示的に計画され文書化された migration がない限り、小さな堅牢性修正でデータベース schema を変更することはありません。新しい列が欠けている古いデータベースは、`verify` または Web health の `missing_columns` 診断で明確に拒否され、暗黙には migration されません。その場合は古い DB をバックアップし、元の export から新しい DB へ再インポートしてください。
 
 ## 既知の制限
 

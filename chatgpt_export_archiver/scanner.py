@@ -34,11 +34,22 @@ class InputSource:
 def find_default_input(path: Path) -> InputSource:
     path = path.resolve()
     if path.is_file():
-        kind = "zip" if path.suffix.lower() == ".zip" else "directory"
+        if path.suffix.lower() == ".zip":
+            kind = "zip"
+        elif is_conversation_json_source(path.name):
+            kind = "json"
+        else:
+            kind = "directory"
         return InputSource(path=path, kind=kind, size=path.stat().st_size, delete_target=path)
     zips = sorted(path.glob("*.zip"))
     if not zips:
-        raise ValueError("no_zip_file_found")
+        json_files = sorted([p for p in path.glob("conversations*.json") if is_conversation_json_source(p.name)])
+        if not json_files:
+            raise ValueError("no_zip_file_found")
+        if len(json_files) > 1:
+            raise ValueError(f"multiple_conversation_json_files_found count {len(json_files)}")
+        resolved_json = json_files[0].resolve()
+        return InputSource(path=resolved_json, kind="json", size=json_files[0].stat().st_size, delete_target=resolved_json)
     if len(zips) > 1:
         raise ValueError(f"multiple_zip_files_found count {len(zips)}")
     resolved = zips[0].resolve()
@@ -55,6 +66,8 @@ def resolve_input(value: str | None, cwd: Path) -> InputSource:
         p = delete_target.resolve()
         if p.is_file() and p.suffix.lower() == ".zip":
             return InputSource(path=p, kind="zip", size=p.stat().st_size, delete_target=delete_target)
+        if p.is_file() and is_conversation_json_source(p.name):
+            return InputSource(path=p, kind="json", size=p.stat().st_size, delete_target=delete_target)
         if p.is_dir():
             return InputSource(path=p, kind="directory", size=0, delete_target=delete_target)
         raise ValueError("input_not_supported")
@@ -98,6 +111,17 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
                 for info in zf.infolist()
                 if not info.is_dir()
             ]
+    elif input_source.kind == "json":
+        name = input_source.path.name
+        entries = [
+            SourceEntry(
+                source_path=name,
+                file_type=classify_file(name),
+                size=input_source.path.stat().st_size,
+                extension=input_source.path.suffix.lower(),
+                is_conversation_json=is_conversation_json_source(name),
+            )
+        ]
     else:
         base = input_source.path
         entries = []
@@ -141,5 +165,10 @@ def load_json_from_source(input_source: InputSource, source_path: str) -> Any:
         with zipfile.ZipFile(input_source.path) as zf:
             with zf.open(source_path) as f:
                 return json.load(f)
+    if input_source.kind == "json":
+        if source_path != input_source.path.name:
+            raise ValueError("source_not_found")
+        with input_source.path.open("r", encoding="utf-8") as f:
+            return json.load(f)
     with (input_source.path / source_path).open("r", encoding="utf-8") as f:
         return json.load(f)

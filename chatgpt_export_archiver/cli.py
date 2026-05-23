@@ -606,6 +606,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"schema_ok {str(result.get('schema_ok', True)).lower()}")
     if result.get("missing_tables"):
         print(f"missing_tables {','.join(result['missing_tables'])}")
+    if result.get("missing_columns"):
+        pairs = [
+            f"{table}.{column}"
+            for table, columns in sorted(result["missing_columns"].items())
+            for column in columns
+        ]
+        print(f"missing_columns {','.join(pairs)}")
     print(f"integrity_check {result['integrity_check']}")
     print(f"latest_import_run_id {result['latest_import_run_id']}")
     print(f"latest_run_warnings {result['latest_run_warnings']}")
@@ -633,7 +640,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         print("invalid_query true")
         conn.close()
         return 2
-    page = search_messages(conn, parsed, limit=args.limit, candidate_limit=MAX_CANDIDATES, count_total=False)
+    page = search_messages(conn, parsed, limit=args.limit, count_total=False)
     for row in page["items"]:
         print(f"conversation_id {row['conversation_id']} node_id {row['node_id']} role {row['role'] or ''}")
     print(f"matches {len(page['items'])}")

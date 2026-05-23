@@ -26,6 +26,8 @@ export default function SettingsPanel({ open, settings, t, onChange, onClose }: 
               <option value="en">{t("english")}</option>
               <option value="zh-Hans">{t("simplifiedChinese")}</option>
               <option value="zh-Hant">{t("traditionalChinese")}</option>
+              <option value="ja">{t("japanese")}</option>
+              <option value="es">{t("spanish")}</option>
             </select>
           </label>
           <label>{t("theme")}

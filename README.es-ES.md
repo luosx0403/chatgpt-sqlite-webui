@@ -33,7 +33,7 @@ Estas son observaciones de ejemplo en una sola máquina local, no una garantía 
 
 ## Qué Hace Este Proyecto
 
-- Importa `conversations.json` y shards `conversations-*.json` desde un ZIP exportado por OpenAI / ChatGPT o desde un directorio ya extraído.
+- Importa `conversations.json` y shards `conversations-*.json` desde un ZIP exportado por OpenAI / ChatGPT, un archivo `conversations.json` suelto o un directorio ya extraído.
 - Conserva metadatos de conversaciones, mapping nodes, roles de mensajes, texto, marcas de tiempo, enlaces de padres, seguimiento de origen y advertencias de importación.
 - Admite importación incremental. Al reimportar un export más reciente en la misma base de datos, actualiza las conversaciones que cambiaron sin duplicar de forma intencionada los datos sin cambios.
 - Crea un índice opcional FTS5 para búsqueda por CLI.
@@ -230,6 +230,8 @@ La Web UI puede usarse de dos formas. Si la base de datos ya existe, pásala de 
 
 Tras una importación Web correcta, el backend ejecuta el mismo import pipeline que la CLI y luego ejecuta `verify`, `stats` y `web-index`. El ZIP subido es una copia temporal del lado del servidor y se limpia de forma independiente del archivo original en tu disco.
 
+Las subidas Web también aplican límites de seguridad de aplicación antes de arrancar el job de importación: `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` controla el tamaño total del ZIP subido y por defecto es 20 GiB; los miembros JSON de conversaciones están limitados a 5.000 archivos, 64 GiB por miembro, 128 GiB de datos descomprimidos en total y una relación de compresión 1000:1 para miembros JSON grandes. Si un archivo legítimo de ChatGPT supera los valores por defecto, define una variable de entorno mayor antes de iniciar la Web UI, pero hazlo solo para archivos locales de confianza porque límites más altos aumentan el riesgo de ZIP bomb y presión de disco.
+
 
 ## Checklist de aceptación de la Web UI
 
@@ -246,6 +248,8 @@ La ruta Web de una entrega runnable no debería necesitar `webui/node_modules`, 
 ## Sintaxis de búsqueda
 
 La búsqueda CLI usa la sintaxis segura del proyecto, no texto de consulta SQLite sin procesar. Puedes usar palabras normales, frases entre comillas, exclusiones `-term`, `OR` y filtros como `role:user`, `source:zip`, `path:current`, `path:all`, `scope:title` y `scope:message`. Imprime conversation IDs, node IDs y roles, no snippets.
+
+Los filtros de fecha como `after:2026-05-01`, `before:2026-05-13`, `--from` y `--to` usan días naturales UTC, no el día natural de tu zona horaria local. Las fechas iniciales incluyen `00:00:00Z`; las fechas finales usan `00:00:00Z` del día siguiente como límite superior exclusivo, por lo que timestamps fraccionarios como `23:59:59.5Z` quedan incluidos en ese día. El cuadro de búsqueda Web está limitado a 500 caracteres; usa filtros avanzados para consultas estructuradas más largas.
 
 ```bash
 python chatgpt_archive.py search --db archive/chatgpt_archive.db "python sqlite"
@@ -357,7 +361,7 @@ tools/                             Delivery and support scripts
 
 La base principal almacena conversaciones, mapping nodes, import runs y warnings. La tabla FTS de CLI es `message_fts`. Las tablas auxiliares opcionales para búsqueda Web incluyen `web_message_norm`, `web_title_norm`, `web_message_trigram` y `web_title_trigram`, además de las shadow tables de SQLite FTS5.
 
-El proyecto evita cambiar el schema de la base de datos durante pequeñas correcciones de robustez, salvo que exista una migración planificada y documentada explícitamente.
+El proyecto evita cambiar el schema de la base de datos durante pequeñas correcciones de robustez, salvo que exista una migración planificada y documentada explícitamente. Las bases de datos antiguas a las que les falten columnas nuevas se rechazan con diagnósticos `missing_columns` en `verify` o Web health, sin migrarlas en silencio; en ese caso, haz una copia de seguridad de la base antigua y vuelve a importar el export original en una base nueva.
 
 ## Límites conocidos
 

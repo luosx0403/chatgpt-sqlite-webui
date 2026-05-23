@@ -14,6 +14,7 @@ from typing import Any
 from .cli import run_import_pipeline
 from .db import connect, get_stats, verify_database
 from .logging_utils import get_logger, parse_log_level
+from .utils import safe_filename_part
 from .web_db import create_web_indexes
 
 LOGGER = get_logger("web_jobs")
@@ -64,7 +65,7 @@ class ImportJob:
             "job_id": self.job_id,
             "status": self.status,
             "stage": self.stage,
-            "filename": "zip",
+            "filename": safe_filename_part(self.filename, 120),
             "size": self.size,
             "created_at": self.created_at,
             "started_at": self.started_at,
