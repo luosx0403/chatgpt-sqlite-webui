@@ -148,6 +148,14 @@ Import an export with the large-archive path:
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+`--input` may point at the official export ZIP, a standalone `conversations.json`, or an extracted export directory. Extracted directories may contain either `conversations.json` or sharded `conversations-*.json` files; do not merge shards manually.
+
+```bash
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input conversations.json --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input ./extracted-export/ --no-input-sha256 --rebuild-fts
+```
+
 Verify structural consistency:
 
 ```bash
@@ -202,6 +210,8 @@ The recommended large-archive command is:
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+The input may be a ZIP, a single `conversations.json`, or an extracted directory containing `conversations.json` or sharded `conversations-*.json` files. Scanner discovery ignores macOS metadata paths such as `__MACOSX`, AppleDouble `._*` files, and `.DS_Store`, so those local artifacts do not become conversation sources.
+
 If you want SQLite to spend extra time tidying planner statistics and the FTS index after import, use:
 
 ```bash
@@ -226,11 +236,88 @@ python chatgpt_archive.py web --port 8787
 
 The default reader layout is `chat`: user messages align right, assistant messages align left, and system/internal messages appear as collapsed disclosure notes. To use the older row-by-row technical layout, open Settings and choose `Classic`, or add `?layout=classic` or `?messageLayout=classic` to the Web UI URL.
 
+Reader copy and export actions follow the visible reader contract. `Copy current path conversation` fetches every page for the current reader path and respects the Show internal messages toggle, while ignoring the current search filters. `Copy visible` copies only the already loaded visible messages. Download links use the same current path and Show internal setting. Raw message access is a bounded larger raw preview through the per-message endpoint; truncated responses must render `raw_text` as plain preview text and the UI only shows that capped preview.
+
+Reader jump-to-hit requests with `around_node_id` use the same pagination collection as the reader: visible-only rows when Show internal is off, the full node collection when Show internal is on, and the effective all-node collection for damaged conversations with no current-path nodes.
+
 The Web UI can be used in two ways. If the database already exists, pass it explicitly or let the default path be used. If the database does not exist, start the Web UI anyway, then use the import panel to upload a ChatGPT export ZIP. Upload imports are serialized so that only one SQLite writer runs in the process at a time.
 
 After a successful Web upload import, the backend runs the same core import pipeline as the CLI, then runs `verify`, `stats`, and `web-index`. The uploaded ZIP is a temporary server-side copy and is cleaned up independently from the original file on your disk.
 
-Web uploads also enforce application-level safety limits before the import job starts: `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` controls the total uploaded ZIP size and defaults to 20 GiB; conversation JSON members are limited to 5,000 files, 64 GiB per member, 128 GiB total uncompressed data, and a 1000:1 compression ratio for large JSON members. If a legitimate ChatGPT archive exceeds the defaults, set a larger environment variable before starting the Web UI, but only for trusted local files because higher limits increase ZIP bomb and disk-pressure risk.
+## Web upload security limits
+
+Web uploads enforce application-level safety limits before the import job starts. These are controlled by environment variables and are independent of CLI `import`, which does not use these limits.
+
+The Web upload pending slot is reserved before reading the file so a large upload cannot race with another writer. Any error after that reservation, including temporary upload path creation failure, must release the slot and clean the server-side temporary directory; a successful import job takes ownership of the slot and temporary copy.
+
+When the Web UI is bound to a loopback address (`127.0.0.1`, `localhost`, `::1`), the defaults allow large trusted archives:
+
+| Environment variable | Local default | Controls |
+|---|---|---|
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` | 20 GiB | Total compressed ZIP upload size |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES` | 64 GiB | Max uncompressed size of a single JSON member |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBERS` | 5,000 | Max number of conversation JSON members |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES` | 128 GiB | Max total uncompressed JSON data |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO` | 1,000.0 | Max compression ratio for large JSON members |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | Max total ZIP members |
+| `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | unset | Set to `local` only on trusted non-loopback networks to use local defaults for unset upload limits |
+
+**Remote binding policy.** If the Web UI is bound to a non-loopback address (e.g. `0.0.0.0`, `::`, a LAN IP), the server applies conservative remote-safe defaults: 128 MiB compressed ZIP, 256 MiB per JSON member, 512 MiB total uncompressed, 200.0 compression ratio, 200 JSON members, and 10,000 total ZIP members. Setting `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` only allows explicit per-limit environment overrides above those remote-safe defaults; unset limits stay remote-safe. To restore the local large defaults for unset limits on a trusted LAN, set `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local`. Both remote modes expose the local archive browser and upload endpoint, so use them only on trusted networks.
+
+`/api/schema` reports the current effective upload policy for the running host, including whether remote-safe, explicit remote override, or local-profile limits are active. ZIP size checks run before import, but direct JSON parsing, SQLite writes, and `web-index` rebuild still use memory, disk, and CPU proportional to decoded conversation JSON size. For very large archives, prefer a trusted local environment, CLI import, and enough disk and memory.
+
+To raise a local limit for a legitimate large archive, set the corresponding variable before starting the Web UI:
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440
+python chatgpt_archive.py web --port 8787
+```
+
+To allow an explicit large compressed ZIP limit on a trusted internal network while keeping other unset limits remote-safe:
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS = "true"
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+To use the full local upload profile on a trusted internal network:
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+Set higher limits only for local files you trust. Larger values raise ZIP bomb, disk-pressure, and CPU/memory risk.
 
 
 ## Web UI acceptance checklist
@@ -249,6 +336,8 @@ The Web path should not require `webui/node_modules` in a runnable delivery beca
 
 CLI search uses the project's safe query syntax, not raw SQLite query text. Use plain keywords, quoted phrases, `-term` exclusions, `OR`, and filters such as `role:user`, `source:zip`, `path:current`, `path:all`, `scope:title`, and `scope:message`. It prints conversation IDs, node IDs, and roles, not snippets.
 
+Exclusions are conversation-level for conversation results: if any title or message in the selected search scope and path matches an excluded fragment, that conversation is not returned. `/api/search/messages` still returns only message hits that do not contain the excluded fragment. `path:current` follows the reader path per conversation; if a damaged archive has no current-path nodes at all, current-path search falls back to the same all-node view that the reader displays.
+
 Date filters such as `after:2026-05-01`, `before:2026-05-13`, `--from`, and `--to` use UTC calendar days, not your local time zone's calendar day. Start dates are inclusive at `00:00:00Z`; end dates include the full UTC day by using the next day's `00:00:00Z` as an exclusive upper bound, so fractional timestamps like `23:59:59.5Z` are included. The Web search box is limited to 500 characters; use advanced filters for longer structured queries.
 
 ```bash
@@ -262,6 +351,8 @@ Web search uses optional normalized trigram indexes built by `web-index`. This i
 ```bash
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
+
+Search diagnostics are best-effort performance hints. They must report only normalized-safe candidate layers or scan fallbacks such as normalized trigram, normalized scan, normalized title scan, or full scan. Legacy raw FTS presence may be reported separately, but it must not be presented as the actual candidate backend because it can miss normalized-equivalent text.
 
 If you manually run `VACUUM`, `VACUUM INTO`, or rewrite the SQLite database with an external compaction or backup tool, run `python chatgpt_archive.py web-index --db <archive.db>` again before relying on Web UI search. The optional Web index is rebuilt from the canonical conversation tables and is safe to regenerate.
 
@@ -338,7 +429,7 @@ python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 
 ## Delivery notes
 
-A runnable delivery should include the Python sources, tests, docs, `requirements-web.txt`, and `webui/dist`. It should not include `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, Python cache directories or bytecode, coverage/typecheck caches, `.DS_Store`, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, temporary logs, local acceptance logs, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, any `*.zip`, `conversations*.json`, real databases such as `*.db`, `*.sqlite`, and `*.sqlite3`, or SQLite sidecars such as `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm`, and `*.sqlite3-journal`. Directory checks allow the target root's own `.git` directory so a normal Git clone can be checked, but nested `.git` directories are forbidden; ZIP delivery checks forbid any `.git` entry.
+A runnable delivery should include the Python sources, tests, docs, `requirements-web.txt`, frontend source and tests under `webui/src` and `webui/tests`, frontend config/package files, and built assets under `webui/dist`. It should not include `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, Python cache directories or bytecode, coverage/typecheck caches, `.DS_Store`, AppleDouble `._*` files, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, temporary logs, local acceptance logs, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, any `*.zip`, `conversations*.json`, real databases such as `*.db`, `*.sqlite`, and `*.sqlite3`, or SQLite sidecars such as `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm`, and `*.sqlite3-journal`. Directory checks allow the target root's own `.git` directory so a normal Git clone can be checked, but nested `.git` directories are forbidden; ZIP delivery checks forbid any `.git` entry.
 
 A source-only delivery may omit `webui/dist`, but then the frontend must be rebuilt before serving the full React UI.
 
@@ -368,4 +459,5 @@ The project intentionally does not change the database schema during small robus
 - This is a local archive tool, not a cloud sync service.
 - The Web UI is intended for local use. Do not expose it to an untrusted network without adding your own access controls.
 - Export parsing follows the observed OpenAI / ChatGPT export format. If the upstream export shape changes, `inspect` and tests should be updated before trusting a new import path.
+- Export file name parts are sanitized for Windows as well as Unix-like systems, including reserved device names such as `CON`, `AUX`, `COM1`, `LPT9`, `COM¹`, and `LPT²`, plus trailing dots and spaces.
 - Very large archives can take time to import, rebuild FTS, and build Web trigram indexes. Prefer the `--rebuild-fts` path for large imports.

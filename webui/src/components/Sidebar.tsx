@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ConversationSummary, Health, MatchMode, PathMode, SearchFilters, SearchScope, SortMode } from "../types";
+import type { ConversationSummary, Health, MatchMode, PathMode, SearchDiagnostics, SearchFilters, SearchScope, SortMode } from "../types";
 import { shortDate } from "../utils/format";
 import { analyzeQuerySyntax } from "../utils/querySyntax";
 
@@ -28,6 +28,7 @@ interface Props {
   hasMore: boolean;
   autoLoadMore: boolean;
   health: Health | null;
+  diagnostics: SearchDiagnostics | null;
 }
 
 export default function Sidebar(props: Props) {
@@ -135,6 +136,7 @@ export default function Sidebar(props: Props) {
         {props.health?.db_ready && !props.health.web_normalized_trigram_indexed && (
           <p className="hint search-index-warning">{props.t("searchIndexMayBeSlow")}</p>
         )}
+        {props.diagnostics && <SearchDiagnosticsHint t={props.t} diagnostics={props.diagnostics} />}
       </div>
       <div className="results-meta">
         {props.loading ? <SearchLoadingProgress label={props.t("loading")} /> : `${props.conversations.length} ${props.t("of")} ${props.total} ${props.t("conversations")}`}
@@ -142,10 +144,12 @@ export default function Sidebar(props: Props) {
       {props.error && <div className="error-box">{props.error}</div>}
       <div className="conversation-list" ref={listRef} onScroll={handleScroll} role="listbox" aria-label={props.t("conversations")}>
         {props.conversations.map((item, index) => {
+          const pathFallback = Boolean(item.current_path_fallback_to_all || (item.node_count && item.node_count > 0 && item.current_path_nodes === 0));
+          const hasSnippetBranch = item.snippets?.some((snippet) => snippet.is_on_current_path === false && !snippet.effective_visible_in_current_view && !snippet.current_path_fallback_to_all) ?? false;
           const badges = [
             (item.has_title_hits || item.title_match || item.reasons?.includes("title match")) ? props.t("titleHitBadge") : "",
             (item.has_internal_hits || item.snippets?.some((snippet) => snippet.is_internal)) ? props.t("internalHitBadge") : "",
-            (item.has_branch_hits || item.snippets?.some((snippet) => snippet.is_on_current_path === false)) ? props.t("branchHitBadge") : "",
+            (!pathFallback && (item.has_branch_hits || hasSnippetBranch)) ? props.t("branchHitBadge") : "",
           ].filter(Boolean);
           return (
             <button
@@ -226,5 +230,26 @@ function SearchLoadingProgress({ label }: { label: string }) {
       <span className="search-loading-label">{label}</span>
       <span className="search-loading-bar" aria-hidden="true"> [{bar}]</span>
     </span>
+  );
+}
+
+function diagnosticsLabel(t: (key: string) => string, diag: SearchDiagnostics): string | null {
+  if (diag.web_index_missing && diag.short_query) return t("searchDiagnosticsMissingShort");
+  if (diag.web_index_missing) return t("searchDiagnosticsMissing");
+  if (diag.legacy_trigram_index || diag.actual_fallback_note || diag.estimated_backend_note) return t("searchDiagnosticsLegacy");
+  if (diag.short_query && (diag.candidate_backend === "normalized_trigram" || diag.candidate_backend === "normalized_title_trigram")) return null;
+  if (diag.short_query) return t("searchDiagnosticsShortQuery");
+  if (diag.candidate_backend === "full_scan") return t("searchDiagnosticsFullScan");
+  if (diag.candidate_backend === "normalized_scan" || diag.candidate_backend === "normalized_title_scan") return t("searchDiagnosticsNormalizedScan");
+  if (diag.diagnostics_accuracy && diag.diagnostics_accuracy !== "best_effort") return t("searchDiagnosticsGeneric");
+  if (diag.candidate_backend && !["normalized_trigram", "normalized_title_trigram"].includes(diag.candidate_backend)) return t("searchDiagnosticsGeneric");
+  return null;
+}
+
+function SearchDiagnosticsHint({ t, diagnostics }: { t: (key: string) => string; diagnostics: SearchDiagnostics }) {
+  const label = diagnosticsLabel(t, diagnostics);
+  if (!label) return null;
+  return (
+    <p className="hint search-diagnostics-hint" data-testid="search-diagnostics-hint">{label}</p>
   );
 }

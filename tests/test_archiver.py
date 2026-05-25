@@ -24,7 +24,7 @@ from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
 from chatgpt_export_archiver.scanner import list_source_entries, load_json_from_source, resolve_input
 from chatgpt_export_archiver.search import parse_query
-from chatgpt_export_archiver.utils import parse_date_boundary
+from chatgpt_export_archiver.utils import parse_date_boundary, safe_filename_part
 from chatgpt_export_archiver.web_db import connect_readonly, create_web_indexes
 from tools.check_delivery_clean import is_forbidden_member, main as delivery_clean_main
 from tools import clean_generated_artifacts
@@ -273,6 +273,51 @@ class ArchiverTests(unittest.TestCase):
         self.assertEqual(main(["--db", str(db), "export", "--out", str(out), "--format", "md", "--to", "2026-05-22"]), 0)
         self.assertTrue(any("fractional export body" in path.read_text(encoding="utf-8") for path in out.glob("*.md")))
 
+    def test_safe_filename_part_avoids_windows_reserved_names(self):
+        cases = {
+            "CON": "_CON",
+            "con": "_con",
+            "PRN": "_PRN",
+            "AUX.txt": "_AUX.txt",
+            "NUL": "_NUL",
+            "COM1": "_COM1",
+            "LPT9": "_LPT9",
+            "COM¹": "_COM¹",
+            "COM²": "_COM²",
+            "COM³": "_COM³",
+            "LPT¹": "_LPT¹",
+            "LPT²": "_LPT²",
+            "LPT³": "_LPT³",
+            "COM¹.txt": "_COM¹.txt",
+            "COM².md": "_COM².md",
+            "LPT².md": "_LPT².md",
+            "LPT³.txt": "_LPT³.txt",
+            "normal.": "normal",
+            "normal ": "normal",
+            "my-COM¹-note": "my-COM¹-note",
+            "": "untitled",
+            "<>|": "untitled",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(safe_filename_part(raw), expected)
+        long = "a" * 200
+        self.assertEqual(len(safe_filename_part(long, 40)), 40)
+
+    def test_export_uses_windows_safe_title_parts(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            z = base / "reserved.zip"
+            db = base / "archive.db"
+            out = base / "out"
+            write_zip(z, {"conversations.json": [conversation("reserved", title="CON", current_node="u1", mapping={"root": null_message_node("root", None, ["u1"]), "u1": message_node("u1", "root", "user", "reserved filename body", 1_700_000_001)})]})
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+            self.assertEqual(main(["--db", str(db), "export", "--out", str(out), "--format", "md"]), 0)
+            names = [path.name for path in out.glob("*.md")]
+            self.assertTrue(names)
+            self.assertFalse(any(name.casefold() in {"con.md", "con.txt"} for name in names))
+            self.assertTrue(any("_CON_" in name or name.startswith("_CON") for name in names))
+
     def test_string_boolean_metadata_parses_false_values(self):
         self.assertEqual(_to_int_bool(True), 1)
         self.assertEqual(_to_int_bool(False), 0)
@@ -365,19 +410,36 @@ class ArchiverTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", ["check_delivery_clean.py", "--mode", "runnable", str(base)]):
                 self.assertEqual(delivery_clean_main(), 1)
 
-    def test_delivery_clean_zip_strips_single_root_and_rejects_git(self):
+    def test_delivery_clean_zip_strips_single_root_ignoring_macosx_and_appledouble(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            ok_zip = base / "ok.zip"
-            bad_zip = base / "bad.zip"
-            with zipfile.ZipFile(ok_zip, "w") as zf:
-                zf.writestr("v17/webui/dist/index.html", "")
-            with zipfile.ZipFile(bad_zip, "w") as zf:
-                zf.writestr("package/.git/config", "")
-            with mock.patch.object(sys, "argv", ["check_delivery_clean.py", "--mode", "runnable", str(ok_zip)]):
-                self.assertEqual(delivery_clean_main(), 0)
-            with mock.patch.object(sys, "argv", ["check_delivery_clean.py", "--mode", "runnable", str(bad_zip)]):
-                self.assertEqual(delivery_clean_main(), 1)
+            z = base / "macosx.zip"
+            with zipfile.ZipFile(z, "w") as zf:
+                zf.writestr("project/webui/dist/index.html", "")
+                zf.writestr("project/webui/dist/assets/app.js", "")
+                zf.writestr("project/webui/dist/assets/style.css", "")
+                zf.writestr("__MACOSX/project/._README.md", "")
+                zf.writestr("__MACOSX/._project", "")
+                zf.writestr("project/.DS_Store", "")
+            with mock.patch.object(sys, "argv", ["check_delivery_clean.py", "--mode", "runnable", str(z)]):
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    self.assertEqual(delivery_clean_main(), 1)
+            output = buf.getvalue()
+            self.assertIn("forbidden_delivery_paths", output)
+            self.assertNotIn("webui/dist/index.html", output)
+            self.assertIn("__MACOSX/project/._README.md", output)
+            self.assertIn(".DS_Store", output)
+            # Now add a real forbidden member
+            z2 = base / "bad.zip"
+            with zipfile.ZipFile(z2, "w") as zf:
+                zf.writestr("project/webui/dist/index.html", "")
+                zf.writestr("project/archive/local.db", "")
+            with mock.patch.object(sys, "argv", ["check_delivery_clean.py", "--mode", "runnable", str(z2)]):
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    self.assertEqual(delivery_clean_main(), 1)
+            self.assertNotIn("webui/dist/index.html", buf.getvalue() or "")
+            self.assertNotIn("webui/dist/assets/app.js", buf.getvalue() or "")
+            self.assertIn("archive/local.db", buf.getvalue() or "")
 
     def test_delivery_clean_zip_rejects_dangerous_member_paths_before_root_strip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -705,9 +767,86 @@ class ArchiverTests(unittest.TestCase):
             root / "README.es-ES.md",
         ]
         command_blocks = []
+        heading_shapes = []
+        env_names = []
+        common_required = [
+            "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS",
+            "CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBERS",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS",
+            "100,000",
+            "10,000",
+            "raw_text",
+            "web-index",
+            "webui/dist",
+            "webui/src",
+            "webui/tests",
+            "webui/node_modules",
+            "webui/tsconfig.tsbuildinfo",
+            "message_fts",
+            "web_message_norm",
+            "web_title_norm",
+            "web_message_trigram",
+            "web_title_trigram",
+            "legacy raw FTS",
+            "candidate backend",
+            "normalized title scan",
+            "full scan",
+            "remote-safe",
+            "/api/schema",
+            "current-path node",
+            "--input conversations.json",
+            "--input ./extracted-export/",
+            "conversations-*.json",
+            "scanner discovery",
+            ".DS_Store",
+            "around_node_id",
+            "visible-only rows",
+            "effective all-node collection",
+            "CON",
+            "COM¹",
+            "LPT²",
+            "._*",
+            "__MACOSX",
+            "conversations*.json",
+            "*.jsonl",
+            "*.zip",
+            "archive/",
+            "exports/",
+        ]
+        localized_required = {
+            "README.md": ["Copy current path conversation", "Copy visible", "bounded larger raw preview", "current reader path", "conversation-level"],
+            "README.zh-CN.md": ["复制当前路径整段对话", "复制当前可见", "有上限的较大 raw 预览", "当前 reader 路径", "conversation-level"],
+            "README.zh-TW.md": ["複製目前路徑整段對話", "複製目前可見", "有上限的較大 raw 預覽", "目前 reader 路徑", "conversation-level"],
+            "README.ja-JP.md": ["現在のパスの会話をコピー", "表示中をコピー", "上限付きの大きな raw プレビュー", "現在の reader パス", "conversation-level"],
+            "README.es-ES.md": ["Copiar conversación de la ruta actual", "Copiar visibles", "vista previa raw ampliada con límite", "ruta actual del reader", "nivel conversación"],
+        }
+        banned_raw_promises = [
+            "raw" + "TooLarge",
+            "load" + "FullRaw",
+            "full raw " + "JSON",
+            "Full raw " + "JSON",
+            "完整 raw " + "JSON",
+            "完全な raw " + "JSON",
+            "raw " + "JSON completo",
+            "complete raw " + "payload",
+            "完整原始" + "载荷",
+        ]
         for path in readmes:
             text = path.read_text(encoding="utf-8")
             command_blocks.append(re.findall(r"```bash\n(.*?)\n```", text, flags=re.S))
+            heading_shapes.append(re.findall(r"^(#{1,4})\s+", text, flags=re.M))
+            env_names.append(sorted(set(re.findall(r"CHATGPT_ARCHIVE_[A-Z0-9_]+", text))))
+            for literal in common_required:
+                self.assertIn(literal.lower(), text.lower(), f"{path.name} missing {literal}")
+            for literal in localized_required[path.name]:
+                self.assertIn(literal, text, f"{path.name} missing localized fact {literal}")
+            for literal in banned_raw_promises:
+                self.assertNotIn(literal, text, f"{path.name} should not retain old raw promise {literal}")
             self.assertIn("valid_conversations", text)
             self.assertIn("inserted_conversations", text)
             self.assertIn("updated_conversations", text)
@@ -739,6 +878,8 @@ class ArchiverTests(unittest.TestCase):
             self.assertIn("windows", lowered)
             self.assertIn("powershell", lowered)
         self.assertTrue(all(blocks == command_blocks[0] for blocks in command_blocks[1:]))
+        self.assertTrue(all(shape == heading_shapes[0] for shape in heading_shapes[1:]))
+        self.assertTrue(all(names == env_names[0] for names in env_names[1:]))
 
     def test_stdout_backslashreplace_avoids_unicode_encode_error(self):
         with tempfile.TemporaryDirectory() as td:
@@ -819,9 +960,9 @@ class ArchiverTests(unittest.TestCase):
             self.assertEqual(code, 0, import_output)
             code, export_output = run_cli(["--db", str(db), "export", "--format", "md", "--out", str(out)])
             self.assertEqual(code, 0, export_output)
-            self.assertIn("out directory", export_output)
-            self.assertNotIn(str(out), export_output)
-            self.assertNotIn(out.name, export_output)
+            self.assertIn(f"out_directory {out.resolve()}", export_output)
+            self.assertNotIn(str(db), export_output)
+            self.assertNotIn(db.name, export_output)
 
     def test_verify_wrong_schema_reports_structured_failure_without_paths(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1144,6 +1285,96 @@ class ArchiverTests(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT input_kind FROM import_runs").fetchone()[0], "json")
             finally:
                 conn.close()
+
+    def test_duplicate_zip_conversation_json_members_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            z = base / "duplicate.zip"
+            with zipfile.ZipFile(z, "w") as zf:
+                zf.writestr("conversations.json", json.dumps([conversation("first")]))
+                zf.writestr("conversations.json", json.dumps([conversation("second")]))
+            source = resolve_input(str(z), Path.cwd())
+            with self.assertRaises(ValueError) as ctx:
+                list_source_entries(source)
+            self.assertIn("duplicate_conversation_json_source", str(ctx.exception))
+            code, output = run_cli(["import", "--db", str(base / "archive.db"), "--input", str(z), "--no-input-sha256"])
+            self.assertEqual(code, 2)
+            self.assertIn("duplicate_conversation_json_source", output)
+
+    def test_scanner_ignores_macos_metadata_conversation_sources(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            z = base / "metadata.zip"
+            write_zip(
+                z,
+                {
+                    "conversations.json": [conversation("real-legacy")],
+                    "__MACOSX/conversations.json": [conversation("metadata-legacy")],
+                    "__MACOSX/foo/conversations-000.json": [conversation("metadata-shard")],
+                    "._conversations.json": [conversation("appledouble-legacy")],
+                    "foo/._conversations-000.json": [conversation("appledouble-shard")],
+                    "__MACOSX/._conversations.json": [conversation("metadata-appledouble")],
+                    ".DS_Store": {"not": "conversation"},
+                },
+            )
+            source = resolve_input(str(z), Path.cwd())
+            entries = list_source_entries(source)
+            self.assertEqual([entry.source_path for entry in entries if entry.is_conversation_json], ["conversations.json"])
+            self.assertEqual([entry.source_path for entry in entries if entry.is_selected_conversation_source], ["conversations.json"])
+            db = base / "archive.db"
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual({row[0] for row in conn.execute("SELECT conversation_id FROM conversations")}, {"real-legacy"})
+            finally:
+                conn.close()
+
+            directory = base / "extracted"
+            (directory / "__MACOSX" / "foo").mkdir(parents=True)
+            (directory / "foo").mkdir()
+            (directory / "conversations.json").write_text(json.dumps([conversation("dir-real")]), encoding="utf-8")
+            (directory / "__MACOSX" / "conversations.json").write_text(json.dumps([conversation("dir-metadata")]), encoding="utf-8")
+            (directory / "__MACOSX" / "foo" / "conversations-000.json").write_text(json.dumps([conversation("dir-metadata-shard")]), encoding="utf-8")
+            (directory / "._conversations.json").write_text(json.dumps([conversation("dir-appledouble")]), encoding="utf-8")
+            (directory / "foo" / "._conversations-000.json").write_text(json.dumps([conversation("dir-appledouble-shard")]), encoding="utf-8")
+            (directory / ".DS_Store").write_text("metadata", encoding="utf-8")
+            dir_source = resolve_input(str(directory), Path.cwd())
+            dir_entries = list_source_entries(dir_source)
+            self.assertEqual([entry.source_path for entry in dir_entries if entry.is_conversation_json], ["conversations.json"])
+            self.assertEqual([entry.source_path for entry in dir_entries if entry.is_selected_conversation_source], ["conversations.json"])
+
+    def test_default_input_uses_directory_for_unambiguous_sharded_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "conversations-000.json").write_text(json.dumps([conversation("default-shard-0")]), encoding="utf-8")
+            (base / "conversations-001.json").write_text(json.dumps([conversation("default-shard-1")]), encoding="utf-8")
+            source = resolve_input(None, base)
+            self.assertEqual(source.kind, "directory")
+            self.assertEqual(source.path, base.resolve())
+            self.assertIsNone(source.delete_target)
+            entries = list_source_entries(source)
+            self.assertEqual(
+                [entry.source_path for entry in entries if entry.is_selected_conversation_source],
+                ["conversations-000.json", "conversations-001.json"],
+            )
+            db = base / "archive.db"
+            with contextlib.chdir(base):
+                self.assertEqual(main(["--db", str(db), "import", "--no-input-sha256"]), 0)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 2)
+                self.assertEqual(conn.execute("SELECT input_kind FROM import_runs").fetchone()[0], "directory")
+            finally:
+                conn.close()
+
+    def test_default_input_keeps_ambiguous_json_selection_explicit(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "conversations.json").write_text(json.dumps([conversation("legacy")]), encoding="utf-8")
+            (base / "conversations-000.json").write_text(json.dumps([conversation("shard")]), encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                resolve_input(None, base)
+            self.assertIn("multiple_conversation_json_files_found", str(ctx.exception))
 
     def test_inspect_counts_backslash_conversation_members_as_shards(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2133,19 +2364,43 @@ class ArchiverTests(unittest.TestCase):
     def test_web_index_cleanup_drops_shadow_tables(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
+            z = base / "export.zip"
             db = base / "archive.db"
-            self.assertEqual(main(["--db", str(db), "init"]), 0)
+            write_zip(z, {"conversations.json": [conversation("shadow-cleanup")]})
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
             conn = sqlite3.connect(db)
             try:
-                # Simulate orphaned shadow tables left after a corrupt DROP
                 conn.execute("CREATE TABLE web_message_trigram_content(x)")
                 conn.execute("CREATE TABLE web_message_trigram_data(x)")
                 conn.execute("CREATE TABLE web_message_trigram_idx(x)")
                 conn.execute("CREATE TABLE web_message_trigram_config(x)")
                 conn.execute("CREATE TABLE web_message_trigram_docsize(x)")
+                conn.execute("CREATE TABLE web_title_trigram_data(x)")
+                conn.execute("CREATE TABLE web_title_trigram_idx(x)")
+                conn.execute("CREATE TABLE web_title_trigram_docsize(x)")
                 conn.commit()
             finally:
                 conn.close()
+            result = create_web_indexes(db)
+            self.assertIn("indexed_messages", result)
+            self.assertIn("indexed_titles", result)
+            rebuild_conn = sqlite3.connect(db)
+            try:
+                tables = {
+                    row[0]
+                    for row in rebuild_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')"
+                    ).fetchall()
+                }
+                self.assertIn("web_index_metadata", tables)
+                self.assertIn("web_message_norm", tables)
+                self.assertIn("web_title_norm", tables)
+                self.assertIn("web_message_trigram", tables)
+                self.assertIn("web_title_trigram", tables)
+                self.assertTrue(rebuild_conn.execute("SELECT 1 FROM web_index_metadata").fetchone() is not None)
+                self.assertTrue(rebuild_conn.execute("SELECT 1 FROM web_message_norm").fetchone() is not None)
+            finally:
+                rebuild_conn.close()
 
     def test_web_index_norm_tables_drop_plainly_and_trigram_uses_shadow_helper(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2313,6 +2568,82 @@ class ArchiverTests(unittest.TestCase):
             self.assertTrue(result["optional_web_index_error"])
             self.assertIn("web-index", result["optional_web_index_recovery_hint"])
 
+
+    def test_make_release_zip_includes_frontend_source_and_excludes_pollution(self):
+        root = Path(__file__).resolve().parents[1]
+        import shutil as _sh, subprocess as _sp, sys as _sys, zipfile as _zf, tempfile as _td
+        work_parent = Path(_td.mkdtemp())
+        work = work_parent / "project"
+        output = work_parent / "release.zip"
+        try:
+            def ignore(_dir, names):
+                return {name for name in names if name in {".git", "node_modules", "__pycache__"}}
+
+            _sh.copytree(root, work, ignore=ignore)
+            for rel in (
+                ".git/config",
+                "archive/chatgpt_archive.db",
+                "archive/chatgpt_archive.db-wal",
+                "archive/chatgpt_archive.db-shm",
+                "exports/manifest.csv",
+                "tools/release.zip",
+                "webui/node_modules/pkg/index.js",
+                "chatgpt_export_archiver/__pycache__/search.cpython-313.pyc",
+                "tests/__pycache__/test_archiver.cpython-313.pyc",
+                ".hidden-local",
+                "tools/.DS_Store",
+                "webui/._index.html",
+                "__MACOSX/._README.md",
+                "webui/tsconfig.tsbuildinfo",
+                "local.sqlite3",
+                "chatgpt-export.zip",
+                "conversations-000.json",
+                "logs/import.jsonl",
+                "run.log",
+                "tools/chatgpt-sqlite-webui-release.zip",
+            ):
+                path = work / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("pollution", encoding="utf-8")
+            result = _sp.run(
+                [_sys.executable, str(work / "tools" / "make_release_zip.py"), "--output", str(output), "--no-check"],
+                capture_output=True, text=True, cwd=work,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            namelist = {n.replace("\\", "/").rstrip("/") for n in _zf.ZipFile(output).namelist()}
+            required = [
+                "README.md", "README.zh-CN.md", "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md",
+                "requirements-web.txt", "LICENSE", "AGENTS.md", "chatgpt_archive.py",
+                "chatgpt_export_archiver/search.py", "chatgpt_export_archiver/web_api.py",
+                "tests/test_archiver.py", "tests/test_web_api.py",
+                "tools/check_delivery_clean.py", "tools/clean_generated_artifacts.py", "tools/make_release_zip.py",
+                "webui/src/App.tsx", "webui/src/i18n.ts", "webui/src/components/ConversationPane.tsx",
+                "webui/tests/dom-smoke.mjs", "webui/index.html", "webui/package.json",
+                "webui/package-lock.json", "webui/tsconfig.json", "webui/vite.config.ts",
+                "webui/dist/index.html",
+            ]
+            for path in required:
+                self.assertIn(path, namelist, f"missing {path}")
+            self.assertTrue(any(name.startswith("webui/dist/assets/") and name.endswith(".js") for name in namelist))
+            self.assertTrue(any(name.startswith("webui/dist/assets/") and name.endswith(".css") for name in namelist))
+            forbidden_markers = [
+                ".git", "node_modules", "__pycache__", "._", "__macosx", ".ds_store",
+                "archive/", "exports/", ".db", ".db-wal", ".db-shm", ".sqlite",
+                "tsconfig.tsbuildinfo", "tools/release.zip", "chatgpt-export.zip",
+                "conversations-000.json", ".jsonl", ".log", "chatgpt-sqlite-webui-release.zip",
+            ]
+            for name in namelist:
+                if name == ".gitignore":
+                    continue
+                for fb in forbidden_markers:
+                    self.assertNotIn(fb, name.lower(), f"forbidden in release: {name}")
+            delivery_check = _sp.run(
+                [_sys.executable, str(work / "tools" / "check_delivery_clean.py"), "--mode", "runnable", str(output)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(delivery_check.returncode, 0, delivery_check.stdout or delivery_check.stderr)
+        finally:
+            _sh.rmtree(work_parent, ignore_errors=True)
 
 if __name__ == "__main__":
     unittest.main()

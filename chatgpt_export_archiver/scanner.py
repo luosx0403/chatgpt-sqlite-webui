@@ -47,6 +47,9 @@ def find_default_input(path: Path) -> InputSource:
         if not json_files:
             raise ValueError("no_zip_file_found")
         if len(json_files) > 1:
+            shard_files = [p for p in json_files if is_shard_conversation_source(p.name)]
+            if len(shard_files) == len(json_files):
+                return InputSource(path=path, kind="directory", size=0, delete_target=None)
             raise ValueError(f"multiple_conversation_json_files_found count {len(json_files)}")
         resolved_json = json_files[0].resolve()
         return InputSource(path=resolved_json, kind="json", size=json_files[0].stat().st_size, delete_target=resolved_json)
@@ -97,6 +100,15 @@ def _logical_zip_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def _is_metadata_path(path: str) -> bool:
+    logical = _logical_zip_path(path)
+    parts = [part for part in logical.split("/") if part]
+    if "__MACOSX" in parts:
+        return True
+    name = parts[-1] if parts else ""
+    return name == ".DS_Store" or name.startswith("._")
+
+
 def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
     if input_source.kind == "zip":
         with zipfile.ZipFile(input_source.path) as zf:
@@ -109,7 +121,7 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
                     is_conversation_json=is_conversation_json_source(info.filename),
                 )
                 for info in zf.infolist()
-                if not info.is_dir()
+                if not info.is_dir() and not _is_metadata_path(info.filename)
             ]
     elif input_source.kind == "json":
         name = input_source.path.name
@@ -128,6 +140,8 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
         for p in sorted(base.rglob("*")):
             if p.is_file():
                 rel = p.relative_to(base).as_posix()
+                if _is_metadata_path(rel):
+                    continue
                 entries.append(
                     SourceEntry(
                         source_path=rel,
@@ -153,11 +167,24 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
 
 def select_conversation_sources(entries: Iterable[SourceEntry]) -> list[SourceEntry]:
     conv = [e for e in entries if e.is_conversation_json]
+    _reject_duplicate_conversation_sources(conv)
     shards = sorted([e for e in conv if is_shard_conversation_source(e.source_path)], key=_shard_sort_key)
     if shards:
         return shards
     legacy = sorted([e for e in conv if is_legacy_conversations_source(e.source_path)], key=lambda e: e.source_path)
     return legacy
+
+
+def _reject_duplicate_conversation_sources(entries: list[SourceEntry]) -> None:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for entry in entries:
+        logical = _logical_zip_path(entry.source_path)
+        if logical in seen:
+            duplicates.add(logical)
+        seen.add(logical)
+    if duplicates:
+        raise ValueError("duplicate_conversation_json_source " + ",".join(sorted(duplicates)))
 
 
 def load_json_from_source(input_source: InputSource, source_path: str) -> Any:

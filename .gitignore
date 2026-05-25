@@ -59,6 +59,8 @@ logs/
 # OS and editor files
 .DS_Store
 **/.DS_Store
+._*
+**/._*
 __MACOSX/
 Thumbs.db
 Desktop.ini

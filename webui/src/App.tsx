@@ -6,7 +6,7 @@ import SettingsPanel from "./components/SettingsPanel";
 import { getConversation, getConversations, getHealth, getImportJob, getStats, uploadImportZip } from "./api/client";
 import { applySettings, clampSettings, loadSettings, saveSettings, type Settings } from "./settings";
 import { createTranslator } from "./i18n";
-import type { ConversationSummary, Health, ImportJob, MatchMode, PathMode, SearchFilters, SortMode, Stats } from "./types";
+import type { ConversationSummary, Health, ImportJob, MatchMode, PathMode, SearchDiagnostics, SearchFilters, SearchScope, SortMode, Stats } from "./types";
 
 const DEFAULT_FILTERS: SearchFilters = {
   role: "",
@@ -72,6 +72,85 @@ function loadMatchMode(): MatchMode {
   }
 }
 
+function readUrlParams(): {
+  query: string;
+  sort: SortMode;
+  path: PathMode;
+  matchMode: MatchMode;
+  selectedId: string | null;
+  filters: SearchFilters;
+} {
+  const params = new URLSearchParams(window.location.search);
+  const query = params.get("q") || "";
+  const sort = (params.get("sort") as SortMode) || "relevance";
+  const path = (params.get("path") as PathMode) || "current";
+  const matchMode = loadMatchMode();
+  const selectedId = params.get("conversation") || null;
+  const allowedSorts: SortMode[] = ["relevance", "newest", "oldest", "updated", "created", "title"];
+  const allowedPaths: PathMode[] = ["current", "all"];
+  const allowedScopes: SearchScope[] = ["all", "title", "message"];
+  const allowedRoles: string[] = ["", "user", "assistant", "tool", "system", "developer", "tool/system", "tool_system"];
+  const filters: SearchFilters = { ...DEFAULT_FILTERS };
+  if (params.has("role")) {
+    const rawRole = params.get("role") || "";
+    filters.role = (allowedRoles.includes(rawRole) ? rawRole : "") as SearchFilters["role"];
+  }
+  if (params.has("scope")) {
+    const rawScope = params.get("scope") || "all";
+    filters.scope = (allowedScopes.includes(rawScope as SearchScope) ? rawScope : "all") as SearchScope;
+  }
+  if (params.has("title")) filters.title = params.get("title") || "";
+  if (params.has("exact")) filters.exact = params.get("exact") || "";
+  if (params.has("exclude")) filters.exclude = params.get("exclude") || "";
+  if (params.has("after")) filters.after = params.get("after") || "";
+  if (params.has("before")) filters.before = params.get("before") || "";
+  if (params.has("source")) filters.source = params.get("source") || "";
+  return {
+    query,
+    sort: allowedSorts.includes(sort) ? sort : "relevance",
+    path: allowedPaths.includes(path) ? path : "current",
+    matchMode,
+    selectedId,
+    filters,
+  };
+}
+
+function syncUrlState(state: {
+  q: string;
+  sort: string;
+  path: string;
+  matchMode: string;
+  selectedId: string | null;
+  filters: SearchFilters;
+}) {
+  try {
+    const params = new URLSearchParams();
+    if (state.q) params.set("q", state.q);
+    if (state.sort && state.sort !== "relevance") params.set("sort", state.sort);
+    if (state.path && state.path !== "current") params.set("path", state.path);
+    if (state.matchMode && state.matchMode !== "contains") params.set("match_mode", state.matchMode);
+    if (state.selectedId) params.set("conversation", state.selectedId);
+    if (state.filters.role) params.set("role", state.filters.role);
+    if (state.filters.scope && state.filters.scope !== "all") params.set("scope", state.filters.scope);
+    if (state.filters.title) params.set("title", state.filters.title);
+    if (state.filters.exact) params.set("exact", state.filters.exact);
+    if (state.filters.exclude) params.set("exclude", state.filters.exclude);
+    if (state.filters.after) params.set("after", state.filters.after);
+    if (state.filters.before) params.set("before", state.filters.before);
+    if (state.filters.source) params.set("source", state.filters.source);
+    const query = params.toString();
+    const url = query ? `${window.location.pathname}?${query}` : window.location.pathname;
+    if (url !== `${window.location.pathname}${window.location.search}`) {
+      // Keep refresh/share URLs current without creating a history entry per keystroke.
+      // Back/Forward restoration should be added with deliberate pushState boundaries
+      // for submitted searches or conversation selection, not from this hot path.
+      window.history.replaceState(null, "", url);
+    }
+  } catch {
+    // URL sync is best-effort.
+  }
+}
+
 function importStageLabel(t: (key: string) => string, stage: string): string {
   const normalized = stage.toLowerCase().replace(/[-\s]+/g, "_");
   const labels: Record<string, string> = {
@@ -97,14 +176,15 @@ function importStageLabel(t: (key: string) => string, stage: string): string {
 }
 
 export default function App() {
-  const [query, setQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [sort, setSort] = useState<SortMode>("relevance");
-  const [path, setPath] = useState<PathMode>("current");
-  const [matchMode, setMatchModeState] = useState<MatchMode>(() => loadMatchMode());
-  const [filters, setFilters] = useState<SearchFilters>(DEFAULT_FILTERS);
+  const urlState = useRef(readUrlParams()).current;
+  const [query, setQuery] = useState(urlState.query);
+  const [debouncedQuery, setDebouncedQuery] = useState(urlState.query);
+  const [sort, setSort] = useState<SortMode>(urlState.sort || "relevance");
+  const [path, setPath] = useState<PathMode>(urlState.path || "current");
+  const [matchMode, setMatchModeState] = useState<MatchMode>(urlState.matchMode);
+  const [filters, setFilters] = useState<SearchFilters>(urlState.filters);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("conversation"));
+  const [selectedId, setSelectedId] = useState<string | null>(urlState.selectedId);
   const [selected, setSelected] = useState<ConversationSummary | null>(null);
   const [total, setTotal] = useState(0);
   const [nextOffset, setNextOffset] = useState<number | null>(0);
@@ -122,7 +202,9 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<SearchDiagnostics | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const listRequestRef = useRef(0);
   const detailRequestRef = useRef(0);
   const detailControllerRef = useRef<AbortController | null>(null);
@@ -130,6 +212,10 @@ export default function App() {
   const selectedRef = useRef<ConversationSummary | null>(null);
   const filtersKey = JSON.stringify(filters);
   const { t } = useMemo(() => createTranslator(settings.language), [settings.language]);
+
+  useEffect(() => {
+    syncUrlState({ q: debouncedQuery, sort, path, matchMode, selectedId, filters });
+  }, [debouncedQuery, sort, path, matchMode, selectedId, filtersKey]);
 
   const setMatchMode = useCallback((value: MatchMode) => {
     setMatchModeState(value);
@@ -257,6 +343,7 @@ export default function App() {
         setTotal(page.total);
         setHasMore(page.has_more);
         setNextOffset(page.next_offset);
+        if (!append) setDiagnostics(page.diagnostics ?? null);
         const currentSelectedId = selectedIdRef.current;
         const selectedStillMatches = currentSelectedId ? page.selected_in_results !== false : false;
         if (selectedStillMatches && currentSelectedId) {
@@ -323,7 +410,11 @@ export default function App() {
     setUploadingImport(true);
     setImportError(null);
     uploadImportZip(importFile)
-      .then((job) => setImportJob(job))
+      .then((job) => {
+        setImportJob(job);
+        setImportFile(null);
+        if (importInputRef.current) importInputRef.current.value = "";
+      })
       .catch((err: Error) => setImportError(err.message))
       .finally(() => setUploadingImport(false));
   };
@@ -360,6 +451,7 @@ export default function App() {
         hasMore={hasMore}
         autoLoadMore={settings.autoLoadMore}
         health={health}
+        diagnostics={debouncedQuery || filters.role || filters.title || filters.exact || filters.exclude || filters.after || filters.before || filters.source ? diagnostics : null}
       />
       <div
         className="sidebar-resizer"
@@ -383,6 +475,7 @@ export default function App() {
           <div className="top-actions">
             <label className="button-like" htmlFor="import-zip-input">{t("importZip")}</label>
             <input
+              ref={importInputRef}
               id="import-zip-input"
               data-testid="import-zip-input"
               className="hidden-file-input"

@@ -575,21 +575,25 @@ def _elapsed(start: float) -> float:
 
 def cmd_export(args: argparse.Namespace) -> int:
     conn = connect_existing(Path(args.db))
-    formats = ["md", "txt"] if args.format == "all" else [args.format]
-    result = export_conversations(conn, Path(args.out), formats, args.from_date, args.to_date, args.force)
-    conn.close()
+    try:
+        formats = ["md", "txt"] if args.format == "all" else [args.format]
+        result = export_conversations(conn, Path(args.out), formats, args.from_date, args.to_date, args.force)
+    finally:
+        conn.close()
     print(f"exported_conversations {result['conversations']}")
     print(f"formats {','.join(result['formats'])}")
     print(f"written {result['written']}")
     print(f"skipped_unchanged {result['skipped_unchanged']}")
-    print("out directory")
+    print(f"out_directory {Path(args.out).resolve()}")
     return 0
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
     conn = connect_existing_readonly(Path(args.db))
-    stats = get_stats(conn)
-    conn.close()
+    try:
+        stats = get_stats(conn)
+    finally:
+        conn.close()
     for key, value in stats.items():
         if key.endswith("_time"):
             print(f"{key} {epoch_to_display(value)}")
@@ -600,8 +604,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     conn = connect_existing_readonly(Path(args.db))
-    result = verify_database(conn)
-    conn.close()
+    try:
+        result = verify_database(conn)
+    finally:
+        conn.close()
     print(f"ok {str(result['ok']).lower()}")
     print(f"schema_ok {str(result.get('schema_ok', True)).lower()}")
     if result.get("missing_tables"):
@@ -635,33 +641,46 @@ def cmd_search(args: argparse.Namespace) -> int:
     from .search import MAX_CANDIDATES, parse_query, search_messages
 
     conn = connect_existing_readonly(Path(args.db))
-    parsed = parse_query(args.query)
-    if parsed.errors:
-        print("invalid_query true")
+    try:
+        parsed = parse_query(args.query)
+        if parsed.errors:
+            print("invalid_query true")
+            return 2
+        page = search_messages(conn, parsed, limit=args.limit, count_total=False)
+    finally:
         conn.close()
-        return 2
-    page = search_messages(conn, parsed, limit=args.limit, count_total=False)
     for row in page["items"]:
         print(f"conversation_id {row['conversation_id']} node_id {row['node_id']} role {row['role'] or ''}")
     print(f"matches {len(page['items'])}")
-    conn.close()
     return 0
 
 
 def cmd_web(args: argparse.Namespace) -> int:
     db_path = Path(args.db)
-    if args.host != "127.0.0.1":
-        print(f"WARNING: binding to {args.host}; only use this on trusted networks.")
     try:
         import uvicorn
     except ImportError as exc:
         raise ValueError("Missing Web dependency uvicorn. Install requirements-web.txt in the active Python environment.") from exc
     from .web_app import create_app
+    from .web_api import _get_upload_policy, _is_loopback, _resolve_web_url_host
 
-    app = create_app(db_path, allow_fallback=args.allow_fallback, log_level=args.log_level)
+    if not _is_loopback(args.host):
+        policy = _get_upload_policy(host=args.host)
+        if policy.remote_profile == "local_profile":
+            upload_policy = "full local upload limits"
+        elif policy.remote_profile == "explicit_remote_override":
+            upload_policy = "explicit remote upload overrides"
+        else:
+            upload_policy = "remote-safe upload limits"
+        print(
+            f"WARNING: binding to {args.host}; this exposes the local archive browser and upload endpoint. "
+            f"Only use this on trusted networks. upload_policy {upload_policy}."
+        )
+    app = create_app(db_path, allow_fallback=args.allow_fallback, log_level=args.log_level, host=args.host)
     if args.allow_fallback:
         print("WARNING: fallback UI is enabled. This is a limited emergency page, not the full React Web UI.")
-    print(f"web_url http://{args.host}:{args.port}")
+    web_host = _resolve_web_url_host(args.host)
+    print(f"web_url http://{web_host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, access_log=False)
     return 0
 

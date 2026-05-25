@@ -94,10 +94,28 @@ class ImportJobManager:
         with self._lock:
             return self._running_job_id is not None
 
+    def acquire_pending_upload_slot(self) -> bool:
+        """Try to reserve a pending upload slot before reading the upload file.
+
+        Returns True when the slot was acquired.  The caller MUST call
+        release_pending_upload_slot() exactly once, or hand the slot over to
+        start_import() which takes ownership.
+        """
+        with self._lock:
+            if self._running_job_id is not None:
+                return False
+            self._running_job_id = "__pending_upload__"
+            return True
+
+    def release_pending_upload_slot(self) -> None:
+        with self._lock:
+            if self._running_job_id == "__pending_upload__":
+                self._running_job_id = None
+
     def start_import(self, upload_path: Path, *, filename: str, size: int) -> ImportJob:
         with self._lock:
             self._prune_jobs_locked()
-            if self._running_job_id is not None:
+            if self._running_job_id is not None and self._running_job_id != "__pending_upload__":
                 raise RuntimeError("an import job is already running")
             job_id = uuid.uuid4().hex
             job = ImportJob(job_id=job_id, db_path=self.db_path, upload_path=upload_path, filename=filename, size=size)

@@ -15,12 +15,16 @@ def create_app(
     static_dir: Path | None = None,
     allow_fallback: bool = False,
     log_level: str = "warning",
+    host: str = "127.0.0.1",
 ) -> FastAPI:
     if db_path is None:
         db_path = Path("archive/chatgpt_archive.db")
     db_path = db_path.resolve()
+    from .web_api import _get_upload_policy
+
+    upload_policy = _get_upload_policy(host=host)
     app = FastAPI(title="ChatGPT Archive Web", docs_url=None, redoc_url=None)
-    app.include_router(create_api_router(db_path, ImportJobManager(db_path, log_level=log_level)))
+    app.include_router(create_api_router(db_path, ImportJobManager(db_path, log_level=log_level), upload_policy=upload_policy))
 
     build_dir = static_dir or Path(__file__).resolve().parent.parent / "webui" / "dist"
     if build_dir.exists() and (build_dir / "index.html").exists():
@@ -54,7 +58,7 @@ def create_app(
             @media(max-width:820px){.shell{grid-template-columns:1fr}aside{height:42vh;border-right:0;border-bottom:1px solid #ddd}}
             </style></head>
             <body>
-              <div class="fallback-warning">Limited fallback UI, not the full React UI. Build the full UI with <code>cd webui && npm ci && npm run build</code>.</div>
+              <div class="fallback-warning">Limited minimal fallback UI — not the full React UI. Some features (internal messages, search filters, raw JSON, full reader) are not available here. Build the full UI with <code>cd webui && npm ci && npm run build</code>.</div>
               <div class="shell">
                 <aside>
                   <div class="search">
@@ -78,7 +82,7 @@ def create_app(
               const esc=s=>String(s??'').replace(/[&<>"'`]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
               const date=v=>v?new Date(v*1000).toLocaleString():'';
               async function loadList(){const p=new URLSearchParams({q:q.value,sort:sort.value,path:pathSel.value,limit:'50'}); const r=await fetch('/api/conversations?'+p); const data=await r.json(); list.innerHTML=data.items.map(x=>`<button class="item ${x.conversation_id===selected?'selected':''}" data-id="${esc(x.conversation_id)}"><span class="title">${esc(x.title||'untitled')}</span><div class="meta">${date(x.update_time||x.create_time)}${x.hit_count?' · '+x.hit_count+' hits':''}</div><div class="snippet">${esc((x.snippets&&x.snippets[0]&&x.snippets[0].snippet)||'')}</div></button>`).join('');}
-              async function openConv(id){selected=id; const d=await (await fetch('/api/conversations/'+encodeURIComponent(id))).json(); heading.textContent=d.title||'untitled'; info.textContent=`Created ${date(d.create_time)} · Updated ${date(d.update_time)} · ${d.current_path_nodes||0}/${d.node_count||0} current path nodes`; actions.innerHTML=`<a href="/api/conversations/${encodeURIComponent(id)}/export?format=md&path=${pathSel.value}">Download MD</a><a href="/api/conversations/${encodeURIComponent(id)}/export?format=txt&path=${pathSel.value}">Download TXT</a>`; const p=new URLSearchParams({q:q.value,path:pathSel.value,limit:'300'}); const page=await (await fetch('/api/conversations/'+encodeURIComponent(id)+'/messages?'+p)).json(); messages.innerHTML=page.items.map(m=>`<article class="msg ${esc(m.role||'message')}"><div class="role">${esc(m.role||'message')} · ${date(m.create_time||m.update_time)}</div><pre>${esc(m.content_text||'[empty]')}</pre></article>`).join(''); await loadList();}
+              async function openConv(id){selected=id; const d=await (await fetch('/api/conversations/'+encodeURIComponent(id))).json(); heading.textContent=d.title||'untitled'; info.textContent=`Created ${date(d.create_time)} · Updated ${date(d.update_time)} · ${d.current_path_nodes||0}/${d.node_count||0} current path nodes`;               actions.innerHTML=`<a href="/api/conversations/${encodeURIComponent(id)}/export?format=md&path=${pathSel.value}&include_internal=true">Download MD</a><a href="/api/conversations/${encodeURIComponent(id)}/export?format=txt&path=${pathSel.value}&include_internal=true">Download TXT</a>`; const p=new URLSearchParams({q:q.value,path:pathSel.value,limit:'300'}); const page=await (await fetch('/api/conversations/'+encodeURIComponent(id)+'/messages?'+p)).json(); messages.innerHTML=page.items.map(m=>`<article class="msg ${esc(m.role||'message')}"><div class="role">${esc(m.role||'message')} · ${date(m.create_time||m.update_time)}</div><pre>${esc(m.content_text||'[empty]')}</pre></article>`).join(''); await loadList();}
               list.addEventListener('click',e=>{const b=e.target.closest('button[data-id]'); if(b) openConv(b.dataset.id);});
               q.addEventListener('input',()=>{clearTimeout(timer); timer=setTimeout(loadList,220)}); sort.addEventListener('change',loadList); pathSel.addEventListener('change',()=>selected?openConv(selected):loadList());
               window.addEventListener('keydown',e=>{const t=e.target; const typing=t&&(['INPUT','TEXTAREA','SELECT'].includes(t.tagName)||t.isContentEditable); if((!typing&&e.key==='/')||((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k')){e.preventDefault();q.focus();}});

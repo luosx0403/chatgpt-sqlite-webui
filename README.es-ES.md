@@ -148,6 +148,14 @@ Importa con la ruta recomendada para archivos grandes:
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+`--input` puede apuntar al ZIP oficial exportado, a un `conversations.json` suelto o a un directorio exportado ya extraído. Los directorios extraídos pueden contener `conversations.json` o archivos sharded `conversations-*.json`; no unas shards manualmente.
+
+```bash
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input conversations.json --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input ./extracted-export/ --no-input-sha256 --rebuild-fts
+```
+
 Verifica la coherencia estructural:
 
 ```bash
@@ -202,6 +210,8 @@ El comando recomendado para archivos grandes es:
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+La entrada puede ser un ZIP, un `conversations.json` suelto o un directorio extraído que contenga `conversations.json` o archivos sharded `conversations-*.json`. Scanner discovery ignora macOS metadata paths como `__MACOSX`, archivos AppleDouble `._*` y `.DS_Store`, por lo que esos artifact locales no se convierten en conversation source.
+
 Si quieres que SQLite dedique tiempo adicional a ordenar estadísticas del planner y el índice FTS después de importar, usa:
 
 ```bash
@@ -226,11 +236,88 @@ python chatgpt_archive.py web --port 8787
 
 El diseño de lectura por defecto es `chat`: los mensajes user se alinean a la derecha, los mensajes assistant a la izquierda y los mensajes system/internal aparecen como notas plegadas. Para usar el diseño técnico anterior por filas, elige `Classic` en Settings o añade `?layout=classic` o `?messageLayout=classic` a la URL de la Web UI.
 
+Las acciones de copiar y exportar del lector siguen el contrato visible del lector. `Copiar conversación de la ruta actual` obtiene todas las páginas de la ruta actual del reader y respeta la opción Show internal messages, pero ignora los filtros de búsqueda actuales. `Copiar visibles` copia solo los mensajes visibles ya cargados. Los enlaces de descarga usan la misma ruta actual y la misma opción Show internal. El acceso raw por mensaje es una vista previa raw ampliada con límite; las respuestas truncadas deben renderizar `raw_text` como texto plano de vista previa y la UI solo muestra esa capped preview.
+
+Cuando el reader salta a un hit con `around_node_id`, usa la misma colección paginada que el reader: visible-only rows si Show internal está desactivado, la node collection completa si Show internal está activado y la effective all-node collection para conversaciones dañadas sin current-path node.
+
 La Web UI puede usarse de dos formas. Si la base de datos ya existe, pásala de forma explícita o usa la ruta por defecto. Si no existe, arranca la Web UI igualmente y usa el panel de importación para subir un ZIP de ChatGPT. Las importaciones subidas se serializan para que solo haya un writer SQLite en el proceso.
 
 Tras una importación Web correcta, el backend ejecuta el mismo import pipeline que la CLI y luego ejecuta `verify`, `stats` y `web-index`. El ZIP subido es una copia temporal del lado del servidor y se limpia de forma independiente del archivo original en tu disco.
 
-Las subidas Web también aplican límites de seguridad de aplicación antes de arrancar el job de importación: `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` controla el tamaño total del ZIP subido y por defecto es 20 GiB; los miembros JSON de conversaciones están limitados a 5.000 archivos, 64 GiB por miembro, 128 GiB de datos descomprimidos en total y una relación de compresión 1000:1 para miembros JSON grandes. Si un archivo legítimo de ChatGPT supera los valores por defecto, define una variable de entorno mayor antes de iniciar la Web UI, pero hazlo solo para archivos locales de confianza porque límites más altos aumentan el riesgo de ZIP bomb y presión de disco.
+## Límites de seguridad de subida Web
+
+Las subidas Web aplican límites de seguridad a nivel de aplicación antes de iniciar el job de importación. Estos se controlan mediante variables de entorno y son independientes del `import` de CLI (que no usa estos límites).
+
+La subida Web reserva un pending slot antes de leer el archivo para que una subida grande no compita con otro writer. Cualquier error posterior a esa reserva, incluida una falla al crear la ruta temporal de subida, debe liberar el slot y limpiar el directorio temporal del servidor; un import job iniciado correctamente toma posesión del slot y de la copia temporal.
+
+Cuando la Web UI está enlazada a una dirección loopback (`127.0.0.1`, `localhost`, `::1`), los valores por defecto permiten archivos grandes de confianza:
+
+| Variable de entorno | Valor local por defecto | Controla |
+|---|---|---|
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` | 20 GiB | Tamaño total del ZIP comprimido subido |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES` | 64 GiB | Tamaño máx. sin comprimir de un solo miembro JSON |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBERS` | 5,000 | Número máx. de miembros JSON de conversación |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES` | 128 GiB | Total máx. de datos JSON sin comprimir |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO` | 1,000.0 | Ratio máx. de compresión para miembros JSON grandes |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | Número máx. total de miembros ZIP |
+| `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | unset | Ponlo en `local` solo en redes no loopback de confianza para usar valores locales por defecto en límites no definidos |
+
+**Política de enlace remoto.** Si la Web UI está enlazada a una dirección no loopback (p.ej. `0.0.0.0`, `::`, una IP de LAN), el servidor aplica valores conservadores remote-safe: 128 MiB ZIP comprimido, 256 MiB por miembro JSON, 512 MiB total sin comprimir, ratio 200.0, 200 miembros JSON y 10,000 miembros ZIP totales. `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` solo permite que los límites configurados explícitamente superen esos valores remote-safe; los límites no definidos siguen siendo remote-safe. Para restaurar los valores locales grandes en límites no definidos dentro de una LAN de confianza, configura `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local`. Ambos modos remotos exponen el navegador local del archivo y el endpoint de subida, así que úsalos solo en redes de confianza.
+
+`/api/schema` informa la política efectiva de subida para el host en ejecución, incluido si están activos los límites remote-safe, un override remoto explícito o el perfil local. Las comprobaciones de tamaño ZIP se ejecutan antes de importar, pero el parseo directo de JSON, las escrituras SQLite y la reconstrucción de `web-index` siguen consumiendo memoria, disco y CPU en proporción al tamaño JSON de conversaciones decodificado. Para archivos muy grandes, usa un entorno local de confianza, importación CLI y suficiente disco y memoria.
+
+Para aumentar un límite local para un archivo legítimo grande, define la variable correspondiente antes de iniciar la Web UI:
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440
+python chatgpt_archive.py web --port 8787
+```
+
+Para permitir un límite explícito grande de ZIP comprimido en una red interna de confianza y mantener otros límites no definidos en remote-safe:
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS = "true"
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+Para usar el profile completo de subida local en una red interna de confianza:
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+Define límites más altos solo para archivos locales de confianza. Valores más altos aumentan el riesgo de ZIP bomb, presión de disco y uso de CPU/memoria.
 
 
 ## Checklist de aceptación de la Web UI
@@ -249,6 +336,8 @@ La ruta Web de una entrega runnable no debería necesitar `webui/node_modules`, 
 
 La búsqueda CLI usa la sintaxis segura del proyecto, no texto de consulta SQLite sin procesar. Puedes usar palabras normales, frases entre comillas, exclusiones `-term`, `OR` y filtros como `role:user`, `source:zip`, `path:current`, `path:all`, `scope:title` y `scope:message`. Imprime conversation IDs, node IDs y roles, no snippets.
 
+Las exclusiones son de nivel conversación para resultados de conversaciones: si cualquier título o mensaje dentro del scope y path de búsqueda seleccionados coincide con un fragmento excluido, esa conversation no se devuelve. `/api/search/messages` sigue devolviendo solo hits de mensajes que no contienen el fragmento excluido. `path:current` sigue la ruta del reader por conversación; si un archivo dañado no tiene ningún current-path node, la búsqueda current-path cae al mismo all-node view que muestra el reader.
+
 Los filtros de fecha como `after:2026-05-01`, `before:2026-05-13`, `--from` y `--to` usan días naturales UTC, no el día natural de tu zona horaria local. Las fechas iniciales incluyen `00:00:00Z`; las fechas finales usan `00:00:00Z` del día siguiente como límite superior exclusivo, por lo que timestamps fraccionarios como `23:59:59.5Z` quedan incluidos en ese día. El cuadro de búsqueda Web está limitado a 500 caracteres; usa filtros avanzados para consultas estructuradas más largas.
 
 ```bash
@@ -262,6 +351,8 @@ La búsqueda Web usa índices opcionales normalized trigram creados por `web-ind
 ```bash
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
+
+Los diagnostics de búsqueda son pistas de rendimiento best-effort. Solo deben informar capas candidatas normalized-safe o fallbacks de escaneo como normalized trigram, normalized scan, normalized title scan o full scan. La presencia de legacy raw FTS puede informarse por separado, pero no debe presentarse como el candidate backend real porque puede omitir texto equivalente tras normalización.
 
 Si ejecutas manualmente `VACUUM`, `VACUUM INTO` o reescribes la base SQLite con una herramienta externa de compactación o backup, vuelve a ejecutar `python chatgpt_archive.py web-index --db <archive.db>` antes de confiar en la búsqueda de la Web UI. El índice Web opcional se reconstruye desde las tablas canónicas de conversaciones y es seguro regenerarlo.
 
@@ -338,7 +429,7 @@ python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 
 ## Notas de entrega
 
-Una entrega runnable debe incluir las fuentes Python, tests, documentación, `requirements-web.txt` y `webui/dist`. No debe incluir `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, directorios de caché o bytecode de Python, cachés de coverage/typecheck, `.DS_Store`, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, logs temporales, logs locales de aceptación, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, ningún `*.zip`, `conversations*.json`, bases de datos reales como `*.db`, `*.sqlite` y `*.sqlite3`, ni sidecars de SQLite como `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm` y `*.sqlite3-journal`. La comprobación de directorio permite el `.git` propio de la raíz objetivo para que un Git clone normal pueda verificarse, pero rechaza `.git` anidados; en un ZIP de entrega cualquier entrada `.git` falla.
+Una entrega runnable debe incluir las fuentes Python, tests, documentación, `requirements-web.txt`, el código fuente y tests frontend bajo `webui/src` y `webui/tests`, los archivos de configuración/package frontend y los assets construidos bajo `webui/dist`. No debe incluir `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, directorios de caché o bytecode de Python, cachés de coverage/typecheck, `.DS_Store`, archivos AppleDouble `._*`, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, logs temporales, logs locales de aceptación, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, ningún `*.zip`, `conversations*.json`, bases de datos reales como `*.db`, `*.sqlite` y `*.sqlite3`, ni sidecars de SQLite como `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm` y `*.sqlite3-journal`. La comprobación de directorio permite el `.git` propio de la raíz objetivo para que un Git clone normal pueda verificarse, pero rechaza `.git` anidados; en un ZIP de entrega cualquier entrada `.git` falla.
 
 Una entrega source-only puede omitir `webui/dist`, pero entonces habrá que reconstruir el frontend antes de servir la React UI completa.
 
@@ -368,4 +459,5 @@ El proyecto evita cambiar el schema de la base de datos durante pequeñas correc
 - Es una herramienta local de archivo, no un servicio de sincronización en la nube.
 - La Web UI está pensada para uso local. No la expongas a redes no confiables sin añadir tus propios controles de acceso.
 - El parser sigue el formato de exportación de OpenAI / ChatGPT observado hasta ahora. Si cambia el formato de origen, actualiza `inspect` y las pruebas antes de confiar en una nueva ruta de importación.
+- Las partes de nombres de archivo exportados se sanean para Windows y sistemas tipo Unix, incluidos nombres reservados de dispositivo como `CON`, `AUX`, `COM1`, `LPT9`, `COM¹` y `LPT²`, además de puntos y espacios finales.
 - Los archivos muy grandes pueden tardar en importarse, reconstruir FTS y crear índices Web trigram. Para importaciones grandes, prefiere la ruta `--rebuild-fts`.

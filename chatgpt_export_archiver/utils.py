@@ -11,6 +11,15 @@ from typing import Any
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+WINDOWS_RESERVED_BASENAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+WINDOWS_RESERVED_DIGIT_TRANSLATION = str.maketrans({"¹": "1", "²": "2", "³": "3"})
 
 
 def utc_now_iso() -> str:
@@ -94,7 +103,17 @@ def safe_filename_part(text: str | None, max_len: int = 80) -> str:
     text = text.strip("._ ")
     if not text:
         text = "untitled"
-    return text[:max_len].rstrip("._ ") or "untitled"
+    text = _avoid_windows_reserved_filename(text)
+    text = text[:max_len].rstrip("._ ") or "untitled"
+    return _avoid_windows_reserved_filename(text)
+
+
+def _avoid_windows_reserved_filename(text: str) -> str:
+    candidate = text.rstrip(" .") or "untitled"
+    stem = candidate.split(".", 1)[0].rstrip(" .").casefold().translate(WINDOWS_RESERVED_DIGIT_TRANSLATION)
+    if stem in WINDOWS_RESERVED_BASENAMES:
+        candidate = f"_{candidate}"
+    return candidate.rstrip(" .") or "untitled"
 
 
 def epoch_to_display(value: float | int | str | None) -> str:

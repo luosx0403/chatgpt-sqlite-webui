@@ -24,7 +24,7 @@ GENERATED_DIR_NAMES = {
 }
 GENERATED_FILE_NAMES = {".DS_Store", "Desktop.ini", "Thumbs.db", "tsconfig.tsbuildinfo"}
 GENERATED_FILE_SUFFIXES = {".pyc", ".pyo"}
-GENERATED_FILE_PREFIXES = (".coverage.",)
+GENERATED_FILE_PREFIXES = (".coverage.", "._")
 WEBUI_GENERATED_PATHS = {
     Path("webui/.cache"),
     Path("webui/.turbo"),
@@ -212,6 +212,8 @@ def _is_generated_file(rel: Path, name: str) -> bool:
     if lower in {item.lower() for item in GENERATED_FILE_NAMES}:
         return True
     if lower == ".coverage" or any(lower.startswith(prefix) for prefix in GENERATED_FILE_PREFIXES):
+        return True
+    if name.startswith("._"):
         return True
     return Path(name).suffix.lower() in GENERATED_FILE_SUFFIXES
 

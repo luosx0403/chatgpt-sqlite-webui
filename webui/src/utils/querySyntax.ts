@@ -1,5 +1,7 @@
 import type { PathMode, SearchScope } from "../types";
 
+const KNOWN_MODIFIERS = new Set(["role", "title", "source", "path", "scope", "before", "after"]);
+
 export interface QuerySyntaxInfo {
   hasBodyText: boolean;
   hasSearchContext: boolean;
@@ -26,7 +28,7 @@ export function analyzeQuerySyntax(raw: string): QuerySyntaxInfo {
     }
     if (key) {
       const value = token.normalize("NFKC").toLocaleLowerCase();
-      if (value && ["role", "source", "before", "after"].includes(key)) {
+      if (value && (key === "role" || key === "source" || key === "before" || key === "after")) {
         info.hasSearchContext = true;
         continue;
       }
@@ -35,14 +37,19 @@ export function analyzeQuerySyntax(raw: string): QuerySyntaxInfo {
         info.hasTitleText = true;
         continue;
       }
-      if (value && key === "path" && (value === "current" || value === "all")) {
-        info.pathOverride = value;
+      if (value && key === "path") {
+        if (value === "current" || value === "all") {
+          info.pathOverride = value;
+        }
         continue;
       }
-      if (value && key === "scope" && (value === "all" || value === "title" || value === "message")) {
-        info.scopeOverride = value;
+      if (value && key === "scope") {
+        if (value === "all" || value === "title" || value === "message") {
+          info.scopeOverride = value;
+        }
         continue;
       }
+      continue;
     }
     info.hasSearchContext = true;
     info.hasBodyText = true;
@@ -71,23 +78,52 @@ function queryTokens(text: string): Array<{ token: string; quoted: boolean; nega
     while (index < text.length && !/\s/.test(text[index]) && text[index] !== ":" && text[index] !== "\"") index += 1;
     const head = text.slice(start, index);
     if (index < text.length && text[index] === ":" && head) {
-      const key = head.normalize("NFKC").toLocaleLowerCase();
+      const rawKey = head.normalize("NFKC").toLocaleLowerCase();
+      if (KNOWN_MODIFIERS.has(rawKey)) {
+        index += 1;
+        if (index < text.length && text[index] === "\"") {
+          const read = readQuoted(text, index + 1);
+          tokens.push({ token: read.value, quoted: true, negated, key: rawKey });
+          index = read.index;
+        } else {
+          const valueStart = index;
+          while (index < text.length && !/\s/.test(text[index])) index += 1;
+          tokens.push({ token: text.slice(valueStart, index), quoted: false, negated, key: rawKey });
+        }
+        continue;
+      }
+    }
+    if (index < text.length && text[index] === ":") {
       index += 1;
-      if (text[index] === "\"") {
+      if (index < text.length && text[index] === "\"") {
         const read = readQuoted(text, index + 1);
-        tokens.push({ token: read.value, quoted: true, negated, key });
+        tokens.push({ token: `${head}:${read.value}`, quoted: false, negated, key: null });
         index = read.index;
       } else {
         const valueStart = index;
         while (index < text.length && !/\s/.test(text[index])) index += 1;
-        tokens.push({ token: text.slice(valueStart, index), quoted: false, negated, key });
+        tokens.push({ token: `${head}:${text.slice(valueStart, index)}`, quoted: false, negated, key: null });
+      }
+      if (negated) {
+        const last = tokens[tokens.length - 1];
+        tokens[tokens.length - 1] = { ...last, token: "-" + last.token };
       }
       continue;
     }
     if (index < text.length && text[index] === "\"") {
-      const read = readQuoted(text, index + 1);
-      tokens.push({ token: `${head}${read.value}`, quoted: false, negated, key: null });
-      index = read.index;
+      const quoteStart = start;
+      index += 1;
+      while (index < text.length && text[index] !== "\"") index += 1;
+      if (index < text.length) {
+        index += 1;
+        tokens.push({ token: text.slice(quoteStart, index), quoted: false, negated, key: null });
+      } else {
+        tokens.push({ token: text.slice(quoteStart, index), quoted: false, negated, key: null });
+      }
+      if (negated) {
+        const last = tokens[tokens.length - 1];
+        tokens[tokens.length - 1] = { ...last, token: "-" + last.token };
+      }
       continue;
     }
     tokens.push({ token: negated ? `-${head}` : head, quoted: false, negated: false, key: null });

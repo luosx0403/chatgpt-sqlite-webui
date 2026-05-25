@@ -68,6 +68,7 @@ export function getMessages(args: {
   limit?: number;
   offset?: number;
   aroundNodeId?: string;
+  includeInternal?: boolean;
   matchMode?: MatchMode;
   signal?: AbortSignal;
 }): Promise<Page<MessageItem>> {
@@ -77,6 +78,7 @@ export function getMessages(args: {
     limit: args.limit ?? 300,
     offset: args.offset ?? 0,
     around_node_id: args.aroundNodeId,
+    include_internal: args.includeInternal,
     role: args.filters?.role,
     title: args.filters?.title,
     scope: args.filters?.scope,
@@ -128,8 +130,8 @@ export function exportUrl(id: string, format: "md" | "txt", path: PathMode, incl
   return `/api/conversations/${encodeURIComponent(id)}/export?${query}`;
 }
 
-export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal): Promise<{ raw_message: unknown }> {
-  return request<{ raw_message: unknown }>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/raw`, signal);
+export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal, maxChars = 50000): Promise<{ raw_message: unknown; raw_size?: number; truncated?: boolean; raw_text?: string }> {
+  return request<{ raw_message: unknown; raw_size?: number; truncated?: boolean; raw_text?: string }>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/raw?max_chars=${maxChars}`, signal);
 }
 
 export async function uploadImportZip(file: File, signal?: AbortSignal): Promise<ImportJob> {

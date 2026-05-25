@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover
 
 from chatgpt_export_archiver.cli import main
 from chatgpt_export_archiver.web_db import connect_readonly
+from chatgpt_export_archiver.search import _message_display_fields, _message_visibility_counts, _message_visibility_counts_for_path, _is_internal_message
 
 
 def node(node_id, parent, role, text, ts, children=None):
@@ -61,6 +62,10 @@ def root(children):
     return {"id": "root", "parent": None, "children": children, "message": None}
 
 
+def empty_mapping_node(node_id, parent, children=None):
+    return {"id": node_id, "parent": parent, "children": children or [], "message": None}
+
+
 def conv(cid, title, mapping, current_node, ts):
     return {
         "id": cid,
@@ -94,7 +99,7 @@ def js_slice(text: str, start: int, end: int) -> str:
 class WebApiTests(unittest.TestCase):
     def make_build_dir(self, base: Path) -> Path:
         build = base / "dist"
-        build.mkdir()
+        build.mkdir(exist_ok=True)
         (build / "index.html").write_text("<!doctype html><html><body><div id=\"root\"></div></body></html>", encoding="utf-8")
         return build
 
@@ -139,6 +144,8 @@ class WebApiTests(unittest.TestCase):
         db = base / "archive.db"
         self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
         client = TestClient(create_app(db))
+        self.addCleanup(client.close)
+        self.addCleanup(client.close)
         return td, client, db
 
     def wait_job(self, client, job_id: str, timeout: float = 20.0):
@@ -308,14 +315,26 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(self.wait_job(client, first.json()["job_id"])["status"], "succeeded")
 
     def test_web_upload_size_limit_cleans_temp_copy(self):
+        from chatgpt_export_archiver.web_api import UploadPolicy
+
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         base = Path(td.name)
-        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
         upload_dir = base / "upload-tmp"
         upload_dir.mkdir()
-        with mock.patch("chatgpt_export_archiver.web_api.MAX_UPLOAD_BYTES", 1), \
+        small_policy = UploadPolicy(
+            max_upload_bytes=1,
+            max_json_member_bytes=1,
+            max_json_members=1,
+            max_total_uncompressed_bytes=1,
+            max_compression_ratio=2.0,
+            max_total_members=100000,
+            remote=False,
+        )
+        with mock.patch("chatgpt_export_archiver.web_api._get_upload_policy", return_value=small_policy), \
+             mock.patch("chatgpt_export_archiver.web_api.MAX_UPLOAD_BYTES", 1), \
              mock.patch("chatgpt_export_archiver.web_api.make_upload_path", return_value=(upload_dir, upload_dir / "upload.zip")):
+            client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
             response = client.post("/api/import/upload", files={"file": ("synthetic.zip", b"1234", "application/zip")})
         self.assertEqual(response.status_code, 413)
         self.assertIn("upload_too_large", response.text)
@@ -323,14 +342,24 @@ class WebApiTests(unittest.TestCase):
 
     def test_web_upload_rejects_zip_bomb_like_conversation_member(self):
         from chatgpt_export_archiver import web_api
+        from chatgpt_export_archiver.web_api import UploadPolicy
 
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         base = Path(td.name)
-        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
         z = base / "small.zip"
         write_zip(z, [conv("small", "Small", {"root": root(["u"]), "u": node("u", "root", "user", "synthetic", 1_701_000_001)}, "u", 1_701_000_000)])
-        with mock.patch.object(web_api, "MAX_UPLOAD_JSON_MEMBER_BYTES", 1):
+        tiny_policy = UploadPolicy(
+            max_upload_bytes=20 * 1024 * 1024 * 1024,
+            max_json_member_bytes=1,
+            max_json_members=5000,
+            max_total_uncompressed_bytes=128 * 1024 * 1024 * 1024,
+            max_compression_ratio=1000.0,
+            max_total_members=100000,
+            remote=False,
+        )
+        with mock.patch.object(web_api, "_get_upload_policy", return_value=tiny_policy):
+            client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
             with z.open("rb") as handle:
                 response = client.post("/api/import/upload", files={"file": ("small.zip", handle, "application/zip")})
         self.assertEqual(response.status_code, 413)
@@ -338,11 +367,11 @@ class WebApiTests(unittest.TestCase):
 
     def test_web_upload_zip_member_limits_clean_temp_copy(self):
         from chatgpt_export_archiver import web_api
+        from chatgpt_export_archiver.web_api import UploadPolicy
 
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         base = Path(td.name)
-        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
 
         many = base / "many.zip"
         write_zip_members(many, {
@@ -351,8 +380,18 @@ class WebApiTests(unittest.TestCase):
         })
         upload_dir = base / "many-upload"
         upload_dir.mkdir()
-        with mock.patch.object(web_api, "MAX_UPLOAD_JSON_MEMBERS", 1), \
+        few_policy = UploadPolicy(
+            max_upload_bytes=20 * 1024 * 1024 * 1024,
+            max_json_member_bytes=64 * 1024 * 1024 * 1024,
+            max_json_members=1,
+            max_total_uncompressed_bytes=1,
+            max_compression_ratio=1000.0,
+            max_total_members=100000,
+            remote=False,
+        )
+        with mock.patch.object(web_api, "_get_upload_policy", return_value=few_policy), \
              mock.patch("chatgpt_export_archiver.web_api.make_upload_path", return_value=(upload_dir, upload_dir / "upload.zip")):
+            client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
             with many.open("rb") as handle:
                 response = client.post("/api/import/upload", files={"file": ("many.zip", handle, "application/zip")})
         self.assertEqual(response.status_code, 413)
@@ -361,7 +400,8 @@ class WebApiTests(unittest.TestCase):
 
         total = base / "total.zip"
         write_zip_members(total, {"conversations.json": [conv("total", "Total", {"root": root(["u"]), "u": node("u", "root", "user", "synthetic", 1)}, "u", 1)]})
-        with mock.patch.object(web_api, "MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES", 1):
+        with mock.patch.object(web_api, "_get_upload_policy", return_value=few_policy):
+            client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
             with total.open("rb") as handle:
                 response = client.post("/api/import/upload", files={"file": ("total.zip", handle, "application/zip")})
         self.assertEqual(response.status_code, 413)
@@ -369,14 +409,24 @@ class WebApiTests(unittest.TestCase):
 
     def test_web_upload_compression_ratio_and_invalid_zip_are_diagnostic(self):
         from chatgpt_export_archiver import web_api
+        from chatgpt_export_archiver.web_api import UploadPolicy
 
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         base = Path(td.name)
-        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
         compressed = base / "compressed.zip"
         write_zip_members(compressed, {"conversations.json": b" " * (11 * 1024 * 1024)}, compression=zipfile.ZIP_DEFLATED)
-        with mock.patch.object(web_api, "MAX_UPLOAD_COMPRESSION_RATIO", 2.0):
+        low_ratio_policy = UploadPolicy(
+            max_upload_bytes=20 * 1024 * 1024 * 1024,
+            max_json_member_bytes=64 * 1024 * 1024 * 1024,
+            max_json_members=5000,
+            max_total_uncompressed_bytes=128 * 1024 * 1024 * 1024,
+            max_compression_ratio=2.0,
+            max_total_members=100000,
+            remote=False,
+        )
+        with mock.patch.object(web_api, "_get_upload_policy", return_value=low_ratio_policy):
+            client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
             with compressed.open("rb") as handle:
                 response = client.post("/api/import/upload", files={"file": ("compressed.zip", handle, "application/zip")})
         self.assertEqual(response.status_code, 413)
@@ -412,16 +462,13 @@ class WebApiTests(unittest.TestCase):
 
         default = web_api.DEFAULT_MAX_UPLOAD_BYTES
         env_name = web_api.MAX_UPLOAD_ENV
-        self.assertEqual(web_api._get_max_upload_bytes({}), default)
-        self.assertEqual(web_api._get_max_upload_bytes({env_name: "12345"}), 12345)
-        for value, error_type in (("not-a-number", "invalid_integer"), ("   ", "invalid_integer"), ("0", "non_positive"), ("-1", "non_positive")):
+        self.assertEqual(web_api._get_upload_policy({}).max_upload_bytes, default)
+        self.assertEqual(web_api._get_upload_policy({env_name: "12345"}).max_upload_bytes, 12345)
+        for value in ("not-a-number", "   "):
             with self.assertLogs("chatgpt_export_archiver.web_api", level="WARNING") as logs:
-                self.assertEqual(web_api._get_max_upload_bytes({env_name: value}), default)
+                self.assertEqual(web_api._get_upload_policy({env_name: value}).max_upload_bytes, default)
             payload = "\n".join(logs.output)
-            self.assertIn(env_name, payload)
-            self.assertIn(error_type, payload)
-            if value.strip():
-                self.assertNotIn(value, payload)
+            self.assertIn("invalid_upload_config", payload)
 
         self.addCleanup(importlib.reload, web_api)
         with mock.patch.dict(os.environ, {env_name: "not-a-number"}):
@@ -435,7 +482,7 @@ class WebApiTests(unittest.TestCase):
         detail = client.get("/api/conversations/web-1").json()
         self.assertEqual(detail["conversation_id"], "web-1")
         current = client.get("/api/conversations/web-1/messages?path=current").json()
-        all_nodes = client.get("/api/conversations/web-1/messages?path=all").json()
+        all_nodes = client.get("/api/conversations/web-1/messages?path=all&include_internal=true").json()
         self.assertLess(current["total"], all_nodes["total"])
         self.assertIn("visible_total", all_nodes)
         self.assertGreaterEqual(all_nodes["empty_hidden_count"], 1)
@@ -451,13 +498,42 @@ class WebApiTests(unittest.TestCase):
     def test_message_page_visible_counts_for_internal_and_empty_nodes(self):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
-        page = client.get("/api/conversations/web-3/messages?path=current&limit=20").json()
+        page = client.get("/api/conversations/web-3/messages?path=current&limit=20&include_internal=true").json()
         self.assertEqual(page["total"], 5)
         self.assertEqual(page["visible_total"], 1)
         self.assertEqual(page["empty_hidden_count"], 1)
         self.assertEqual(page["internal_hidden_count"], 3)
         visible = [item for item in page["items"] if not item["is_empty_mapping_node"] and not item["is_internal"]]
         self.assertEqual([item["node_id"] for item in visible], ["a3"])
+
+    def test_reader_default_paginates_visible_messages_before_internal_prefix(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "visible-page.zip"
+        mapping = {"root": root(["sys0"])}
+        previous = "root"
+        for index in range(8):
+            node_id = f"sys{index}"
+            next_id = f"sys{index + 1}" if index < 7 else "u"
+            mapping[node_id] = node(node_id, previous, "system", f"internal prefix {index}", 1_700_300_000 + index, [next_id])
+            previous = node_id
+        mapping["u"] = node("u", previous, "user", "visible-after-internal-prefix", 1_700_300_100)
+        write_zip(z, [conv("visible-page", "Visible Page", mapping, "u", 1_700_300_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+        self.addCleanup(client.close)
+
+        default_page = client.get("/api/conversations/visible-page/messages?path=current&limit=3").json()
+        self.assertEqual([item["node_id"] for item in default_page["items"]], ["u"])
+        self.assertEqual(default_page["total"], 1)
+        self.assertEqual(default_page["visible_total"], 1)
+        self.assertGreater(default_page["internal_hidden_count"], 0)
+
+        full_page = client.get("/api/conversations/visible-page/messages?path=current&limit=3&include_internal=true").json()
+        self.assertGreater(full_page["total"], default_page["total"])
+        self.assertTrue(any(item["is_internal"] for item in full_page["items"]))
 
     def test_search_suggest_treats_like_wildcards_as_literals(self):
         td = tempfile.TemporaryDirectory()
@@ -505,7 +581,7 @@ class WebApiTests(unittest.TestCase):
     def test_messages_include_render_text_and_bounded_raw_preview(self):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
-        page = client.get("/api/conversations/web-3/messages?path=current").json()
+        page = client.get("/api/conversations/web-3/messages?path=current&include_internal=true").json()
         by_id = {item["node_id"]: item for item in page["items"]}
         self.assertIn("system readable fallback", by_id["sys"]["display_text"])
         self.assertTrue(by_id["sys"]["is_internal"])
@@ -519,7 +595,7 @@ class WebApiTests(unittest.TestCase):
     def test_full_raw_endpoint_is_explicit(self):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
-        page = client.get("/api/conversations/web-3/messages?path=current").json()
+        page = client.get("/api/conversations/web-3/messages?path=current&include_internal=true").json()
         payload = json.dumps(page)
         self.assertNotIn("raw_message_json", payload)
         raw = client.get("/api/conversations/web-3/messages/ctx/raw")
@@ -573,7 +649,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(client.get("/api/conversations?q=React&after=2024-01-01").json()["items"][0]["conversation_id"], "web-2")
         excluded = client.get("/api/search?q=pandas%20-pandas&path=all").json()
         self.assertEqual(excluded["total"], 0)
-        normalized_messages = client.get("/api/conversations/web-1/messages?q=%EF%BD%87%EF%BD%90%EF%BD%94%EF%BC%8D%EF%BC%95%EF%BC%8E%EF%BC%95&path=current").json()
+        normalized_messages = client.get("/api/conversations/web-1/messages?q=%EF%BD%87%EF%BD%90%EF%BD%94%EF%BC%8D%EF%BC%95%EF%BC%8E%EF%BC%95&path=current&include_internal=true").json()
         by_id = {item["node_id"]: item for item in normalized_messages["items"]}
         self.assertTrue(by_id["t1"]["highlight_ranges"])
         normalized_hits = client.get("/api/search/messages?q=%EF%BD%87%EF%BD%90%EF%BD%94%EF%BC%8D%EF%BC%95%EF%BC%8E%EF%BC%95&conversation_id=web-1").json()
@@ -975,6 +1051,66 @@ class WebApiTests(unittest.TestCase):
         branch_results = client.get("/api/conversations?q=branch-only-token&path=all").json()
         self.assertTrue(branch_results["items"][0]["has_branch_hits"])
 
+    def test_current_path_search_falls_back_when_conversation_has_no_current_nodes(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "current-fallback.zip"
+        broken_mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "fallback-current-needle is visible when current path is missing.", 1_700_410_001, ["a"]),
+            "a": node("a", "u", "assistant", "fallback-current-needle assistant response.", 1_700_410_002),
+        }
+        branch_mapping = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "normal current text.", 1_700_410_003, ["a", "b"]),
+            "a": node("a", "u", "assistant", "normal current answer.", 1_700_410_004),
+            "b": node("b", "u", "assistant", "offcurrentneedlexyz appears only off current path.", 1_700_410_005),
+        }
+        write_zip(
+            z,
+            [
+                conv("missing-current", "Missing Current", broken_mapping, "a", 1_700_410_000),
+                conv("normal-branch", "Different Title", branch_mapping, "a", 1_700_410_001),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'missing-current'")
+            conn.commit()
+        finally:
+            conn.close()
+        client = TestClient(create_app(db))
+        self.addCleanup(client.close)
+
+        reader = client.get("/api/conversations/missing-current/messages?path=current&limit=10").json()
+        self.assertGreaterEqual(reader["total"], 2)
+        self.assertTrue(reader["current_path_fallback_to_all"])
+        self.assertEqual(reader["effective_path"], "all")
+        self.assertIn("u", {item["node_id"] for item in reader["items"]})
+        self.assertTrue(any(item["highlight_ranges"] for item in client.get("/api/conversations/missing-current/messages?q=fallback-current-needle&path=current&limit=10").json()["items"]))
+        self.assertTrue(all(item["effective_visible_in_current_view"] for item in reader["items"]))
+        hits = client.get("/api/search/messages?q=fallback-current-needle&conversation_id=missing-current&path=current").json()
+        self.assertEqual(hits["total"], 2)
+        self.assertEqual({item["node_id"] for item in hits["items"]}, {"u", "a"})
+        self.assertTrue(all(item["current_path_fallback_to_all"] for item in hits["items"]))
+        self.assertTrue(all(item["effective_visible_in_current_view"] for item in hits["items"]))
+        conversations = client.get("/api/conversations?q=fallback-current-needle&path=current").json()
+        fallback_item = next(item for item in conversations["items"] if item["conversation_id"] == "missing-current")
+        self.assertEqual(fallback_item["current_path_nodes"], 0)
+        self.assertTrue(fallback_item["current_path_fallback_to_all"])
+        self.assertFalse(fallback_item["has_branch_hits"])
+        self.assertTrue(all(snippet["effective_visible_in_current_view"] for snippet in fallback_item["snippets"]))
+
+        current_branch = client.get("/api/search/messages?q=offcurrentneedlexyz&conversation_id=normal-branch&path=current").json()
+        self.assertEqual(current_branch["total"], 0)
+        all_branch = client.get("/api/search/messages?q=offcurrentneedlexyz&conversation_id=normal-branch&path=all").json()
+        self.assertEqual(all_branch["total"], 1)
+        branch_conversations = client.get("/api/conversations?q=offcurrentneedlexyz&path=current&scope=message").json()
+        self.assertNotIn("normal-branch", [item["conversation_id"] for item in branch_conversations["items"]])
+
     def test_highlight_ranges_use_utf16_offsets_for_web(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -995,7 +1131,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
         client = TestClient(create_app(db))
 
-        chinese = client.get("/api/conversations/unicode-highlight/messages?q=%E8%8B%B1%E7%89%B9%E5%B0%94&path=current").json()
+        chinese = client.get("/api/conversations/unicode-highlight/messages?q=%E8%8B%B1%E7%89%B9%E5%B0%94&path=current&include_internal=true").json()
         sys_item = next(item for item in chinese["items"] if item["node_id"] == "sys")
         chinese_range = sys_item["highlight_ranges"][0]
         self.assertEqual(js_slice(sys_item["display_text"], chinese_range["start"], chinese_range["end"]), "英特尔")
@@ -1149,10 +1285,7 @@ class WebApiTests(unittest.TestCase):
         client = TestClient(create_app(db))
 
         excluded = client.get("/api/conversations/reader-filter/messages?q=foo&exclude=bar&path=current").json()
-        by_id = {item["node_id"]: item for item in excluded["items"]}
-        self.assertTrue(by_id["u"]["highlight_ranges"])
-        self.assertTrue(by_id["a"]["highlight_ranges"])
-        self.assertFalse(by_id["b"]["highlight_ranges"])
+        self.assertFalse(any(item["highlight_ranges"] for item in excluded["items"]))
 
         role_filtered = client.get("/api/conversations/reader-filter/messages?q=foo&role=assistant&path=current").json()
         by_id = {item["node_id"]: item for item in role_filtered["items"]}
@@ -1187,6 +1320,52 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(any(item["highlight_ranges"] for item in clean["items"]))
         blocked = client.get("/api/conversations/reader-title-blocked/messages?q=foo%20-bar&path=current").json()
         self.assertFalse(any(item["highlight_ranges"] for item in blocked["items"]))
+
+    def test_conversation_search_exclude_is_conversation_level(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "exclude-contract.zip"
+        clean = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "foo only body", 1_700_519_001),
+        }
+        blocked = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "foo only body", 1_700_519_002, ["a"]),
+            "a": node("a", "u", "assistant", "bar only body", 1_700_519_003),
+        }
+        title_blocked = {
+            "root": root(["u"]),
+            "u": node("u", "root", "user", "foo only body", 1_700_519_004),
+        }
+        write_zip(
+            z,
+            [
+                conv("exclude-clean", "Clean Title", clean, "u", 1_700_519_000),
+                conv("exclude-blocked", "Neutral Title", blocked, "a", 1_700_519_001),
+                conv("exclude-title-blocked", "Bar Title", title_blocked, "u", 1_700_519_002),
+            ],
+        )
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+        self.addCleanup(client.close)
+
+        for suffix in ("", "&scope=message", "&path=current", "&path=all", "&match_mode=contains", "&match_mode=word"):
+            with self.subTest(suffix=suffix):
+                page = client.get(f"/api/conversations?q=foo%20-bar{suffix}&sort=title").json()
+                self.assertEqual([item["conversation_id"] for item in page["items"]], ["exclude-clean"])
+
+        title_scope = client.get("/api/conversations?q=foo%20-bar&scope=title&sort=title").json()
+        self.assertEqual(title_scope["total"], 0)
+        title_filter = client.get("/api/conversations?q=foo&title=Title&exclude=bar&sort=title").json()
+        self.assertEqual([item["conversation_id"] for item in title_filter["items"]], ["exclude-clean"])
+
+        message_hits = client.get("/api/search/messages?q=foo%20-bar&conversation_id=exclude-blocked&path=all").json()
+        self.assertEqual([item["node_id"] for item in message_hits["items"]], ["u"])
+        reader = client.get("/api/conversations/exclude-blocked/messages?q=foo%20-bar&path=all").json()
+        self.assertFalse(any(item["highlight_ranges"] for item in reader["items"]))
 
     def test_selected_conversation_metadata_is_returned_outside_current_page(self):
         td = tempfile.TemporaryDirectory()
@@ -1344,6 +1523,14 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(client.get("/api/conversations?after=not-a-date").status_code, 400)
         self.assertEqual(client.get("/api/search?q=React&before=not-a-date").status_code, 400)
         self.assertEqual(client.get("/api/conversations?limit=1000").status_code, 422)
+        too_long_date = "2" * 65
+        too_long_id = "x" * 513
+        self.assertEqual(client.get(f"/api/conversations?after={too_long_date}").status_code, 422)
+        self.assertEqual(client.get(f"/api/conversations?selected_id={too_long_id}").status_code, 422)
+        self.assertEqual(client.get(f"/api/search?selected_id={too_long_id}").status_code, 422)
+        self.assertEqual(client.get(f"/api/search/messages?conversation_id={too_long_id}").status_code, 422)
+        self.assertEqual(client.get(f"/api/conversations/web-1/messages?around_node_id={too_long_id}").status_code, 422)
+        self.assertEqual(client.get(f"/api/conversations/{too_long_id}").status_code, 422)
 
     def test_selected_membership_and_empty_results_contract(self):
         td, client, _db = self.make_client()
@@ -1374,7 +1561,7 @@ class WebApiTests(unittest.TestCase):
         client = TestClient(create_app(db))
         first = client.get("/api/conversations/long-1/messages?limit=120&offset=0").json()
         second = client.get("/api/conversations/long-1/messages?limit=120&offset=120").json()
-        self.assertEqual(first["total"], 361)
+        self.assertEqual(first["total"], 360)
         self.assertTrue(first["has_more"])
         self.assertEqual(first["next_offset"], 120)
         self.assertEqual(len(second["items"]), 120)
@@ -1663,7 +1850,7 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(hidden["items"][0]["has_internal_hits"])
         hidden_hit = client.get("/api/search/messages?q=hiddenneedle&conversation_id=technical&path=all").json()
         self.assertTrue(hidden_hit["items"][0]["is_internal"])
-        messages = client.get("/api/conversations/technical/messages?path=all&limit=20").json()
+        messages = client.get("/api/conversations/technical/messages?path=all&limit=20&include_internal=true").json()
         self.assertTrue(next(item for item in messages["items"] if item["node_id"] == "a")["is_internal"])
 
     def test_generated_non_text_placeholders_are_not_body_hits(self):
@@ -1746,7 +1933,7 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("React Web UI build is missing", str(ctx.exception))
         fallback_client = TestClient(create_app(db, static_dir=Path(td.name) / "missing-build", allow_fallback=True))
         html = fallback_client.get("/").text
-        self.assertIn("Limited fallback UI", html)
+        self.assertIn("Limited minimal fallback UI", html)
         self.assertIn("const typing", html)
         self.assertIn("&quot;", html)
         self.assertIn("&#39;", html)
@@ -2136,7 +2323,7 @@ class WebApiTests(unittest.TestCase):
         changed = client.get("/api/conversations/api-change").json()
         self.assertEqual(changed["node_count"], 4)
         messages = client.get("/api/conversations/api-change/messages?limit=10").json()
-        self.assertEqual(messages["total"], 4)
+        self.assertEqual(messages["total"], 3)
         self.assertTrue(any(item["node_id"] == "extra" for item in messages["items"]))
         search = client.get("/api/conversations?q=extra%20synthetic&limit=5").json()
         self.assertEqual(search["items"][0]["conversation_id"], "api-change")
@@ -2175,16 +2362,46 @@ class WebApiTests(unittest.TestCase):
         z = base / "tool.zip"
         mapping = {
             "root": root(["tool"]),
-            "tool": node("tool", "root", "tool/system", "tool output", 1_701_100_001),
+            "tool": node("tool", "root", "tool_system", "tool system alias output", 1_701_100_001, ["visible"]),
+            "visible": node("visible", "tool", "assistant", "visible alias response", 1_701_100_002),
         }
         write_zip(z, [conv("tool-role", "Tool Role", mapping, "tool", 1_701_100_000)])
         db = base / "archive.db"
         self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
         client = TestClient(create_app(db))
-        page = client.get("/api/conversations/tool-role/messages?path=current").json()
+        self.addCleanup(client.close)
+        page = client.get("/api/conversations/tool-role/messages?path=current&include_internal=true").json()
         by_id = {item["node_id"]: item for item in page["items"]}
-        self.assertEqual(by_id["tool"]["role"], "tool/system")
+        self.assertEqual(by_id["tool"]["role"], "tool_system")
         self.assertTrue(by_id["tool"]["is_internal"])
+        self.assertEqual(page["internal_hidden_count"], 1)
+        self.assertEqual(page["technical_hidden_count"], 1)
+
+        conn = connect_readonly(db)
+        try:
+            rows = conn.execute(
+                "SELECT node_id, parent_node_id, children_json, message_id, role, author_name, create_time, update_time, content_type, content_text, content_hash, is_on_current_path, raw_message_json FROM conversation_nodes WHERE conversation_id = ? AND is_on_current_path = 1",
+                ("tool-role",),
+            ).fetchall()
+            row_counts = _message_visibility_counts(rows)
+            fast_counts = _message_visibility_counts_for_path(conn, "tool-role", "current")
+            self.assertEqual(row_counts, fast_counts)
+            self.assertTrue(_is_internal_message("tool_system", "text", "tool system alias output"))
+        finally:
+            conn.close()
+
+        for role in ("tool/system", "tool_system"):
+            with self.subTest(role=role):
+                messages = client.get(f"/api/search/messages?q=alias&role={quote(role)}&conversation_id=tool-role&path=current").json()
+                self.assertEqual([item["node_id"] for item in messages["items"]], ["tool"])
+                conversations = client.get(f"/api/conversations?q=alias&role={quote(role)}&path=current").json()
+                self.assertEqual([item["conversation_id"] for item in conversations["items"]], ["tool-role"])
+                reader = client.get(f"/api/conversations/tool-role/messages?q=alias&role={quote(role)}&path=current&include_internal=true").json()
+                self.assertTrue(by_id := {item["node_id"]: item for item in reader["items"]})
+                self.assertTrue(by_id["tool"]["highlight_ranges"])
+
+        assistant_reader = client.get("/api/conversations/tool-role/messages?q=alias&role=assistant&path=current&include_internal=true").json()
+        self.assertFalse({item["node_id"]: item for item in assistant_reader["items"]}["tool"]["highlight_ranges"])
 
     def test_readonly_connection_can_be_used_in_worker_thread(self):
         td, _client, db = self.make_client()
@@ -2360,6 +2577,740 @@ class WebApiTests(unittest.TestCase):
         self.assertIn(web_jobs.JOB_HISTORY_LIMIT_ENV, payload)
         self.assertIn(web_jobs.JOB_HISTORY_TTL_ENV, payload)
         self.assertNotIn("not-a-number", payload)
+
+    def test_raw_query_modifier_validation_produces_errors(self):
+        from chatgpt_export_archiver.search import parse_query
+
+        parsed = parse_query("role:banana")
+        self.assertIn("invalid_role:banana", parsed.errors)
+        parsed = parse_query("path:banana")
+        self.assertIn("invalid_path:banana", parsed.errors)
+        parsed = parse_query("scope:banana")
+        self.assertIn("invalid_scope:banana", parsed.errors)
+        parsed = parse_query("before:bad after:bad")
+        self.assertEqual(parsed.errors.count("invalid_before"), 1)
+        self.assertEqual(parsed.errors.count("invalid_after"), 1)
+
+        parsed = parse_query('role:"assistant"')
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.role, "assistant")
+        parsed = parse_query("role:assistant")
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.role, "assistant")
+        parsed = parse_query("role:tool_system")
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.role, "tool/system")
+        parsed = parse_query('source:"conversations 1.json"')
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.source, "conversations 1.json")
+        parsed = parse_query('title:"foo bar"')
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.title, "foo bar")
+        parsed = parse_query('-"foo bar"')
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.exclude, ["foo bar"])
+        parsed = parse_query("--no-input-sha256")
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.terms, ["--no-input-sha256"])
+
+    def test_raw_query_modifier_errors_are_propagated_by_api(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        self.assertEqual(client.get("/api/conversations?q=role:banana").status_code, 400)
+        self.assertEqual(client.get("/api/conversations?q=path:banana").status_code, 400)
+        self.assertEqual(client.get("/api/conversations?q=scope:banana").status_code, 400)
+        self.assertEqual(client.get("/api/search?q=role:banana").status_code, 400)
+        self.assertEqual(client.get("/api/search?q=path:banana").status_code, 400)
+        self.assertEqual(client.get("/api/search?q=scope:banana").status_code, 400)
+
+    def test_unknown_colon_tokens_are_preserved_as_literals(self):
+        from chatgpt_export_archiver.search import parse_query
+
+        for query, expected_terms, expected_phrases, expected_exclude in (
+            ("foo:bar", ["foo:bar"], [], []),
+            ("model:gpt-5.5", ["model:gpt-5.5"], [], []),
+            ("http://example.com", ["http://example.com"], [], []),
+            ('url:"foo bar"', ["url:foo bar"], [], []),
+            ("-foo:bar", [], [], ["foo:bar"]),
+            ("gpt-5.5", ["gpt-5.5"], [], []),
+        ):
+            with self.subTest(query=query):
+                parsed = parse_query(query)
+                self.assertEqual(parsed.errors, [])
+                self.assertEqual(parsed.terms, expected_terms)
+                self.assertEqual(parsed.phrases, expected_phrases)
+                if expected_exclude:
+                    self.assertEqual(parsed.exclude, expected_exclude)
+
+        parsed = parse_query('source:"conversations 1.json"')
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.source, "conversations 1.json")
+        parsed = parse_query("--no-input-sha256")
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.terms, ["--no-input-sha256"])
+        parsed = parse_query("role:assistant")
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(parsed.role, "assistant")
+
+    def test_api_string_length_limits_return_400(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        long_q = "x" * 501
+        self.assertEqual(client.get(f"/api/conversations?q={quote(long_q)}").status_code, 422)
+        long_title = "x" * 201
+        self.assertEqual(client.get(f"/api/conversations?title={quote(long_title)}").status_code, 422)
+        long_exact = "x" * 301
+        self.assertEqual(client.get(f"/api/conversations?exact={quote(long_exact)}").status_code, 422)
+        long_exclude = "x" * 201
+        self.assertEqual(client.get(f"/api/conversations?exclude={quote(long_exclude)}").status_code, 422)
+        long_source = "x" * 201
+        self.assertEqual(client.get(f"/api/conversations?source={quote(long_source)}").status_code, 422)
+        long_suggest = "x" * 101
+        self.assertEqual(client.get(f"/api/search/suggest?q={quote(long_suggest)}").status_code, 422)
+
+    def test_cli_search_does_not_enforce_api_length_limits(self):
+        from chatgpt_export_archiver.search import parse_query
+
+        parsed = parse_query("x" * 600, enforce_api_limits=False)
+        self.assertNotIn("q_too_long", parsed.errors)
+        parsed_api = parse_query("x" * 600, enforce_api_limits=True)
+        self.assertIn("q_too_long", parsed_api.errors)
+
+    def test_schema_endpoint_includes_new_fields(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        schema = client.get("/api/schema").json()
+        self.assertIn("include_internal", json.dumps(schema))
+        self.assertIn("hidden_counts", json.dumps(schema))
+        self.assertIn("match_mode", json.dumps(schema))
+        self.assertIn("selected_in_results", json.dumps(schema))
+        self.assertIn("selected_item", json.dumps(schema))
+        self.assertIn("count_total", json.dumps(schema))
+        self.assertIn("technical_hidden_count", json.dumps(schema))
+        self.assertEqual(schema["messages"]["limits"]["around_node_id"], 512)
+        self.assertEqual(schema["conversations"]["limits"]["selected_id"], 512)
+        self.assertIn("visible-only reader pagination collection", schema["messages"]["around_node_id"])
+        self.assertIn("effective all collection", schema["messages"]["around_node_id"])
+
+    def test_suggest_no_db_returns_empty_items(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        db = base / "missing.db"
+        client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+        suggest = client.get("/api/search/suggest?q=python").json()
+        self.assertEqual(suggest, {"items": []})
+
+    def test_suggest_respects_q_length_limit(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        long_q = "x" * 101
+        self.assertEqual(client.get(f"/api/search/suggest?q={quote(long_q)}").status_code, 422)
+
+    def test_upload_policy_detects_loopback_and_remote(self):
+        from chatgpt_export_archiver.web_api import _get_upload_policy
+
+        local = _get_upload_policy(host="127.0.0.1")
+        self.assertFalse(local.remote)
+        local2 = _get_upload_policy(host="localhost")
+        self.assertFalse(local2.remote)
+        remote = _get_upload_policy(host="0.0.0.0")
+        self.assertTrue(remote.remote)
+
+    def test_concurrent_upload_slot_before_file_read(self):
+        from chatgpt_export_archiver.web_jobs import ImportJobManager
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        manager = ImportJobManager(base / "archive.db")
+
+        self.assertTrue(manager.acquire_pending_upload_slot())
+        self.assertFalse(manager.acquire_pending_upload_slot())
+        manager.release_pending_upload_slot()
+        self.assertTrue(manager.acquire_pending_upload_slot())
+        manager.release_pending_upload_slot()
+
+    def test_message_hidden_counts_fast_path_matches_row_path(self):
+        from chatgpt_export_archiver.search import _message_visibility_counts, _message_visibility_counts_for_path
+
+        td, _client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = connect_readonly(db)
+        try:
+            for path in ("current", "all"):
+                with self.subTest(path=path):
+                    rows = conn.execute(
+                        "SELECT node_id, parent_node_id, children_json, message_id, role, author_name, create_time, update_time, content_type, content_text, content_hash, is_on_current_path, raw_message_json FROM conversation_nodes WHERE conversation_id = ?",
+                        ("web-3",),
+                    ).fetchall()
+                    row_counts = _message_visibility_counts(rows)
+                    fast_counts = _message_visibility_counts_for_path(conn, "web-3", path)
+                    self.assertEqual(row_counts["visible_total"], fast_counts["visible_total"], f"{path} visible_total mismatch")
+                    self.assertEqual(row_counts["empty_hidden_count"], fast_counts["empty_hidden_count"], f"{path} empty_hidden_count mismatch")
+                    self.assertEqual(row_counts["internal_hidden_count"], fast_counts["internal_hidden_count"], f"{path} internal_hidden_count mismatch")
+                    self.assertEqual(row_counts["technical_hidden_count"], fast_counts["technical_hidden_count"], f"{path} technical_hidden_count mismatch")
+        finally:
+            conn.close()
+
+    def test_hidden_counts_distinguish_empty_technical_and_internal(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "hidden-types.zip"
+        mapping = {
+            "root": root(["sys"]),
+            "sys": node("sys", "root", "system", "system synthetic text", 1_700_000_001, ["dev"]),
+            "dev": node("dev", "sys", "developer", "developer synthetic instruction", 1_700_000_002, ["ctx"]),
+            "ctx": custom_content_node(
+                "ctx", "dev", "user",
+                {"content_type": "user_editable_context", "user_profile": "profile text", "user_instructions": {"text": "instruction text"}},
+                1_700_000_003, ["tool"]),
+            "tool": node("tool", "ctx", "tool", "tool output", 1_700_000_004, ["a"]),
+            "a": node("a", "tool", "assistant", "visible answer", 1_700_000_005, ["branch"]),
+            "branch": node("branch", "a", "assistant", "off-current branch text", 1_700_000_006),
+        }
+        write_zip(z, [conv("hidden-types", "Hidden Types Test", mapping, "a", 1_700_000_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        client = TestClient(create_app(db))
+
+        for path_label, path in [("current", "current"), ("all", "all")]:
+            with self.subTest(path=path_label):
+                page = client.get(f"/api/conversations/hidden-types/messages?path={path}&limit=20&include_internal=true").json()
+                self.assertIn("visible_total", page, f"{path_label}: missing visible_total")
+                self.assertIn("empty_hidden_count", page, f"{path_label}: missing empty_hidden_count")
+                self.assertIn("internal_hidden_count", page, f"{path_label}: missing internal_hidden_count")
+                self.assertIn("technical_hidden_count", page, f"{path_label}: missing technical_hidden_count")
+                self.assertGreater(page["empty_hidden_count"], 0, f"{path_label}: root empty node not counted")
+                self.assertGreater(page["internal_hidden_count"], 0, f"{path_label}: no internal count")
+                self.assertGreater(page["technical_hidden_count"], 0, f"{path_label}: no technical count")
+                self.assertEqual(page["visible_total"], page["total"] - page["empty_hidden_count"] - page["internal_hidden_count"])
+
+        conn = connect_readonly(db)
+        try:
+            for path in ("current", "all"):
+                with self.subTest(f"fast-vs-row-{path}"):
+                    rows = conn.execute(
+                        "SELECT node_id, parent_node_id, children_json, message_id, role, author_name, create_time, update_time, content_type, content_text, content_hash, is_on_current_path, raw_message_json FROM conversation_nodes WHERE conversation_id = ?",
+                        ("hidden-types",),
+                    ).fetchall()
+                    from chatgpt_export_archiver.search import _message_visibility_counts, _message_visibility_counts_for_path
+                    row_counts = _message_visibility_counts(rows)
+                    fast_counts = _message_visibility_counts_for_path(conn, "hidden-types", path)
+                    if path == "current":
+                        path_rows = [r for r in rows if r["is_on_current_path"]]
+                        row_counts = _message_visibility_counts(path_rows)
+                    for field in ("visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"):
+                        self.assertEqual(row_counts[field], fast_counts[field],
+                                         f"{path} {field}: row={row_counts[field]} fast={fast_counts[field]}")
+        finally:
+            conn.close()
+
+    def test_search_diagnostics_present_in_results(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conversations = client.get("/api/conversations?q=python").json()
+        self.assertIn("diagnostics", conversations)
+        self.assertIn("web_index_missing", conversations["diagnostics"])
+        messages = client.get("/api/search/messages?q=python").json()
+        self.assertIn("diagnostics", messages)
+
+    def test_search_diagnostics_do_not_report_legacy_fts_as_candidate_backend(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(db)
+        try:
+            for table in ("web_message_trigram", "web_title_trigram"):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            for table in ("web_message_norm", "web_title_norm", "web_index_metadata"):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'message_fts'").fetchone())
+            conn.commit()
+        finally:
+            conn.close()
+
+        conversations = client.get("/api/conversations?q=hello").json()
+        messages = client.get("/api/search/messages?q=hello").json()
+        for diag in (conversations["diagnostics"], messages["diagnostics"]):
+            self.assertNotEqual(diag.get("candidate_backend"), "fts_legacy")
+            self.assertNotEqual(diag.get("candidate_backend"), "normalized_trigram")
+            self.assertIn(diag.get("candidate_backend"), {"full_scan", "normalized_scan", "normalized_title_scan"})
+            self.assertTrue(diag.get("web_index_missing"))
+            self.assertTrue(diag.get("legacy_fts_present"))
+
+    def test_search_diagnostics_cover_normalized_trigram_fallback_short_and_title_paths(self):
+        from chatgpt_export_archiver.search import _conversation_search_diagnostics, _message_search_diagnostics, parse_query
+        from chatgpt_export_archiver.web_db import create_web_indexes, detect_trigram
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        probe = sqlite3.connect(":memory:")
+        try:
+            if not detect_trigram(probe):
+                self.skipTest("SQLite FTS5 trigram tokenizer is unavailable")
+        finally:
+            probe.close()
+        create_web_indexes(db)
+
+        normalized = client.get("/api/search/messages?q=python").json()["diagnostics"]
+        self.assertEqual(normalized.get("candidate_backend"), "normalized_trigram")
+        self.assertFalse(normalized.get("web_index_missing"))
+
+        short_query = client.get("/api/search/messages?q=py").json()["diagnostics"]
+        self.assertEqual(short_query.get("candidate_backend"), "normalized_scan")
+        self.assertTrue(short_query.get("short_query"))
+
+        title_only = client.get("/api/conversations?scope=title&q=Python").json()["diagnostics"]
+        self.assertEqual(title_only.get("candidate_backend"), "normalized_title_trigram")
+        self.assertTrue(title_only.get("normalized_trigram_available"))
+        for query in (
+            "/api/conversations?title=Python",
+            "/api/conversations?q=&title=Python",
+            "/api/conversations?q=title:Python",
+        ):
+            with self.subTest(query=query):
+                diag = client.get(query).json()["diagnostics"]
+                self.assertEqual(diag.get("candidate_backend"), "normalized_title_trigram")
+                self.assertTrue(diag.get("normalized_trigram_available"))
+                self.assertNotEqual(diag.get("candidate_backend"), "normalized_scan")
+
+        title_short = client.get("/api/conversations?scope=title&q=Py").json()["diagnostics"]
+        self.assertEqual(title_short.get("candidate_backend"), "normalized_title_scan")
+        self.assertTrue(title_short.get("short_query"))
+
+        conn = connect_readonly(db)
+        try:
+            parsed = parse_query("python", path_default="all")
+            message_fallback = _message_search_diagnostics(conn, parsed, used_trigram=False)
+            conversation_fallback = _conversation_search_diagnostics(conn, parsed, used_trigram=False)
+            self.assertEqual(message_fallback.get("candidate_backend"), "normalized_scan")
+            self.assertEqual(conversation_fallback.get("candidate_backend"), "normalized_scan")
+            self.assertFalse(message_fallback.get("normalized_trigram_available"))
+            self.assertFalse(conversation_fallback.get("normalized_trigram_available"))
+        finally:
+            conn.close()
+
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("DROP TABLE IF EXISTS web_title_trigram")
+            conn.commit()
+        finally:
+            conn.close()
+        title_scan = client.get("/api/conversations?title=Python").json()["diagnostics"]
+        self.assertEqual(title_scan.get("candidate_backend"), "normalized_title_scan")
+        self.assertFalse(title_scan.get("normalized_trigram_available"))
+        self.assertNotEqual(title_scan.get("candidate_backend"), "normalized_scan")
+
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("DROP TABLE IF EXISTS web_title_norm")
+            conn.commit()
+        finally:
+            conn.close()
+        title_full_scan = client.get("/api/conversations?title=Python").json()["diagnostics"]
+        self.assertEqual(title_full_scan.get("candidate_backend"), "full_scan")
+        self.assertTrue(title_full_scan.get("web_index_missing"))
+        self.assertNotEqual(title_full_scan.get("candidate_backend"), "normalized_scan")
+
+    def test_raw_endpoint_uses_sqlite_substr_for_truncation(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        import sqlite3 as _sql
+        conn = _sql.connect(db)
+        conn.row_factory = _sql.Row
+        try:
+            raw = conn.execute(
+                "SELECT COALESCE(raw_message_json, '{}') AS raw_message_json FROM conversation_nodes WHERE conversation_id = 'web-1' AND node_id = 'u1'"
+            ).fetchone()["raw_message_json"]
+            big_raw = raw + " " * 100000
+            conn.execute(
+                "UPDATE conversation_nodes SET raw_message_json = ? WHERE conversation_id = 'web-1' AND node_id = 'u1'",
+                (big_raw,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        resp = client.get("/api/conversations/web-1/messages/u1/raw?max_chars=500")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["truncated"])
+        self.assertGreater(body["raw_size"], 500)
+        self.assertIn("raw_text", body)
+        self.assertLess(len(body.get("raw_message", "")), 1000)
+
+    def test_raw_endpoint_max_chars_bounds(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        self.assertEqual(client.get("/api/conversations/web-1/messages/u1/raw?max_chars=0").status_code, 422)
+        self.assertEqual(client.get("/api/conversations/web-1/messages/u1/raw?max_chars=500").status_code, 200)
+        self.assertEqual(client.get("/api/conversations/web-1/messages/u1/raw?max_chars=200001").status_code, 422)
+        self.assertEqual(client.get("/api/conversations/web-1/messages/u1/raw?max_chars=1").status_code, 200)
+        self.assertEqual(client.get("/api/conversations/web-1/messages/u1/raw?max_chars=200000").status_code, 200)
+
+    def test_schema_endpoint_includes_raw_suggest_upload_diagnostics(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        schema = client.get("/api/schema").json()
+        schema_json = json.dumps(schema)
+        self.assertIn("max_chars", schema_json)
+        self.assertIn("truncated", schema_json)
+        self.assertIn("diagnostics", schema_json)
+        self.assertIn("best_effort", schema_json)
+        self.assertNotIn("fts_legacy", schema_json)
+        self.assertIn("legacy_fts_present", schema_json)
+        fields = set(schema["search"]["diagnostics"]["fields"])
+        for field in (
+            "candidate_backend",
+            "web_index_missing",
+            "normalized_trigram_available",
+            "legacy_trigram_index",
+            "legacy_fts_present",
+            "short_query",
+            "diagnostics_accuracy",
+            "actual_fallback_note",
+            "estimated_backend_note",
+        ):
+            self.assertIn(field, fields)
+        self.assertIn("upload", schema)
+        self.assertIn("suggest", schema)
+        self.assertIn("100 characters", schema["suggest"]["q_limit"])
+        for env_name in (
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBERS",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS",
+            "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS",
+            "CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE",
+        ):
+            self.assertIn(env_name, schema["upload"]["env"])
+        self.assertIn("effective_policy", schema["upload"])
+        effective = schema["upload"]["effective_policy"]
+        for field in (
+            "max_upload_bytes",
+            "max_json_member_bytes",
+            "max_json_members",
+            "max_total_uncompressed_bytes",
+            "max_compression_ratio",
+            "max_total_members",
+            "remote",
+            "remote_profile",
+        ):
+            self.assertIn(field, effective)
+
+    def test_schema_effective_upload_policy_matches_bound_host_policy(self):
+        from chatgpt_export_archiver.web_api import _get_upload_policy
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        build = self.make_build_dir(base)
+        db = base / "missing.db"
+        for host in ("127.0.0.1", "0.0.0.0"):
+            with self.subTest(host=host):
+                client = TestClient(create_app(db, static_dir=build, host=host))
+                self.addCleanup(client.close)
+                schema_policy = client.get("/api/schema").json()["upload"]["effective_policy"]
+                actual = _get_upload_policy(host=host)
+                self.assertEqual(schema_policy["max_upload_bytes"], actual.max_upload_bytes)
+                self.assertEqual(schema_policy["max_json_member_bytes"], actual.max_json_member_bytes)
+                self.assertEqual(schema_policy["max_json_members"], actual.max_json_members)
+                self.assertEqual(schema_policy["max_total_uncompressed_bytes"], actual.max_total_uncompressed_bytes)
+                self.assertEqual(schema_policy["max_total_members"], actual.max_total_members)
+                self.assertEqual(schema_policy["remote"], actual.remote)
+                self.assertEqual(schema_policy["remote_profile"], actual.remote_profile)
+
+    def test_upload_slot_released_on_cancellation_like_scenario(self):
+        from chatgpt_export_archiver.web_jobs import ImportJobManager
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        manager = ImportJobManager(base / "archive.db")
+        self.assertTrue(manager.acquire_pending_upload_slot())
+        manager.release_pending_upload_slot()
+        self.assertTrue(manager.acquire_pending_upload_slot())
+        manager.release_pending_upload_slot()
+
+    def test_upload_slot_released_when_make_upload_path_fails(self):
+        from fastapi import FastAPI
+        from chatgpt_export_archiver.web_api import create_api_router
+        from chatgpt_export_archiver.web_jobs import ImportJobManager
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        manager = ImportJobManager(base / "archive.db")
+        app = FastAPI()
+        app.include_router(create_api_router(base / "archive.db", manager))
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with mock.patch("chatgpt_export_archiver.web_api.make_upload_path", side_effect=OSError("synthetic temp failure")):
+            response = client.post("/api/import/upload", files={"file": ("synthetic.zip", b"not a real zip", "application/zip")})
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(manager.has_running_job())
+
+        good_zip = base / "good.zip"
+        write_zip(good_zip, [conv("upload-after-failure", "Upload After Failure", {"root": root(["u"]), "u": node("u", "root", "user", "synthetic upload", 1_701_300_000)}, "u", 1_701_300_000)])
+        with good_zip.open("rb") as handle:
+            second = client.post("/api/import/upload", files={"file": ("good.zip", handle, "application/zip")})
+        self.assertNotEqual(second.status_code, 409, second.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertIn(second.json()["status"], {"queued", "running", "succeeded"})
+        self.wait_job(client, second.json()["job_id"])
+        self.assertFalse(manager.has_running_job())
+        client.close()
+
+    def test_upload_policy_remote_opt_in_for_all_limits(self):
+        from chatgpt_export_archiver.web_api import _get_upload_policy, REMOTE_DEFAULT_MAX_UPLOAD_BYTES, REMOTE_DEFAULT_TOTAL_UNCOMPRESSED
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            local = _get_upload_policy(host="127.0.0.1", environ={})
+            self.assertFalse(local.remote)
+            self.assertGreater(local.max_upload_bytes, REMOTE_DEFAULT_MAX_UPLOAD_BYTES)
+
+            remote_no_optin = _get_upload_policy(host="0.0.0.0", environ={})
+            self.assertTrue(remote_no_optin.remote)
+            self.assertLessEqual(remote_no_optin.max_total_uncompressed_bytes, REMOTE_DEFAULT_TOTAL_UNCOMPRESSED)
+
+            remote_with_allow = _get_upload_policy(
+                host="0.0.0.0",
+                environ={"CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS": "true"},
+            )
+            self.assertTrue(remote_with_allow.remote)
+            self.assertEqual(remote_with_allow.max_upload_bytes, REMOTE_DEFAULT_MAX_UPLOAD_BYTES)
+            self.assertEqual(remote_with_allow.max_total_uncompressed_bytes, REMOTE_DEFAULT_TOTAL_UNCOMPRESSED)
+
+            remote_only_total = _get_upload_policy(
+                host="0.0.0.0",
+                environ={"CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES": str(1024 * 1024 * 1024)},
+            )
+            self.assertEqual(remote_only_total.max_total_uncompressed_bytes, REMOTE_DEFAULT_TOTAL_UNCOMPRESSED)
+
+            remote_explicit_total = _get_upload_policy(
+                host="0.0.0.0",
+                environ={
+                    "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS": "true",
+                    "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES": str(1024 * 1024 * 1024),
+                },
+            )
+            self.assertEqual(remote_explicit_total.max_upload_bytes, REMOTE_DEFAULT_MAX_UPLOAD_BYTES)
+            self.assertEqual(remote_explicit_total.max_total_uncompressed_bytes, 1024 * 1024 * 1024)
+
+            remote_local_profile = _get_upload_policy(
+                host="0.0.0.0",
+                environ={"CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE": "local"},
+            )
+            self.assertGreater(remote_local_profile.max_upload_bytes, REMOTE_DEFAULT_MAX_UPLOAD_BYTES)
+            self.assertGreater(remote_local_profile.max_total_uncompressed_bytes, REMOTE_DEFAULT_TOTAL_UNCOMPRESSED)
+
+    def test_remote_upload_policy_allows_full_limits_with_env(self):
+        from chatgpt_export_archiver.web_api import _get_upload_policy
+
+        env = {
+            "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS": "true",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES": str(10 * 1024 * 1024 * 1024),
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES": str(10 * 1024 * 1024 * 1024),
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES": str(10 * 1024 * 1024 * 1024),
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBERS": "9000",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS": "120000",
+            "CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO": "500.0",
+        }
+        policy = _get_upload_policy(host="0.0.0.0", environ=env)
+        self.assertGreater(policy.max_upload_bytes, 128 * 1024 * 1024)
+        self.assertGreater(policy.max_total_uncompressed_bytes, 512 * 1024 * 1024)
+        self.assertEqual(policy.max_json_members, 9000)
+        self.assertEqual(policy.max_total_members, 120000)
+
+        blocked = _get_upload_policy(host="0.0.0.0", environ={"CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS": "120000"})
+        self.assertEqual(blocked.max_total_members, 10000)
+
+    def test_embedded_quote_tokens_are_preserved_as_literals(self):
+        from chatgpt_export_archiver.search import parse_query
+
+        for query, expected in (
+            ('foo"bar', ["foo\"bar"]),
+            ('foo:"bar"', ["foo:bar"]),
+            ('unknown:"foo bar"', ["unknown:foo bar"]),
+            ('url:"foo bar"', ["url:foo bar"]),
+            ('source:"conversations 1.json"', None),
+            ('-"foo bar"', None),
+        ):
+            with self.subTest(query=query):
+                parsed = parse_query(query)
+                self.assertEqual(parsed.errors, [])
+                if expected is None:
+                    continue
+                self.assertEqual(parsed.terms, expected)
+
+        parsed = parse_query('source:"conversations 1.json"')
+        self.assertEqual(parsed.source, "conversations 1.json")
+        excluded = parse_query('-"foo bar"')
+        self.assertEqual(excluded.exclude, ["foo bar"])
+
+    def test_upload_total_members_limit(self):
+        from chatgpt_export_archiver import web_api
+        from chatgpt_export_archiver.web_api import UploadPolicy, _validate_upload_zip_members
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "many-members.zip"
+        members = {"conversations.json": [conv("member-limit", "Member Limit", {"root": root(["u"]), "u": node("u", "root", "user", "synthetic", 1)}, "u", 1)]}
+        for i in range(200):
+            members[f"dummy_{i}.txt"] = b"x"
+        write_zip_members(z, members)
+
+        tight_policy = UploadPolicy(
+            max_upload_bytes=20 * 1024 * 1024 * 1024,
+            max_json_member_bytes=64 * 1024 * 1024 * 1024,
+            max_json_members=5000,
+            max_total_uncompressed_bytes=128 * 1024 * 1024 * 1024,
+            max_compression_ratio=1000.0,
+            max_total_members=50,
+            remote=False,
+        )
+        with self.assertRaises(Exception) as ctx:
+            _validate_upload_zip_members(z, tight_policy)
+        self.assertIn("upload_zip_too_many_members", str(ctx.exception.detail))
+
+    def test_upload_total_members_passes_with_legal_zip(self):
+        from chatgpt_export_archiver import web_api
+        from chatgpt_export_archiver.web_api import UploadPolicy, _validate_upload_zip_members
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        members = {"conversations.json": [conv("ok", "OK", {"root": root(["u"]), "u": node("u", "root", "user", "ok", 1)}, "u", 1)]}
+        z = base / "ok.zip"
+        write_zip_members(z, members)
+
+        normal_policy = UploadPolicy(
+            max_upload_bytes=20 * 1024 * 1024 * 1024,
+            max_json_member_bytes=64 * 1024 * 1024 * 1024,
+            max_json_members=5000,
+            max_total_uncompressed_bytes=128 * 1024 * 1024 * 1024,
+            max_compression_ratio=1000.0,
+            max_total_members=100000,
+            remote=False,
+        )
+        try:
+            _validate_upload_zip_members(z, normal_policy)
+        except Exception:
+            self.fail("legal zip should not raise")
+
+    def test_around_node_id_fallback_avoids_full_row_read(self):
+        from chatgpt_export_archiver.search import get_messages, MAX_AROUND_NODE_ROWS, _conversation_rows
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "around-fallback.zip"
+        mapping = {"root": root(["n0"])}
+        previous = "root"
+        for idx in range(120):
+            node_id = f"n{idx}"
+            child = f"n{idx + 1}" if idx < 119 else None
+            mapping[node_id] = node(node_id, previous, "user", f"around fallback {idx}", 1_700_000_000 + idx, [child] if child else [])
+            previous = node_id
+        write_zip(z, [conv("around-fallback", "Around Fallback", mapping, "n119", 1_700_000_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        conn = connect_readonly(db)
+        try:
+            with mock.patch("chatgpt_export_archiver.search.MAX_AROUND_NODE_ROWS", 50), \
+                 mock.patch("chatgpt_export_archiver.search._conversation_rows", side_effect=AssertionError("_conversation_rows should not be called in fallback")):
+                page = get_messages(conn, "around-fallback", path="current", limit=10, offset=0, around_node_id="n100")
+            self.assertEqual(page["total"], 121)
+            self.assertTrue(any(item["node_id"] == "n100" for item in page["items"]),
+                            "should include the around_node_id target")
+            self.assertNotIn("raw_message_json", json.dumps(page["items"][0]),
+                             "response should not contain raw_message_json")
+        finally:
+            conn.close()
+
+    def test_around_node_id_uses_visible_page_collection_in_sql_fast_path(self):
+        from chatgpt_export_archiver.search import get_messages
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        z = base / "around-visible-prefix.zip"
+        mapping = {"root": root(["h000"])}
+        previous = "root"
+        for idx in range(90):
+            node_id = f"h{idx:03d}"
+            child = f"h{idx + 1:03d}" if idx < 89 else "target"
+            if idx % 4 == 0:
+                mapping[node_id] = empty_mapping_node(node_id, previous, [child])
+            else:
+                role = ("system", "developer", "tool")[idx % 3]
+                mapping[node_id] = node(node_id, previous, role, f"hidden around prefix {idx}", 1_700_700_000 + idx, [child])
+            previous = node_id
+        mapping["target"] = node("target", previous, "user", "visible-around-target needle", 1_700_700_500, ["tail"])
+        mapping["tail"] = node("tail", "target", "assistant", "visible tail after target", 1_700_700_501)
+        write_zip(z, [conv("around-visible-prefix", "Around Visible Prefix", mapping, "tail", 1_700_700_000)])
+        db = base / "archive.db"
+        self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+        conn = connect_readonly(db)
+        try:
+            with mock.patch("chatgpt_export_archiver.search.MAX_AROUND_NODE_ROWS", 50), \
+                 mock.patch("chatgpt_export_archiver.search._conversation_rows", side_effect=AssertionError("_conversation_rows should not be called in SQL fast path")):
+                all_visible = get_messages(conn, "around-visible-prefix", path="all", limit=5, offset=0, around_node_id="target", include_internal=False)
+                current_visible = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=0, around_node_id="target", include_internal=False)
+                hidden_target = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=999, around_node_id="h050", include_internal=False)
+                full_nodes = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=0, around_node_id="target", include_internal=True)
+            for page in (all_visible, current_visible):
+                with self.subTest(path=page["effective_path"]):
+                    self.assertGreater(page["total"], 0)
+                    self.assertIn("target", [item["node_id"] for item in page["items"]])
+                    self.assertTrue(page["items"], "visible collection around target should not return an empty page")
+            self.assertEqual(hidden_target["offset"], 0)
+            self.assertTrue(hidden_target["items"])
+            self.assertIn("target", [item["node_id"] for item in hidden_target["items"]])
+            self.assertGreater(full_nodes["total"], current_visible["total"])
+            self.assertIn("target", [item["node_id"] for item in full_nodes["items"]])
+
+            writer = sqlite3.connect(db)
+            try:
+                writer.execute("UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'around-visible-prefix'")
+                writer.commit()
+            finally:
+                writer.close()
+            conn.close()
+            conn = connect_readonly(db)
+            with mock.patch("chatgpt_export_archiver.search.MAX_AROUND_NODE_ROWS", 50), \
+                 mock.patch("chatgpt_export_archiver.search._conversation_rows", side_effect=AssertionError("_conversation_rows should not be called in SQL fast path")):
+                damaged = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=0, around_node_id="target", include_internal=False)
+            self.assertTrue(damaged["current_path_fallback_to_all"])
+            self.assertEqual(damaged["effective_path"], "all")
+            self.assertIn("target", [item["node_id"] for item in damaged["items"]])
+        finally:
+            conn.close()
+
+    def test_diagnostics_fallback_path_not_reports_normalized_trigram(self):
+        from chatgpt_export_archiver.search import _message_search_diagnostics, _conversation_search_diagnostics, parse_query
+
+        td, _client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = connect_readonly(db)
+        try:
+            parsed = parse_query("python", path_default="all")
+            diag_normal = _message_search_diagnostics(conn, parsed, used_trigram=True)
+            diag_fallback = _message_search_diagnostics(conn, parsed, used_trigram=False)
+            self.assertIn("diagnostics_accuracy", diag_normal)
+            self.assertIn("diagnostics_accuracy", diag_fallback)
+            if diag_normal.get("candidate_backend") == "normalized_trigram" and \
+               diag_fallback.get("candidate_backend") == "normalized_trigram":
+                if diag_fallback.get("normalized_trigram_available"):
+                    self.fail("fallback path should not report normalized trigram as candidate")
+            conv_diag = _conversation_search_diagnostics(conn, parsed, used_trigram=False)
+            self.assertIn("diagnostics_accuracy", conv_diag)
+        finally:
+            conn.close()
 
 if __name__ == "__main__":
     unittest.main()

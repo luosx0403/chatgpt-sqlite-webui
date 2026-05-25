@@ -27,6 +27,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const [emptyHiddenCount, setEmptyHiddenCount] = useState(0);
   const [internalHiddenCount, setInternalHiddenCount] = useState(0);
   const [technicalHiddenCount, setTechnicalHiddenCount] = useState(0);
+  const [currentPathFallbackToAll, setCurrentPathFallbackToAll] = useState(false);
   const [nextOffset, setNextOffset] = useState<number | null>(0);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -82,7 +83,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     if (append) setLoadingMore(true);
     else setLoading(true);
     setError(null);
-    getMessages({ id: conversation.conversation_id, q: highlightQuery, path: effectivePath, filters: effectiveFilters, offset, limit: settings.messagePageSize, aroundNodeId, matchMode, signal: controller.signal })
+    getMessages({ id: conversation.conversation_id, q: highlightQuery, path: effectivePath, filters: effectiveFilters, offset, limit: settings.messagePageSize, aroundNodeId, includeInternal: showInternal, matchMode, signal: controller.signal })
       .then((page) => {
         if (requestId !== messageRequestRef.current) return;
         setMessages((current) => append ? [...current, ...page.items] : page.items);
@@ -91,6 +92,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
         setEmptyHiddenCount(page.empty_hidden_count ?? 0);
         setInternalHiddenCount(page.internal_hidden_count ?? 0);
         setTechnicalHiddenCount(page.technical_hidden_count ?? 0);
+        setCurrentPathFallbackToAll(Boolean(page.current_path_fallback_to_all || conversation.current_path_fallback_to_all));
         setHasMore(page.has_more);
         setNextOffset(page.next_offset);
       })
@@ -105,7 +107,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
         }
       });
     return controller;
-  }, [conversation?.conversation_id, effectivePath, highlightQuery, matchMode, effectiveFiltersKey, settings.messagePageSize]);
+  }, [conversation?.conversation_id, conversation?.current_path_fallback_to_all, effectivePath, highlightQuery, matchMode, effectiveFiltersKey, settings.messagePageSize, showInternal]);
 
   useEffect(() => {
     if (!conversation) {
@@ -115,6 +117,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
       setEmptyHiddenCount(0);
       setInternalHiddenCount(0);
       setTechnicalHiddenCount(0);
+      setCurrentPathFallbackToAll(false);
       setHasMore(false);
       setNextOffset(null);
       return;
@@ -231,9 +234,10 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   }, [measureMessagesSoon]);
 
   const hiddenInternalHits = useMemo(() => hitItems.filter((hit) => hit.is_internal && !showInternal), [hitItems, showInternal]);
+  const isCurrentFallbackHit = useCallback((hit: SearchMessageHit) => Boolean(hit.effective_visible_in_current_view || hit.current_path_fallback_to_all || currentPathFallbackToAll || conversation?.current_path_fallback_to_all), [conversation?.current_path_fallback_to_all, currentPathFallbackToAll]);
   const currentViewHits = useMemo(
-    () => hitItems.filter((hit) => !(hit.is_internal && !showInternal) && !(effectivePath === "current" && !hit.is_on_current_path)),
-    [hitItems, effectivePath, showInternal],
+    () => hitItems.filter((hit) => !(hit.is_internal && !showInternal) && !(effectivePath === "current" && !hit.is_on_current_path && !isCurrentFallbackHit(hit))),
+    [hitItems, effectivePath, showInternal, isCurrentFallbackHit],
   );
   const titleOnlyMatch = Boolean(searchActive && (conversation?.title_match || conversation?.has_title_hits || conversation?.reasons?.includes("title match")) && hitItems.length === 0);
   const hiddenSnippetInternal = Boolean(!showInternal && (conversation?.has_internal_hits || conversation?.snippets?.some((snippet) => snippet.is_internal)));
@@ -361,20 +365,17 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const formatMessagesForCopy = (items: MessageItem[]) => copyableMessages(items).map((m) => `${m.role || "message"}:\n${messageText(m)}`).join("\n\n");
   const fetchMessagesForCopy = async (mode: "visible" | "conversation") => {
     if (!conversation) return;
+    if (mode === "visible") return visibleMessages;
     const allMessages: MessageItem[] = [];
     let offset = 0;
-    const copyPath = mode === "conversation" ? "all" : effectivePath;
-    const copyFilters: SearchFilters = mode === "conversation"
-      ? { ...effectiveFilters, role: "", title: "", exact: "", exclude: "", after: "", before: "", source: "", scope: "all" }
-      : effectiveFilters;
-    const copyQuery = mode === "conversation" ? "" : highlightQuery;
+    const copyFilters: SearchFilters = { ...effectiveFilters, role: "", title: "", exact: "", exclude: "", after: "", before: "", source: "", scope: "all" };
     for (;;) {
-      const page = await getMessages({ id: conversation.conversation_id, q: copyQuery, path: copyPath, filters: copyFilters, offset, limit: 300, matchMode });
+      const page = await getMessages({ id: conversation.conversation_id, q: "", path: effectivePath, filters: copyFilters, offset, limit: 300, includeInternal: showInternal, matchMode });
       allMessages.push(...page.items);
       if (!page.has_more || page.next_offset === null) break;
       offset = page.next_offset;
     }
-    return allMessages.filter((message) => !message.is_empty_mapping_node && (mode === "conversation" || showInternal || !message.is_internal));
+    return allMessages.filter((message) => !message.is_empty_mapping_node && (showInternal || !message.is_internal));
   };
   const runCopy = async (mode: "visible" | "conversation") => {
     if (copyBusy) return;
@@ -525,8 +526,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
                     showRawDefault={settings.showRawDefault}
                     t={t}
                     onCopy={copyText}
-                    onSizeMayChange={onSizeMayChange}
-                  />
+	                    onSizeMayChange={onSizeMayChange}
+	                    currentPathFallbackToAll={currentPathFallbackToAll || Boolean(conversation.current_path_fallback_to_all)}
+	                  />
                 )}
               </VirtualMessageRow>
             );

@@ -4,7 +4,7 @@ export type SearchScope = "all" | "title" | "message";
 export type MatchMode = "contains" | "word";
 
 export interface SearchFilters {
-  role: "" | "user" | "assistant" | "system" | "developer" | "tool" | "tool/system";
+  role: "" | "user" | "assistant" | "system" | "developer" | "tool" | "tool/system" | "tool_system";
   scope: SearchScope;
   title: string;
   exact: string;
@@ -23,6 +23,7 @@ export interface ConversationSummary {
   source_file: string | null;
   node_count?: number;
   current_path_nodes?: number;
+  current_path_fallback_to_all?: boolean;
   hit_count?: number;
   snippets?: SearchSnippet[];
   reasons?: string[];
@@ -40,6 +41,8 @@ export interface SearchSnippet {
   content_type?: string | null;
   snippet: string;
   is_on_current_path: boolean;
+  current_path_fallback_to_all?: boolean;
+  effective_visible_in_current_view?: boolean;
   is_internal?: boolean;
 }
 
@@ -59,8 +62,11 @@ export interface MessageItem {
   has_text: boolean;
   has_raw: boolean;
   raw_preview: string;
+  raw_text?: string;
   content_hash: string | null;
   is_on_current_path: boolean;
+  current_path_fallback_to_all?: boolean;
+  effective_visible_in_current_view?: boolean;
   is_internal: boolean;
   is_empty_mapping_node?: boolean;
   highlight_ranges: HighlightRange[];
@@ -80,6 +86,8 @@ export interface SearchMessageHit {
   content_text: string;
   snippet: string;
   is_on_current_path: boolean;
+  current_path_fallback_to_all?: boolean;
+  effective_visible_in_current_view?: boolean;
   is_internal: boolean;
   title: string | null;
   conversation_create_time?: number | null;
@@ -108,7 +116,30 @@ export interface Page<T> {
   technical_hidden_count?: number;
   selected_in_results?: boolean;
   selected_item?: T;
+  raw_size?: number;
+  truncated?: boolean;
+  diagnostics?: SearchDiagnostics;
   db_ready?: boolean;
+  effective_path?: PathMode;
+  current_path_fallback_to_all?: boolean;
+}
+
+export interface SearchDiagnostics {
+  candidate_backend?:
+    | "normalized_trigram"
+    | "normalized_title_trigram"
+    | "normalized_scan"
+    | "normalized_title_scan"
+    | "full_scan"
+    | (string & {});
+  web_index_missing?: boolean;
+  normalized_trigram_available?: boolean;
+  legacy_trigram_index?: boolean;
+  legacy_fts_present?: boolean;
+  short_query?: boolean;
+  diagnostics_accuracy?: "best_effort" | (string & {});
+  actual_fallback_note?: string;
+  estimated_backend_note?: string;
 }
 
 export interface Stats {

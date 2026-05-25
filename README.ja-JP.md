@@ -148,6 +148,14 @@ python chatgpt_archive.py init --db archive/chatgpt_archive.db
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+`--input` には公式エクスポート ZIP、単体の `conversations.json`、または展開済みのエクスポートディレクトリを指定できます。展開済みディレクトリには `conversations.json`、または sharded `conversations-*.json` ファイルを含められます。shard を手作業で結合しないでください。
+
+```bash
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input conversations.json --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input ./extracted-export/ --no-input-sha256 --rebuild-fts
+```
+
 構造上の整合性を確認します。
 
 ```bash
@@ -202,6 +210,8 @@ python chatgpt_archive.py web --db archive/chatgpt_archive.db --port 8787
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+入力は ZIP、単体の `conversations.json`、または `conversations.json` か sharded `conversations-*.json` ファイルを含む展開済みディレクトリにできます。scanner discovery は `__MACOSX`、AppleDouble `._*` ファイル、`.DS_Store` などの macOS metadata paths を無視するため、これらのローカル artifact が conversation source になることはありません。
+
 インポート後に SQLite の planner statistics と FTS インデックスをさらに整理したい場合は、次を使います。
 
 ```bash
@@ -226,11 +236,88 @@ python chatgpt_archive.py web --port 8787
 
 既定のリーダーレイアウトは `chat` です。user メッセージは右、assistant メッセージは左に配置され、system/internal メッセージは折りたたみ表示になります。以前の行単位の技術レイアウトを使うには、Settings で `Classic` を選ぶか、Web UI の URL に `?layout=classic` または `?messageLayout=classic` を追加してください。
 
+リーダーのコピーとエクスポートは、表示中のリーダー契約に従います。`現在のパスの会話をコピー` は現在の reader パスの全ページを取得し、Show internal messages の切り替えを尊重し、現在の検索フィルターは無視します。`表示中をコピー` は、すでに読み込まれている表示メッセージだけをコピーします。ダウンロードリンクも同じ現在のパスと Show internal 設定を使います。Raw メッセージアクセスは、メッセージ単位 endpoint による上限付きの大きな raw プレビューです。切り詰められた応答では `raw_text` をプレーンなプレビューテキストとして描画し、UI はその capped preview だけを表示します。
+
+reader が `around_node_id` でヒットへ移動する場合は、reader と同じページング集合を使います。Show internal がオフなら visible-only rows、Show internal がオンなら完全な node collection、current-path node がない壊れた conversation では effective all-node collection です。
+
 データベースがある場合は明示的に指定するか、既定のパスを使えます。データベースがない場合でも Web UI を起動し、インポートパネルから ChatGPT エクスポート ZIP をアップロードできます。アップロードインポートは直列化され、同じプロセス内で同時に動く SQLite writer は 1 つだけです。
 
 Web アップロードインポートが成功すると、バックエンドは CLI と同じコア import pipeline を使い、その後 `verify`、`stats`、`web-index` を実行します。アップロードされた ZIP はサーバー側の一時コピーであり、ディスク上の元ファイルとは独立して削除されます。
 
-Web アップロードでは、インポート job を開始する前にアプリケーションレベルの安全制限も適用されます。`CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` はアップロード ZIP 全体のサイズを制御し、既定は 20 GiB です。conversation JSON member は既定で最大 5,000 ファイル、1 member あたり 64 GiB、合計未圧縮データ 128 GiB、大きな JSON member の圧縮率 1000:1 に制限されます。正規の ChatGPT アーカイブが既定値を超える場合は、Web UI 起動前により大きい環境変数を設定できますが、ZIP bomb やディスク圧迫のリスクが増えるため、信頼できるローカルファイルだけに使ってください。
+## Web アップロードの安全制限
+
+Web アップロードは、インポート job の開始前にアプリケーションレベルの安全制限を適用します。これらは環境変数で制御され、CLI の `import`（これらの制限を使用しません）とは独立しています。
+
+Web アップロードは、ファイル読み取り前に pending slot を予約するため、大きなアップロードが別の writer と競合することはありません。その予約後のあらゆるエラー、たとえば一時アップロードパスの作成失敗では、slot を解放し、サーバー側の一時ディレクトリを削除する必要があります。成功した import job は slot と一時コピーを引き継ぎます。
+
+Web UI が loopback アドレス（`127.0.0.1`、`localhost`、`::1`）にバインドされている場合、デフォルトで大規模な信頼できるアーカイブを許可します：
+
+| 環境変数 | ローカルデフォルト | 制御対象 |
+|---|---|---|
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` | 20 GiB | 圧縮 ZIP アップロードの総サイズ |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES` | 64 GiB | 単一 JSON member の最大非圧縮サイズ |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBERS` | 5,000 | conversation JSON member の最大数 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES` | 128 GiB | 非圧縮 JSON データ総量の上限 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO` | 1,000.0 | 大規模 JSON member の最大圧縮率 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | ZIP 内の総 member 数の上限 |
+| `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | unset | 信頼できる非 loopback ネットワークでのみ `local` に設定し、未設定のアップロード制限にローカル既定値を使う |
+
+**リモートバインドポリシー。** Web UI が非 loopback アドレス（`0.0.0.0`、`::`、LAN IP など）にバインドされている場合、サーバーは保守的な remote-safe デフォルトを適用します：128 MiB 圧縮 ZIP、256 MiB/JSON member、512 MiB 総非圧縮、200.0 圧縮率、200 JSON member、10,000 ZIP 総 member。`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` は明示的に設定した各制限だけを remote-safe デフォルトより上にできます。未設定の制限は remote-safe のままです。信頼できる LAN で未設定の制限もローカルの大きな既定値に戻すには、`CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` を設定します。どちらのリモートモードもローカルアーカイブブラウザーとアップロード入口を公開するため、信頼できるネットワークでのみ使ってください。
+
+`/api/schema` は実行中ホストの有効なアップロードポリシーを報告します。remote-safe、明示的な remote override、local-profile のどれが有効かも含まれます。ZIP サイズチェックはインポート前に実行されますが、直接 JSON 解析、SQLite 書き込み、`web-index` 再構築は、展開後の conversation JSON サイズに応じてメモリ、ディスク、CPU を消費します。非常に大きなアーカイブでは、信頼できるローカル環境、CLI import、十分なディスクとメモリを推奨します。
+
+正規の大規模アーカイブのためにローカル制限を引き上げるには、Web UI 起動前に対応する変数を設定します：
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440
+python chatgpt_archive.py web --port 8787
+```
+
+信頼できる内部ネットワークで明示的な圧縮 ZIP 上限だけを上げ、他の未設定制限を remote-safe のままにするには：
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS = "true"
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+信頼できる内部ネットワークで完全なローカルアップロード profile を使うには：
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+信頼できるローカルファイルにのみ、より高い制限を設定してください。値を大きくすると、ZIP bomb、ディスク圧迫、CPU/メモリのリスクが高まります。
 
 
 ## Web UI 受け入れチェックリスト
@@ -249,6 +336,8 @@ runnable delivery の Web 経路は `webui/node_modules` を必要としない�
 
 CLI 検索は、SQLite のクエリ文字列を直接渡すのではなく、プロジェクト共通の安全な検索構文を使います。通常のキーワード、引用符付きフレーズ、`-term` による除外、`OR`、`role:user`、`source:zip`、`path:current`、`path:all`、`scope:title`、`scope:message` などのフィルターを使えます。表示されるのは conversation ID、node ID、role で、snippet は表示されません。
 
+除外語は会話結果では conversation-level の意味です。選択中の検索 scope と path 内で、タイトルまたは任意のメッセージが除外 fragment に一致すると、その conversation は返されません。`/api/search/messages` は、除外 fragment を含まないメッセージヒットだけを返します。`path:current` は conversation ごとの reader パスに従います。壊れたアーカイブに current-path node が 1 つもない場合、current-path 検索は reader が表示する同じ all-node ビューへ fallback します。
+
 `after:2026-05-01`、`before:2026-05-13`、`--from`、`--to` などの日付フィルターは、ローカルタイムゾーンの日付ではなく UTC のカレンダー日を使います。開始日はその日の `00:00:00Z` を含み、終了日は翌日の `00:00:00Z` を排他的な上限として扱うため、`23:59:59.5Z` のような小数秒 timestamp もその日に含まれます。Web 検索欄は 500 文字までです。より長い構造化条件には詳細フィルターを使ってください。
 
 ```bash
@@ -262,6 +351,8 @@ Web 検索は `web-index` が作成する任意の normalized trigram インデ�
 ```bash
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
+
+検索 diagnostics は best-effort の性能ヒントです。normalized trigram、normalized scan、normalized title scan、full scan など、normalized-safe な候補層または scan fallback だけを報告します。legacy raw FTS の存在は別項目として報告できますが、正規化等価テキストを見落とす可能性があるため、実際の candidate backend として表示してはいけません。
 
 `VACUUM`、`VACUUM INTO` を手動で実行した場合、または外部の圧縮/バックアップツールで SQLite データベースを書き直した場合は、Web UI 検索に頼る前に `python chatgpt_archive.py web-index --db <archive.db>` をもう一度実行してください。任意 Web インデックスは正規の会話テーブルから安全に再構築でき、元の会話データは変更しません。
 
@@ -338,7 +429,7 @@ python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 
 ## 配布時の注意
 
-runnable delivery には Python ソース、テスト、ドキュメント、`requirements-web.txt`、`webui/dist` を含めます。`webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python cache ディレクトリや bytecode、coverage/typecheck cache、`.DS_Store`、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、一時ログ、ローカル受け入れログ、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任意の `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` などの実データベースファイル、または `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` などの SQLite sidecar は含めないでください。ディレクトリ検査では対象ルート直下の `.git` は許可されるため通常の Git clone をそのまま検査できますが、入れ子の `.git` は失敗します。ZIP delivery ではどの `.git` エントリも失敗します。
+runnable delivery には Python ソース、テスト、ドキュメント、`requirements-web.txt`、`webui/src` と `webui/tests` のフロントエンドソースとテスト、フロントエンド設定/package ファイル、`webui/dist` のビルド済み assets を含めます。`webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python cache ディレクトリや bytecode、coverage/typecheck cache、`.DS_Store`、AppleDouble `._*` ファイル、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、一時ログ、ローカル受け入れログ、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任意の `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` などの実データベースファイル、または `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` などの SQLite sidecar は含めないでください。ディレクトリ検査では対象ルート直下の `.git` は許可されるため通常の Git clone をそのまま検査できますが、入れ子の `.git` は失敗します。ZIP delivery ではどの `.git` エントリも失敗します。
 
 source-only delivery では `webui/dist` を省略できますが、その場合は完全な React UI を配信する前にフロントエンドを再ビルドする必要があります。
 
@@ -368,4 +459,5 @@ tools/                             Delivery and support scripts
 - これはローカルアーカイブツールであり、クラウド同期サービスではありません。
 - Web UI はローカル利用を想定しています。独自のアクセス制御なしに信頼できないネットワークへ公開しないでください。
 - エクスポート解析は、現在確認されている OpenAI / ChatGPT のエクスポート形式に従います。上流の形式が変わった場合は、新しいインポート経路を信頼する前に `inspect` とテストを更新してください。
+- エクスポートファイル名の部品は Windows と Unix 系の両方に向けてサニタイズされます。`CON`、`AUX`、`COM1`、`LPT9`、`COM¹`、`LPT²` などの予約デバイス名、末尾のドットや空白も対象です。
 - 非常に大きなアーカイブでは、インポート、FTS 再構築、Web trigram インデックス作成に時間がかかることがあります。大規模インポートでは `--rebuild-fts` 経路を優先してください。

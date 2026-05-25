@@ -13,6 +13,7 @@ interface Props {
   t: (key: string) => string;
   onCopy: (text: string) => Promise<boolean>;
   onSizeMayChange: () => void;
+  currentPathFallbackToAll?: boolean;
 }
 
 function pieces(text: string, ranges: HighlightRange[]) {
@@ -64,31 +65,17 @@ function looksLikeTechnicalPayload(message: MessageItem, text: string): boolean 
   if (role !== "assistant") return false;
   const trimmed = text.trim();
   if (contentType === "thoughts" || trimmed.startsWith("source analysis msg id:")) return true;
-  if (!trimmed.startsWith("{") || !trimmed.endsWith("}") || trimmed.length > 4000) return false;
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    const keys = Object.keys(parsed as Record<string, unknown>);
-    return keys.some((key) => [
-      "search_query",
-      "open",
-      "click",
-      "find",
-      "screenshot",
-      "response_length",
-      "ref_id",
-    ].includes(key));
-  } catch {
-    return false;
-  }
+  return false;
 }
 
-export default function MessageBlock({ message, conversationId, active, layout, showRawDefault, t, onCopy, onSizeMayChange }: Props) {
+export default function MessageBlock({ message, conversationId, active, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
   const [showRaw, setShowRaw] = useState(showRawDefault);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [fullRaw, setFullRaw] = useState("");
+  const [fullRawTruncated, setFullRawTruncated] = useState(false);
   const [fullRawLoading, setFullRawLoading] = useState(false);
   const [fullRawError, setFullRawError] = useState("");
+  const FULL_RAW_MAX_CHARS = 50000;
   const mountedRef = useRef(true);
   const measureFrameRef = useRef<number | null>(null);
   const rawControllerRef = useRef<AbortController | null>(null);
@@ -102,6 +89,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   const side = isTechnicalPayload ? "system" : chatSide(message);
   const shouldCollapseDetails = shouldUseChat && isTechnicalPayload;
   const articleClass = `message ${roleClass(message.role)} ${message.is_internal ? "message-internal" : ""} ${active ? "message-active" : ""}`;
+  const showBranchBadge = !message.is_on_current_path && !message.effective_visible_in_current_view && !message.current_path_fallback_to_all && !currentPathFallbackToAll;
   const messageIdentity = `${conversationId}:${message.node_id}:${message.message_id || ""}:${message.content_hash || ""}`;
   const messageIdentityRef = useRef(messageIdentity);
   messageIdentityRef.current = messageIdentity;
@@ -132,6 +120,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
     setShowRaw(showRawDefault);
     setDetailsOpen(false);
     setFullRaw("");
+    setFullRawTruncated(false);
     setFullRawLoading(false);
     setFullRawError("");
     notifySizeMayChange();
@@ -148,6 +137,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
       rawControllerRef.current?.abort();
       rawControllerRef.current = null;
       setFullRaw("");
+      setFullRawTruncated(false);
       setFullRawError("");
       setFullRawLoading(false);
       notifySizeMayChange();
@@ -162,9 +152,18 @@ export default function MessageBlock({ message, conversationId, active, layout, 
     setFullRawError("");
     notifySizeMayChange();
     try {
-      const data = await getRawMessage(conversationId, message.node_id, controller.signal);
+      const data = await getRawMessage(conversationId, message.node_id, controller.signal, FULL_RAW_MAX_CHARS);
       if (!mountedRef.current || requestId !== rawRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
-      setFullRaw(JSON.stringify(data.raw_message, null, 2));
+      if (data.truncated && typeof data.raw_text === "string") {
+        setFullRaw(data.raw_text);
+      } else if (typeof data.raw_message === "object" && data.raw_message !== null) {
+        setFullRaw(JSON.stringify(data.raw_message, null, 2));
+      } else if (typeof data.raw_message === "string") {
+        setFullRaw(data.raw_message);
+      } else {
+        setFullRaw(String(data.raw_message ?? ""));
+      }
+      setFullRawTruncated(Boolean(data.truncated));
     } catch (error) {
       if (
         !mountedRef.current ||
@@ -200,7 +199,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
       <header className="message-header">
         <span className="role-pill">{role}</span>
         <span>{timestamp}</span>
-        {!message.is_on_current_path && <span className="branch-pill">{t("branch")}</span>}
+        {showBranchBadge && <span className="branch-pill">{t("branch")}</span>}
         {message.is_internal && <span className="branch-pill">{t("internal")}</span>}
         {message.has_raw && (
           <button type="button" className="icon-button" onClick={toggleRawPreview}>
@@ -238,6 +237,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
           {message.has_raw && <button type="button" className="raw-full-button" onClick={openFullRaw} disabled={fullRawLoading}>{fullRawLoading ? t("fullRawLoading") : fullRaw ? t("closeFullRaw") : t("openFullRaw")}</button>}
           {fullRawError && <p className="raw-error">{fullRawError}</p>}
           {fullRaw && <pre className="raw-message raw-full">{fullRaw}</pre>}
+          {fullRawTruncated && <p className="raw-error">{t("rawTruncated")}</p>}
         </>
       )}
     </>
@@ -251,7 +251,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
             <span className="role-pill">{role}</span>
             <span>{timestamp}</span>
             {message.is_internal && <span className="branch-pill">{t("internal")}</span>}
-            {!message.is_on_current_path && <span className="branch-pill">{t("branch")}</span>}
+            {showBranchBadge && <span className="branch-pill">{t("branch")}</span>}
             <span>{message.content_type || "text"} {t("hiddenInternal")}</span>
           </summary>
           {header}

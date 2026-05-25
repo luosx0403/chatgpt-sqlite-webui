@@ -242,8 +242,9 @@ def drop_optional_web_indexes(conn: sqlite3.Connection) -> list[dict[str, str]]:
     """Invalidate optional Web search indexes before archive tables change.
 
     These indexes are rebuilt by the explicit `web-index` command. Import/upsert
-    modifies conversations and nodes, so keeping stale normalized rows would
-    create false-positive search results after an incremental import.
+    modifies conversations and nodes, so keeping stale normalized rows or
+    stale trigram candidates could create false-positive or false-negative
+    search results after an incremental import.
     """
     failures: list[dict[str, str]] = []
     for table in OPTIONAL_WEB_TRIGRAM_TABLES:

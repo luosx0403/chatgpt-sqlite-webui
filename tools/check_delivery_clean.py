@@ -108,14 +108,26 @@ def _is_dangerous_zip_member(name: str) -> bool:
 
 def _strip_single_zip_root(names: list[str]) -> list[str]:
     normalized = [name.replace("\\", "/").lstrip("/") for name in names]
-    roots = {PurePosixPath(name).parts[0] for name in normalized if PurePosixPath(name).parts}
+    usable = [
+        name for name in normalized
+        if PurePosixPath(name).parts
+        and PurePosixPath(name).parts[0] != "__MACOSX"
+        and not any(part.startswith("._") for part in PurePosixPath(name).parts)
+    ]
+    roots = {PurePosixPath(name).parts[0] for name in usable if PurePosixPath(name).parts}
     if len(roots) != 1:
         return normalized
     root = next(iter(roots))
     stripped = []
     for name in normalized:
         parts = PurePosixPath(name).parts
-        stripped.append(PurePosixPath(*parts[1:]).as_posix() if len(parts) > 1 else "")
+        if not parts:
+            stripped.append("")
+            continue
+        if parts[0] == root:
+            stripped.append(PurePosixPath(*parts[1:]).as_posix() if len(parts) > 1 else "")
+        else:
+            stripped.append(name)
     return [name for name in stripped if name]
 
 
@@ -155,6 +167,8 @@ def _is_forbidden_parts(parts: tuple[str, ...], suffix: str, mode: str) -> bool:
     if suffix.lower() in ALWAYS_FORBIDDEN_SUFFIXES:
         return True
     if any(pattern.fullmatch(name) for pattern in ALWAYS_FORBIDDEN_PATTERNS):
+        return True
+    if name.startswith("._") or any(part.startswith("._") for part in parts):
         return True
     return False
 

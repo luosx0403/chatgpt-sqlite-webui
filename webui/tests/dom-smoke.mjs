@@ -59,6 +59,7 @@ function assertStaticFrontendContracts() {
   const paneSource = fs.readFileSync(path.join(webRoot, "src/components/ConversationPane.tsx"), "utf8");
   const querySyntaxSource = fs.readFileSync(path.join(webRoot, "src/utils/querySyntax.ts"), "utf8");
   const i18nSource = fs.readFileSync(path.join(webRoot, "src/i18n.ts"), "utf8");
+  const stylesSource = fs.readFileSync(path.join(webRoot, "src/styles.css"), "utf8");
   assert.ok(appSource.includes('web_index_recovery: t("stageWebIndexRecovery")'), "web-index-recovery import stage should use a localized label");
   assert.ok(appSource.includes("has_internal_hits: meta.has_internal_hits"), "selected conversation merge must preserve hidden/internal search metadata after detail load");
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
@@ -73,6 +74,9 @@ function assertStaticFrontendContracts() {
   assert.ok(i18nSource.includes("stageWebIndexRecovery"), "web-index-recovery stage label should be translated");
   assert.ok(i18nSource.includes("UTC calendar days"), "date filter UTC wording should be visible in search help");
   assert.ok(i18nSource.includes("preparingCopy"), "copy loading state should be localized");
+  assert.ok(appSource.includes("importInputRef"), "successful upload should be able to clear the file input");
+  assert.ok(stylesSource.includes(".search-diagnostics-hint"), "diagnostics hint styles should target the current class");
+  assert.equal(stylesSource.includes(".diagnostics-hint"), false, "stale diagnostics-hint selector should not return");
 }
 
 if (process.argv.includes("--self-test-python-resolution")) {
@@ -227,6 +231,13 @@ function makeSyntheticConversations() {
   };
   conversations.push(conversation("dom-branch-override", "DOM Branch Override Conversation", branchOverrideMapping, "a", 1_955_200_000));
 
+  const damagedCurrentMapping = {
+    root: root(["u"]),
+    u: node("u", "root", "user", "damaged-current-visible-needle is visible through current fallback.", 1_955_300_001, ["a"]),
+    a: node("a", "u", "assistant", "Assistant repeats damaged-current-visible-needle for navigation.", 1_955_300_002),
+  };
+  conversations.push(conversation("dom-damaged-current", "DOM Damaged Current Fallback", damagedCurrentMapping, "a", 1_955_300_000));
+
   const readerFilterMapping = {
     root: root(["u"]),
     u: node("u", "root", "user", "filtertarget user body", 1_955_500_001, ["a"]),
@@ -247,8 +258,9 @@ function makeSyntheticConversations() {
     u: node("u", "root", "user", '{"ordinary":"user json should stay as a normal chat message"}', 1_957_000_001, ["a"]),
     a: node("a", "u", "assistant", "```json\n{\"ordinary\":\"assistant code block should stay readable\"}\n```", 1_957_000_002, ["q"]),
     q: node("q", "a", "assistant", '{"query":"synthetic archive question","answer":{"data":[1,2,3],"title":"ordinary JSON result"}}', 1_957_000_003, ["b"]),
-    b: node("b", "q", "assistant", '{"search_query":[{"q":"synthetic docs"}],"response_length":"short"}', 1_957_000_004, ["c"]),
-    c: rawNode("c", "b", "assistant", { content_type: "thoughts", text: "source analysis msg id: synthetic-source-analysis-id", extra: "x".repeat(1200) }, 1_957_000_004),
+    b: node("b", "q", "assistant", '{"search_query":[{"q":"ordinary assistant JSON example"}],"response_length":"short"}', 1_957_000_004, ["d"]),
+    d: node("d", "b", "tool/system", '{"search_query":[{"q":"synthetic docs"}],"response_length":"short"}', 1_957_000_005, ["c"]),
+    c: rawNode("c", "d", "assistant", { content_type: "thoughts", text: "source analysis msg id: synthetic-source-analysis-id", extra: "x".repeat(1200) }, 1_957_000_006),
   };
   conversations.push(conversation("dom-tech-json", "DOM Technical JSON Conversation", techJsonMapping, "c", 1_957_000_000));
 
@@ -608,10 +620,26 @@ async function main() {
     await noDbPage.goto(noDbUrl, { waitUntil: "networkidle" });
     assert.equal(await noDbPage.locator("text=Fallback UI").count(), 0, "no-db web should serve React UI, not fallback");
     await noDbPage.getByTestId("import-panel").waitFor({ state: "visible", timeout: 20_000 });
+    let failedUploadOnce = false;
+    await noDbPage.route("**/api/import/upload", async (route) => {
+      if (!failedUploadOnce) {
+        failedUploadOnce = true;
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ detail: "synthetic upload failure" }) });
+        return;
+      }
+      await route.continue();
+    });
     await noDbPage.getByTestId("import-zip-input").setInputFiles(uploadZip);
     await noDbPage.getByTestId("import-start-button").click();
+    await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("synthetic upload failure"), undefined, { timeout: 20_000 });
+    assert.ok((await noDbPage.getByTestId("import-panel").textContent())?.includes("Selected ZIP"), "failed upload should keep selected file for retry");
+    assert.equal(await noDbPage.getByTestId("import-start-button").count(), 1, "failed upload should keep retry button");
+    await noDbPage.getByTestId("import-start-button").click();
     await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-status"]')?.textContent?.includes("succeeded"), undefined, { timeout: 60_000 });
+    await noDbPage.waitForFunction(() => !document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("Selected ZIP"), undefined, { timeout: 20_000 });
+    assert.equal(await noDbPage.getByTestId("import-start-button").count(), 0, "successful job creation should clear selected file and start button");
     await noDbPage.waitForFunction(() => document.querySelectorAll(".conversation-item").length >= 1, undefined, { timeout: 20_000 });
+    await noDbPage.unroute("**/api/import/upload");
     await noDbContext.close();
     if (noDbServer.exitCode === null && noDbServer.signalCode === null) {
       noDbServer.kill("SIGTERM");
@@ -624,6 +652,12 @@ async function main() {
     await fsp.writeFile(path.join(inputDir, "conversations.json"), JSON.stringify(makeSyntheticConversations()), "utf8");
     const db = path.join(tmp, "archive.db");
     run([...pythonCommand(), "chatgpt_archive.py", "import", "--db", db, "--input", inputDir, "--no-input-sha256"]);
+    run([
+      ...pythonCommand(),
+      "-c",
+      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.commit(); conn.close()",
+      db,
+    ]);
     run([...pythonCommand(), "chatgpt_archive.py", "web-index", "--db", db]);
 
     const port = 19_000 + Math.floor(Math.random() * 2000);
@@ -692,6 +726,95 @@ async function main() {
     await page.waitForFunction(() => document.querySelector(".results-meta")?.textContent?.includes("0 of 0 conversations"), undefined, { timeout: 10_000 });
     await page.unroute("**/api/conversations**");
     await page.locator("#global-search").fill("");
+    await waitForCount(page, ".conversation-item", 20);
+    assert.equal(await page.getByTestId("search-diagnostics-hint").count(), 0, "diagnostics hint should not show without a search context");
+
+    const internalDiagnosticEnums = [
+      "candidate_backend",
+      "web_index_missing",
+      "fts_legacy",
+      "normalized_trigram",
+      "normalized_title_trigram",
+      "normalized_scan",
+      "normalized_title_scan",
+      "full_scan",
+      "actual_fallback_note",
+      "estimated_backend_note",
+      "diagnostics_accuracy",
+    ];
+    await page.route("**/api/conversations**", async (route) => {
+      const url = new URL(route.request().url());
+      const diagQuery = url.searchParams.get("q");
+      if (url.pathname === "/api/conversations" && ["diag-target", "diag-ja", "diag-es"].includes(diagQuery || "")) {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            items: [],
+            total: 0,
+            limit: 50,
+            offset: 0,
+            has_more: false,
+            next_offset: null,
+            selected_in_results: null,
+            diagnostics: {
+              candidate_backend: diagQuery === "diag-ja" ? "unknown_future_backend" : "full_scan",
+              web_index_missing: diagQuery === "diag-target",
+              short_query: diagQuery === "diag-es",
+              legacy_fts_present: true,
+              actual_fallback_note: diagQuery === "diag-ja" ? undefined : "legacy_fts_present_not_normalized_safe_candidate",
+              estimated_backend_note: diagQuery === "diag-ja" ? undefined : "synthetic_estimate",
+              diagnostics_accuracy: diagQuery === "diag-ja" ? "future_accuracy" : "best_effort",
+            },
+          }),
+        });
+        return;
+      }
+      await route.continue();
+    });
+    await page.locator("#global-search").fill("diag-target");
+    await page.getByTestId("search-diagnostics-hint").waitFor({ state: "visible", timeout: 20_000 });
+    const diagnosticsHint = await page.getByTestId("search-diagnostics-hint").textContent();
+    assert.ok(diagnosticsHint?.includes("Web search index") || diagnosticsHint?.includes("search index"), "diagnostics hint should be user-readable localized text");
+    for (const token of internalDiagnosticEnums) {
+      assert.equal(diagnosticsHint?.includes(token), false, `diagnostics hint should not leak internal enum ${token}`);
+    }
+    for (const [lang, query, expectedFragment] of [
+      ["ja", "diag-ja", "Web 検索インデックス"],
+      ["es", "diag-es", "ruta segura"],
+    ]) {
+      await page.evaluate((language) => {
+        const key = "chatgptArchiveWeb.settings.v2";
+        const current = JSON.parse(localStorage.getItem(key) || "{}");
+        localStorage.setItem(key, JSON.stringify({ ...current, language }));
+      }, lang);
+      await page.reload({ waitUntil: "networkidle" });
+      await page.locator("#global-search").fill(query);
+      await page.waitForFunction(
+        (expected) => new URL(window.location.href).searchParams.get("q") === expected,
+        query,
+        { timeout: 20_000 },
+      );
+      const hintHandle = await page.waitForFunction(
+        () => document.querySelector('[data-testid="search-diagnostics-hint"]')?.textContent || false,
+        undefined,
+        { timeout: 20_000 },
+      );
+      const localizedHint = await hintHandle.jsonValue();
+      assert.ok(localizedHint?.includes(expectedFragment), `${lang} diagnostics hint should use localized readable text; got ${localizedHint}`);
+      for (const token of internalDiagnosticEnums) {
+        assert.equal(localizedHint?.includes(token), false, `${lang} diagnostics hint should not leak internal enum ${token}`);
+      }
+    }
+    await page.evaluate(() => {
+      const key = "chatgptArchiveWeb.settings.v2";
+      const current = JSON.parse(localStorage.getItem(key) || "{}");
+      localStorage.setItem(key, JSON.stringify({ ...current, language: "en" }));
+    });
+    await page.reload({ waitUntil: "networkidle" });
+    await page.unroute("**/api/conversations**");
+    await page.locator("#global-search").fill("");
+    await page.getByTestId("search-diagnostics-hint").waitFor({ state: "hidden", timeout: 20_000 });
     await waitForCount(page, ".conversation-item", 20);
 
     const matchModeRequests = [];
@@ -836,24 +959,13 @@ async function main() {
     await page.locator(".message-scroll").evaluate((node) => { node.scrollTop = 500; });
     await page.waitForFunction(() => document.querySelector(".message-scroll")?.scrollTop > 0);
 
-    await page.getByRole("button", { name: "Copy full conversation" }).click();
+    await page.getByRole("button", { name: "Copy current path conversation" }).click();
     await page.waitForFunction(() => window.__copiedText?.includes("Synthetic message 379"), undefined, { timeout: 20_000 });
-    assert.equal(await page.evaluate(() => window.__copiedText.includes("Synthetic system context for DOM test")), true, "copy full conversation should include all nodes, including internal messages");
+    assert.equal(await page.evaluate(() => window.__copiedText.includes("Synthetic system context for DOM test")), false, "copy current path conversation should respect hidden internal messages");
     await page.evaluate(() => { window.__copiedText = ""; });
-    const slowCopyFirstPage = async (route) => {
-      const url = new URL(route.request().url());
-      if (url.pathname === "/api/conversations/dom-long/messages" && url.searchParams.get("offset") === "0") {
-        await new Promise((resolve) => setTimeout(resolve, 300));
-      }
-      await route.continue();
-    };
-    await page.route("**/api/conversations/dom-long/messages**", slowCopyFirstPage, { times: 1 });
     await page.getByRole("button", { name: "Copy visible" }).click();
-    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Preparing copy"), undefined, { timeout: 20_000 });
-    assert.equal(await page.getByRole("button", { name: "Preparing copy..." }).isDisabled(), true, "copy buttons should be disabled while preparing the full visible collection");
-    await page.waitForFunction(() => window.__copiedText?.includes("Synthetic message 379"), undefined, { timeout: 20_000 });
-    assert.equal(await page.evaluate(() => window.__copiedText.includes("Synthetic system context for DOM test")), false, "copy visible should copy the full current reader-visible message set, not only rendered rows");
-    await page.unroute("**/api/conversations/dom-long/messages**", slowCopyFirstPage).catch(() => undefined);
+    await page.waitForFunction(() => window.__copiedText?.includes("Synthetic message 120"), undefined, { timeout: 20_000 });
+    assert.equal(await page.evaluate(() => window.__copiedText.includes("Synthetic system context for DOM test")), false, "copy visible should copy loaded reader-visible messages, not hidden internal messages");
     const copiedBeforeFailure = await page.evaluate(() => window.__copiedText || "");
     await page.evaluate(() => {
       Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
@@ -876,7 +988,7 @@ async function main() {
       await route.continue();
     };
     await page.route("**/api/conversations/dom-long/messages**", failSecondMessagePage);
-    await page.getByRole("button", { name: "Copy full conversation" }).click();
+    await page.getByRole("button", { name: "Copy current path conversation" }).click();
     await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Copy conversation failed"), undefined, { timeout: 20_000 });
     assert.equal(await page.evaluate(() => window.__copiedText || ""), copiedBeforeFailure, "failed full-copy pagination must not overwrite clipboard with a partial conversation");
     await page.unroute("**/api/conversations/dom-long/messages**", failSecondMessagePage);
@@ -889,24 +1001,40 @@ async function main() {
     await page.getByRole("button", { name: "Show raw preview" }).first().click();
     await page.locator(".raw-message").first().waitFor({ state: "visible", timeout: 10_000 });
     await assertStableMessageViewport(page, "raw preview expansion");
-    await page.getByRole("button", { name: "Open full raw JSON" }).first().click();
+    const cappedRawText = 'plain raw_text preview with "quotes" and \\ backslash';
+    await page.route("**/api/conversations/*/messages/*/raw?*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          raw_message: { compat: "field should not render when raw_text is present" },
+          raw_text: cappedRawText,
+          raw_size: cappedRawText.length + 20,
+          truncated: true,
+        }),
+      });
+    }, { times: 1 });
+    await page.getByRole("button", { name: "Open larger raw preview" }).first().click();
     await page.locator(".raw-full").first().waitFor({ state: "visible", timeout: 20_000 });
-    await assertStableMessageViewport(page, "async full raw JSON expansion");
-    await page.route("**/api/conversations/*/messages/*/raw", async (route) => {
+    assert.equal(await page.locator(".raw-full").first().textContent(), cappedRawText, "truncated larger raw preview should render raw_text as plain text");
+    assert.equal((await page.locator(".raw-full").first().textContent())?.includes('\\"'), false, "truncated raw_text should not be JSON string escaped");
+    assert.ok((await page.locator(".raw-error").first().textContent())?.includes("truncated"), "truncated capped raw preview should show a localized note");
+    await assertStableMessageViewport(page, "async larger raw preview expansion");
+    await page.route("**/api/conversations/*/messages/*/raw?*", async (route) => {
       await route.fulfill({ status: 500, contentType: "application/json", body: '{"detail":"synthetic raw failure"}' });
     }, { times: 1 });
-    await page.getByRole("button", { name: "Close full raw JSON" }).first().click();
+    await page.getByRole("button", { name: "Close larger raw preview" }).first().click();
     await page.waitForFunction(() => document.querySelectorAll(".raw-full").length === 0, undefined, { timeout: 20_000 });
-    await assertStableMessageViewport(page, "full raw JSON collapse");
-    await page.getByRole("button", { name: "Open full raw JSON" }).first().click();
+    await assertStableMessageViewport(page, "larger raw preview collapse");
+    await page.getByRole("button", { name: "Open larger raw preview" }).first().click();
     await page.locator(".raw-error").first().waitFor({ state: "visible", timeout: 20_000 });
-    await assertStableMessageViewport(page, "full raw JSON error state");
-    await page.unroute("**/api/conversations/*/messages/*/raw");
-    await page.getByRole("button", { name: "Open full raw JSON" }).first().click();
+    await assertStableMessageViewport(page, "larger raw preview error state");
+    await page.unroute("**/api/conversations/*/messages/*/raw?*");
+    await page.getByRole("button", { name: "Open larger raw preview" }).first().click();
     await page.locator(".raw-full").first().waitFor({ state: "visible", timeout: 20_000 });
     assert.equal(await page.locator(".raw-error").count(), 0, "full raw retry should clear the visible error state");
-    await assertStableMessageViewport(page, "full raw JSON retry success");
-    await page.getByRole("button", { name: "Close full raw JSON" }).first().click();
+    await assertStableMessageViewport(page, "larger raw preview retry success");
+    await page.getByRole("button", { name: "Close larger raw preview" }).first().click();
     await page.waitForFunction(() => document.querySelectorAll(".raw-full").length === 0, undefined, { timeout: 20_000 });
     await page.getByRole("button", { name: "Hide raw preview" }).first().click();
     await page.waitForFunction(() => document.querySelectorAll(".raw-message").length === 0, undefined, { timeout: 20_000 });
@@ -915,7 +1043,7 @@ async function main() {
     await page.locator(".message-scroll").evaluate((node) => { node.scrollTop = 0; });
     await page.getByLabel("Show internal messages").check();
     await page.locator(".message-disclosure.message-internal").first().waitFor({ state: "visible", timeout: 20_000 });
-    await page.getByRole("button", { name: "Copy full conversation" }).click();
+    await page.getByRole("button", { name: "Copy current path conversation" }).click();
     await page.waitForFunction(() => window.__copiedText?.includes("Synthetic system context for DOM test"), undefined, { timeout: 20_000 });
     assert.equal(await page.locator('[data-node-id="root"]').count(), 0, "empty root mapping node should not render as a normal visible message");
     assert.equal(await page.evaluate(() => window.__copiedText.includes("root:\n") || window.__copiedText.includes("message:\n\n")), false, "copy conversation should skip empty mapping nodes");
@@ -946,10 +1074,10 @@ async function main() {
       await openInternal.getByRole("button", { name: "Show raw preview" }).click();
       await openInternal.locator(".raw-message").first().waitFor({ state: "visible", timeout: 10_000 });
       await assertStableMessageViewport(page, "internal raw preview expansion");
-      await openInternal.getByRole("button", { name: "Open full raw JSON" }).click();
+      await openInternal.getByRole("button", { name: "Open larger raw preview" }).click();
       await openInternal.locator(".raw-full").first().waitFor({ state: "visible", timeout: 20_000 });
-      await assertStableMessageViewport(page, "internal full raw JSON expansion");
-      await openInternal.getByRole("button", { name: "Close full raw JSON" }).click();
+      await assertStableMessageViewport(page, "internal larger raw preview expansion");
+      await openInternal.getByRole("button", { name: "Close larger raw preview" }).click();
       await openInternal.locator(".raw-full").waitFor({ state: "hidden", timeout: 20_000 });
       await openInternal.getByRole("button", { name: "Hide raw preview" }).click();
       await openInternal.locator(".raw-message").waitFor({ state: "hidden", timeout: 20_000 });
@@ -1002,14 +1130,14 @@ async function main() {
     assert.ok(!toolClassName.includes("/"), "message role classes must be CSS-safe");
 
     await page.goto(`${baseUrl}?conversation=dom-tech-json`, { waitUntil: "networkidle" });
-    await page.locator(".message-disclosure.message-role-assistant").first().waitFor({ state: "visible", timeout: 20_000 });
     assert.ok(await page.locator(".message-row-user .message-disclosure").count() === 0, "ordinary user JSON should not be folded as technical payload");
     assert.ok(await page.locator(".message-row-assistant .message-disclosure").count() === 0, "ordinary assistant code block should not be folded as technical payload");
     assert.ok(await page.locator(".message-row-assistant .message-text").filter({ hasText: "ordinary JSON result" }).count() >= 1, "ordinary assistant JSON with a query key should stay expanded");
-    assert.ok(await page.locator(".message-disclosure.message-role-assistant").count() >= 1, "assistant tool JSON should fold as a technical payload");
+    assert.ok(await page.locator(".message-row-assistant .message-text").filter({ hasText: "ordinary assistant JSON example" }).count() >= 1, "ordinary assistant tool-like JSON should stay expanded");
     await page.getByLabel("Show internal messages").check();
     await page.locator(".message-disclosure.message-internal").first().waitFor({ state: "visible", timeout: 20_000 });
-    assert.ok(await page.locator(".message-disclosure.message-role-assistant").count() >= 2, "source analysis assistant payload should be hidden until internal messages are shown, then fold as technical");
+    assert.ok(await page.locator(".message-disclosure.message-role-tool-system").count() >= 1, "internal tool JSON should fold as a technical payload");
+    assert.ok(await page.locator(".message-disclosure.message-role-assistant").count() >= 1, "source analysis assistant payload should be hidden until internal messages are shown, then fold as technical");
     assert.equal(await page.locator(".message-scroll").evaluate((node) => node.scrollWidth > node.clientWidth), false, "technical JSON should not cause horizontal message scrolling");
 
     await page.goto(`${baseUrl}?conversation=dom-title-only`, { waitUntil: "networkidle" });
@@ -1024,10 +1152,36 @@ async function main() {
     assert.equal(await page.locator(".search-highlight").count(), 0);
 
     await page.goto(`${baseUrl}?conversation=dom-branch-override`, { waitUntil: "networkidle" });
+	    await page.getByLabel("Message path").selectOption("current");
+	    await page.evaluate(() => { window.__copiedText = ""; });
+	    await page.getByRole("button", { name: "Copy current path conversation" }).click();
+	    await page.waitForFunction(() => window.__copiedText?.includes("Current answer body."), undefined, { timeout: 20_000 });
+	    assert.equal(await page.evaluate(() => window.__copiedText.includes("branchoverride-token")), false, "copy current path conversation should not include branch-only nodes while path=current");
+
+	    await page.goto(`${baseUrl}?conversation=dom-damaged-current`, { waitUntil: "networkidle" });
+	    await page.getByLabel("Message path").selectOption("current");
+	    await page.locator("#global-search").fill("damaged-current-visible-needle");
+	    await page.waitForFunction(() => document.querySelector(".reader-header h1")?.textContent?.includes("DOM Damaged Current Fallback"), undefined, { timeout: 20_000 });
+    await waitForActiveHighlightVisible(page);
+    const damagedItemText = await page.getByRole("button", { name: /DOM Damaged Current Fallback/ }).textContent();
+    assert.ok(!/branch/i.test(damagedItemText || ""), "sidebar should not mark damaged current fallback hits as branch hits");
+    assert.equal(await page.locator(".message .branch-pill").count(), 0, "fallback-visible messages should not be marked as branch messages");
+    assert.ok(!((await page.locator(".hit-counter").textContent()) || "").includes("Hidden hits"), "fallback current hits should be navigable visible hits");
+    await page.getByRole("button", { name: "Next hit" }).click();
+    await waitForActiveHighlightVisible(page);
+
+	    await page.goto(`${baseUrl}?conversation=dom-branch-override`, { waitUntil: "networkidle" });
+	    await page.getByLabel("Message path").selectOption("current");
+	    await page.getByLabel("Message path").selectOption("all");
+	    await page.evaluate(() => { window.__copiedText = ""; });
+    await page.getByRole("button", { name: "Copy current path conversation" }).click();
+    await page.waitForFunction(() => window.__copiedText?.includes("branchoverride-token"), undefined, { timeout: 20_000 });
+    await page.getByLabel("Message path").selectOption("current");
     await page.locator("#global-search").fill("PATH:ALL branchoverride-token");
     await page.waitForFunction(() => document.querySelector(".reader-header h1")?.textContent?.includes("DOM Branch Override Conversation"), undefined, { timeout: 20_000 });
-    await page.waitForFunction(() => document.querySelector(".search-visibility-notes")?.textContent?.includes("Query overrides path"), undefined, { timeout: 20_000 });
-    await page.waitForFunction(() => document.querySelector(".message-scroll")?.textContent?.includes("branchoverride-token"), undefined, { timeout: 20_000 });
+	    await page.waitForFunction(() => document.querySelector(".search-visibility-notes")?.textContent?.includes("Query overrides path"), undefined, { timeout: 20_000 });
+	    await page.waitForFunction(() => document.querySelector(".message-scroll")?.textContent?.includes("branchoverride-token"), undefined, { timeout: 20_000 });
+	    assert.ok(await page.locator(".message", { hasText: "branchoverride-token" }).locator(".branch-pill").count() >= 1, "normal path=all branch message should keep branch badge");
     assert.equal(await page.getByLabel("Message path").inputValue(), "all", "reader path dropdown should show effective query path override");
     assert.equal(await page.getByLabel("Message path").isDisabled(), true, "reader path dropdown should be disabled while raw query overrides it");
     assert.equal(await page.getByLabel("Search path").isDisabled(), true, "sidebar path dropdown should be disabled while raw query overrides it");
@@ -1081,20 +1235,14 @@ async function main() {
     await page.locator("#global-search").fill("");
     await page.getByLabel("Scope").selectOption("all");
     await page.getByLabel("Title contains").fill("");
-    await page.getByLabel("Exclude").fill("excluded");
-    await page.locator("#global-search").fill("filtertarget");
-    await page.waitForFunction(() => document.querySelector(".reader-header h1")?.textContent?.includes("DOM Reader Filter Conversation"), undefined, { timeout: 20_000 });
-    await page.waitForFunction(
-      () => {
-        const excluded = Array.from(document.querySelectorAll(".message")).find((node) => node.textContent?.includes("filtertarget excluded body"));
-        return Boolean(excluded) && excluded.querySelectorAll(".search-highlight").length === 0 && document.querySelectorAll(".search-highlight").length >= 2;
-      },
-      undefined,
-      { timeout: 20_000 },
-    );
-    assert.equal(await page.locator(".message", { hasText: "filtertarget excluded body" }).locator(".search-highlight").count(), 0, "excluded reader message should not be highlighted");
-    await page.getByLabel("Exclude").fill("");
-    await page.getByLabel("Role").selectOption("assistant");
+	    await page.getByLabel("Exclude").fill("excluded");
+	    await page.locator("#global-search").fill("filtertarget");
+	    await page.waitForFunction(() => document.querySelectorAll(".search-highlight").length === 0, undefined, { timeout: 20_000 });
+	    assert.equal(await page.getByRole("button", { name: /DOM Reader Filter Conversation/ }).count(), 0, "conversation-level exclude should remove conversations containing the excluded body fragment");
+	    await page.getByLabel("Exclude").fill("");
+	    await page.goto(`${baseUrl}?conversation=dom-reader-filter&q=filtertarget`, { waitUntil: "networkidle" });
+	    await page.locator("details.advanced-panel").evaluate((node) => { node.open = true; });
+	    await page.getByLabel("Role").selectOption("assistant");
     await page.waitForFunction(
       () => !document.querySelector(".message-role-user .search-highlight") && Boolean(document.querySelector(".message-role-assistant .search-highlight")),
       undefined,
@@ -1117,9 +1265,10 @@ async function main() {
 
     await page.goto(`${baseUrl}?conversation=dom-tech-json`, { waitUntil: "networkidle" });
     await page.locator("details.advanced-panel").evaluate((node) => { node.open = true; });
+    await page.getByLabel("Show internal messages").check();
     await page.getByLabel("Scope").selectOption("all");
-    await page.locator("#global-search").fill("search_query");
-    await page.waitForFunction(() => document.querySelector(".message-disclosure.message-role-assistant")?.open, undefined, { timeout: 20_000 });
+    await page.locator("#global-search").fill("synthetic docs");
+    await page.waitForFunction(() => document.querySelector(".message-disclosure.message-role-tool-system")?.open, undefined, { timeout: 20_000 });
     await waitForActiveHighlightVisible(page);
     await assertStableMessageViewport(page, "technical payload active hit opens details");
 

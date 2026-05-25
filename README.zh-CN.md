@@ -148,6 +148,14 @@ python chatgpt_archive.py init --db archive/chatgpt_archive.db
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+`--input` 可以指向官方导出 ZIP、单个 `conversations.json`，或解压后的导出目录。解压目录可以包含 `conversations.json`，也可以包含分片形式的 `conversations-*.json`；不要手动合并分片。
+
+```bash
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input conversations.json --no-input-sha256 --rebuild-fts
+python chatgpt_archive.py import --db archive/chatgpt_archive.db --input ./extracted-export/ --no-input-sha256 --rebuild-fts
+```
+
 检查结构一致性：
 
 ```bash
@@ -202,6 +210,8 @@ python chatgpt_archive.py web --db archive/chatgpt_archive.db --port 8787
 python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_ZIP" --no-input-sha256 --rebuild-fts
 ```
 
+输入可以是 ZIP、单个 `conversations.json`，或包含 `conversations.json` 或分片 `conversations-*.json` 文件的解压目录。scanner discovery 会忽略 `__MACOSX`、AppleDouble `._*` 文件和 `.DS_Store` 等 macOS metadata paths，因此这些本地 artifact 不会成为 conversation source。
+
 如果你愿意让 SQLite 在导入后额外花时间整理 planner statistics 和 FTS 索引，可以使用：
 
 ```bash
@@ -226,11 +236,88 @@ python chatgpt_archive.py web --port 8787
 
 默认阅读布局是 `chat`：user 消息靠右，assistant 消息靠左，system/internal 消息以折叠提示显示。要使用旧的逐行技术布局，可以在设置里选择「经典逐行」，或在 Web UI URL 后添加 `?layout=classic` 或 `?messageLayout=classic`。
 
+阅读器复制和导出动作遵守可见阅读器契约。`复制当前路径整段对话` 会按当前 reader 路径抓取全部分页，并遵守「显示内部消息」开关，同时忽略当前搜索筛选。`复制当前可见` 只复制已经加载的可见消息。下载链接使用同样的当前路径和「显示内部消息」设置。Raw 消息访问只通过单条消息 endpoint 提供有上限的较大 raw 预览；截断响应必须把 `raw_text` 当作纯文本预览渲染，UI 只显示这个 capped preview。
+
+reader 使用 `around_node_id` 跳转到命中时，会使用与 reader 相同的分页集合：Show internal 关闭时使用 visible-only rows，Show internal 开启时使用完整 node collection；对没有 current-path node 的损坏 conversation，使用 effective all-node collection。
+
 Web UI 有两种使用方式。如果数据库已经存在，可以显式传入数据库路径，也可以使用默认路径。如果数据库不存在，也可以先启动 Web UI，再用导入面板上传 ChatGPT 导出 ZIP。上传导入会串行执行，同一进程内一次只允许一个 SQLite writer。
 
 Web 上传导入成功后，后端使用与 CLI 相同的核心 import pipeline，然后运行 `verify`、`stats` 和 `web-index`。上传 ZIP 是服务端临时副本，会独立于你磁盘上的原始文件进行清理。
 
-Web 上传在导入 job 启动前还会执行应用层安全限制：`CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` 控制上传 ZIP 总大小，默认 20 GiB；conversation JSON member 默认最多 5,000 个、单个最多 64 GiB、总未压缩数据最多 128 GiB，大型 JSON member 的压缩比限制为 1000:1。如果真实 ChatGPT 归档超过默认值，可以在启动 Web UI 前设置更大的环境变量，但只应对可信本机文件这样做，因为更高限制会增加 ZIP bomb 和磁盘压力风险。
+## Web 上传安全限制
+
+Web 上传在导入 job 启动前执行应用层安全限制。这些限制由环境变量控制，与 CLI `import` 无关（CLI 不使用这些限制）。
+
+Web 上传会在读取文件前先保留 pending slot，因此大型上传不能与另一个 writer 竞争。从保留 slot 之后发生的任何错误，包括临时上传路径创建失败，都必须释放 slot 并清理服务端临时目录；成功启动的 import job 会接管 slot 和临时副本。
+
+当 Web UI 绑定到 loopback 地址（`127.0.0.1`、`localhost`、`::1`）时，默认允许大型可信归档：
+
+| 环境变量 | 本机默认值 | 控制内容 |
+|---|---|---|
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES` | 20 GiB | 压缩 ZIP 上传总大小 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES` | 64 GiB | 单个 JSON member 最大未压缩大小 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBERS` | 5,000 | conversation JSON member 最大数量 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES` | 128 GiB | 未压缩 JSON 数据总量上限 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO` | 1,000.0 | 大型 JSON member 最大压缩比 |
+| `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | ZIP 内总 member 数上限 |
+| `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | 未设置 | 只在可信非 loopback 网络上设为 `local`，让未设置的上传限制使用本机默认值 |
+
+**远程绑定策略。** 如果 Web UI 绑定到非 loopback 地址（如 `0.0.0.0`、`::`、局域网 IP），服务端会使用保守的 remote-safe 默认值：128 MiB 压缩 ZIP、256 MiB 每 JSON member、512 MiB 总未压缩、200.0 压缩比、200 个 JSON member、10,000 个 ZIP 总 member。设置 `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` 只允许显式设置的单项限制超过这些 remote-safe 默认值；未设置的限制仍保持 remote-safe。如需在可信 LAN 上让未设置限制恢复本机大默认值，设置 `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local`。两种远程模式都会暴露本地归档浏览器和上传入口，因此只应在可信网络使用。
+
+`/api/schema` 会报告当前运行主机的有效上传策略，包括 remote-safe、显式远程 override 或 local-profile 限制是否生效。ZIP 大小检查会在导入前执行，但直接 JSON 解析、SQLite 写入和 `web-index` 重建仍会按解码后的 conversation JSON 大小消耗内存、磁盘和 CPU。超大归档建议在可信本地环境使用 CLI import，并准备足够磁盘和内存。
+
+如需为合法的大型归档提高本机限制，在启动 Web UI 前设置相应变量：
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 64424509440  # 60 GiB
+python chatgpt_archive.py web --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=64424509440
+python chatgpt_archive.py web --port 8787
+```
+
+在可信内网只提高显式压缩 ZIP 上限，同时让其他未设置限制保持 remote-safe：
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+export CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS = "true"
+$env:CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES = 10737418240  # 10 GiB
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+```batch
+:: Windows cmd.exe
+set CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true
+set CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES=10737418240
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+在可信内网使用完整本机上传 profile：
+
+```bash
+# macOS / Linux
+export CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local
+python chatgpt_archive.py web --host 0.0.0.0 --port 8787
+```
+
+仅对你信任的本机文件设置更高限制。更大的值会提高 ZIP bomb、磁盘压力和 CPU/内存风险。
 
 
 ## Web UI 验收清单
@@ -249,6 +336,8 @@ runnable 交付包中的 Web 路径不应依赖 `webui/node_modules`，因为构
 
 CLI 搜索使用项目统一的安全查询语法，不直接使用 SQLite 查询文本。可以使用普通关键词、带引号的短语、`-term` 排除、`OR`，以及 `role:user`、`source:zip`、`path:current`、`path:all`、`scope:title`、`scope:message` 等过滤条件。输出只包含 conversation ID、node ID 和角色，不包含 snippet。
 
+排除词对会话结果采用 conversation-level 语义：只要所选搜索 scope 和 path 内任意标题或消息命中排除片段，该 conversation 就不会返回。`/api/search/messages` 仍只返回自身不包含排除片段的消息命中。`path:current` 按每个 conversation 遵守 reader 路径；如果损坏归档完全没有 current-path node，current-path 搜索会 fallback 到 reader 显示的同一个 all-node 视图。
+
 日期筛选（例如 `after:2026-05-01`、`before:2026-05-13`、`--from`、`--to`）使用 UTC 自然日，而不是你本地时区的自然日。起始日期包含当天 `00:00:00Z`；结束日期会用次日 `00:00:00Z` 作为排他上界，因此 `23:59:59.5Z` 这类小数秒时间戳仍包含在当天内。Web 搜索框最多 500 个字符；更长的结构化条件请使用高级筛选。
 
 ```bash
@@ -262,6 +351,8 @@ Web 搜索使用 `web-index` 建立的可选 normalized trigram 索引，适合�
 ```bash
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
+
+搜索 diagnostics 是 best-effort 性能提示。它们只能报告 normalized-safe 候选层或扫描 fallback，例如 normalized trigram、normalized scan、normalized title scan 或 full scan。可以单独报告 legacy raw FTS 是否存在，但不能把它声明为实际 candidate backend，因为它可能漏掉规范化等价文本。
 
 如果你手动执行 `VACUUM`、`VACUUM INTO`，或使用外部工具重写/压缩 SQLite 数据库，请在继续依赖 Web UI 搜索前重新运行 `python chatgpt_archive.py web-index --db <archive.db>`。Web UI 的可选索引可以从主数据表安全重建，不会改变原始会话数据。
 
@@ -338,7 +429,7 @@ python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 
 ## 交付说明
 
-runnable delivery 应包含 Python 源码、测试、文档、`requirements-web.txt` 和 `webui/dist`。不应包含 `webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python 缓存目录或字节码、coverage/typecheck 缓存、`.DS_Store`、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、临时日志、本机验收日志、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任何 `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` 等真实数据库文件，或 `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` 等 SQLite sidecar。目录检查允许目标根目录自己的 `.git`，因此普通 Git clone 可以直接检查；嵌套 `.git` 会失败，ZIP delivery 中任何 `.git` 都会失败。
+runnable delivery 应包含 Python 源码、测试、文档、`requirements-web.txt`、`webui/src` 和 `webui/tests` 下的前端源码与测试、前端配置/package 文件，以及 `webui/dist` 下的构建产物。不应包含 `webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python 缓存目录或字节码、coverage/typecheck 缓存、`.DS_Store`、AppleDouble `._*` 文件、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、临时日志、本机验收日志、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任何 `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` 等真实数据库文件，或 `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` 等 SQLite sidecar。目录检查允许目标根目录自己的 `.git`，因此普通 Git clone 可以直接检查；嵌套 `.git` 会失败，ZIP delivery 中任何 `.git` 都会失败。
 
 source-only delivery 可以省略 `webui/dist`，但之后需要先重新构建前端，才能提供完整 React UI。
 
@@ -368,4 +459,5 @@ tools/                             交付检查和辅助脚本
 - 这是本地归档工具，不是云同步服务。
 - Web UI 面向本地使用。不要在没有额外访问控制的情况下暴露到不可信网络。
 - 导出解析遵循目前观察到的 OpenAI / ChatGPT 导出格式。如果上游导出结构变化，应先更新 `inspect` 和测试，再信任新的导入路径。
+- 导出文件名片段会同时按 Windows 和类 Unix 系统清理，包括 `CON`、`AUX`、`COM1`、`LPT9`、`COM¹`、`LPT²` 等保留设备名，以及尾随点和空格。
 - 超大型归档在导入、重建 FTS 和构建 Web trigram 索引时都可能需要时间。大型导入优先使用 `--rebuild-fts` 路径。
