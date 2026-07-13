@@ -3,10 +3,11 @@ import Sidebar from "./components/Sidebar";
 import ConversationPane from "./components/ConversationPane";
 import SearchHelp from "./components/SearchHelp";
 import SettingsPanel from "./components/SettingsPanel";
-import { getConversation, getConversations, getHealth, getImportJob, getStats, uploadImportZip } from "./api/client";
+import { ApiError, getConversation, getConversations, getHealth, getImportJob, getStats, uploadImportZip } from "./api/client";
 import { applySettings, clampSettings, loadSettings, saveSettings, type Settings } from "./settings";
 import { createTranslator } from "./i18n";
 import type { ConversationSummary, Health, ImportJob, MatchMode, PathMode, SearchDiagnostics, SearchFilters, SearchScope, SortMode, Stats } from "./types";
+import { isInteractiveTarget } from "./utils/interaction";
 
 const DEFAULT_FILTERS: SearchFilters = {
   role: "",
@@ -122,6 +123,8 @@ function syncUrlState(state: {
   matchMode: string;
   selectedId: string | null;
   filters: SearchFilters;
+  layout: string;
+  showInternal: boolean;
 }) {
   try {
     const params = new URLSearchParams();
@@ -130,6 +133,8 @@ function syncUrlState(state: {
     if (state.path && state.path !== "current") params.set("path", state.path);
     if (state.matchMode && state.matchMode !== "contains") params.set("match_mode", state.matchMode);
     if (state.selectedId) params.set("conversation", state.selectedId);
+    if (state.layout && state.layout !== "chat") params.set("layout", state.layout);
+    if (state.showInternal) params.set("show_internal", "true");
     if (state.filters.role) params.set("role", state.filters.role);
     if (state.filters.scope && state.filters.scope !== "all") params.set("scope", state.filters.scope);
     if (state.filters.title) params.set("title", state.filters.title);
@@ -151,6 +156,38 @@ function syncUrlState(state: {
   }
 }
 
+function canonicalShareUrl(state: {
+  q: string;
+  sort: string;
+  path: string;
+  matchMode: string;
+  selectedId: string | null;
+  filters: SearchFilters;
+  layout: string;
+  showInternal: boolean;
+}): string {
+  const url = new URL(window.location.href);
+  const params = new URLSearchParams();
+  params.set("sort", state.sort || "relevance");
+  params.set("path", state.path || "current");
+  params.set("match_mode", state.matchMode || "contains");
+  params.set("layout", state.layout || "chat");
+  params.set("show_internal", state.showInternal ? "true" : "false");
+  params.set("scope", state.filters.scope || "all");
+  if (state.q) params.set("q", state.q);
+  if (state.selectedId) params.set("conversation", state.selectedId);
+  if (state.filters.role) params.set("role", state.filters.role);
+  if (state.filters.title) params.set("title", state.filters.title);
+  if (state.filters.exact) params.set("exact", state.filters.exact);
+  if (state.filters.exclude) params.set("exclude", state.filters.exclude);
+  if (state.filters.after) params.set("after", state.filters.after);
+  if (state.filters.before) params.set("before", state.filters.before);
+  if (state.filters.source) params.set("source", state.filters.source);
+  url.search = params.toString();
+  url.hash = "";
+  return url.toString();
+}
+
 function importStageLabel(t: (key: string) => string, stage: string): string {
   const normalized = stage.toLowerCase().replace(/[-\s]+/g, "_");
   const labels: Record<string, string> = {
@@ -160,6 +197,11 @@ function importStageLabel(t: (key: string) => string, stage: string): string {
     validating_upload: t("stageInspect"),
     import: t("stageImport"),
     importing: t("stageImport"),
+    source_scan_complete: t("stageImport"),
+    shard_complete: t("stageImport"),
+    fts_rebuild_complete: t("stageImport"),
+    import_index_rebuild_complete: t("stageImport"),
+    pragma_optimize_complete: t("stageImport"),
     verify: t("stageVerify"),
     verifying: t("stageVerify"),
     stats: t("stageStats"),
@@ -171,8 +213,42 @@ function importStageLabel(t: (key: string) => string, stage: string): string {
     finished: t("stageFinished"),
     succeeded: t("stageFinished"),
     postcheck_failed: t("stagePostcheckFailed"),
+    verify_failed: t("importError_verify_failed"),
+    stats_failed: t("importError_stats_failed"),
+    web_index_failed: t("importError_web_index_failed"),
+    input_preflight: t("stageImport"),
+    source_scan: t("stageImport"),
+    json_decode: t("stageImport"),
+    top_level_contract: t("stageImport"),
+    transaction: t("stageImport"),
+    failed: t("importError_import_transaction_failed"),
   };
   return labels[normalized] || t("stageUnknown");
+}
+
+function importErrorLabel(t: (key: string) => string, code: string | null | undefined): string {
+  const direct = new Set([
+    "no_conversation_sources",
+    "ambiguous_conversation_sources",
+    "source_scan_failed",
+    "invalid_conversation_json",
+    "non_finite_json_number",
+    "conversation_json_top_level_not_list",
+    "import_transaction_failed",
+    "verify_failed",
+    "stats_failed",
+    "web_index_failed",
+    "import_job_active",
+    "upload_zip_no_conversation_sources",
+    "upload_zip_ambiguous_conversation_sources",
+    "upload_origin_not_allowed",
+    "upload_origin_required",
+  ]);
+  if (code && direct.has(code)) return t(`importError_${code}`);
+  if (code === "upload_content_length_required") return t("importError_upload_content_length_required");
+  if (code && (code.includes("too_large") || code.includes("too_many") || code.includes("compression_ratio"))) return t("importError_upload_limits");
+  if (code && (code.includes("not_zip") || code.includes("invalid_zip") || code.includes("valid_zip"))) return t("importError_invalid_zip");
+  return t("importError_unknown");
 }
 
 export default function App() {
@@ -196,8 +272,10 @@ export default function App() {
   const [importError, setImportError] = useState<string | null>(null);
   const [uploadingImport, setUploadingImport] = useState(false);
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
+  const [showInternal, setShowInternal] = useState(() => new URLSearchParams(window.location.search).get("show_internal") === "true" || (new URLSearchParams(window.location.search).get("show_internal") === null && loadSettings().showInternalDefault));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [storageWarning, setStorageWarning] = useState(false);
   const [focusIndex, setFocusIndex] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -208,14 +286,20 @@ export default function App() {
   const listRequestRef = useRef(0);
   const detailRequestRef = useRef(0);
   const detailControllerRef = useRef<AbortController | null>(null);
+  const listControllerRef = useRef<AbortController | null>(null);
   const selectedIdRef = useRef<string | null>(null);
   const selectedRef = useRef<ConversationSummary | null>(null);
+  const importPollGenerationRef = useRef(0);
+  const importRefreshDoneRef = useRef<string | null>(null);
   const filtersKey = JSON.stringify(filters);
+  const searchContextKey = JSON.stringify({ q: debouncedQuery, sort, path, matchMode, filters, listPageSize: settings.listPageSize });
+  const searchContextRef = useRef(searchContextKey);
+  searchContextRef.current = searchContextKey;
   const { t } = useMemo(() => createTranslator(settings.language), [settings.language]);
 
   useEffect(() => {
-    syncUrlState({ q: debouncedQuery, sort, path, matchMode, selectedId, filters });
-  }, [debouncedQuery, sort, path, matchMode, selectedId, filtersKey]);
+    syncUrlState({ q: debouncedQuery, sort, path, matchMode, selectedId, filters, layout: settings.messageLayout, showInternal });
+  }, [debouncedQuery, sort, path, matchMode, selectedId, filtersKey, settings.messageLayout, showInternal]);
 
   const setMatchMode = useCallback((value: MatchMode) => {
     setMatchModeState(value);
@@ -229,7 +313,7 @@ export default function App() {
   const updateSettings = useCallback((next: Settings) => {
     const clamped = clampSettings(next);
     setSettings(clamped);
-    saveSettings(clamped);
+    setStorageWarning(!saveSettings(clamped));
     applySettings(clamped);
   }, []);
 
@@ -262,18 +346,20 @@ export default function App() {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const isTyping = Boolean(target && (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable));
+      const interactive = isInteractiveTarget(event.target);
       if (event.key === "Escape") {
         if (settingsOpen) setSettingsOpen(false);
         else if (helpOpen) setHelpOpen(false);
         else if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
       }
-      if ((!isTyping && event.key === "/") || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k")) {
+      if ((!interactive && !event.metaKey && !event.ctrlKey && !event.altKey && event.key === "/") || ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k")) {
         event.preventDefault();
         document.getElementById("global-search")?.focus();
       }
-      if (!isTyping && !settingsOpen && !helpOpen) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const activeElement = document.activeElement instanceof Element ? document.activeElement : null;
+      const sidebarNavigation = Boolean(activeElement?.closest(".sidebar"));
+      if (!interactive && sidebarNavigation && !settingsOpen && !helpOpen) {
         if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {
           event.preventDefault();
           setFocusIndex((value) => Math.min(conversations.length - 1, value + 1));
@@ -292,7 +378,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", handler);
   }, [conversations, focusIndex, settingsOpen, helpOpen]);
 
-  const loadConversationDetail = useCallback((id: string, local?: ConversationSummary) => {
+  const loadConversationDetail = useCallback((id: string, local?: ConversationSummary, requestedContextKey = searchContextRef.current) => {
     setSelectedId(id);
     selectedIdRef.current = id;
     if (local) setSelected(local);
@@ -302,18 +388,22 @@ export default function App() {
     const requestId = ++detailRequestRef.current;
     getConversation(id, controller.signal)
       .then((detail) => {
-        if (requestId === detailRequestRef.current) {
+        if (requestId === detailRequestRef.current && selectedIdRef.current === id && searchContextRef.current === requestedContextKey) {
           setSelected(mergeConversationSearchMeta(detail, local || null));
         }
       })
       .catch((err: Error) => {
-        if (err.name !== "AbortError" && requestId === detailRequestRef.current) setError(err.message);
+        if (err.name !== "AbortError" && requestId === detailRequestRef.current && selectedIdRef.current === id && searchContextRef.current === requestedContextKey) setError(t("requestFailed"));
       });
-  }, []);
+  }, [t]);
 
   const loadConversationPage = useCallback((offset: number, append: boolean) => {
+    if (!append) listControllerRef.current?.abort();
     const controller = new AbortController();
+    if (!append) listControllerRef.current = controller;
     const requestId = ++listRequestRef.current;
+    const requestedSelectedId = selectedIdRef.current;
+    const requestedContextKey = searchContextKey;
     if (append) setLoadingMore(true);
     else setLoading(true);
     setError(null);
@@ -325,11 +415,11 @@ export default function App() {
       matchMode,
       offset,
       limit: settings.listPageSize,
-      selectedId: selectedIdRef.current,
+      selectedId: requestedSelectedId,
       signal: controller.signal
     })
       .then((page) => {
-        if (requestId !== listRequestRef.current) return;
+        if (requestId !== listRequestRef.current || searchContextRef.current !== requestedContextKey) return;
         setConversations((current) => {
           const merged = append ? [...current, ...page.items] : page.items;
           const seen = new Set<string>();
@@ -343,17 +433,18 @@ export default function App() {
         setTotal(page.total);
         setHasMore(page.has_more);
         setNextOffset(page.next_offset);
-        if (!append) setDiagnostics(page.diagnostics ?? null);
-        const currentSelectedId = selectedIdRef.current;
-        const selectedStillMatches = currentSelectedId ? page.selected_in_results !== false : false;
-        if (selectedStillMatches && currentSelectedId) {
-          const localSelected = page.items.find((item) => item.conversation_id === currentSelectedId) || page.selected_item;
-          if (!selectedRef.current || selectedRef.current.conversation_id !== currentSelectedId) {
-            loadConversationDetail(currentSelectedId, localSelected);
+        if (append) return;
+        setDiagnostics(page.diagnostics ?? null);
+        if (selectedIdRef.current !== requestedSelectedId) return;
+        const selectedStillMatches = requestedSelectedId ? page.selected_in_results !== false : false;
+        if (selectedStillMatches && requestedSelectedId) {
+          const localSelected = page.items.find((item) => item.conversation_id === requestedSelectedId) || page.selected_item;
+          if (!selectedRef.current || selectedRef.current.conversation_id !== requestedSelectedId) {
+            loadConversationDetail(requestedSelectedId, localSelected, requestedContextKey);
           } else if (localSelected) {
-            setSelected((current) => current?.conversation_id === currentSelectedId ? { ...current, ...localSelected } : current);
+            setSelected((current) => current?.conversation_id === requestedSelectedId ? { ...current, ...localSelected } : current);
           } else {
-            setSelected((current) => current?.conversation_id === currentSelectedId ? clearConversationSearchMeta(current) : current);
+            setSelected((current) => current?.conversation_id === requestedSelectedId ? clearConversationSearchMeta(current) : current);
           }
         } else {
           const first = page.items[0] ?? null;
@@ -363,7 +454,7 @@ export default function App() {
         }
       })
       .catch((err: Error) => {
-        if (err.name !== "AbortError" && requestId === listRequestRef.current) setError(err.message);
+        if (err.name !== "AbortError" && requestId === listRequestRef.current) setError(t("requestFailed"));
       })
       .finally(() => {
         if (requestId === listRequestRef.current) {
@@ -372,7 +463,7 @@ export default function App() {
         }
       });
     return controller;
-  }, [debouncedQuery, sort, path, matchMode, filtersKey, loadConversationDetail, settings.listPageSize]);
+  }, [debouncedQuery, sort, path, matchMode, filtersKey, loadConversationDetail, settings.listPageSize, searchContextKey, t]);
 
   useEffect(() => {
     const controller = loadConversationPage(0, false);
@@ -381,23 +472,58 @@ export default function App() {
 
   useEffect(() => {
     if (!importJob || !["queued", "running"].includes(importJob.status)) return;
-    const timer = window.setInterval(() => {
-      getImportJob(importJob.job_id)
-        .then((job) => {
-          setImportJob(job);
-          if (job.status === "succeeded" || job.status === "postcheck_failed") {
+    const jobId = importJob.job_id;
+    const generation = ++importPollGenerationRef.current;
+    const controller = new AbortController();
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const job = await getImportJob(jobId, controller.signal);
+        if (controller.signal.aborted || generation !== importPollGenerationRef.current) return;
+        setImportJob(job);
+        if (job.status === "succeeded" || job.status === "postcheck_failed" || job.status === "failed") {
+          if (job.canonical_commit_succeeded && importRefreshDoneRef.current !== jobId) {
+            importRefreshDoneRef.current = jobId;
             refreshArchiveState();
             loadConversationPage(0, false);
           }
-        })
-        .catch((err: Error) => setImportError(err.message));
-    }, 1200);
-    return () => window.clearInterval(timer);
-  }, [importJob?.job_id, importJob?.status, refreshArchiveState, loadConversationPage]);
+          return;
+        }
+        timer = window.setTimeout(poll, 1200);
+      } catch (err) {
+        if (!controller.signal.aborted && generation === importPollGenerationRef.current) {
+          setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null));
+          timer = window.setTimeout(poll, 1200);
+        }
+      }
+    };
+    timer = window.setTimeout(poll, 1200);
+    return () => {
+      controller.abort();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [importJob?.job_id, refreshArchiveState, loadConversationPage, t]);
 
   const selectConversation = (id: string) => {
     const local = conversations.find((item) => item.conversation_id === id);
     loadConversationDetail(id, local);
+  };
+
+  const copyCurrentUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(canonicalShareUrl({
+        q: query,
+        sort,
+        path,
+        matchMode,
+        selectedId: selectedIdRef.current,
+        filters,
+        layout: settings.messageLayout,
+        showInternal,
+      }));
+    } catch {
+      setError(t("copyFailed"));
+    }
   };
 
   const loadMore = () => {
@@ -415,7 +541,7 @@ export default function App() {
         setImportFile(null);
         if (importInputRef.current) importInputRef.current.value = "";
       })
-      .catch((err: Error) => setImportError(err.message))
+      .catch((err: unknown) => setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null)))
       .finally(() => setUploadingImport(false));
   };
 
@@ -456,8 +582,19 @@ export default function App() {
       <div
         className="sidebar-resizer"
         role="separator"
+        tabIndex={0}
         aria-orientation="vertical"
         aria-label={t("sidebarWidth")}
+        aria-valuemin={280}
+        aria-valuemax={560}
+        aria-valuenow={settings.sidebarWidth}
+        onKeyDown={(event) => {
+          const step = event.shiftKey ? 40 : 10;
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
+          event.preventDefault();
+          const width = event.key === "Home" ? 280 : event.key === "End" ? 560 : settings.sidebarWidth + (event.key === "ArrowLeft" ? -step : step);
+          updateSettings({ ...settings, sidebarWidth: width });
+        }}
         onPointerDown={(event) => {
           event.currentTarget.setPointerCapture(event.pointerId);
           const move = (moveEvent: PointerEvent) => updateSettings({ ...settings, sidebarWidth: moveEvent.clientX });
@@ -470,7 +607,7 @@ export default function App() {
         }}
       />
       <section className="main-column">
-        <div className="top-bar">
+        <div className="top-bar" data-testid="top-toolbar">
           <span>{header}</span>
           <div className="top-actions">
             <label className="button-like" htmlFor="import-zip-input">{t("importZip")}</label>
@@ -486,10 +623,12 @@ export default function App() {
             />
             <button type="button" onClick={() => setHelpOpen(true)}>{t("searchHelp")}</button>
             <button type="button" onClick={() => setSettingsOpen(true)}>{t("settings")}</button>
-            <span className="privacy-note">{t("localOnly")}</span>
+            <button type="button" onClick={copyCurrentUrl}>{t("copyUrl")}</button>
+            <span className="privacy-note">{health?.remote_access ? t("remoteAccessEnabled") : t("localOnly")}</span>
           </div>
           <input ref={searchRef} className="hidden-focus-target" tabIndex={-1} aria-hidden="true" />
         </div>
+        {storageWarning && <div className="storage-warning warning-text" role="status">{t("settingsStorageWarning")}</div>}
         {(importFile || importJob || importError || health?.db_ready === false) && (
           <div className="import-panel" data-testid="import-panel">
             {health?.db_ready === false && <strong>{t("noArchiveYet")}</strong>}
@@ -510,7 +649,8 @@ export default function App() {
               </div>
             )}
             {importError && <span className="error-text">{importError}</span>}
-            {importJob?.error && <span className="error-text">{importJob.error}</span>}
+            {importJob?.error_code && <span className="error-text">{importErrorLabel(t, importJob.error_code)}</span>}
+            {importJob?.cleanup_warning && <span className="warning-text">{t("importCleanupWarning")}</span>}
           </div>
         )}
         <ConversationPane
@@ -521,6 +661,8 @@ export default function App() {
           path={path}
           setPath={setPath}
           settings={settings}
+          showInternal={showInternal}
+          setShowInternal={setShowInternal}
           t={t}
         />
       </section>

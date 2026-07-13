@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .current_path import effective_current_metadata, ensure_effective_current_views
+
 from .parser import ParsedConversation, WarningRecord
 from .scanner import InputSource, SourceEntry
-from .utils import compact_json, utc_now_iso
+from .utils import compact_json, finite_float_or_none, utc_now_iso
 
 SQLITE_VARIABLE_CHUNK = 500
 INSERT_ROW_CHUNK = 5000
@@ -770,7 +773,14 @@ def record_export(
 
 
 def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
-    conv = conn.execute("SELECT COUNT(*) AS c, MIN(create_time) AS min_ct, MAX(create_time) AS max_ct, MIN(update_time) AS min_ut, MAX(update_time) AS max_ut FROM conversations").fetchone()
+    conv = conn.execute(
+        """SELECT COUNT(*) AS c,
+                  MIN(CASE WHEN create_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN create_time END) AS min_ct,
+                  MAX(CASE WHEN create_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN create_time END) AS max_ct,
+                  MIN(CASE WHEN update_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN update_time END) AS min_ut,
+                  MAX(CASE WHEN update_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN update_time END) AS max_ut
+           FROM conversations"""
+    ).fetchone()
     nodes = conn.execute("SELECT COUNT(*) AS c FROM conversation_nodes").fetchone()
     warnings = conn.execute("SELECT COUNT(*) AS c FROM import_warnings").fetchone()
     exports = conn.execute("SELECT COUNT(*) AS c FROM exports").fetchone()
@@ -778,10 +788,10 @@ def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "conversations": conv["c"],
         "nodes": nodes["c"],
         "warnings": warnings["c"],
-        "earliest_create_time": conv["min_ct"],
-        "latest_create_time": conv["max_ct"],
-        "earliest_update_time": conv["min_ut"],
-        "latest_update_time": conv["max_ut"],
+        "earliest_create_time": finite_float_or_none(conv["min_ct"]),
+        "latest_create_time": finite_float_or_none(conv["max_ct"]),
+        "earliest_update_time": finite_float_or_none(conv["min_ut"]),
+        "latest_update_time": finite_float_or_none(conv["max_ut"]),
         "exports": exports["c"],
     }
 
@@ -927,6 +937,8 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             "broken_parent_links": 0,
             "conversations_with_zero_nodes": 0,
             "parent_cycles": 0,
+            "non_finite_timestamps": 0,
+            "effective_current_diagnostics": {},
             "integrity_check": integrity,
             "optional_web_index_error": False,
             "optional_web_index_recovery_hint": "",
@@ -994,6 +1006,13 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         ]
     total_warnings = conn.execute("SELECT COUNT(*) AS c FROM import_warnings").fetchone()["c"]
     cycles = count_parent_cycles(conn)
+    non_finite_timestamps = 0
+    for table in ("conversations", "conversation_nodes"):
+        for row in conn.execute(f"SELECT create_time, update_time FROM {table}"):
+            for value in row:
+                if isinstance(value, float) and not math.isfinite(value):
+                    non_finite_timestamps += 1
+    effective_diagnostics = _effective_current_diagnostics(conn)
     optional_web_index_error = False
     optional_web_index_recovery_hint = ""
     if integrity != "ok":
@@ -1010,13 +1029,69 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         "broken_parent_links": broken_parent,
         "conversations_with_zero_nodes": zero_node,
         "parent_cycles": cycles,
+        "non_finite_timestamps": non_finite_timestamps,
+        "effective_current_diagnostics": effective_diagnostics,
         "integrity_check": integrity,
         "optional_web_index_error": optional_web_index_error,
         "optional_web_index_recovery_hint": optional_web_index_recovery_hint,
         "warnings_by_type": warning_counts,
         "latest_warnings_by_type": latest_warning_counts,
-        "ok": missing_current == 0 and broken_parent == 0 and zero_node == 0 and cycles == 0 and integrity == "ok",
+        "ok": missing_current == 0 and broken_parent == 0 and zero_node == 0 and cycles == 0 and non_finite_timestamps == 0 and integrity == "ok",
     }
+
+
+def _effective_current_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
+    conversation_rows = conn.execute(
+        "SELECT conversation_id, current_node FROM conversations ORDER BY conversation_id"
+    ).fetchall()
+    conversation_ids = [str(row["conversation_id"]) for row in conversation_rows]
+    ensure_effective_current_views(conn, None)
+    metadata = effective_current_metadata(conn, conversation_ids)
+    counts = {
+        "selected_current_node": 0,
+        "selected_raw_flags": 0,
+        "selected_fallback_all": 0,
+        "valid_current_node_zero_flags": 0,
+        "flags_missing_current_chain_nodes": 0,
+        "multiple_flag_leaves": 0,
+        "invalid_current_node_flags_used": 0,
+        "cycle_detected": 0,
+        "missing_parent_in_selected_chain": 0,
+        "cross_conversation_parent_in_selected_chain": 0,
+        "partial_selected_chain": 0,
+    }
+    for conversation in conversation_rows:
+        conversation_id = str(conversation["conversation_id"])
+        item = metadata.get(conversation_id, {})
+        source = str(item.get("current_collection_source", "fallback_all"))
+        counts[f"selected_{source}"] += 1
+        if source == "current_node" and int(item.get("current_path_nodes") or 0) == 0:
+            counts["valid_current_node_zero_flags"] += 1
+        if source == "current_node":
+            missing_flag = conn.execute(
+                """SELECT 1
+                   FROM effective_current_nodes ec
+                   JOIN conversation_nodes n
+                     ON n.conversation_id = ec.conversation_id AND n.node_id = ec.node_id
+                   WHERE ec.conversation_id = ? AND n.is_on_current_path = 0
+                   LIMIT 1""",
+                (conversation_id,),
+            ).fetchone()
+            if missing_flag:
+                counts["flags_missing_current_chain_nodes"] += 1
+        if int(item.get("raw_flag_leaf_count") or 0) > 1:
+            counts["multiple_flag_leaves"] += 1
+        if source == "raw_flags" and conversation["current_node"]:
+            counts["invalid_current_node_flags_used"] += 1
+        if item.get("cycle_detected"):
+            counts["cycle_detected"] += 1
+        if item.get("missing_parent"):
+            counts["missing_parent_in_selected_chain"] += 1
+        if item.get("cross_conversation_parent"):
+            counts["cross_conversation_parent_in_selected_chain"] += 1
+        if item.get("partial_chain"):
+            counts["partial_selected_chain"] += 1
+    return counts
 
 
 def count_parent_cycles(conn: sqlite3.Connection) -> int:

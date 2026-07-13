@@ -1,5 +1,6 @@
 import type { Language } from "../i18n";
 import { DEFAULT_SETTINGS, type Settings } from "../settings";
+import { useModalFocus } from "../hooks/useModalFocus";
 
 interface Props {
   open: boolean;
@@ -10,11 +11,12 @@ interface Props {
 }
 
 export default function SettingsPanel({ open, settings, t, onChange, onClose }: Props) {
+  const dialogRef = useModalFocus(open, onClose);
   if (!open) return null;
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => onChange({ ...settings, [key]: value });
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section className="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} tabIndex={-1} className="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={(event) => event.stopPropagation()}>
         <header className="modal-header">
           <h2 id="settings-title">{t("settings")}</h2>
           <button type="button" onClick={onClose}>{t("close")}</button>

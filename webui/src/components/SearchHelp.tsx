@@ -5,11 +5,15 @@ interface Props {
 }
 
 export default function SearchHelp({ open, t, onClose }: Props) {
+  const dialogRef = useModalFocus(open, onClose);
   if (!open) return null;
-  const rows = ["helpPlain", "helpPhrase", "helpExclude", "helpRole", "helpTitle", "helpDate", "helpSource", "helpAdvanced"];
+  const rows = [
+    "helpPlain", "helpOr", "helpPhrase", "helpExclude", "helpCjk", "helpRole",
+    "helpTitle", "helpDate", "helpSource", "helpOverrides", "helpBrowserFind", "helpAdvanced",
+  ];
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="search-help-title" onClick={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-labelledby="search-help-title" onClick={(event) => event.stopPropagation()}>
         <header className="modal-header">
           <h2 id="search-help-title">{t("searchHelp")}</h2>
           <button type="button" onClick={onClose}>{t("close")}</button>
@@ -22,3 +26,4 @@ export default function SearchHelp({ open, t, onClose }: Props) {
     </div>
   );
 }
+import { useModalFocus } from "../hooks/useModalFocus";

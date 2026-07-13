@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -97,7 +98,23 @@ def validate_conversation_element(value: Any, source_file: str, array_index: int
             keys_json=keys_json,
             raw_json=compact_json({"id_type": type(value.get("id")).__name__, "mapping_type": type(value.get("mapping")).__name__}, 1000),
         )
+    if not value.get("mapping"):
+        return WarningRecord(
+            source_file=source_file,
+            array_index=array_index,
+            warning_type="empty_mapping",
+            keys_json=keys_json,
+            raw_json=None,
+        )
     return None
+
+
+def conversation_id_from_value(value: Any) -> str | None:
+    """Return the same id precedence used by validation and import."""
+
+    if not isinstance(value, dict):
+        return None
+    return _normalize_conversation_id(value.get("id")) or _normalize_conversation_id(value.get("conversation_id"))
 
 
 def parse_conversation(value: dict[str, Any], source_file: str, array_index: int) -> ParsedConversation:
@@ -150,8 +167,20 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
                 message_id=message_id,
                 role=role,
                 author_name=author_name,
-                create_time=_to_float(message_dict.get("create_time") if message_dict else node.get("create_time")),
-                update_time=_to_float(message_dict.get("update_time") if message_dict else node.get("update_time")),
+                create_time=_to_float(
+                    message_dict.get("create_time") if message_dict else node.get("create_time"),
+                    warnings=warnings,
+                    source_file=source_file,
+                    array_index=array_index,
+                    field="node_create_time",
+                ),
+                update_time=_to_float(
+                    message_dict.get("update_time") if message_dict else node.get("update_time"),
+                    warnings=warnings,
+                    source_file=source_file,
+                    array_index=array_index,
+                    field="node_update_time",
+                ),
                 content_type=content_type,
                 content_text=content_text,
                 content_hash=sha256_text(canonical_json({"content_type": content_type, "content_text": content_text})),
@@ -183,8 +212,20 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
         conversation_id=conversation_id,
         exported_id=exported_id,
         title=title,
-        create_time=_to_float(value.get("create_time")),
-        update_time=_to_float(value.get("update_time")),
+        create_time=_to_float(
+            value.get("create_time"),
+            warnings=warnings,
+            source_file=source_file,
+            array_index=array_index,
+            field="conversation_create_time",
+        ),
+        update_time=_to_float(
+            value.get("update_time"),
+            warnings=warnings,
+            source_file=source_file,
+            array_index=array_index,
+            field="conversation_update_time",
+        ),
         current_node=current_node,
         source_file=source_file,
         source_array_index=array_index,
@@ -363,13 +404,33 @@ def compute_aggregate_hash(current_node: str | None, nodes: list[ParsedNode]) ->
     return sha256_text(canonical_json(core))
 
 
-def _to_float(value: Any) -> float | None:
+def _to_float(
+    value: Any,
+    *,
+    warnings: list[WarningRecord] | None = None,
+    source_file: str = "",
+    array_index: int | None = None,
+    field: str = "timestamp",
+) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    if math.isfinite(number):
+        return number
+    if warnings is not None:
+        warnings.append(
+            WarningRecord(
+                source_file,
+                array_index,
+                "non_finite_timestamp",
+                compact_json({"field": field, "value_type": type(value).__name__}),
+                None,
+            )
+        )
+    return None
 
 
 def _to_int_bool(value: Any) -> int | None:

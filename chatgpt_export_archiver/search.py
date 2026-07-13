@@ -3,18 +3,23 @@ from __future__ import annotations
 import re
 import json
 import sqlite3
+import threading
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Mapping, Sequence
 
+from .current_path import (
+    effective_current_metadata,
+    ensure_effective_current_views,
+    resolve_effective_current_collection,
+)
 from .parser import extract_message_content
 from .utils import compact_json
 
 
 MAX_QUERY_LENGTH = 500
-MAX_CANDIDATES = 3000
 MAX_API_LIMIT = 100
 MAX_MESSAGE_LIMIT = 300
 MAX_AROUND_NODE_ROWS = 8000
@@ -41,6 +46,10 @@ NORMALIZE_TRANSLATION = str.maketrans(
         "\u3000": " ",
     }
 )
+
+_CAPABILITY_CACHE_LOCK = threading.RLock()
+_CAPABILITY_CACHE: OrderedDict[int, tuple[sqlite3.Connection, int, dict[str, Any]]] = OrderedDict()
+_CAPABILITY_CACHE_MAX = 128
 
 
 @dataclass
@@ -206,6 +215,9 @@ def parse_query(
         if not token:
             continue
         if negated_quote:
+            if key is not None:
+                parsed.errors.append(f"negated_modifier_not_supported:{key}")
+                continue
             parsed.exclude.append(normalize_search_text(token))
             continue
         if key is None and token == "or" and not quoted:
@@ -281,13 +293,11 @@ def _sql_internal_role_condition(alias: str | None = None) -> str:
 
 
 def _current_path_condition(alias: str = "n") -> str:
-    """Match reader path=current fallback: current nodes if present, otherwise all nodes in that conversation."""
+    """Match the shared effective reader collection for path=current."""
     return (
-        f"({alias}.is_on_current_path = 1 OR NOT EXISTS ("
-        "SELECT 1 FROM conversation_nodes current_probe "
-        f"WHERE current_probe.conversation_id = {alias}.conversation_id "
-        "AND current_probe.is_on_current_path = 1"
-        "))"
+        "EXISTS (SELECT 1 FROM effective_current_nodes effective_current "
+        f"WHERE effective_current.conversation_id = {alias}.conversation_id "
+        f"AND effective_current.node_id = {alias}.node_id)"
     )
 
 
@@ -320,12 +330,37 @@ def _sql_visible_message_condition(alias: str = "n") -> str:
 def _current_path_fallback_to_all_from_counts(counts: dict[str, int] | dict[str, Any] | None) -> bool:
     if not counts:
         return False
+    if "current_path_fallback_to_all" in counts:
+        return bool(counts["current_path_fallback_to_all"])
     return int(counts.get("node_count") or 0) > 0 and int(counts.get("current_path_nodes") or 0) == 0
 
 
 def _fallback_map_for_conversations(conn: sqlite3.Connection, conversation_ids: list[str]) -> dict[str, bool]:
-    counts = _node_counts_for_conversations(conn, sorted(set(conversation_ids)))
-    return {cid: _current_path_fallback_to_all_from_counts(value) for cid, value in counts.items()}
+    metadata = effective_current_metadata(conn, conversation_ids)
+    return {cid: bool(value.get("current_path_fallback_to_all")) for cid, value in metadata.items()}
+
+
+def _effective_pairs_for_rows(
+    conn: sqlite3.Connection,
+    rows: Sequence[Mapping[str, Any]],
+) -> set[tuple[str, str]]:
+    conversation_ids = sorted({str(row["conversation_id"]) for row in rows})
+    if not conversation_ids:
+        return set()
+    ensure_effective_current_views(conn, conversation_ids)
+    placeholders = ",".join("?" for _ in conversation_ids)
+    effective = conn.execute(
+        f"""SELECT conversation_id, node_id
+            FROM effective_current_nodes
+            WHERE conversation_id IN ({placeholders})""",
+        conversation_ids,
+    ).fetchall()
+    wanted = {(str(row["conversation_id"]), str(row["node_id"])) for row in rows}
+    return {
+        (str(row["conversation_id"]), str(row["node_id"]))
+        for row in effective
+        if (str(row["conversation_id"]), str(row["node_id"])) in wanted
+    }
 
 
 def _effective_visible_in_current_view(is_on_current_path: bool, current_path_fallback_to_all: bool) -> bool:
@@ -504,14 +539,33 @@ def list_conversations(
         """,
         params + [limit, offset],
     ).fetchall()
-    counts = _node_counts_for_conversations(conn, [row["conversation_id"] for row in rows])
+    selected_in_results = _selected_in_conversation_filter(conn, where, params, selected_id)
+    page_ids = [str(row["conversation_id"]) for row in rows]
+    selected_row = None
+    if selected_id and selected_in_results and selected_id not in page_ids:
+        selected_where = f"{where} {'AND' if where else 'WHERE'} c.conversation_id = ?"
+        selected_row = conn.execute(
+            f"""SELECT c.conversation_id, c.title, c.create_time, c.update_time,
+                       c.current_node, c.source_file
+                FROM conversations c
+                {selected_where}
+                LIMIT 1""",
+            params + [selected_id],
+        ).fetchone()
+    scope_ids = page_ids + ([selected_id] if selected_row is not None and selected_id else [])
+    counts = _node_counts_for_conversations(conn, scope_ids)
     total = conn.execute(f"SELECT COUNT(*) AS c FROM conversations c {where}", params).fetchone()["c"]
     return _page_payload(
         [_conversation_summary_with_counts(row, counts.get(row["conversation_id"], {})) for row in rows],
         total,
         limit,
         offset,
-        selected_in_results=_selected_in_conversation_filter(conn, where, params, selected_id),
+        selected_in_results=selected_in_results,
+        selected_item=(
+            _conversation_summary_with_counts(selected_row, counts.get(selected_id, {}))
+            if selected_row is not None and selected_id is not None
+            else None
+        ),
     )
 
 
@@ -527,20 +581,26 @@ def search_messages(
     count_total: bool = True,
 ) -> dict[str, Any]:
     _ensure_search_functions(conn)
+    if parsed.path == "current":
+        ensure_effective_current_views(conn, [conversation_id] if conversation_id else None)
+    else:
+        ensure_effective_current_views(conn, [])
     limit = _bounded_limit(limit, max_page_limit)
     offset = max(0, offset)
     if parsed.scope == "title":
-        return _page_payload([], 0, limit, offset)
+        return _page_payload([], 0, limit, offset, extra={"total_exact": bool(count_total)})
     has_message_text = bool(parsed.phrases or parsed.terms or parsed.required_phrases)
     if not has_message_text:
-        return _page_payload([], 0, limit, offset)
+        return _page_payload([], 0, limit, offset, extra={"total_exact": bool(count_total)})
     try:
         rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, count_total=count_total)
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=True)
     except sqlite3.OperationalError:
         rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, use_trigram=False, count_total=count_total)
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=False)
-    fallback_map = _fallback_map_for_conversations(conn, [row["conversation_id"] for row in rows]) if rows else {}
+    result_ids = [str(row["conversation_id"]) for row in rows]
+    fallback_map = _fallback_map_for_conversations(conn, result_ids) if rows else {}
+    effective_pairs = _effective_pairs_for_rows(conn, rows) if rows else set()
     items = [
         _message_search_payload(
             row,
@@ -548,10 +608,11 @@ def search_messages(
             row["match_reason"] or ("exact phrase" if (parsed.phrases or parsed.required_phrases) else "substring"),
             row["bm25_score"],
             current_path_fallback_to_all=fallback_map.get(row["conversation_id"], False),
+            effective_visible_in_current_view=(str(row["conversation_id"]), str(row["node_id"])) in effective_pairs,
         )
         for row in rows
     ]
-    result = _page_payload(items, total, limit, offset)
+    result = _page_payload(items, total, limit, offset, extra={"total_exact": bool(count_total)})
     result["diagnostics"] = diagnostics
     return result
 
@@ -566,6 +627,10 @@ def search_conversations(
     selected_id: str | None = None,
 ) -> dict[str, Any]:
     _ensure_search_functions(conn)
+    if parsed.path == "current":
+        ensure_effective_current_views(conn, None)
+    else:
+        ensure_effective_current_views(conn, [])
     if not parsed.has_search_context():
         return list_conversations(conn, limit=limit, offset=offset, sort=sort, after=parsed.after, before=parsed.before, selected_id=selected_id)
     limit = _bounded_limit(limit, MAX_API_LIMIT)
@@ -576,28 +641,19 @@ def search_conversations(
     except sqlite3.OperationalError:
         items, total = _conversation_search_page(conn, parsed, limit, offset, sort, use_trigram=False)
         diagnostics = _conversation_search_diagnostics(conn, parsed, used_trigram=False)
-    used_fuzzy = False
-    if not items and parsed.terms and parsed.scope != "message" and parsed.match_mode != "word" and not parsed.has_effective_filters():
-        used_fuzzy = True
-        items = _fuzzy_title_items(conn, parsed, 30)
-        total = len(items)
     _add_counts_and_path_metadata(conn, items)
     for conv in items:
         conv["reasons"] = sorted(conv["reasons"])
-        conv["snippets"] = _conversation_snippets(conn, parsed, conv["conversation_id"]) if conv.get("hit_count") else []
-        _add_conversation_visibility_metadata(conn, parsed, conv)
+    _batch_conversation_enrichment(conn, parsed, items)
     selected_in_results = None
     selected_item = None
     if selected_id:
-        selected_item = _fuzzy_title_item(conn, parsed, selected_id) if used_fuzzy else None
-        selected_in_results = selected_item is not None if used_fuzzy else _conversation_search_contains(conn, parsed, selected_id)
+        selected_in_results = _conversation_search_contains(conn, parsed, selected_id)
         if selected_in_results and not any(item["conversation_id"] == selected_id for item in items):
-            selected_item = selected_item or _conversation_search_item(conn, parsed, selected_id)
-            if selected_item and selected_item.get("hit_count"):
-                selected_item["snippets"] = _conversation_snippets(conn, parsed, selected_id)
+            selected_item = _conversation_search_item(conn, parsed, selected_id)
     if selected_item:
         _add_counts_and_path_metadata(conn, [selected_item])
-        _add_conversation_visibility_metadata(conn, parsed, selected_item)
+        _batch_conversation_enrichment(conn, parsed, [selected_item])
     result = _page_payload(items, total, limit, offset, selected_in_results=selected_in_results, selected_item=selected_item)
     result["diagnostics"] = diagnostics
     return result
@@ -616,6 +672,7 @@ def _is_title_only_candidate_context(parsed: ParsedQuery) -> bool:
 
 
 def get_conversation(conn: sqlite3.Connection, conversation_id: str) -> dict[str, Any] | None:
+    ensure_effective_current_views(conn, [conversation_id])
     row = conn.execute(
         """
         SELECT c.*, COUNT(n.node_id) AS node_count,
@@ -627,7 +684,12 @@ def get_conversation(conn: sqlite3.Connection, conversation_id: str) -> dict[str
         """,
         (conversation_id,),
     ).fetchone()
-    return _conversation_summary(row) if row else None
+    if not row:
+        return None
+    summary = _conversation_summary(row)
+    metadata = effective_current_metadata(conn, [conversation_id]).get(conversation_id, {})
+    summary.update(metadata)
+    return summary
 
 
 def get_messages(
@@ -654,9 +716,16 @@ def get_messages(
         if row_count > MAX_AROUND_NODE_ROWS:
             return _get_messages_around_node_sql(conn, conversation_id, path, limit, offset, highlight_query, highlight_parsed, match_mode, around_node_id, include_internal=include_internal)
         rows = _conversation_rows(conn, conversation_id)
-        ordered = _order_nodes_for_display(rows, path)
-        parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
         conversation = get_conversation(conn, conversation_id)
+        current_collection = resolve_effective_current_collection(
+            conversation.get("current_node") if conversation else None,
+            rows,
+        )
+        effective_ids = set(current_collection.node_ids)
+        ordered = _order_nodes_for_display(rows, path, conversation.get("current_node") if conversation else None)
+        target_found = any(str(row["node_id"]) == around_node_id for row in rows)
+        target_in_collection = any(str(row["node_id"]) == around_node_id for row in ordered)
+        parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
         conversation_excluded = _conversation_has_excluded_in_scope(conn, parsed, conversation_id)
         total = len(ordered)
         visibility_counts = _message_visibility_counts(ordered)
@@ -664,6 +733,7 @@ def get_messages(
         if not include_internal:
             ordered = [row for row in ordered if _message_display_fields(row)["is_empty_mapping_node"] is False and _message_display_fields(row)["is_internal"] is False]
             total = len(ordered)
+        target_visible = any(str(row["node_id"]) == around_node_id for row in ordered)
         index = next((idx for idx, row in enumerate(ordered) if row["node_id"] == around_node_id), None)
         if index is not None:
             offset = max(0, min(index, max(0, total - limit)))
@@ -674,53 +744,95 @@ def get_messages(
             [
                 _message_payload(
                     row,
-                    _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path) else [],
+                    _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path, str(row["node_id"]) in effective_ids) else [],
                     current_path_fallback_to_all=current_path_fallback_to_all,
+                    effective_visible_in_current_view=str(row["node_id"]) in effective_ids,
                 )
                 for row in window
             ],
             total,
             limit,
             offset,
-            extra={**visibility_counts, **_path_metadata_extra(path, current_path_fallback_to_all)},
+            extra={
+                **visibility_counts,
+                **_path_metadata_extra(path, current_path_fallback_to_all, conversation),
+                "around_target_found": target_found,
+                "around_target_in_effective_collection": target_in_collection,
+                "around_target_visible": target_visible,
+                "around_target_applied": index is not None,
+            },
         )
     conversation = get_conversation(conn, conversation_id)
     current_path_fallback_to_all = _current_path_fallback_to_all_from_counts(conversation) if path == "current" else False
     rows, total = _paged_conversation_rows(conn, conversation_id, path, limit, offset, include_internal=include_internal)
+    effective_ids = _effective_node_ids_for_rows(conn, conversation_id, rows)
     parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
     conversation_excluded = _conversation_has_excluded_in_scope(conn, parsed, conversation_id)
     return _page_payload(
         [
             _message_payload(
                 row,
-                _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path) else [],
+                _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path, str(row["node_id"]) in effective_ids) else [],
                 current_path_fallback_to_all=current_path_fallback_to_all,
+                effective_visible_in_current_view=str(row["node_id"]) in effective_ids,
             )
             for row in rows
         ],
         total,
         limit,
         offset,
-        extra={**_message_visibility_counts_for_path(conn, conversation_id, path), **_path_metadata_extra(path, current_path_fallback_to_all)},
+        extra={**_message_visibility_counts_for_path(conn, conversation_id, path), **_path_metadata_extra(path, current_path_fallback_to_all, conversation)},
     )
 
 
-_MESSAGE_SELECT_COLUMNS = """
-    node_id, parent_node_id, children_json, message_id, role, author_name,
-    create_time, update_time, content_type, content_text, content_hash,
-    is_on_current_path, raw_message_json
-"""
+_MESSAGE_SIMPLE_COLUMNS = (
+    "node_id", "parent_node_id", "children_json", "message_id", "role", "author_name",
+    "create_time", "update_time", "content_type", "content_text", "content_hash", "is_on_current_path",
+)
+
+
+def _message_select_columns(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    columns = [f"{prefix}{name}" for name in _MESSAGE_SIMPLE_COLUMNS]
+    columns.extend(
+        [
+            f"substr({prefix}raw_message_json, 1, 20001) AS raw_message_json",
+            f"length({prefix}raw_message_json) AS raw_message_size",
+        ]
+    )
+    return ", ".join(columns)
 
 
 def _conversation_rows(conn: sqlite3.Connection, conversation_id: str) -> list[sqlite3.Row]:
     return conn.execute(
         f"""
-        SELECT {_MESSAGE_SELECT_COLUMNS}
+        SELECT {_message_select_columns()}
         FROM conversation_nodes
         WHERE conversation_id = ?
         """,
         (conversation_id,),
     ).fetchall()
+
+
+def _effective_node_ids_for_rows(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    rows: list[sqlite3.Row],
+) -> set[str]:
+    node_ids = [str(row["node_id"]) for row in rows]
+    if not node_ids:
+        return set()
+    ensure_effective_current_views(conn, [conversation_id])
+    placeholders = ",".join("?" for _ in node_ids)
+    matched = conn.execute(
+        f"""
+        SELECT node_id
+        FROM effective_current_nodes
+        WHERE conversation_id = ? AND node_id IN ({placeholders})
+        """,
+        [conversation_id] + node_ids,
+    ).fetchall()
+    return {str(row["node_id"]) for row in matched}
 
 
 def _get_messages_around_node_sql(
@@ -746,82 +858,90 @@ def _get_messages_around_node_sql(
         offset = 0
     current_path_fallback_to_all = _current_path_fallback_to_all_from_counts(conversation) if path == "current" else False
     rows, page_total = _paged_conversation_rows(conn, conversation_id, path, limit, offset, include_internal=include_internal)
+    effective_ids = _effective_node_ids_for_rows(conn, conversation_id, rows)
     total = page_total
     visibility_counts = _message_visibility_counts_for_path(conn, conversation_id, path)
+    around_metadata = _around_target_metadata(
+        conn,
+        conversation_id,
+        path,
+        around_node_id,
+        include_internal=include_internal,
+        applied=index is not None,
+    )
     return _page_payload(
         [
             _message_payload(
                 row,
-                _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path) else [],
+                _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path, str(row["node_id"]) in effective_ids) else [],
                 current_path_fallback_to_all=current_path_fallback_to_all,
+                effective_visible_in_current_view=str(row["node_id"]) in effective_ids,
             )
             for row in rows
         ],
         total,
         limit,
         offset,
-        extra={**visibility_counts, **_path_metadata_extra(path, current_path_fallback_to_all)},
+        extra={
+            **visibility_counts,
+            **_path_metadata_extra(path, current_path_fallback_to_all, conversation),
+            **around_metadata,
+        },
     )
 
 
+def _around_target_metadata(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    path: str,
+    node_id: str,
+    *,
+    include_internal: bool,
+    applied: bool,
+) -> dict[str, bool]:
+    ensure_effective_current_views(conn, [conversation_id])
+    row = conn.execute(
+        f"""SELECT 1 AS found,
+                   CASE WHEN {_sql_visible_message_condition('n')} THEN 1 ELSE 0 END AS reader_visible,
+                   CASE WHEN {_current_path_condition('n')} THEN 1 ELSE 0 END AS effective_visible
+            FROM conversation_nodes n
+            WHERE n.conversation_id = ? AND n.node_id = ?""",
+        (conversation_id, node_id),
+    ).fetchone()
+    found = row is not None
+    in_collection = bool(found and (path == "all" or row["effective_visible"]))
+    visible = bool(in_collection and (include_internal or row["reader_visible"]))
+    return {
+        "around_target_found": found,
+        "around_target_in_effective_collection": in_collection,
+        "around_target_visible": visible,
+        "around_target_applied": bool(applied and visible),
+    }
+
+
 def _message_visibility_counts_for_path(conn: sqlite3.Connection, conversation_id: str, path: str) -> dict[str, int]:
+    ensure_effective_current_views(conn, [conversation_id])
     path_clause = ""
     params: list[Any] = [conversation_id]
     if path == "current":
-        current_total = conn.execute(
-            "SELECT COUNT(*) AS c FROM conversation_nodes WHERE conversation_id = ? AND is_on_current_path = 1",
-            (conversation_id,),
-        ).fetchone()["c"]
-        if current_total:
-            path_clause = "AND is_on_current_path = 1"
+        path_clause = f"AND {_current_path_condition('conversation_nodes')}"
     row = conn.execute(
         f"""
         SELECT
             COUNT(*) AS total,
             SUM(CASE
-                WHEN message_id IS NULL
-                     AND COALESCE(content_text, '') = ''
-                     AND COALESCE(raw_message_json, '') = ''
+                WHEN {_sql_empty_mapping_condition('conversation_nodes')}
                 THEN 1 ELSE 0 END) AS empty_hidden_count,
             SUM(CASE
-                WHEN NOT (
-                    message_id IS NULL
-                    AND COALESCE(content_text, '') = ''
-                    AND COALESCE(raw_message_json, '') = ''
-                )
-                AND (
-                    {_sql_internal_role_condition()}
-                    OR lower(COALESCE(content_type, '')) IN (
-                        'user_editable_context',
-                        'model_editable_context',
-                        'system_context',
-                        'developer_context',
-                        'thoughts'
-                    )
-                    OR lower(trim(COALESCE(content_text, ''))) LIKE 'source analysis msg id:%'
-                )
+                WHEN NOT ({_sql_empty_mapping_condition('conversation_nodes')})
+                AND ({_sql_internal_content_condition('conversation_nodes')})
                 THEN 1 ELSE 0 END) AS internal_hidden_count,
             SUM(CASE
-                WHEN NOT (
-                    message_id IS NULL
-                    AND COALESCE(content_text, '') = ''
-                    AND COALESCE(raw_message_json, '') = ''
-                )
-                AND (
-                    {_sql_internal_role_condition()}
-                    OR lower(COALESCE(content_type, '')) IN (
-                        'user_editable_context',
-                        'model_editable_context',
-                        'system_context',
-                        'developer_context',
-                        'thoughts'
-                    )
-                    OR lower(trim(COALESCE(content_text, ''))) LIKE 'source analysis msg id:%'
-                )
+                WHEN NOT ({_sql_empty_mapping_condition('conversation_nodes')})
+                AND ({_sql_internal_content_condition('conversation_nodes')})
                 THEN 1 ELSE 0 END) AS technical_hidden_count
-            -- technical_hidden_count uses same conditions as internal_hidden_count;
-            -- currently all non-empty internal nodes are also technical. The separate
-            -- aggregate preserves the contract for future schema changes.
+            -- Deprecated compatibility alias: technical_hidden_count is exactly
+            -- internal_hidden_count and must not be interpreted as a second bucket.
         FROM conversation_nodes
         WHERE conversation_id = ? {path_clause}
         """,
@@ -863,10 +983,22 @@ def _message_visibility_counts(rows: list[sqlite3.Row]) -> dict[str, int]:
     }
 
 
-def _path_metadata_extra(path: str, current_path_fallback_to_all: bool) -> dict[str, Any]:
+def _path_metadata_extra(
+    path: str,
+    current_path_fallback_to_all: bool,
+    conversation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "effective_path": "all" if path == "current" and current_path_fallback_to_all else path,
         "current_path_fallback_to_all": bool(path == "current" and current_path_fallback_to_all),
+        "current_node_exists": bool(conversation and conversation.get("current_node_exists")),
+        "current_collection_source": (
+            conversation.get("current_collection_source", "fallback_all") if conversation else "fallback_all"
+        ),
+        "cycle_detected": bool(conversation and conversation.get("cycle_detected")),
+        "missing_parent": bool(conversation and conversation.get("missing_parent")),
+        "cross_conversation_parent": bool(conversation and conversation.get("cross_conversation_parent")),
+        "partial_chain": bool(conversation and conversation.get("partial_chain")),
     }
 
 
@@ -879,6 +1011,7 @@ def _paged_conversation_rows(
     *,
     include_internal: bool = True,
 ) -> tuple[list[sqlite3.Row], int]:
+    ensure_effective_current_views(conn, [conversation_id])
     visible_clause = "" if include_internal else f" AND {_sql_visible_message_condition('conversation_nodes')}"
     if path == "all":
         total = conn.execute(
@@ -887,7 +1020,7 @@ def _paged_conversation_rows(
         ).fetchone()["c"]
         rows = conn.execute(
             f"""
-            SELECT {_MESSAGE_SELECT_COLUMNS}
+            SELECT {_message_select_columns()}
             FROM conversation_nodes
             WHERE conversation_id = ?{visible_clause}
             ORDER BY create_time IS NULL,
@@ -899,88 +1032,34 @@ def _paged_conversation_rows(
         ).fetchall()
         return rows, total
 
-    current_total = conn.execute(
-        """
+    output_filter = "" if include_internal else f"AND {_sql_visible_message_condition('n')}"
+    total = conn.execute(
+        f"""
         SELECT COUNT(*) AS c
-        FROM conversation_nodes
-        WHERE conversation_id = ? AND is_on_current_path = 1
+        FROM conversation_nodes n
+        JOIN effective_current_nodes ec
+          ON ec.conversation_id = n.conversation_id AND ec.node_id = n.node_id
+        WHERE n.conversation_id = ? {output_filter}
         """,
         (conversation_id,),
     ).fetchone()["c"]
-    if not current_total:
-        return _paged_conversation_rows(conn, conversation_id, "all", limit, offset, include_internal=include_internal)
-    output_filter = "" if include_internal else f"WHERE {_sql_visible_message_condition('n')}"
     rows = conn.execute(
         f"""
-        WITH current_nodes AS (
-            SELECT {_MESSAGE_SELECT_COLUMNS}
-            FROM conversation_nodes
-            WHERE conversation_id = ? AND is_on_current_path = 1
-        ),
-        leaf AS (
-            SELECT node_id
-            FROM current_nodes
-            WHERE node_id NOT IN (
-                SELECT parent_node_id FROM current_nodes WHERE parent_node_id IS NOT NULL
-            )
-            ORDER BY node_id
-            LIMIT 1
-        ),
-        path_nodes(node_id, depth) AS (
-            SELECT node_id, 0 FROM leaf
-            UNION ALL
-            SELECT n.parent_node_id, p.depth + 1
-            FROM current_nodes n
-            JOIN path_nodes p ON p.node_id = n.node_id
-            WHERE n.parent_node_id IS NOT NULL
-        ),
-        ordered AS (
-            SELECT n.*, p.depth AS display_depth
-            FROM current_nodes n
-            JOIN path_nodes p ON p.node_id = n.node_id
-            {output_filter}
-        )
-        SELECT {_MESSAGE_SELECT_COLUMNS}
-        FROM ordered
-        ORDER BY display_depth DESC
+        SELECT {_message_select_columns('n')}
+        FROM conversation_nodes n
+        JOIN effective_current_nodes ec
+          ON ec.conversation_id = n.conversation_id AND ec.node_id = n.node_id
+        WHERE n.conversation_id = ? {output_filter}
+        ORDER BY CASE WHEN ec.source = 'fallback_all' THEN 1 ELSE 0 END,
+                 CASE WHEN ec.source <> 'fallback_all' THEN ec.depth END DESC,
+                 CASE WHEN ec.source = 'fallback_all' THEN n.create_time IS NULL END,
+                 CASE WHEN ec.source = 'fallback_all' THEN COALESCE(n.create_time, n.update_time, 0) END,
+                 n.node_id
         LIMIT ? OFFSET ?
         """,
         (conversation_id, limit, offset),
     ).fetchall()
-    if include_internal:
-        return rows, current_total
-    visible_total = conn.execute(
-        f"""
-        WITH current_nodes AS (
-            SELECT {_MESSAGE_SELECT_COLUMNS}
-            FROM conversation_nodes
-            WHERE conversation_id = ? AND is_on_current_path = 1
-        ),
-        leaf AS (
-            SELECT node_id
-            FROM current_nodes
-            WHERE node_id NOT IN (
-                SELECT parent_node_id FROM current_nodes WHERE parent_node_id IS NOT NULL
-            )
-            ORDER BY node_id
-            LIMIT 1
-        ),
-        path_nodes(node_id, depth) AS (
-            SELECT node_id, 0 FROM leaf
-            UNION ALL
-            SELECT n.parent_node_id, p.depth + 1
-            FROM current_nodes n
-            JOIN path_nodes p ON p.node_id = n.node_id
-            WHERE n.parent_node_id IS NOT NULL
-        )
-        SELECT COUNT(*) AS c
-        FROM current_nodes n
-        JOIN path_nodes p ON p.node_id = n.node_id
-        WHERE {_sql_visible_message_condition('n')}
-        """,
-        (conversation_id,),
-    ).fetchone()["c"]
-    return rows, int(visible_total or 0)
+    return rows, int(total or 0)
 
 
 def _page_collection_index(
@@ -992,6 +1071,7 @@ def _page_collection_index(
     include_internal: bool,
 ) -> tuple[int | None, int]:
     """Return node index within the exact collection used by reader pagination."""
+    ensure_effective_current_views(conn, [conversation_id])
     visible_clause = "" if include_internal else f" AND {_sql_visible_message_condition('conversation_nodes')}"
     if path == "all":
         row = conn.execute(
@@ -1014,48 +1094,22 @@ def _page_collection_index(
         ).fetchone()
         return (int(row["idx"]) if row["idx"] is not None else None, int(row["total"] or 0))
 
-    current_total = conn.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM conversation_nodes
-        WHERE conversation_id = ? AND is_on_current_path = 1
-        """,
-        (conversation_id,),
-    ).fetchone()["c"]
-    if not current_total:
-        return _page_collection_index(conn, conversation_id, "all", node_id, include_internal=include_internal)
-
-    output_filter = "" if include_internal else f"WHERE {_sql_visible_message_condition('n')}"
+    output_filter = "" if include_internal else f"AND {_sql_visible_message_condition('n')}"
     row = conn.execute(
         f"""
-        WITH current_nodes AS (
-            SELECT {_MESSAGE_SELECT_COLUMNS}
-            FROM conversation_nodes
-            WHERE conversation_id = ? AND is_on_current_path = 1
-        ),
-        leaf AS (
-            SELECT node_id
-            FROM current_nodes
-            WHERE node_id NOT IN (
-                SELECT parent_node_id FROM current_nodes WHERE parent_node_id IS NOT NULL
-            )
-            ORDER BY node_id
-            LIMIT 1
-        ),
-        path_nodes(node_id, depth) AS (
-            SELECT node_id, 0 FROM leaf
-            UNION ALL
-            SELECT n.parent_node_id, p.depth + 1
-            FROM current_nodes n
-            JOIN path_nodes p ON p.node_id = n.node_id
-            WHERE n.parent_node_id IS NOT NULL
-        ),
-        collection AS (
+        WITH collection AS (
             SELECT n.node_id,
-                   row_number() OVER (ORDER BY p.depth DESC) - 1 AS idx
-            FROM current_nodes n
-            JOIN path_nodes p ON p.node_id = n.node_id
-            {output_filter}
+                   row_number() OVER (
+                       ORDER BY CASE WHEN ec.source = 'fallback_all' THEN 1 ELSE 0 END,
+                                CASE WHEN ec.source <> 'fallback_all' THEN ec.depth END DESC,
+                                CASE WHEN ec.source = 'fallback_all' THEN n.create_time IS NULL END,
+                                CASE WHEN ec.source = 'fallback_all' THEN COALESCE(n.create_time, n.update_time, 0) END,
+                                n.node_id
+                   ) - 1 AS idx
+            FROM conversation_nodes n
+            JOIN effective_current_nodes ec
+              ON ec.conversation_id = n.conversation_id AND ec.node_id = n.node_id
+            WHERE n.conversation_id = ? {output_filter}
         )
         SELECT MAX(CASE WHEN node_id = ? THEN idx END) AS idx,
                COUNT(*) AS total
@@ -1068,7 +1122,12 @@ def _page_collection_index(
 
 def _display_order_map(conn: sqlite3.Connection, conversation_id: str, path: str) -> dict[str, int]:
     rows = _conversation_order_rows(conn, conversation_id)
-    return {row["node_id"]: index for index, row in enumerate(_order_nodes_for_display(rows, path))}
+    current_row = conn.execute(
+        "SELECT current_node FROM conversations WHERE conversation_id = ?",
+        (conversation_id,),
+    ).fetchone()
+    current_node = current_row["current_node"] if current_row else None
+    return {row["node_id"]: index for index, row in enumerate(_order_nodes_for_display(rows, path, current_node))}
 
 
 def _conversation_order_rows(conn: sqlite3.Connection, conversation_id: str) -> list[sqlite3.Row]:
@@ -1084,15 +1143,18 @@ def _conversation_order_rows(conn: sqlite3.Connection, conversation_id: str) -> 
 
 
 def _fts_message_rows(conn: sqlite3.Connection, parsed: ParsedQuery, fts_query: str, conversation_id: str | None, limit: int | None) -> list[sqlite3.Row]:
+    _ensure_search_functions(conn)
+    if parsed.path == "current":
+        ensure_effective_current_views(conn, [conversation_id] if conversation_id else None)
+    effective_expression = _current_path_condition("n") if parsed.path == "current" else "0"
     where, params = _node_filters(parsed, conversation_id)
-    if "web_search_match" in where:
-        _ensure_search_functions(conn)
     limit_clause, limit_params = _limit_clause(limit)
     order_clause = "ORDER BY bm25(message_fts)" if limit is not None else ""
     return conn.execute(
         f"""
         SELECT n.conversation_id, n.node_id, n.role, n.create_time, n.update_time,
                n.content_type, n.content_text, n.is_on_current_path,
+               CASE WHEN {effective_expression} THEN 1 ELSE 0 END AS effective_visible_in_current_view,
                c.title, c.create_time AS conversation_create_time, c.update_time AS conversation_update_time,
                c.current_node, c.source_file, bm25(message_fts) AS bm25_score
         FROM message_fts
@@ -1126,38 +1188,18 @@ def _message_search_page_rows(
     if order == "display" and conversation_id and parsed.path == "current":
         rows = conn.execute(
             f"""
-            WITH current_nodes AS (
-                SELECT node_id, parent_node_id
-                FROM conversation_nodes
-                WHERE conversation_id = ? AND {_current_path_condition("conversation_nodes")}
-            ),
-            leaf AS (
-                SELECT node_id
-                FROM current_nodes
-                WHERE node_id NOT IN (
-                    SELECT parent_node_id FROM current_nodes WHERE parent_node_id IS NOT NULL
-                )
-                ORDER BY node_id
-                LIMIT 1
-            ),
-            path_nodes(node_id, depth) AS (
-                SELECT node_id, 0 FROM leaf
-                UNION ALL
-                SELECT n.parent_node_id, p.depth + 1
-                FROM current_nodes n
-                JOIN path_nodes p ON p.node_id = n.node_id
-                WHERE n.parent_node_id IS NOT NULL
-            ),
-            matched AS (
+            WITH matched AS (
                 {base_sql}
             )
-            SELECT matched.*, p.depth AS display_depth
+            SELECT matched.*
             FROM matched
-            LEFT JOIN path_nodes p ON p.node_id = matched.node_id
+            JOIN effective_current_nodes effective_order
+              ON effective_order.conversation_id = matched.conversation_id
+             AND effective_order.node_id = matched.node_id
             {order_sql}
             LIMIT ? OFFSET ?
             """,
-            [conversation_id] + params + [query_limit, offset],
+            params + [query_limit, offset],
         ).fetchall()
     else:
         rows = conn.execute(
@@ -1193,9 +1235,11 @@ def _message_search_base_select(
         LEFT JOIN web_message_norm mn
           ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
     """ if has_norm else ""
+    effective_expression = _current_path_condition("n") if parsed.path == "current" else "0"
     sql = f"""
         SELECT n.conversation_id, n.node_id, n.role, n.create_time, n.update_time,
                n.content_type, n.content_text, n.is_on_current_path,
+               CASE WHEN {effective_expression} THEN 1 ELSE 0 END AS effective_visible_in_current_view,
                c.title, c.create_time AS conversation_create_time, c.update_time AS conversation_update_time,
                c.current_node, c.source_file, {score_expr} AS bm25_score, ? AS match_reason
         FROM {source_sql}
@@ -1283,7 +1327,13 @@ def _raw_candidate_indexes_are_safe(conn: sqlite3.Connection) -> bool:
 def _message_search_order_clause(order: str, conversation_id: str | None, path: str) -> str:
     if order == "display" and conversation_id:
         if path == "current":
-            return "display_depth DESC, matched.node_id ASC"
+            return """
+                CASE WHEN effective_order.source = 'fallback_all' THEN 1 ELSE 0 END,
+                CASE WHEN effective_order.source <> 'fallback_all' THEN effective_order.depth END DESC,
+                CASE WHEN effective_order.source = 'fallback_all' THEN matched.create_time IS NULL END,
+                CASE WHEN effective_order.source = 'fallback_all' THEN COALESCE(matched.create_time, matched.update_time, 0) END,
+                matched.node_id ASC
+            """
         return "matched.create_time IS NULL, COALESCE(matched.create_time, matched.update_time, 0) ASC, matched.node_id ASC"
     return """
         COALESCE(matched.bm25_score, 0) ASC,
@@ -1665,7 +1715,7 @@ def _message_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, 
         f"""
         SELECT n.conversation_id,
                COUNT(*) AS hit_count,
-               COUNT(*) * 10.0 + SUM(CASE WHEN n.is_on_current_path = 1 THEN 5.0 ELSE 0.0 END)
+               COUNT(*) * 10.0
                    + MAX(CASE WHEN {score_expr} IS NULL THEN 0.0 ELSE 25.0 - min(25.0, abs({score_expr})) END) AS score,
                1 AS message_match,
                0 AS title_match
@@ -1755,11 +1805,94 @@ def _conversation_snippets(conn: sqlite3.Connection, parsed: ParsedQuery, conver
                 "snippet": make_snippet(row["content_text"] or "", _highlight_terms(parsed), parsed.match_mode),
                 "is_on_current_path": bool(row["is_on_current_path"]),
                 "current_path_fallback_to_all": current_path_fallback_to_all,
-                "effective_visible_in_current_view": _effective_visible_in_current_view(bool(row["is_on_current_path"]), current_path_fallback_to_all),
+                "effective_visible_in_current_view": bool(row["effective_visible_in_current_view"]),
                 "is_internal": _is_internal_message(row["role"], row["content_type"], row["content_text"]),
             }
         )
     return snippets
+
+
+def _batch_conversation_enrichment(
+    conn: sqlite3.Connection,
+    parsed: ParsedQuery,
+    items: list[dict[str, Any]],
+) -> None:
+    """Populate snippets and hit visibility with one query for the current page."""
+
+    for item in items:
+        item["snippets"] = []
+        item["has_title_hits"] = bool(item.get("title_match"))
+        item["has_internal_hits"] = False
+        item["has_branch_hits"] = False
+    wanted = [item for item in items if item.get("message_match") and item.get("hit_count")]
+    if not wanted or parsed.scope == "title" or not (parsed.terms or parsed.phrases or parsed.required_phrases):
+        return
+    ids = [item["conversation_id"] for item in wanted]
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        base_sql, params = _message_search_base_select(conn, parsed, None, use_trigram=True)
+        rows = conn.execute(
+            f"""
+            WITH matched AS ({base_sql}),
+            page_matches AS (
+                SELECT matched.*,
+                       row_number() OVER (
+                           PARTITION BY matched.conversation_id
+                           ORDER BY matched.create_time IS NULL,
+                                    COALESCE(matched.create_time, matched.update_time, 0),
+                                    matched.node_id
+                       ) AS snippet_rank
+                FROM matched
+                WHERE matched.conversation_id IN ({placeholders})
+            )
+            SELECT * FROM page_matches
+            ORDER BY conversation_id, snippet_rank
+            """,
+            params + ids,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        base_sql, params = _message_search_base_select(conn, parsed, None, use_trigram=False)
+        rows = conn.execute(
+            f"""
+            WITH matched AS ({base_sql}),
+            page_matches AS (
+                SELECT matched.*,
+                       row_number() OVER (
+                           PARTITION BY matched.conversation_id
+                           ORDER BY matched.create_time IS NULL,
+                                    COALESCE(matched.create_time, matched.update_time, 0),
+                                    matched.node_id
+                       ) AS snippet_rank
+                FROM matched
+                WHERE matched.conversation_id IN ({placeholders})
+            )
+            SELECT * FROM page_matches
+            ORDER BY conversation_id, snippet_rank
+            """,
+            params + ids,
+        ).fetchall()
+    by_id = {item["conversation_id"]: item for item in wanted}
+    for row in rows:
+        item = by_id.get(row["conversation_id"])
+        if item is None:
+            continue
+        internal = _is_internal_message(row["role"], row["content_type"], row["content_text"])
+        effective_visible = bool(row["effective_visible_in_current_view"])
+        item["has_internal_hits"] = bool(item["has_internal_hits"] or internal)
+        item["has_branch_hits"] = bool(item["has_branch_hits"] or not effective_visible)
+        if int(row["snippet_rank"] or 0) <= 3:
+            item["snippets"].append(
+                {
+                    "node_id": row["node_id"],
+                    "role": row["role"],
+                    "content_type": row["content_type"],
+                    "snippet": make_snippet(row["content_text"] or "", _highlight_terms(parsed), parsed.match_mode),
+                    "is_on_current_path": bool(row["is_on_current_path"]),
+                    "current_path_fallback_to_all": bool(item.get("current_path_fallback_to_all")),
+                    "effective_visible_in_current_view": effective_visible,
+                    "is_internal": internal,
+                }
+            )
 
 
 def _add_conversation_visibility_metadata(conn: sqlite3.Connection, parsed: ParsedQuery, item: dict[str, Any]) -> None:
@@ -1789,23 +1922,10 @@ def _conversation_message_visibility_flags(
         f"""
         SELECT
             MAX(CASE
-                WHEN {_sql_internal_role_condition()}
-                     OR lower(COALESCE(content_type, '')) IN (
-                         'user_editable_context',
-                         'model_editable_context',
-                         'system_context',
-                         'developer_context',
-                         'thoughts'
-                     )
-                     OR lower(trim(COALESCE(content_text, ''))) LIKE 'source analysis msg id:%'
+                WHEN {_sql_internal_content_condition('matched')}
                 THEN 1 ELSE 0 END) AS has_internal_hits,
             MAX(CASE
-                WHEN is_on_current_path = 0
-                     AND EXISTS (
-                         SELECT 1 FROM conversation_nodes current_probe
-                         WHERE current_probe.conversation_id = matched.conversation_id
-                           AND current_probe.is_on_current_path = 1
-                     )
+                WHEN effective_visible_in_current_view = 0
                 THEN 1 ELSE 0 END) AS has_branch_hits
         FROM ({base_sql}) matched
         """,
@@ -2148,85 +2268,6 @@ def _trigram_fragment_query(norm: str) -> str | None:
     return "(" + " AND ".join(tokens) + ")"
 
 
-def _fuzzy_title_rows(conn: sqlite3.Connection, parsed: ParsedQuery, limit: int) -> list[dict[str, Any]]:
-    needle = normalize_search_text(" ".join(parsed.terms)).strip()
-    if len(needle) < 3 or parsed.role:
-        return []
-    where, params = _conversation_time_where(parsed.after, parsed.before)
-    clauses = []
-    if parsed.source:
-        clauses.append("web_search_match(COALESCE(c.source_file, ''), ?, 'contains') > 0")
-        params.append(parsed.source)
-    for title_filter in [frag for frag in (parsed.title, parsed.required_title) if frag]:
-        if parsed.match_mode == "word":
-            clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) > 0")
-            params.extend([title_filter, parsed.match_mode])
-        else:
-            clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) > 0")
-            params.extend([title_filter, parsed.match_mode])
-    if parsed.scope != "message":
-        for frag in parsed.exclude:
-            clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) = 0")
-            params.extend([frag, parsed.match_mode])
-    if clauses:
-        where += (" AND " if where else "WHERE ") + " AND ".join(clauses)
-    rows = conn.execute(
-        f"""
-        SELECT c.conversation_id, c.title, c.create_time, c.update_time, c.current_node, c.source_file
-        FROM conversations c
-        {where}
-        ORDER BY COALESCE(c.update_time, c.create_time, 0) DESC
-        LIMIT 2000
-        """,
-        params,
-    ).fetchall()
-    scored = []
-    for row in rows:
-        title = normalize_search_text(row["title"] or "")
-        score = SequenceMatcher(None, needle, title).ratio() * 45
-        if score >= 18:
-            item = dict(row)
-            item["score"] = score
-            scored.append(item)
-    scored.sort(key=lambda row: (-row["score"], -(row["update_time"] or row["create_time"] or 0), row["conversation_id"]))
-    return scored[:limit]
-
-
-def _fuzzy_title_items(conn: sqlite3.Connection, parsed: ParsedQuery, limit: int) -> list[dict[str, Any]]:
-    items = []
-    for row in _fuzzy_title_rows(conn, parsed, limit):
-        if _title_has_excluded(row.get("title"), parsed):
-            continue
-        items.append(
-            {
-                "conversation_id": row["conversation_id"],
-                "title": row["title"],
-                "create_time": row["create_time"],
-                "update_time": row["update_time"],
-                "current_node": row["current_node"],
-                "source_file": row["source_file"],
-                "hit_count": 0,
-                "snippets": [],
-                "reasons": ["fuzzy title"],
-                "score": float(row["score"] or 0),
-                "message_match": False,
-                "title_match": True,
-            }
-        )
-    return items
-
-
-def _fuzzy_title_item(conn: sqlite3.Connection, parsed: ParsedQuery, conversation_id: str) -> dict[str, Any] | None:
-    for item in _fuzzy_title_items(conn, parsed, 2000):
-        if item["conversation_id"] == conversation_id:
-            return item
-    return None
-
-
-def _title_has_excluded(title: str | None, parsed: ParsedQuery) -> bool:
-    return any(term and _fragment_matches(title or "", term, parsed.match_mode) for term in parsed.exclude)
-
-
 def _node_filters(parsed: ParsedQuery, conversation_id: str | None) -> tuple[str, list[Any]]:
     clauses = []
     params: list[Any] = []
@@ -2280,11 +2321,17 @@ def _message_search_payload(
     bm25_score: float | None,
     *,
     current_path_fallback_to_all: bool = False,
+    effective_visible_in_current_view: bool | None = None,
 ) -> dict[str, Any]:
     text = row["content_text"] or ""
     reasons = {reason}
     score = 10.0
-    if row["is_on_current_path"]:
+    effective_visible = (
+        bool(row["effective_visible_in_current_view"])
+        if effective_visible_in_current_view is None
+        else effective_visible_in_current_view
+    )
+    if effective_visible:
         score += 5.0
         reasons.add("current path")
     for phrase in parsed.phrases + parsed.required_phrases:
@@ -2308,7 +2355,7 @@ def _message_search_payload(
         "snippet": make_snippet(text, _highlight_terms(parsed), parsed.match_mode),
         "is_on_current_path": bool(row["is_on_current_path"]),
         "current_path_fallback_to_all": current_path_fallback_to_all,
-        "effective_visible_in_current_view": _effective_visible_in_current_view(bool(row["is_on_current_path"]), current_path_fallback_to_all),
+        "effective_visible_in_current_view": effective_visible,
         "is_internal": _is_internal_message(row["role"], row["content_type"], text),
         "title": row["title"],
         "conversation_create_time": row["conversation_create_time"],
@@ -2320,8 +2367,15 @@ def _message_search_payload(
     }
 
 
-def _message_payload(row: sqlite3.Row, terms: list[str], *, current_path_fallback_to_all: bool = False) -> dict[str, Any]:
+def _message_payload(
+    row: sqlite3.Row,
+    terms: list[str],
+    *,
+    current_path_fallback_to_all: bool = False,
+    effective_visible_in_current_view: bool | None = None,
+) -> dict[str, Any]:
     fields = _message_display_fields(row)
+    message_highlights = highlight_ranges(fields["display_text"], terms)
     return {
         "node_id": row["node_id"],
         "parent_node_id": row["parent_node_id"],
@@ -2338,13 +2392,19 @@ def _message_payload(row: sqlite3.Row, terms: list[str], *, current_path_fallbac
         "has_text": bool(fields["display_text"]),
         "has_raw": bool(fields["raw_preview"]),
         "raw_preview": fields["raw_preview"],
+        "raw_preview_truncated": fields["raw_preview_truncated"],
         "content_hash": row["content_hash"],
         "is_on_current_path": bool(row["is_on_current_path"]),
         "current_path_fallback_to_all": current_path_fallback_to_all,
-        "effective_visible_in_current_view": _effective_visible_in_current_view(bool(row["is_on_current_path"]), current_path_fallback_to_all),
+        "effective_visible_in_current_view": (
+            bool(effective_visible_in_current_view)
+            if effective_visible_in_current_view is not None
+            else _effective_visible_in_current_view(bool(row["is_on_current_path"]), current_path_fallback_to_all)
+        ),
         "is_internal": fields["is_internal"],
         "is_empty_mapping_node": fields["is_empty_mapping_node"],
-        "highlight_ranges": highlight_ranges(fields["display_text"], terms),
+        "highlight_ranges": message_highlights,
+        "highlight_ranges_truncated": len(terms) > 10 or len(message_highlights) >= 50,
     }
 
 
@@ -2357,17 +2417,26 @@ def _message_display_fields(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]
     display_text = raw_text or text
     is_empty_mapping_node = not row["message_id"] and not display_text and not raw_preview
     is_technical = _is_internal_message(row["role"], row["content_type"], display_text)
+    keys = row.keys()
+    raw_size = row["raw_message_size"] if "raw_message_size" in keys else len(row["raw_message_json"] or "")
     return {
         "content_text": text,
         "display_text": display_text,
         "raw_preview": raw_preview,
+        "raw_preview_truncated": bool(raw_size and raw_size > 20000),
         "is_empty_mapping_node": is_empty_mapping_node,
         "is_technical": is_technical,
         "is_internal": is_technical or is_empty_mapping_node,
     }
 
 
-def _message_row_matches_highlight(row: sqlite3.Row, conversation: dict[str, Any] | None, parsed: ParsedQuery, path: str) -> bool:
+def _message_row_matches_highlight(
+    row: sqlite3.Row,
+    conversation: dict[str, Any] | None,
+    parsed: ParsedQuery,
+    path: str,
+    effective_visible_in_current_view: bool,
+) -> bool:
     if not (parsed.terms or parsed.phrases or parsed.required_phrases):
         return False
     if parsed.scope == "title":
@@ -2376,7 +2445,7 @@ def _message_row_matches_highlight(row: sqlite3.Row, conversation: dict[str, Any
         roles = set(_role_filter_values(parsed.role))
         if _canonical_role(row["role"]) not in roles:
             return False
-    if parsed.path == "current" and path == "all" and not row["is_on_current_path"] and conversation and conversation.get("current_path_nodes"):
+    if parsed.path == "current" and path == "all" and not effective_visible_in_current_view:
         return False
     if conversation:
         title = conversation.get("title") or ""
@@ -2475,32 +2544,14 @@ def _conversation_summary(row: sqlite3.Row) -> dict[str, Any]:
         "node_count": node_count,
         "current_path_nodes": current_path_nodes,
         "current_path_fallback_to_all": node_count > 0 and current_path_nodes == 0,
+        "current_node_exists": bool(row["current_node"] and node_count),
+        "effective_path": "all" if node_count > 0 and current_path_nodes == 0 else "current",
     }
 
 
 def _node_counts_for_conversations(conn: sqlite3.Connection, conversation_ids: list[str]) -> dict[str, dict[str, int]]:
     """Count nodes only for the current page, avoiding a full-table GROUP BY for empty lists."""
-    if not conversation_ids:
-        return {}
-    placeholders = ",".join("?" for _ in conversation_ids)
-    rows = conn.execute(
-        f"""
-        SELECT conversation_id,
-               COUNT(node_id) AS node_count,
-               SUM(CASE WHEN is_on_current_path = 1 THEN 1 ELSE 0 END) AS current_path_nodes
-        FROM conversation_nodes
-        WHERE conversation_id IN ({placeholders})
-        GROUP BY conversation_id
-        """,
-        conversation_ids,
-    ).fetchall()
-    return {
-        row["conversation_id"]: {
-            "node_count": int(row["node_count"] or 0),
-            "current_path_nodes": int(row["current_path_nodes"] or 0),
-        }
-        for row in rows
-    }
+    return effective_current_metadata(conn, conversation_ids)
 
 
 def _conversation_summary_with_counts(row: sqlite3.Row, counts: dict[str, int]) -> dict[str, Any]:
@@ -2515,7 +2566,14 @@ def _conversation_summary_with_counts(row: sqlite3.Row, counts: dict[str, int]) 
         "source_file": row["source_file"],
         "node_count": node_count,
         "current_path_nodes": current_path_nodes,
-        "current_path_fallback_to_all": node_count > 0 and current_path_nodes == 0,
+        "current_path_fallback_to_all": bool(counts.get("current_path_fallback_to_all", node_count > 0 and current_path_nodes == 0)),
+        "current_node_exists": bool(counts.get("current_node_exists", False)),
+        "current_collection_source": counts.get("current_collection_source", "fallback_all"),
+        "effective_path": counts.get("effective_path", "all" if node_count > 0 and current_path_nodes == 0 else "current"),
+        "cycle_detected": bool(counts.get("cycle_detected", False)),
+        "missing_parent": bool(counts.get("missing_parent", False)),
+        "cross_conversation_parent": bool(counts.get("cross_conversation_parent", False)),
+        "partial_chain": bool(counts.get("partial_chain", False)),
     }
 
 
@@ -2527,10 +2585,17 @@ def _add_counts_and_path_metadata(conn: sqlite3.Connection, items: list[dict[str
         current_path_nodes = int(item_counts.get("current_path_nodes", item.get("current_path_nodes") or 0))
         item["node_count"] = node_count
         item["current_path_nodes"] = current_path_nodes
-        item["current_path_fallback_to_all"] = node_count > 0 and current_path_nodes == 0
+        item["current_path_fallback_to_all"] = bool(item_counts.get("current_path_fallback_to_all", node_count > 0 and current_path_nodes == 0))
+        item["current_node_exists"] = bool(item_counts.get("current_node_exists", False))
+        item["current_collection_source"] = item_counts.get("current_collection_source", "fallback_all")
+        item["effective_path"] = item_counts.get("effective_path", "all" if item["current_path_fallback_to_all"] else "current")
+        item["cycle_detected"] = bool(item_counts.get("cycle_detected", False))
+        item["missing_parent"] = bool(item_counts.get("missing_parent", False))
+        item["cross_conversation_parent"] = bool(item_counts.get("cross_conversation_parent", False))
+        item["partial_chain"] = bool(item_counts.get("partial_chain", False))
 
 
-def _order_nodes_for_display(rows: list[sqlite3.Row], path: str) -> list[sqlite3.Row]:
+def _order_nodes_for_display(rows: list[sqlite3.Row], path: str, current_node: str | None = None) -> list[sqlite3.Row]:
     if path == "all":
         return sorted(
             rows,
@@ -2540,23 +2605,9 @@ def _order_nodes_for_display(rows: list[sqlite3.Row], path: str) -> list[sqlite3
                 row["node_id"],
             ),
         )
-    by_id = {row["node_id"]: row for row in rows}
-    current_candidates = [row for row in rows if row["is_on_current_path"]]
-    current = None
-    if current_candidates:
-        child_parents = {row["parent_node_id"] for row in current_candidates if row["parent_node_id"]}
-        leaves = [row["node_id"] for row in current_candidates if row["node_id"] not in child_parents]
-        current = sorted(leaves)[0] if leaves else current_candidates[-1]["node_id"]
-    ordered = []
-    seen: set[str] = set()
-    while current and current in by_id and current not in seen:
-        seen.add(current)
-        row = by_id[current]
-        if row["is_on_current_path"]:
-            ordered.append(row)
-        current = row["parent_node_id"]
-    ordered.reverse()
-    return ordered or _order_nodes_for_display(rows, "all")
+    by_id = {str(row["node_id"]): row for row in rows}
+    collection = resolve_effective_current_collection(current_node, rows)
+    return [by_id[node_id] for node_id in collection.node_ids]
 
 
 def _highlight_terms(parsed: ParsedQuery) -> list[tuple[str, str]]:
@@ -2692,8 +2743,47 @@ def _bounded_limit(limit: int, maximum: int = 100) -> int:
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    row = conn.execute("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1", (name,)).fetchone()
-    return row is not None
+    return name in _connection_capabilities(conn)["tables"]
+
+
+def _connection_capabilities(conn: sqlite3.Connection) -> dict[str, Any]:
+    schema_row = conn.execute("PRAGMA main.schema_version").fetchone()
+    schema_version = int(schema_row[0] if schema_row is not None else -1)
+    cache_key = id(conn)
+    with _CAPABILITY_CACHE_LOCK:
+        cached = _CAPABILITY_CACHE.get(cache_key)
+        if cached is not None and cached[0] is conn and cached[1] == schema_version:
+            _CAPABILITY_CACHE.move_to_end(cache_key)
+            return cached[2]
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view', 'virtual table')").fetchall()
+    tables = {str(row["name"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows}
+    metadata: dict[str, str] = {}
+    if "web_index_metadata" in tables:
+        try:
+            metadata = {
+                str(row["key"] if isinstance(row, sqlite3.Row) else row[0]):
+                str(row["value"] if isinstance(row, sqlite3.Row) else row[1])
+                for row in conn.execute("SELECT key, value FROM web_index_metadata")
+            }
+        except sqlite3.Error:
+            metadata = {}
+    result = {"tables": tables, "metadata": metadata}
+    with _CAPABILITY_CACHE_LOCK:
+        _CAPABILITY_CACHE[cache_key] = (conn, schema_version, result)
+        _CAPABILITY_CACHE.move_to_end(cache_key)
+        while len(_CAPABILITY_CACHE) > _CAPABILITY_CACHE_MAX:
+            _CAPABILITY_CACHE.popitem(last=False)
+    return result
+
+
+def invalidate_capability_cache(conn: sqlite3.Connection | None = None) -> None:
+    """Invalidate cached schema/index capabilities after same-connection rebuilds."""
+
+    with _CAPABILITY_CACHE_LOCK:
+        if conn is None:
+            _CAPABILITY_CACHE.clear()
+        else:
+            _CAPABILITY_CACHE.pop(id(conn), None)
 
 
 def _table_has_columns(conn: sqlite3.Connection, name: str, columns: set[str]) -> bool:
@@ -2703,13 +2793,7 @@ def _table_has_columns(conn: sqlite3.Connection, name: str, columns: set[str]) -
 
 
 def _web_index_metadata_value(conn: sqlite3.Connection, key: str) -> str | None:
-    if not _table_exists(conn, "web_index_metadata"):
-        return None
-    try:
-        row = conn.execute("SELECT value FROM web_index_metadata WHERE key = ? LIMIT 1", (key,)).fetchone()
-    except sqlite3.Error:
-        return None
-    return row["value"] if row else None
+    return _connection_capabilities(conn)["metadata"].get(key)
 
 
 def _has_normalized_message_norm(conn: sqlite3.Connection) -> bool:

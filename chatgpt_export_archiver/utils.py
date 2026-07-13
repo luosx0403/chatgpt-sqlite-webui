@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -97,7 +99,7 @@ def classify_file(path: str | Path) -> str:
 
 
 def safe_filename_part(text: str | None, max_len: int = 80) -> str:
-    text = (text or "untitled").strip() or "untitled"
+    text = unicodedata.normalize("NFC", (text or "untitled")).strip() or "untitled"
     text = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]+", "_", text)
     text = re.sub(r"\s+", "_", text)
     text = text.strip("._ ")
@@ -106,6 +108,27 @@ def safe_filename_part(text: str | None, max_len: int = 80) -> str:
     text = _avoid_windows_reserved_filename(text)
     text = text[:max_len].rstrip("._ ") or "untitled"
     return _avoid_windows_reserved_filename(text)
+
+
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate at a UTF-8 code-point boundary without emitting invalid text."""
+
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def finite_float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _avoid_windows_reserved_filename(text: str) -> str:
@@ -119,12 +142,11 @@ def _avoid_windows_reserved_filename(text: str) -> str:
 def epoch_to_display(value: float | int | str | None) -> str:
     if value in (None, ""):
         return ""
+    number = finite_float_or_none(value)
+    if number is None:
+        return ""
     try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    try:
-        return datetime.fromtimestamp(number).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(number, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except (OverflowError, OSError, ValueError):
         return str(value)
 

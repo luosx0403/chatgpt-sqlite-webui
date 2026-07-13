@@ -26,7 +26,7 @@ function pythonCandidates(platform = process.platform, env = process.env) {
 }
 
 function commandWorks(candidate) {
-  const result = spawnSync(candidate.command, [...candidate.args, "--version"], {
+  const result = spawnSync(candidate.command, [...candidate.args, "-c", "import fastapi, uvicorn"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
@@ -60,16 +60,29 @@ function assertStaticFrontendContracts() {
   const querySyntaxSource = fs.readFileSync(path.join(webRoot, "src/utils/querySyntax.ts"), "utf8");
   const i18nSource = fs.readFileSync(path.join(webRoot, "src/i18n.ts"), "utf8");
   const stylesSource = fs.readFileSync(path.join(webRoot, "src/styles.css"), "utf8");
+  const interactionSource = fs.readFileSync(path.join(webRoot, "src/utils/interaction.ts"), "utf8");
   assert.ok(appSource.includes('web_index_recovery: t("stageWebIndexRecovery")'), "web-index-recovery import stage should use a localized label");
   assert.ok(appSource.includes("has_internal_hits: meta.has_internal_hits"), "selected conversation merge must preserve hidden/internal search metadata after detail load");
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
   assert.ok(paneSource.includes("countTotal: false"), "reader hit navigation should request fast message-hit pages without exact total counts");
+  assert.ok(paneSource.includes("readerDataContextKey"), "reader requests should use a data-only context key");
+  assert.ok(paneSource.includes("readerLayoutContextKey"), "reader visual remeasure should use a separate layout context key");
+  assert.ok(appSource.includes("canonicalShareUrl"), "Copy URL should use a canonical serializer");
+  for (const explicitParam of ['params.set("match_mode"', 'params.set("layout"', 'params.set("show_internal"']) {
+    assert.ok(appSource.includes(explicitParam), `canonical Copy URL should explicitly include ${explicitParam}`);
+  }
+  assert.ok(appSource.includes('activeElement?.closest(".sidebar")'), "conversation keyboard navigation should be restricted to the sidebar context");
+  for (const selector of ["button", "a[href]", "summary", "[role='button']", "[role='menuitem']", "[tabindex]:not([tabindex='-1'])"]) {
+    assert.ok(interactionSource.includes(selector), `interactive target helper should recognize ${selector}`);
+  }
+  assert.ok(interactionSource.includes("target.closest"), "interactive target helper should recognize nested icons/spans through closest()");
   assert.ok(paneSource.includes("visible_total"), "reader should consume visible message totals from the API");
   assert.ok(paneSource.includes("effectivePath"), "reader download/copy/navigation should use effective query path");
   assert.ok(clientSource.includes("include_internal"), "reader download links should pass current internal visibility");
   assert.ok(paneSource.includes('disabled={Boolean(querySyntax.pathOverride)}'), "overridden path select should not look interactive");
-  assert.ok(querySyntaxSource.includes("toLocaleLowerCase"), "frontend query syntax should case-fold modifier values like the backend");
+  assert.ok(querySyntaxSource.includes("toLowerCase"), "frontend query syntax should use locale-independent modifier case folding");
+  assert.equal(querySyntaxSource.includes("toLocaleLowerCase"), false, "modifier parsing must not depend on the browser locale");
   assert.ok(querySyntaxSource.includes("readQuoted"), "frontend query syntax should parse quoted modifier values");
   assert.ok(i18nSource.includes("stageWebIndexRecovery"), "web-index-recovery stage label should be translated");
   assert.ok(i18nSource.includes("UTC calendar days"), "date filter UTC wording should be visible in search help");
@@ -243,7 +256,7 @@ function makeSyntheticConversations() {
     u: node("u", "root", "user", "filtertarget user body", 1_955_500_001, ["a"]),
     a: node("a", "u", "assistant", "filtertarget assistant body", 1_955_500_002, ["b"]),
     b: node("b", "a", "assistant", "filtertarget excluded body", 1_955_500_003, ["c"]),
-    c: node("c", "b", "assistant", 'filtertarget exact phrase foo "bar" and backslash \\ marker', 1_955_500_004),
+    c: node("c", "b", "assistant", 'filtertarget exact phrase foo "bar" and backslash \\ marker amber birch cedar denim ember frost glade hazel ivory jewel khaki', 1_955_500_004),
   };
   conversations.push(conversation("dom-reader-filter", "DOM Reader Filter Conversation titleblock", readerFilterMapping, "c", 1_955_500_000));
 
@@ -612,9 +625,14 @@ async function main() {
       cwd: repoRoot,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    let noDbServerError = "";
     noDbServer.stdout.on("data", () => undefined);
-    noDbServer.stderr.on("data", () => undefined);
-    await waitForHealth(noDbUrl);
+    noDbServer.stderr.on("data", (chunk) => { noDbServerError = `${noDbServerError}${chunk}`.slice(-4000); });
+    try {
+      await waitForHealth(noDbUrl);
+    } catch (error) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; server=${noDbServerError.trim() || `exit ${noDbServer.exitCode}`}`);
+    }
     const noDbContext = await browser.newContext({ viewport: { width: 1100, height: 760 }, locale: "en-US" });
     const noDbPage = await noDbContext.newPage();
     await noDbPage.goto(noDbUrl, { waitUntil: "networkidle" });
@@ -631,15 +649,48 @@ async function main() {
     });
     await noDbPage.getByTestId("import-zip-input").setInputFiles(uploadZip);
     await noDbPage.getByTestId("import-start-button").click();
-    await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("synthetic upload failure"), undefined, { timeout: 20_000 });
+    await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("could not be completed"), undefined, { timeout: 20_000 });
+    assert.equal((await noDbPage.getByTestId("import-panel").textContent())?.includes("synthetic upload failure"), false, "upload API details must not leak into localized UI");
     assert.ok((await noDbPage.getByTestId("import-panel").textContent())?.includes("Selected ZIP"), "failed upload should keep selected file for retry");
     assert.equal(await noDbPage.getByTestId("import-start-button").count(), 1, "failed upload should keep retry button");
+    let activeJobPolls = 0;
+    let maxActiveJobPolls = 0;
+    let delayedFirstJobPoll = true;
+    await noDbPage.route("**/api/import/jobs/*", async (route) => {
+      activeJobPolls += 1;
+      maxActiveJobPolls = Math.max(maxActiveJobPolls, activeJobPolls);
+      try {
+        if (delayedFirstJobPoll) {
+          delayedFirstJobPoll = false;
+          await new Promise((resolve) => setTimeout(resolve, 1_600));
+          const jobId = new URL(route.request().url()).pathname.split("/").pop();
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ job_id: jobId, status: "running", stage: "import", outcome: "import_running", canonical_commit_succeeded: false, elapsed_seconds: 1.6 }),
+          });
+        } else {
+          const jobId = new URL(route.request().url()).pathname.split("/").pop();
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ job_id: jobId, status: "succeeded", stage: "succeeded", outcome: "succeeded", canonical_commit_succeeded: true, elapsed_seconds: 3.0 }),
+          });
+        }
+      } finally {
+        activeJobPolls -= 1;
+      }
+    });
     await noDbPage.getByTestId("import-start-button").click();
     await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-status"]')?.textContent?.includes("succeeded"), undefined, { timeout: 60_000 });
+    await noDbPage.waitForTimeout(1_500);
+    assert.equal(maxActiveJobPolls, 1, "import job polling must be serial even when one response exceeds the polling interval");
+    assert.ok((await noDbPage.getByTestId("import-status").textContent())?.includes("succeeded"), "a late running response must not regress a terminal import status");
     await noDbPage.waitForFunction(() => !document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("Selected ZIP"), undefined, { timeout: 20_000 });
     assert.equal(await noDbPage.getByTestId("import-start-button").count(), 0, "successful job creation should clear selected file and start button");
     await noDbPage.waitForFunction(() => document.querySelectorAll(".conversation-item").length >= 1, undefined, { timeout: 20_000 });
     await noDbPage.unroute("**/api/import/upload");
+    await noDbPage.unroute("**/api/import/jobs/*");
     await noDbContext.close();
     if (noDbServer.exitCode === null && noDbServer.signalCode === null) {
       noDbServer.kill("SIGTERM");
@@ -694,10 +745,100 @@ async function main() {
       const apiPage = await (await fetch(new URL("/api/conversations?limit=5&sort=newest", baseUrl))).json();
       throw new Error(`initial conversation items did not render; health=${JSON.stringify(health)} api_count=${apiPage.items?.length ?? 0} diagnostics=${browserDiagnostics.join(" | ")}`);
     }
-    await page.getByRole("button", { name: "Search help" }).click();
+    const selectedBeforeInteractiveKeys = new URL(page.url()).searchParams.get("conversation");
+    await page.evaluate(() => {
+      const fixture = document.createElement("div");
+      fixture.id = "interactive-key-fixture";
+      fixture.innerHTML = `
+        <button data-kind="button"><span>Nested button</span></button>
+        <a data-kind="link" href="#synthetic-link"><span>Nested link</span></a>
+        <details><summary data-kind="summary"><span>Nested summary</span></summary><span>Details</span></details>
+        <div data-kind="role-button" role="button" tabindex="0"><span>Nested role button</span></div>
+        <div data-kind="tabindex" tabindex="0"><span>Nested tabindex</span></div>`;
+      document.body.appendChild(fixture);
+    });
+    for (const kind of ["button", "link", "summary", "role-button", "tabindex"]) {
+      for (const key of ["Enter", "n", "p", "j", "k", "ArrowDown", "ArrowUp"]) {
+        await page.locator(`#interactive-key-fixture [data-kind="${kind}"] span`).evaluate((node, pressedKey) => {
+          node.dispatchEvent(new KeyboardEvent("keydown", { key: pressedKey, bubbles: true, cancelable: true }));
+        }, key);
+        assert.equal(new URL(page.url()).searchParams.get("conversation"), selectedBeforeInteractiveKeys, `${key} from nested ${kind} content must not change conversation`);
+      }
+    }
+    await page.locator("#interactive-key-fixture [data-kind=button]").focus();
+    for (const key of ["Meta+k", "Control+k", "Alt+j"]) {
+      await page.keyboard.press(key);
+      assert.equal(new URL(page.url()).searchParams.get("conversation"), selectedBeforeInteractiveKeys, `${key} must not navigate conversations`);
+    }
+    await page.locator("#interactive-key-fixture").evaluate((node) => node.remove());
+    const helpOpener = page.getByRole("button", { name: "Search help" });
+    await helpOpener.focus();
+    await helpOpener.click();
     await page.getByRole("dialog", { name: "Search help" }).waitFor({ state: "visible", timeout: 20_000 });
     assert.ok((await page.getByRole("dialog", { name: "Search help" }).textContent())?.includes("UTC calendar days"), "search help should state date filters use UTC calendar days");
-    await page.getByRole("button", { name: "Close" }).click();
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent), "Close", "help dialog should focus its first control");
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog", { name: "Search help" }).waitFor({ state: "hidden" });
+    assert.equal(await helpOpener.evaluate((node) => node === document.activeElement), true, "closing help should restore opener focus");
+
+    await page.evaluate(() => {
+      window.__nativeFetch = window.fetch;
+      window.__listRace = {};
+      window.fetch = (input, init) => {
+        const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
+        const query = url.searchParams.get("q");
+        if (url.pathname === "/api/conversations" && (query === "race-a" || query === "race-b")) {
+          return new Promise((resolve) => {
+            window.__listRace[query] = () => resolve(new Response(JSON.stringify({
+              items: [{ conversation_id: query, title: query === "race-a" ? "Stale Race A" : "Fresh Race B", create_time: 1, update_time: 1, current_node: null }],
+              total: 1, limit: 60, offset: 0, has_more: false, next_offset: null, selected_in_results: false,
+            }), { status: 200, headers: { "content-type": "application/json" } }));
+          });
+        }
+        return window.__nativeFetch(input, init);
+      };
+    });
+    await page.locator("#global-search").fill("race-a");
+    await page.waitForFunction(() => Boolean(window.__listRace?.["race-a"]), undefined, { timeout: 20_000 });
+    await page.locator("#global-search").fill("race-b");
+    await page.waitForFunction(() => Boolean(window.__listRace?.["race-b"]), undefined, { timeout: 20_000 });
+    await page.evaluate(() => window.__listRace["race-b"]());
+    await page.getByRole("heading", { name: "Fresh Race B" }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.evaluate(() => window.__listRace["race-a"]());
+    await page.waitForTimeout(200);
+    assert.equal(await page.getByRole("heading", { name: "Fresh Race B" }).count(), 1, "late list response must not replace the newer selection");
+    assert.equal(await page.getByRole("heading", { name: "Stale Race A" }).count(), 0, "stale selected metadata must be discarded");
+    await page.evaluate(() => { window.fetch = window.__nativeFetch; });
+    await page.locator("#global-search").fill("");
+    await waitForCount(page, ".conversation-item", 20);
+
+    const settingsOpener = page.getByRole("button", { name: "Settings" });
+    await settingsOpener.focus();
+    await settingsOpener.click();
+    const settingsDialog = page.getByRole("dialog", { name: "Settings" });
+    await settingsDialog.waitFor({ state: "visible" });
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent), "Close", "settings dialog should focus its first control");
+    await page.keyboard.press("Shift+Tab");
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent), "Reset settings", "Shift+Tab should wrap to the final modal control");
+    await page.keyboard.press("Tab");
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent), "Close", "Tab should remain trapped inside settings");
+    await page.evaluate(() => {
+      window.__nativeStorageSetItem = Storage.prototype.setItem;
+      Storage.prototype.setItem = function () { throw new DOMException("synthetic quota", "QuotaExceededError"); };
+    });
+    await page.getByLabel("Density").selectOption("compact");
+    await page.waitForFunction(() => document.documentElement.dataset.density === "compact");
+    await page.getByText("Settings are applied for this session", { exact: false }).waitFor({ state: "visible" });
+    await page.keyboard.press("Escape");
+    await settingsDialog.waitFor({ state: "hidden" });
+    await page.waitForFunction(() => document.activeElement?.textContent === "Settings");
+    assert.equal(await settingsOpener.evaluate((node) => node === document.activeElement), true, "closing settings should restore opener focus");
+    await page.evaluate(() => { Storage.prototype.setItem = window.__nativeStorageSetItem; });
+    const resizer = page.getByRole("separator", { name: "Sidebar width" });
+    const widthBefore = Number(await resizer.getAttribute("aria-valuenow"));
+    await resizer.focus();
+    await page.keyboard.press("ArrowRight");
+    assert.equal(Number(await resizer.getAttribute("aria-valuenow")), widthBefore + 10, "sidebar resizer should support keyboard arrows");
 
     let delayedProgressRequest = false;
     await page.route("**/api/conversations**", async (route) => {
@@ -912,6 +1053,8 @@ async function main() {
     await page.waitForFunction(() => document.querySelector(".conversation-list")?.scrollTop > 0);
 
     const beforeItems = await page.locator(".conversation-item").count();
+    const selectedBeforeAppend = await page.locator(".reader-header h1").textContent();
+    const selectedUrlBeforeAppend = new URL(page.url()).searchParams.get("conversation");
     await page.locator(".conversation-list").evaluate((node) => { node.scrollTop = node.scrollHeight; });
     try {
       await waitForCount(page, ".conversation-item", beforeItems + 1);
@@ -921,6 +1064,37 @@ async function main() {
     }
     const afterItems = await page.locator(".conversation-item").count();
     assert.ok(afterItems > beforeItems, "Load more should append conversations");
+    assert.equal(await page.locator(".reader-header h1").textContent(), selectedBeforeAppend, "append page must not change the selected conversation");
+    assert.equal(new URL(page.url()).searchParams.get("conversation"), selectedUrlBeforeAppend, "append page must not change shareable selected state");
+
+    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    await waitForCount(page, ".conversation-item", 20);
+    await page.evaluate(() => {
+      window.__nativeFetch = window.fetch;
+      window.__readerRace = {};
+      window.fetch = (input, init) => {
+        const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
+        const isDelayedDetail = url.pathname === "/api/conversations/dom-long";
+        const isDelayedMessages = url.pathname === "/api/conversations/dom-long/messages";
+        if (isDelayedDetail || isDelayedMessages) {
+          const key = isDelayedDetail ? "detail" : "messages";
+          return new Promise((resolve, reject) => {
+            window.__readerRace[key] = () => window.__nativeFetch(input, { ...init, signal: undefined }).then(resolve, reject);
+          });
+        }
+        return window.__nativeFetch(input, init);
+      };
+    });
+    await page.getByRole("button", { name: /DOM Long Conversation/ }).click();
+    await page.waitForFunction(() => Boolean(window.__readerRace?.detail && window.__readerRace?.messages), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: /DOM Reader Filter Conversation/ }).click();
+    await page.getByRole("heading", { name: "DOM Reader Filter Conversation titleblock" }).waitFor({ state: "visible", timeout: 20_000 });
+    await waitForCount(page, ".message", 1);
+    await page.evaluate(() => { window.__readerRace.detail(); window.__readerRace.messages(); });
+    await page.waitForTimeout(300);
+    assert.equal(await page.getByRole("heading", { name: "DOM Reader Filter Conversation titleblock" }).count(), 1, "late detail response must not overwrite the newer selected conversation");
+    assert.equal((await page.locator(".reader").textContent())?.includes("Synthetic message 379"), false, "late reader response must not render under a newer conversation title");
+    await page.evaluate(() => { window.fetch = window.__nativeFetch; });
 
     await page.goto(`${baseUrl}?conversation=dom-long`, { waitUntil: "networkidle" });
     try {
@@ -938,8 +1112,61 @@ async function main() {
     await page.goto(`${baseUrl}?conversation=dom-long&layout=classic`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
     assert.equal(await page.locator(".message-row-chat").count(), 0, "classic layout query parameter should restore row-by-row message blocks");
+    assert.equal(new URL(page.url()).searchParams.get("layout"), "classic", "initial URL state sync must preserve the layout override");
+    await page.goto(`${baseUrl}?conversation=dom-long&layout=classic&show_internal=true`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    assert.equal(await page.getByLabel("Show internal messages").isChecked(), true, "shareable show_internal state should survive reload");
+    await page.locator("#global-search").fill("copy-url-live-query");
+    await page.getByRole("button", { name: "Copy URL" }).click();
+    const copiedUrl = await page.evaluate(() => window.__copiedText);
+    assert.equal(new URL(copiedUrl).searchParams.get("q"), "copy-url-live-query", "Copy URL must use the live query before debounce completes");
+    assert.equal(new URL(copiedUrl).searchParams.get("match_mode"), "contains", "Copy URL must serialize the sender's explicit default match mode");
+    assert.equal(new URL(copiedUrl).searchParams.get("layout"), "classic");
+    assert.equal(new URL(copiedUrl).searchParams.get("show_internal"), "true");
+    const receiverContext = await browser.newContext({ viewport: { width: 1200, height: 800 }, locale: "en-US" });
+    await receiverContext.addInitScript(() => {
+      localStorage.setItem("chatgptArchiveWeb.searchMatchMode.v1", "word");
+      localStorage.setItem("chatgptArchiveWeb.settings.v2", JSON.stringify({ messageLayout: "chat", showInternalDefault: false }));
+    });
+    const receiverPage = await receiverContext.newPage();
+    const receiverUrl = new URL(copiedUrl);
+    receiverUrl.searchParams.delete("q");
+    await receiverPage.goto(receiverUrl.toString(), { waitUntil: "networkidle" });
+    await waitForCount(receiverPage, ".message", 1);
+    assert.equal(await receiverPage.getByLabel("Whole word").isChecked(), false, "copied contains mode must beat recipient localStorage word mode");
+    assert.equal(await receiverPage.getByLabel("Show internal messages").isChecked(), true, "copied internal visibility must beat recipient localStorage");
+    await receiverPage.getByRole("button", { name: "Settings" }).click();
+    assert.equal(await receiverPage.getByLabel("Message layout").inputValue(), "classic", "copied layout must beat recipient localStorage");
+    await receiverContext.close();
+    await page.goto(`${baseUrl}?conversation=dom-long&match_mode=word&layout=chat&show_internal=false`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    await page.getByRole("button", { name: "Copy URL" }).click();
+    const copiedOppositeUrl = await page.evaluate(() => window.__copiedText);
+    assert.equal(new URL(copiedOppositeUrl).searchParams.get("match_mode"), "word");
+    assert.equal(new URL(copiedOppositeUrl).searchParams.get("layout"), "chat");
+    assert.equal(new URL(copiedOppositeUrl).searchParams.get("show_internal"), "false");
+    const oppositeContext = await browser.newContext({ viewport: { width: 1200, height: 800 }, locale: "en-US" });
+    await oppositeContext.addInitScript(() => {
+      localStorage.setItem("chatgptArchiveWeb.searchMatchMode.v1", "contains");
+      localStorage.setItem("chatgptArchiveWeb.settings.v2", JSON.stringify({ messageLayout: "classic", showInternalDefault: true }));
+    });
+    const oppositePage = await oppositeContext.newPage();
+    await oppositePage.goto(copiedOppositeUrl, { waitUntil: "networkidle" });
+    await waitForCount(oppositePage, ".message", 1);
+    assert.equal(await oppositePage.getByLabel("Whole word").isChecked(), true);
+    assert.equal(await oppositePage.getByLabel("Show internal messages").isChecked(), false);
+    await oppositePage.getByRole("button", { name: "Settings" }).click();
+    assert.equal(await oppositePage.getByLabel("Message layout").inputValue(), "chat");
+    await oppositeContext.close();
     await page.goto(`${baseUrl}?conversation=dom-long`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
+    let visualDataRequests = 0;
+    const visualRequestListener = (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/api/conversations/dom-long/messages" || url.pathname === "/api/search/messages") visualDataRequests += 1;
+    };
+    page.on("request", visualRequestListener);
+    const firstMessageBeforeVisualChanges = await page.locator(".message").first().textContent();
     await page.getByRole("button", { name: "Settings" }).click();
     await page.getByLabel("Message layout").selectOption("classic");
     await page.waitForFunction(() => document.querySelectorAll(".message-row-chat").length === 0, undefined, { timeout: 20_000 });
@@ -950,6 +1177,11 @@ async function main() {
     await page.getByLabel("Message max width").fill("760");
     await page.getByRole("button", { name: "Close" }).click();
     await assertStableMessageViewport(page, "settings layout density font and width changes");
+    await page.waitForTimeout(200);
+    page.off("request", visualRequestListener);
+    assert.equal(visualDataRequests, 0, "pure layout/density/font/max-width changes must not request messages or hits again");
+    assert.equal(await page.locator(".message").first().textContent(), firstMessageBeforeVisualChanges, "visual changes must preserve loaded reader bubbles");
+    assert.equal(await page.locator(".reader .loading-progress").count(), 0, "visual changes must not flash the reader back to loading");
     const messageMetrics = await page.locator(".message-scroll").evaluate((node) => ({
       clientHeight: node.clientHeight,
       scrollHeight: node.scrollHeight,
@@ -979,6 +1211,32 @@ async function main() {
         value: { writeText: async (text) => { window.__copiedText = text; } },
       });
     });
+    await page.evaluate(() => {
+      window.__copiedText = "copy-race-sentinel";
+      window.__nativeFetch = window.fetch;
+      window.__copyRaceRelease = null;
+      window.fetch = (input, init) => {
+        const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
+        if (url.pathname === "/api/conversations/dom-long/messages" && !url.searchParams.has("q") && url.searchParams.get("offset") === "0") {
+          return new Promise((resolve, reject) => {
+            window.__copyRaceRelease = () => window.__nativeFetch(input, { ...init, signal: undefined }).then(resolve, reject);
+          });
+        }
+        return window.__nativeFetch(input, init);
+      };
+    });
+    await page.getByRole("button", { name: "Copy current path conversation" }).click();
+    await page.waitForFunction(() => Boolean(window.__copyRaceRelease), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: /DOM Role Class Conversation/ }).click();
+    await page.getByRole("heading", { name: "DOM Role Class Conversation" }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.evaluate(() => window.__copyRaceRelease());
+    await page.waitForTimeout(300);
+    assert.equal(await page.evaluate(() => window.__copiedText), "copy-race-sentinel", "copy response from an old reader context must not write to the clipboard");
+    assert.equal((await page.locator(".hit-counter").textContent())?.includes("Copied"), false, "old copy completion must not set success in the new reader context");
+    await page.evaluate(() => { window.fetch = window.__nativeFetch; });
+    await page.goto(`${baseUrl}?conversation=dom-long`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    await page.evaluate((value) => { window.__copiedText = value; }, copiedBeforeFailure);
     const failSecondMessagePage = async (route) => {
       const url = new URL(route.request().url());
       if (url.pathname === "/api/conversations/dom-long/messages" && url.searchParams.get("offset") === "300") {
@@ -1123,6 +1381,10 @@ async function main() {
     await page.locator("#global-search").fill("a/b");
     await page.waitForFunction(() => document.querySelector("#global-search")?.value === "a/b", undefined, { timeout: 10_000 });
 
+    await page.goto(`${baseUrl}?conversation=dom-reader-filter`, { waitUntil: "networkidle" });
+    await page.locator("#global-search").fill("amber birch cedar denim ember frost glade hazel ivory jewel khaki");
+    await page.getByText("This message has more matches than the highlight preview can mark", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+
     await page.goto(`${baseUrl}?conversation=dom-role-class`, { waitUntil: "networkidle" });
     await page.getByLabel("Show internal messages").check();
     await page.waitForFunction(() => document.querySelector(".message-role-tool-system"), undefined, { timeout: 20_000 });
@@ -1174,7 +1436,7 @@ async function main() {
 	    await page.getByLabel("Message path").selectOption("current");
 	    await page.getByLabel("Message path").selectOption("all");
 	    await page.evaluate(() => { window.__copiedText = ""; });
-    await page.getByRole("button", { name: "Copy current path conversation" }).click();
+    await page.getByRole("button", { name: "Copy all-nodes conversation" }).click();
     await page.waitForFunction(() => window.__copiedText?.includes("branchoverride-token"), undefined, { timeout: 20_000 });
     await page.getByLabel("Message path").selectOption("current");
     await page.locator("#global-search").fill("PATH:ALL branchoverride-token");
@@ -1210,7 +1472,8 @@ async function main() {
     assert.equal(await page.locator(".search-highlight").count(), 0, "source-only filter should not create body highlights");
     await page.getByLabel("Source shard").fill("");
     await page.getByLabel("Exclude").fill("absent-filter-token");
-    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Filter match"), undefined, { timeout: 20_000 });
+    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("No hits"), undefined, { timeout: 20_000 });
+    assert.equal((await page.locator(".hit-counter").textContent())?.includes("Filter match"), false, "exclude-only context is not a positive filter-only match");
     assert.equal(await page.locator(".search-highlight").count(), 0, "exclude-only filter should not create body highlights");
     await page.getByLabel("Exclude").fill("");
     await page.getByLabel("Role").selectOption("assistant");
@@ -1218,7 +1481,8 @@ async function main() {
     assert.equal(await page.locator(".search-highlight").count(), 0, "role-only filter should not be presented as a body hit");
     await page.getByLabel("Role").selectOption("");
     await page.locator("#global-search").fill("-filtertarget");
-    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Filter match"), undefined, { timeout: 20_000 });
+    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("No hits"), undefined, { timeout: 20_000 });
+    assert.equal((await page.locator(".hit-counter").textContent())?.includes("Filter match"), false, "raw exclude-only query is not a positive filter-only match");
     assert.equal(await page.locator(".search-highlight").count(), 0, "raw exclude-only q should not create body hit UI");
     await page.locator("#global-search").fill("source:conversations.json");
     await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Filter match"), undefined, { timeout: 20_000 });
@@ -1237,7 +1501,7 @@ async function main() {
     await page.getByLabel("Title contains").fill("");
 	    await page.getByLabel("Exclude").fill("excluded");
 	    await page.locator("#global-search").fill("filtertarget");
-	    await page.waitForFunction(() => document.querySelectorAll(".search-highlight").length === 0, undefined, { timeout: 20_000 });
+	    await page.waitForFunction(() => !document.querySelector('[data-testid="search-loading-progress"]') && !Array.from(document.querySelectorAll(".conversation-title")).some((node) => node.textContent?.includes("DOM Reader Filter Conversation")), undefined, { timeout: 20_000 });
 	    assert.equal(await page.getByRole("button", { name: /DOM Reader Filter Conversation/ }).count(), 0, "conversation-level exclude should remove conversations containing the excluded body fragment");
 	    await page.getByLabel("Exclude").fill("");
 	    await page.goto(`${baseUrl}?conversation=dom-reader-filter&q=filtertarget`, { waitUntil: "networkidle" });
@@ -1323,8 +1587,17 @@ async function main() {
     await page.setViewportSize({ width: 390, height: 800 });
     await page.goto(baseUrl, { waitUntil: "networkidle" });
     await waitForCount(page, ".conversation-item", 5);
+    const mobileToolbar = await page.getByTestId("top-toolbar").boundingBox();
+    assert.ok(mobileToolbar && mobileToolbar.height >= 40, "390px layout must keep a mobile toolbar visible");
+    assert.ok(await page.locator('label[for="import-zip-input"]').isVisible(), "mobile toolbar must keep ZIP import accessible");
+    assert.ok(await page.getByRole("button", { name: "设置" }).isVisible(), "mobile toolbar must keep Settings accessible");
+    assert.ok(await page.getByRole("button", { name: "搜索帮助" }).isVisible(), "mobile toolbar must keep Search Help accessible");
+    await page.getByRole("button", { name: "设置" }).focus();
+    const focusOutline = await page.getByRole("button", { name: "设置" }).evaluate((node) => getComputedStyle(node).outlineStyle);
+    assert.notEqual(focusOutline, "none", "mobile controls need a visible keyboard focus indicator");
+    await page.locator(".advanced-panel summary").click();
     const narrow = await page.locator(".message-scroll, .empty-state").first().boundingBox();
-    assert.ok(narrow && narrow.height > 100, "narrow layout should keep reader usable");
+    assert.ok(narrow && narrow.height > 100, "narrow layout should keep reader usable even with advanced filters open");
 
     console.log("dom_smoke ok");
   } finally {

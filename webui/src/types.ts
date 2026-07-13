@@ -2,6 +2,7 @@ export type SortMode = "relevance" | "newest" | "oldest" | "created" | "updated"
 export type PathMode = "current" | "all";
 export type SearchScope = "all" | "title" | "message";
 export type MatchMode = "contains" | "word";
+export type UnknownApiEnum = string & { readonly __unknownApiEnum?: never };
 
 export interface SearchFilters {
   role: "" | "user" | "assistant" | "system" | "developer" | "tool" | "tool/system" | "tool_system";
@@ -24,6 +25,13 @@ export interface ConversationSummary {
   node_count?: number;
   current_path_nodes?: number;
   current_path_fallback_to_all?: boolean;
+  current_node_exists?: boolean;
+  current_collection_source?: "current_node" | "raw_flags" | "fallback_all" | UnknownApiEnum;
+  effective_path?: PathMode;
+  cycle_detected?: boolean;
+  missing_parent?: boolean;
+  cross_conversation_parent?: boolean;
+  partial_chain?: boolean;
   hit_count?: number;
   snippets?: SearchSnippet[];
   reasons?: string[];
@@ -62,6 +70,7 @@ export interface MessageItem {
   has_text: boolean;
   has_raw: boolean;
   raw_preview: string;
+  raw_preview_truncated?: boolean;
   raw_text?: string;
   content_hash: string | null;
   is_on_current_path: boolean;
@@ -70,6 +79,7 @@ export interface MessageItem {
   is_internal: boolean;
   is_empty_mapping_node?: boolean;
   highlight_ranges: HighlightRange[];
+  highlight_ranges_truncated?: boolean;
   snippet?: string;
   title?: string | null;
   reasons?: string[];
@@ -103,9 +113,10 @@ export interface HighlightRange {
   end: number;
 }
 
-export interface Page<T> {
+export interface BasePage<T> {
   items: T[];
   total: number;
+  total_exact?: boolean;
   limit: number;
   offset: number;
   has_more: boolean;
@@ -113,13 +124,33 @@ export interface Page<T> {
   visible_total?: number;
   empty_hidden_count?: number;
   internal_hidden_count?: number;
+  /** @deprecated Exact alias of internal_hidden_count for compatibility. */
   technical_hidden_count?: number;
-  selected_in_results?: boolean;
-  selected_item?: T;
   raw_size?: number;
   truncated?: boolean;
   diagnostics?: SearchDiagnostics;
   db_ready?: boolean;
+  effective_path?: PathMode;
+  current_path_fallback_to_all?: boolean;
+  current_node_exists?: boolean;
+  current_collection_source?: "current_node" | "raw_flags" | "fallback_all" | UnknownApiEnum;
+  around_target_found?: boolean;
+  around_target_visible?: boolean;
+  around_target_in_effective_collection?: boolean;
+  around_target_applied?: boolean;
+}
+
+export interface ConversationPage extends BasePage<ConversationSummary> {
+  selected_in_results?: boolean;
+  selected_item?: ConversationSummary;
+}
+
+export interface MessagePage extends BasePage<MessageItem> {
+  effective_path?: PathMode;
+  current_path_fallback_to_all?: boolean;
+}
+
+export interface SearchMessagePage extends BasePage<SearchMessageHit> {
   effective_path?: PathMode;
   current_path_fallback_to_all?: boolean;
 }
@@ -131,13 +162,13 @@ export interface SearchDiagnostics {
     | "normalized_scan"
     | "normalized_title_scan"
     | "full_scan"
-    | (string & {});
+    | UnknownApiEnum;
   web_index_missing?: boolean;
   normalized_trigram_available?: boolean;
   legacy_trigram_index?: boolean;
   legacy_fts_present?: boolean;
   short_query?: boolean;
-  diagnostics_accuracy?: "best_effort" | (string & {});
+  diagnostics_accuracy?: "best_effort" | UnknownApiEnum;
   actual_fallback_note?: string;
   estimated_backend_note?: string;
 }
@@ -170,12 +201,19 @@ export interface Health {
   web_normalized_trigram_indexed?: boolean;
   web_legacy_trigram_indexed?: boolean;
   web_index_metadata?: boolean;
+  access_profile?: "loopback_local" | "remote_opt_in";
+  remote_access?: boolean;
+  allowed_hosts?: string[];
+  trusted_proxies?: string[];
+  write_origin_required?: boolean;
 }
 
 export interface ImportJob {
   job_id: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "postcheck_failed" | "cancelled";
+  status: "queued" | "running" | "succeeded" | "failed" | "postcheck_failed";
   stage: string;
+  outcome: "queued" | "import_running" | "input_preflight_failed" | "source_scan_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "succeeded";
+  canonical_commit_succeeded: boolean;
   filename: string;
   size: number;
   created_at: number;
@@ -187,5 +225,31 @@ export interface ImportJob {
   stats: Stats | null;
   web_index: Record<string, unknown> | null;
   error: string | null;
+  error_code: string | null;
+  cleanup_warning: string | null;
   log_tail: string[];
+}
+
+export interface RawMessageResponse {
+  conversation_id: string;
+  node_id: string;
+  raw_message: unknown;
+  raw_text?: string;
+  raw_size: number;
+  truncated: boolean;
+}
+
+export interface ApiSchemaResponse {
+  version: number;
+  pagination: { fields: string[] };
+  conversations: Record<string, unknown>;
+  messages: Record<string, unknown>;
+  raw: Record<string, unknown>;
+  export: Record<string, unknown>;
+  search: Record<string, unknown>;
+  suggest: Record<string, unknown>;
+  upload: { effective_policy: Record<string, unknown>; [key: string]: unknown };
+  jobs: Record<string, unknown>;
+  stable_error_codes: string[];
+  provenance: Record<string, string>;
 }

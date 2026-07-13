@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import stat
 import shutil
 from pathlib import Path
@@ -53,6 +54,7 @@ SENSITIVE_FILE_SUFFIXES = {
     ".sqlite3-wal",
     ".zip",
 }
+SENSITIVE_FILE_PATTERNS = (re.compile(r"conversations.*\.json$", re.IGNORECASE),)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,7 +222,7 @@ def _is_generated_file(rel: Path, name: str) -> bool:
 
 def _is_sensitive_file(name: str) -> bool:
     lower = name.lower()
-    return Path(lower).suffix in SENSITIVE_FILE_SUFFIXES
+    return Path(lower).suffix in SENSITIVE_FILE_SUFFIXES or any(pattern.fullmatch(name) for pattern in SENSITIVE_FILE_PATTERNS)
 
 
 def _dedupe(items: list[tuple[Path, Path]]) -> list[tuple[Path, Path]]:

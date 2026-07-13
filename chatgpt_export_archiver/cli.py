@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,9 +33,10 @@ from .db import (
 )
 from .exporter import export_conversations
 from .logging_utils import configure_logging, get_logger
-from .parser import WarningRecord, parse_conversation, validate_conversation_element
+from .parser import WarningRecord, conversation_id_from_value, parse_conversation, validate_conversation_element
 from .scanner import (
     InputSource,
+    NonFiniteJsonNumberError,
     is_legacy_conversations_source,
     is_shard_conversation_source,
     list_source_entries,
@@ -48,6 +50,28 @@ from .web_db import create_web_indexes
 LOGGER = get_logger("cli")
 
 
+class ImportPipelineError(ValueError):
+    """Safe structured failure shared by CLI and Web import jobs."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        stage: str,
+        source_identifier: str = "input",
+        run_id: int | None = None,
+        summary: dict[str, Any] | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.stage = stage
+        self.source_identifier = source_identifier
+        self.run_id = run_id
+        self.summary = dict(summary) if summary else None
+        self.detail = dict(detail) if detail else {}
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
     parser = build_parser()
@@ -59,12 +83,12 @@ def main(argv: list[str] | None = None) -> int:
             json_logs=args.json_logs,
         )
     except ValueError as exc:
-        print(f"ERROR: {exc}")
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     try:
         return args.func(args)
     except (ValueError, sqlite3.Error, OSError, json.JSONDecodeError) as exc:
-        print(f"ERROR: {exc}")
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
 
@@ -162,6 +186,14 @@ def build_parser() -> argparse.ArgumentParser:
     web_p = sub.add_parser("web", help="Start the local browser Web UI.")
     web_p.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
     web_p.add_argument("--host", default="127.0.0.1", help="Bind host. Defaults to 127.0.0.1.")
+    web_p.add_argument(
+        "--allowed-hosts",
+        help="Comma-separated exact browser hostnames/IPs. Required for non-loopback binds; also configurable with CHATGPT_ARCHIVE_ALLOWED_HOSTS.",
+    )
+    web_p.add_argument(
+        "--trusted-proxies",
+        help="Comma-separated proxy IPs/CIDRs allowed to supply forwarded host/proto headers. Defaults to CHATGPT_ARCHIVE_TRUSTED_PROXIES.",
+    )
     web_p.add_argument("--port", type=int, default=8787, help="Bind port.")
     web_p.add_argument("--allow-fallback", action="store_true", help="Allow the limited fallback HTML UI if the React build is missing.")
     web_p.set_defaults(func=cmd_web)
@@ -208,7 +240,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     for entry in selected:
         try:
             data = load_json_from_source(source, entry.source_path)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, NonFiniteJsonNumberError):
             top_level_bad += 1
             print(f"source {Path(entry.source_path).name} top_level invalid_json valid 0 invalid 0")
             continue
@@ -225,7 +257,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                 invalid_locations.append((Path(entry.source_path).name, idx, warning.warning_type))
                 continue
             source_valid += 1
-            ids.append(str(item.get("id")))
+            conversation_id = conversation_id_from_value(item)
+            if conversation_id is not None:
+                ids.append(conversation_id)
         valid_count += source_valid
         print(f"source {Path(entry.source_path).name} top_level list valid {source_valid} invalid {source_invalid}")
     duplicate_count = len(ids) - len(set(ids))
@@ -315,11 +349,20 @@ def run_import_pipeline(
     if optimize_fts_after_import and not rebuild_fts:
         raise ValueError("--optimize-fts-after-import requires --rebuild-fts")
     LOGGER.info("import_start input_kind=%s input_size=%s", source.kind, source.size)
-    conn = connect(db_path)
-    configure_import_connection(conn)
-    init_db(conn)
-    input_sha = None if no_input_sha256 or source.kind != "zip" else sha256_file(source.path)
-    run_id = begin_import_run(conn, source, input_sha)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = connect(db_path)
+        configure_import_connection(conn)
+        init_db(conn)
+        input_sha = None if no_input_sha256 or source.kind != "zip" else sha256_file(source.path)
+        run_id = begin_import_run(conn, source, input_sha)
+    except Exception:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
     summary: dict[str, Any] = {
         "import_run_id": run_id,
         "source": source.kind,
@@ -393,8 +436,21 @@ def run_import_pipeline(
             summary["warnings"] += len(optional_drop_failures)
         drop_import_rebuildable_indexes(conn)
         source_scan_started = time.perf_counter()
-        entries = list_source_entries(source)
-        selected = select_conversation_sources(entries)
+        try:
+            entries = list_source_entries(source)
+            selected = select_conversation_sources(entries)
+        except (ValueError, zipfile.BadZipFile) as exc:
+            raw_code = str(exc).split(" ", 1)[0]
+            code = (
+                "ambiguous_conversation_sources"
+                if raw_code in {"duplicate_conversation_json_source", "ambiguous_conversation_source_identity"}
+                else "source_scan_failed"
+            )
+            summary["failure_code"] = code
+            raise ImportPipelineError(code, stage="source_scan", run_id=run_id) from exc
+        if not selected:
+            summary["failure_code"] = "no_conversation_sources"
+            raise ImportPipelineError("no_conversation_sources", stage="input_preflight", run_id=run_id)
         record_source_entries(conn, run_id, entries)
         summary["source_scan_seconds"] = _elapsed(source_scan_started)
         notify("source_scan_complete")
@@ -409,17 +465,34 @@ def run_import_pipeline(
             batch.clear()
 
         parse_started = time.perf_counter()
-        for entry in selected:
+        for source_index, entry in enumerate(selected):
             try:
                 data = load_json_from_source(source, entry.source_path)
             except json.JSONDecodeError as exc:
-                record_warning(conn, run_id, WarningRecord(entry.source_path, None, "invalid_json", None, str(exc)))
-                summary["warnings"] += 1
-                continue
+                summary["failure_code"] = "invalid_conversation_json"
+                raise ImportPipelineError(
+                    "invalid_conversation_json",
+                    stage="json_decode",
+                    source_identifier=f"selected_source_{source_index}",
+                    run_id=run_id,
+                ) from exc
+            except NonFiniteJsonNumberError as exc:
+                summary["failure_code"] = "non_finite_json_number"
+                raise ImportPipelineError(
+                    "non_finite_json_number",
+                    stage="json_decode",
+                    source_identifier=f"selected_source_{source_index}",
+                    run_id=run_id,
+                ) from exc
             if not isinstance(data, list):
-                record_warning(conn, run_id, WarningRecord(entry.source_path, None, "top_level_not_list", None, type(data).__name__))
-                summary["warnings"] += 1
-                continue
+                summary["failure_code"] = "conversation_json_top_level_not_list"
+                raise ImportPipelineError(
+                    "conversation_json_top_level_not_list",
+                    stage="top_level_contract",
+                    source_identifier=f"selected_source_{source_index}",
+                    run_id=run_id,
+                    detail={"top_level_type": type(data).__name__},
+                )
             parsed_conversations = []
             for idx, item in enumerate(data):
                 warning = validate_conversation_element(item, entry.source_path, idx)
@@ -493,16 +566,42 @@ def run_import_pipeline(
             result["summary_update_after_close_failed"] = message
             LOGGER.warning("summary_update_after_close_failed %s", message)
         import_succeeded = True
-    except Exception:
+    except Exception as exc:
         try:
             in_transaction = conn.in_transaction
         except sqlite3.ProgrammingError:
             in_transaction = False
         if in_transaction:
             conn.rollback()
+        pipeline_error = exc if isinstance(exc, ImportPipelineError) else ImportPipelineError(
+            "import_transaction_failed",
+            stage="transaction",
+            run_id=run_id,
+        )
+        summary["failure_code"] = pipeline_error.code
+        summary["failure_stage"] = pipeline_error.stage
         summary["wall_total_seconds"] = _elapsed(import_started)
         summary["total_import_seconds"] = summary["wall_total_seconds"]
         try:
+            record_warning(
+                conn,
+                run_id,
+                WarningRecord(
+                    pipeline_error.source_identifier,
+                    None,
+                    pipeline_error.code,
+                    compact_json({"stage": pipeline_error.stage, **pipeline_error.detail}),
+                    None,
+                ),
+            )
+            warning_rows = conn.execute(
+                """SELECT warning_type, COUNT(*) AS count
+                   FROM import_warnings WHERE import_run_id = ?
+                   GROUP BY warning_type ORDER BY warning_type""",
+                (run_id,),
+            ).fetchall()
+            summary["warnings"] = sum(int(row["count"]) for row in warning_rows)
+            summary["warnings_by_type"] = [dict(row) for row in warning_rows]
             finish_import_run(conn, run_id, "failed", summary)
         except Exception:
             pass
@@ -510,7 +609,9 @@ def run_import_pipeline(
             conn.close()
         except Exception:
             pass
-        raise
+        pipeline_error.run_id = run_id
+        pipeline_error.summary = dict(summary)
+        raise pipeline_error from exc if pipeline_error is not exc else None
     if not import_succeeded:
         raise RuntimeError("import did not complete")
     if delete_input_on_success:
@@ -627,6 +728,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"broken_parent_links {result['broken_parent_links']}")
     print(f"conversations_with_zero_nodes {result['conversations_with_zero_nodes']}")
     print(f"parent_cycles {result['parent_cycles']}")
+    print(f"non_finite_timestamps {result.get('non_finite_timestamps', 0)}")
+    for key, value in sorted(result.get("effective_current_diagnostics", {}).items()):
+        print(f"effective_current_{key} {value}")
     if result.get("optional_web_index_error"):
         print(f"optional_web_index_error {str(result['optional_web_index_error']).lower()}")
         print(f"optional_web_index_recovery_hint {result['optional_web_index_recovery_hint']}")
@@ -638,7 +742,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    from .search import MAX_CANDIDATES, parse_query, search_messages
+    from .search import parse_query, search_messages
 
     conn = connect_existing_readonly(Path(args.db))
     try:
@@ -676,7 +780,14 @@ def cmd_web(args: argparse.Namespace) -> int:
             f"WARNING: binding to {args.host}; this exposes the local archive browser and upload endpoint. "
             f"Only use this on trusted networks. upload_policy {upload_policy}."
         )
-    app = create_app(db_path, allow_fallback=args.allow_fallback, log_level=args.log_level, host=args.host)
+    app = create_app(
+        db_path,
+        allow_fallback=args.allow_fallback,
+        log_level=args.log_level,
+        host=args.host,
+        allowed_hosts=args.allowed_hosts,
+        trusted_proxies=args.trusted_proxies,
+    )
     if args.allow_fallback:
         print("WARNING: fallback UI is enabled. This is a limited emergency page, not the full React Web UI.")
     web_host = _resolve_web_url_host(args.host)

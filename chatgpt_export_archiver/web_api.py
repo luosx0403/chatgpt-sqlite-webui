@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Annotated, Mapping
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, Request, Response, UploadFile
 
 from .exporter import render_markdown, render_txt
 from .logging_utils import get_logger
+from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
 from .search import get_conversation, get_messages, list_conversations, normalize_search_text, parse_query, search_conversations, search_messages
-from .utils import safe_filename_part
+from .utils import finite_float_or_none, safe_filename_part
 from .web_db import check_schema, connect_readonly, detect_fts5, detect_trigram, web_index_status
 from .web_jobs import ImportJobManager, cleanup_upload_dir, make_upload_path
 
@@ -43,13 +44,17 @@ _MAX_UPLOAD_TOTAL_UNCOMPRESSED_BYTES_ENV = "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_UNC
 _MAX_UPLOAD_COMPRESSION_RATIO_ENV = "CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO"
 _MAX_UPLOAD_TOTAL_MEMBERS_ENV = "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS"
 ALLOW_REMOTE_UPLOADS_ENV = "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS"
+ALLOW_REMOTE_ACCESS_ENV = "CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS"
 REMOTE_UPLOAD_PROFILE_ENV = "CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE"
+ALLOWED_HOSTS_ENV = "CHATGPT_ARCHIVE_ALLOWED_HOSTS"
+TRUSTED_PROXIES_ENV = "CHATGPT_ARCHIVE_TRUSTED_PROXIES"
 
 REMOTE_DEFAULT_MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 REMOTE_DEFAULT_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024
 REMOTE_DEFAULT_MEMBER_BYTES = 256 * 1024 * 1024
 REMOTE_DEFAULT_COMPRESSION_RATIO = 200.0
 REMOTE_DEFAULT_TOTAL_MEMBERS = 10000
+MULTIPART_OVERHEAD_ALLOWANCE = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,61 @@ class UploadPolicy:
     max_total_members: int
     remote: bool
     remote_profile: str = "local"
+    max_multipart_body_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class WebTrustPolicy:
+    allowed_hosts: tuple[str, ...]
+    trusted_proxies: tuple[str, ...]
+    remote: bool
+    allow_missing_origin_for_writes: bool
+
+
+def _split_config_list(raw: str | None) -> tuple[str, ...]:
+    return tuple(sorted({part.strip().casefold() for part in (raw or "").split(",") if part.strip()}))
+
+
+def _get_web_trust_policy(
+    *,
+    host: str,
+    environ: Mapping[str, str] = os.environ,
+    allowed_hosts: str | None = None,
+    trusted_proxies: str | None = None,
+) -> WebTrustPolicy:
+    remote = not _is_loopback(host)
+    configured_hosts = _split_config_list(
+        allowed_hosts if allowed_hosts is not None else environ.get(ALLOWED_HOSTS_ENV)
+    )
+    if "*" in configured_hosts:
+        raise ValueError("allowed_hosts_wildcard_not_permitted")
+    if remote:
+        if not configured_hosts:
+            raise ValueError(
+                "non_loopback_access_requires_allowed_hosts: set CHATGPT_ARCHIVE_ALLOWED_HOSTS "
+                "to the actual browser hostname or LAN IP"
+            )
+        effective_hosts = configured_hosts
+    else:
+        effective_hosts = tuple(sorted(set(configured_hosts) | {"localhost", "127.0.0.1", "::1", "testserver", host.casefold()}))
+    proxy_values = _split_config_list(
+        trusted_proxies if trusted_proxies is not None else environ.get(TRUSTED_PROXIES_ENV)
+    )
+    for value in proxy_values:
+        try:
+            ipaddress.ip_network(value, strict=False)
+        except ValueError as exc:
+            raise ValueError("invalid_trusted_proxy") from exc
+    return WebTrustPolicy(
+        allowed_hosts=effective_hosts,
+        trusted_proxies=proxy_values,
+        remote=remote,
+        allow_missing_origin_for_writes=not remote,
+    )
+
+
+def upload_body_limit(policy: UploadPolicy) -> int:
+    return int(policy.max_multipart_body_bytes or (policy.max_upload_bytes + MULTIPART_OVERHEAD_ALLOWANCE))
 
 
 def _positive_int(value_str: str, default: int) -> int:
@@ -87,6 +147,14 @@ def _positive_float_from_env(name: str, default: float, environ: Mapping[str, st
 
 def _env_truthy(environ: Mapping[str, str], name: str) -> bool:
     return environ.get(name, "").strip().casefold() in {"true", "1", "yes"}
+
+
+def _remote_access_allowed(environ: Mapping[str, str] = os.environ) -> bool:
+    return (
+        _env_truthy(environ, ALLOW_REMOTE_ACCESS_ENV)
+        or _env_truthy(environ, ALLOW_REMOTE_UPLOADS_ENV)
+        or environ.get(REMOTE_UPLOAD_PROFILE_ENV, "").strip().casefold() == "local"
+    )
 
 
 def _env_int_value(environ: Mapping[str, str], name: str, default: int) -> int:
@@ -221,6 +289,7 @@ def _effective_upload_policy(policy: UploadPolicy) -> UploadPolicy:
 
 def _upload_policy_schema(policy: UploadPolicy) -> dict[str, object]:
     return {
+        "max_multipart_body_bytes": upload_body_limit(policy),
         "max_upload_bytes": policy.max_upload_bytes,
         "max_json_member_bytes": policy.max_json_member_bytes,
         "max_json_members": policy.max_json_members,
@@ -231,21 +300,28 @@ def _upload_policy_schema(policy: UploadPolicy) -> dict[str, object]:
         "remote_profile": policy.remote_profile,
         "explicit_remote_override": policy.remote and policy.remote_profile == "explicit_remote_override",
         "local_profile": policy.remote_profile in {"local", "local_profile"},
+        "remote_access_requires_opt_in": policy.remote,
     }
 
 
-def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None, upload_policy: UploadPolicy | None = None) -> APIRouter:
+def create_api_router(
+    db_path: Path,
+    job_manager: ImportJobManager | None = None,
+    upload_policy: UploadPolicy | None = None,
+    trust_policy: WebTrustPolicy | None = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api")
     manager = job_manager or ImportJobManager(db_path)
     policy = _effective_upload_policy(upload_policy or _get_upload_policy())
+    trust = trust_policy or _get_web_trust_policy(host="127.0.0.1")
 
     def get_conn():
         if not db_path.exists():
-            raise HTTPException(status_code=409, detail="database is not ready")
+            raise HTTPException(status_code=409, detail="database_not_ready")
         try:
             conn = connect_readonly(db_path)
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail="database is not ready") from exc
+            raise HTTPException(status_code=409, detail="database_not_ready") from exc
         try:
             schema = check_schema(conn)
             if not schema["ok"]:
@@ -273,6 +349,13 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
 
     @router.get("/health")
     def health():
+        access = {
+            "access_profile": "remote_opt_in" if policy.remote else "loopback_local",
+            "remote_access": policy.remote,
+            "allowed_hosts": list(trust.allowed_hosts),
+            "trusted_proxies": list(trust.trusted_proxies),
+            "write_origin_required": not trust.allow_missing_origin_for_writes,
+        }
         if not db_path.exists():
             return {
                 "ok": True,
@@ -287,11 +370,12 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
                 "web_normalized_trigram_indexed": False,
                 "web_legacy_trigram_indexed": False,
                 "schema_compatible": False,
+                **access,
             }
         try:
             conn = connect_readonly(db_path)
         except ValueError:
-            return {"ok": True, "db_ready": False, "database": {"name": "database", "exists": db_path.exists()}, "schema_version": 1}
+            return {"ok": True, "db_ready": False, "database": {"name": "database", "exists": db_path.exists()}, "schema_version": 1, **access}
         try:
             schema = check_schema(conn)
             web_status = web_index_status(conn)
@@ -310,6 +394,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             "fts5_available": fts5,
             "message_fts_available": schema["message_fts"],
             "trigram_available": trigram,
+            **access,
             **web_status,
         }
 
@@ -328,10 +413,10 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS conversations,
-                       MIN(create_time) AS earliest_create_time,
-                       MAX(create_time) AS latest_create_time,
-                       MIN(update_time) AS earliest_update_time,
-                       MAX(update_time) AS latest_update_time
+                       MIN(CASE WHEN create_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN create_time END) AS earliest_create_time,
+                       MAX(CASE WHEN create_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN create_time END) AS latest_create_time,
+                       MIN(CASE WHEN update_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN update_time END) AS earliest_update_time,
+                       MAX(CASE WHEN update_time BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 THEN update_time END) AS latest_update_time
                 FROM conversations
                 """
             ).fetchone()
@@ -347,36 +432,49 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             "nodes": nodes["total"],
             "current_path_nodes": nodes["current_path"] or 0,
             "warnings": warnings,
-            "earliest_create_time": row["earliest_create_time"],
-            "latest_create_time": row["latest_create_time"],
-            "earliest_update_time": row["earliest_update_time"],
-            "latest_update_time": row["latest_update_time"],
+            "earliest_create_time": finite_float_or_none(row["earliest_create_time"]),
+            "latest_create_time": finite_float_or_none(row["latest_create_time"]),
+            "earliest_update_time": finite_float_or_none(row["earliest_update_time"]),
+            "latest_update_time": finite_float_or_none(row["latest_update_time"]),
         }
 
     @router.get("/schema")
     def schema_docs():
         return {
-            "pagination": {"fields": ["items", "total", "limit", "offset", "has_more", "next_offset"]},
+            "version": 2,
+            "pagination": {
+                "fields": ["items", "total", "total_exact", "limit", "offset", "has_more", "next_offset"],
+                "total_exact": "true means total is an exact count; false means total is only the known lower bound from the current page probe",
+            },
             "conversations": {
+                "endpoint": "/api/conversations",
                 "filters": ["q", "sort", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "path", "match_mode"],
                 "limits": {"q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH, "selected_id": MAX_ID_PARAM_LENGTH},
                 "path": ["current", "all"],
                 "match_mode": ["contains", "word"],
                 "date": "after/before use UTC calendar days as YYYY-MM-DD; before is exclusive (next-day 00:00:00 UTC)",
-                "response": ["total", "items", "has_more", "next_offset", "selected_in_results", "selected_item", "node_count", "current_path_nodes", "current_path_fallback_to_all"],
+                "selection": ["selected_id", "selected_in_results", "selected_item"],
+                "response": ["total", "items", "has_more", "next_offset", "selected_in_results", "selected_item", "node_count", "current_path_nodes", "current_node_exists", "current_collection_source", "current_path_fallback_to_all", "effective_path", "cycle_detected", "missing_parent", "cross_conversation_parent", "partial_chain", "raw_flag_leaf_count"],
                 "diagnostics": "best-effort search diagnostics; see search.diagnostics",
             },
             "messages": {
+                "endpoint": "/api/conversations/{conversation_id}/messages",
                 "path": ["current", "all"],
                 "include_internal": "boolean; default false for reader pages so pagination is over visible messages, true includes root/internal/technical nodes",
                 "filters": ["q", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "match_mode"],
                 "limits": {"conversation_id": MAX_ID_PARAM_LENGTH, "around_node_id": MAX_ID_PARAM_LENGTH, "q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH},
                 "raw": "message pages return raw_preview only; capped raw preview is available per message endpoint",
-                "hidden_counts": ["visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"],
-                "path_metadata": ["effective_path", "current_path_fallback_to_all", "effective_visible_in_current_view"],
-                "highlight": "highlight_ranges use UTF-16 code-unit offsets for JS text.slice()",
+                "hidden_counts": {
+                    "fields": ["visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"],
+                    "contract": "internal_hidden_count is the one canonical non-empty internal-node count; technical_hidden_count is a deprecated exact alias retained for compatibility",
+                },
+                "path_metadata": ["current_node_exists", "current_collection_source", "effective_path", "current_path_fallback_to_all", "effective_visible_in_current_view", "cycle_detected", "missing_parent", "cross_conversation_parent", "partial_chain", "raw_flag_leaf_count"],
+                "highlight": "highlight_ranges use UTF-16 code-unit offsets for JS text.slice(); highlight_ranges_truncated discloses the bounded preview cap",
                 "match_mode": ["contains", "word"],
-                "around_node_id": "optional scroll-to-node; include_internal=false computes offset in the visible-only reader pagination collection, include_internal=true uses the full node collection, and path=current with no current-path nodes uses the effective all collection",
+                "around_node_id": {
+                    "description": "optional scroll-to-node; include_internal=false computes offset in the visible-only reader pagination collection, include_internal=true uses the full node collection, and path=current with no current-path nodes uses the effective all collection",
+                    "response": ["around_target_found", "around_target_visible", "around_target_in_effective_collection", "around_target_applied"],
+                },
             },
             "raw": {
                 "endpoint": "/api/conversations/{conversation_id}/messages/{node_id}/raw",
@@ -391,7 +489,10 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
                 "include_internal": "boolean; when true, internal/technical nodes are included in the export",
             },
             "search": {
-                "count_total": "boolean; disable exact total count for faster navigation pages",
+                "endpoints": ["/api/conversations", "/api/search/messages"],
+                "parameters": ["q", "title", "exact", "exclude", "role", "source", "after", "before", "scope", "path", "match_mode", "order", "conversation_id", "count_total"],
+                "message_order": ["relevance", "display"],
+                "count_total": "boolean; false disables the exact count and returns total_exact=false with a known lower-bound total",
                 "raw_query_override": "path: and scope: modifiers in q override sidebar path/scope selectors",
                 "diagnostics": {
                     "fields": [
@@ -412,6 +513,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             },
             "suggest": {
                 "endpoint": "/api/search/suggest",
+                "parameters": ["q", "limit"],
                 "q_limit": "100 characters max",
             },
             "upload": {
@@ -424,11 +526,55 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
                     "CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO": "max compression ratio (default 1000.0 local, 200.0 remote)",
                     "CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS": "max total ZIP members (default 100000 local, 10000 remote)",
                     "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS": "set to true on non-loopback hosts to allow explicit per-limit env overrides above remote-safe defaults",
+                    "CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS": "set to true to explicitly permit non-loopback browser access while retaining remote-safe upload limits",
                     "CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE": "set to local on trusted non-loopback hosts only to use local large defaults for unset limits",
+                    "CHATGPT_ARCHIVE_ALLOWED_HOSTS": "comma-separated exact browser hostnames/IPs; required for non-loopback binding; wildcard is rejected",
+                    "CHATGPT_ARCHIVE_TRUSTED_PROXIES": "comma-separated proxy IPs/CIDRs allowed to supply Forwarded/X-Forwarded-Host/Proto",
                 },
                 "remote": "non-loopback hosts use conservative defaults; ALLOW_REMOTE_UPLOADS=true only honors explicit per-limit overrides, while CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local restores local large defaults",
                 "effective_policy": _upload_policy_schema(policy),
+                "host_origin_policy": {
+                    "allowed_hosts": list(trust.allowed_hosts),
+                    "trusted_proxies": list(trust.trusted_proxies),
+                    "missing_origin_write_allowed": trust.allow_missing_origin_for_writes,
+                    "origin": "writes require a trusted Host and a same-origin Origin in remote mode; loopback permits non-browser clients without Origin",
+                    "forwarded_headers": "ignored unless the direct client IP matches CHATGPT_ARCHIVE_TRUSTED_PROXIES",
+                },
                 "limits_note": "ZIP size checks run before import; JSON parsing, SQLite writes, and web-index rebuild still consume memory, disk, and CPU proportional to decoded conversation JSON size.",
+            },
+            "jobs": {
+                "endpoints": ["/api/import/jobs", "/api/import/jobs/{job_id}"],
+                "statuses": ["queued", "running", "succeeded", "failed", "postcheck_failed"],
+                "outcomes": ["queued", "import_running", "input_preflight_failed", "source_scan_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
+                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "cleanup_warning", "summary", "verify", "stats", "web_index"],
+                "failure_codes": ["no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed"],
+                "cleanup_warnings": ["upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"],
+            },
+            "ui_state": {
+                "canonical_copy_url": ["match_mode", "layout", "show_internal", "sort", "path", "scope", "q", "role", "title", "exact", "exclude", "source", "after", "before", "selected conversation"],
+                "url_precedence": "explicit URL values win over localStorage; missing values may use local settings",
+                "back_forward": "incremental search and selection history restoration is not implemented; routine address-bar updates use replaceState",
+            },
+            "database_compatibility": "older databases are checked but are not automatically migrated; re-import the original export into a new database when required columns are missing",
+            "stable_error_codes": [
+                "database_not_ready", "database_schema_incompatible", "job_not_found",
+                "conversation_not_found", "message_not_found", "invalid_export_format",
+                "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
+                "invalid_match_mode", "invalid_message_order", "invalid_query",
+                "host_not_allowed", "import_job_active", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required",
+                "upload_invalid_content_length", "upload_multipart_body_too_large", "upload_too_large",
+                "uploaded_file_not_zip", "uploaded_file_invalid_zip", "upload_zip_no_conversation_sources",
+                "upload_zip_ambiguous_conversation_sources", "upload_zip_too_many_members",
+                "upload_zip_too_many_json_members", "upload_zip_member_too_large",
+                "upload_zip_uncompressed_too_large", "upload_zip_compression_ratio_too_high",
+                "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed",
+                "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list",
+                "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed",
+            ],
+            "provenance": {
+                "input_sha256": "computed only for ZIP imports unless --no-input-sha256 is used",
+                "source_entry_sha256": "source_files/file_index sha256 columns are reserved and currently unset",
+                "raw_preservation": "full raw JSON is stored for messages only; conversation and mapping-node raw objects are normalized, not preserved byte-for-byte",
             },
         }
 
@@ -451,8 +597,6 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         selected_id: Annotated[str | None, Query(max_length=MAX_ID_PARAM_LENGTH)] = None,
         conn=Depends(get_optional_conn),
     ):
-        if conn is None:
-            return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
         _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
         parsed = parse_query(
             q,
@@ -469,20 +613,23 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             enforce_api_limits=True,
         )
         _raise_query_errors(parsed)
+        if conn is None:
+            return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
         if parsed.has_search_context():
             return search_conversations(conn, parsed, limit=limit, offset=offset, sort=sort, selected_id=selected_id)
         return list_conversations(conn, limit=limit, offset=offset, sort=sort, after=parsed.after, before=parsed.before, selected_id=selected_id)
 
     @router.post("/import/upload")
-    async def import_upload(file: UploadFile = File(...)):
-        if not manager.acquire_pending_upload_slot():
-            raise HTTPException(status_code=409, detail="an import job is already running")
+    async def import_upload(request: Request, file: UploadFile = File(...)):
+        ingress_reserved = bool(getattr(request.state, "upload_slot_reserved", False))
+        if not ingress_reserved and not manager.acquire_pending_upload_slot():
+            raise HTTPException(status_code=409, detail="import_job_active")
         upload_dir: Path | None = None
         transferred = False
         filename = file.filename or "upload.zip"
         try:
             if not filename.lower().endswith(".zip"):
-                raise HTTPException(status_code=400, detail="only .zip uploads are supported")
+                raise HTTPException(status_code=400, detail="uploaded_file_not_zip")
             upload_dir, upload_path = make_upload_path()
             size = 0
             with upload_path.open("wb") as out:
@@ -495,19 +642,26 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
                         raise HTTPException(status_code=413, detail="upload_too_large")
                     out.write(chunk)
             if not zipfile.is_zipfile(upload_path):
-                raise HTTPException(status_code=400, detail="uploaded file is not a valid zip")
+                raise HTTPException(status_code=400, detail="uploaded_file_invalid_zip")
             _validate_upload_zip_members(upload_path, policy)
             try:
                 job = manager.start_import(upload_path, filename=Path(filename.replace("\\", "/")).name, size=size)
             except RuntimeError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                raise HTTPException(status_code=409, detail="import_job_active") from exc
             transferred = True
+            request.state.upload_slot_transferred = True
             return job.snapshot()
         finally:
             if not transferred:
                 manager.release_pending_upload_slot()
                 if upload_dir is not None:
-                    cleanup_upload_dir(upload_dir)
+                    cleanup = cleanup_upload_dir(upload_dir)
+                    if not cleanup["ok"]:
+                        LOGGER.warning(
+                            "upload_preflight_cleanup_failed error_type=%s path_still_exists=%s",
+                            cleanup["error_type"] or "none",
+                            cleanup["path_still_exists"],
+                        )
             # On success, start_import() took ownership of the slot and upload_dir;
             # the import job thread will clean up.
 
@@ -519,14 +673,14 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
     def import_job(job_id: str):
         job = manager.get(job_id)
         if not job:
-            raise HTTPException(status_code=404, detail="job not found")
+            raise HTTPException(status_code=404, detail="job_not_found")
         return job.snapshot()
 
     @router.get("/conversations/{conversation_id}")
     def conversation_detail(conversation_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)], conn=Depends(get_conn)):
         item = get_conversation(conn, conversation_id)
         if not item:
-            raise HTTPException(status_code=404, detail="conversation not found")
+            raise HTTPException(status_code=404, detail="conversation_not_found")
         return item
 
     @router.get("/conversations/{conversation_id}/messages")
@@ -566,7 +720,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         )
         _raise_query_errors(parsed)
         if not get_conversation(conn, conversation_id):
-            raise HTTPException(status_code=404, detail="conversation not found")
+            raise HTTPException(status_code=404, detail="conversation_not_found")
         return get_messages(
             conn,
             conversation_id,
@@ -592,7 +746,7 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
             (conversation_id, node_id),
         ).fetchone()
         if size_row is None:
-            raise HTTPException(status_code=404, detail="message not found")
+            raise HTTPException(status_code=404, detail="message_not_found")
         raw_size = int(size_row["raw_size"] or 0)
         if raw_size == 0:
             return {"conversation_id": conversation_id, "node_id": node_id, "raw_message": None, "raw_size": 0, "truncated": False}
@@ -624,10 +778,10 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
     def conversation_export(conversation_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)], format: str = "md", path: str = "current", include_internal: bool = False, conn=Depends(get_conn)):
         _validate_common(path=path)
         if format not in {"md", "txt"}:
-            raise HTTPException(status_code=400, detail="format must be md or txt")
+            raise HTTPException(status_code=400, detail="invalid_export_format")
         conv = conn.execute("SELECT * FROM conversations WHERE conversation_id = ?", (conversation_id,)).fetchone()
         if not conv:
-            raise HTTPException(status_code=404, detail="conversation not found")
+            raise HTTPException(status_code=404, detail="conversation_not_found")
         messages = []
         offset = 0
         while True:
@@ -669,11 +823,11 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         selected_id: Annotated[str | None, Query(max_length=MAX_ID_PARAM_LENGTH)] = None,
         conn=Depends(get_optional_conn),
     ):
-        if conn is None:
-            return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
         _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
         parsed = parse_query(q, path_default=path, role=role, title=title, scope=scope, exact=exact, exclude=exclude, after=after, before=before, source=source, match_mode=match_mode, enforce_api_limits=True)
         _raise_query_errors(parsed)
+        if conn is None:
+            return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
         return search_conversations(conn, parsed, limit=limit, offset=offset, sort=sort, selected_id=selected_id)
 
     @router.get("/search/messages")
@@ -696,13 +850,13 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
         count_total: bool = True,
         conn=Depends(get_optional_conn),
     ):
-        if conn is None:
-            return _empty_page(limit, offset, selected_id=None, db_ready=False)
         _validate_common(role=role, path=path, scope=scope, match_mode=match_mode)
         if order not in ALLOWED_MESSAGE_ORDERS:
-            raise HTTPException(status_code=400, detail="invalid message order")
+            raise HTTPException(status_code=400, detail="invalid_message_order")
         parsed = parse_query(q, path_default=path, role=role, title=title, scope=scope, exact=exact, exclude=exclude, after=after, before=before, source=source, match_mode=match_mode, enforce_api_limits=True)
         _raise_query_errors(parsed)
+        if conn is None:
+            return _empty_page(limit, offset, selected_id=None, db_ready=False)
         return search_messages(conn, parsed, limit=limit, offset=offset, conversation_id=conversation_id, order=order, count_total=count_total)
 
     @router.get("/search/suggest")
@@ -723,16 +877,16 @@ def create_api_router(db_path: Path, job_manager: ImportJobManager | None = None
                 (normalized, limit),
             ).fetchall()
         else:
-            needle = _like_pattern(q[:100])
+            conn.create_function("web_normalize", 1, normalize_search_text, deterministic=True)
             rows = conn.execute(
                 """
                 SELECT conversation_id, title
                 FROM conversations
-                WHERE ? = '%%' OR title LIKE ? ESCAPE '\\'
+                WHERE ? = '' OR instr(web_normalize(COALESCE(title, '')), ?) > 0
                 ORDER BY COALESCE(update_time, create_time, 0) DESC
                 LIMIT ?
                 """,
-                (needle, needle, limit),
+                (normalized, normalized, limit),
             ).fetchall()
         return {"items": [dict(row) for row in rows]}
 
@@ -757,12 +911,32 @@ def _validate_upload_zip_members(path: Path, policy: UploadPolicy) -> None:
     try:
         with zipfile.ZipFile(path) as zf:
             all_infos = zf.infolist()
-            total_members = len(all_infos)
-            candidates = [_info for _info in all_infos if _is_conversation_json_member(_info.filename)]
+            file_infos = [info for info in all_infos if not info.is_dir()]
+            total_members = len(file_infos)
+            source_infos = [info for info in file_infos if not is_metadata_path(info.filename)]
     except zipfile.BadZipFile as exc:
-        raise HTTPException(status_code=400, detail="uploaded file is not a valid zip") from exc
+        raise HTTPException(status_code=400, detail="uploaded_file_invalid_zip") from exc
     if total_members > policy.max_total_members:
         raise HTTPException(status_code=413, detail="upload_zip_too_many_members")
+    try:
+        selected = select_conversation_sources(
+            [
+                SourceEntry(
+                    source_path=info.filename,
+                    file_type="json",
+                    size=int(info.file_size or 0),
+                    extension=".json",
+                    is_conversation_json=is_conversation_json_source(info.filename),
+                )
+                for info in source_infos
+            ]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="upload_zip_ambiguous_conversation_sources") from exc
+    if not selected:
+        raise HTTPException(status_code=400, detail="upload_zip_no_conversation_sources")
+    selected_paths = {entry.source_path for entry in selected}
+    candidates = [info for info in source_infos if info.filename in selected_paths]
     if len(candidates) > policy.max_json_members:
         raise HTTPException(status_code=413, detail="upload_zip_too_many_json_members")
     total_uncompressed = 0
@@ -778,11 +952,6 @@ def _validate_upload_zip_members(path: Path, policy: UploadPolicy) -> None:
         raise HTTPException(status_code=413, detail="upload_zip_uncompressed_too_large")
     if total_uncompressed >= 10 * 1024 * 1024 and (total_uncompressed / max(1, total_compressed)) > policy.max_compression_ratio:
         raise HTTPException(status_code=413, detail="upload_zip_compression_ratio_too_high")
-
-
-def _is_conversation_json_member(name: str) -> bool:
-    basename = Path(name.replace("\\", "/")).name
-    return basename == "conversations.json" or (basename.startswith("conversations-") and basename.endswith(".json"))
 
 
 def _like_pattern(value: str) -> str:
@@ -810,7 +979,7 @@ def _empty_page(limit: int, offset: int, *, selected_id: str | None, db_ready: b
 
 def _schema_error_detail(schema: dict[str, object]) -> dict[str, object]:
     return {
-        "error": "database schema is not compatible",
+        "code": "database_schema_incompatible",
         "schema_compatible": False,
         "missing_tables": schema.get("missing_tables", []),
         "missing_columns": schema.get("missing_columns", {}),
@@ -837,11 +1006,25 @@ def _download_filename(conversation_id: str, fmt: str) -> str:
 
 
 def _content_disposition(filename: str) -> str:
-    ascii_name = filename.encode("ascii", "ignore").decode("ascii")
-    ascii_name = safe_filename_part(ascii_name, 80)
-    if "." not in ascii_name and "." in filename:
-        ascii_name = f"{ascii_name}.{filename.rsplit('.', 1)[-1]}"
-    quoted = quote(filename, safe="")
+    clean_name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    clean_name = "".join(ch for ch in clean_name if ch not in "\r\n" and ord(ch) >= 32).strip().rstrip(" .")
+    if clean_name.casefold() in {".md", ".txt"}:
+        suffix = clean_name.casefold()
+        stem = ""
+    else:
+        candidate_suffix = Path(clean_name).suffix.casefold()
+        suffix = candidate_suffix if candidate_suffix in {".md", ".txt"} else ".txt"
+        stem = clean_name[: -len(suffix)] if candidate_suffix == suffix else clean_name
+    utf8_stem = stem.strip(" .") or "download"
+    utf8_name = f"{utf8_stem}{suffix}"
+    ascii_stem = utf8_stem.encode("ascii", "ignore").decode("ascii").strip(" .")
+    if not ascii_stem:
+        ascii_stem = "download"
+    ascii_stem = safe_filename_part(ascii_stem, max(1, 80 - len(suffix)))
+    if ascii_stem.casefold().endswith(suffix):
+        ascii_stem = ascii_stem[: -len(suffix)] or "download"
+    ascii_name = f"{ascii_stem}{suffix}"
+    quoted = quote(utf8_name, safe="")
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
 
 
@@ -854,17 +1037,17 @@ def _validate_common(
     match_mode: str | None = None,
 ) -> None:
     if sort is not None and sort not in ALLOWED_SORTS:
-        raise HTTPException(status_code=400, detail="invalid sort")
+        raise HTTPException(status_code=400, detail="invalid_sort")
     if scope is not None and scope not in ALLOWED_SCOPES:
-        raise HTTPException(status_code=400, detail="invalid scope")
+        raise HTTPException(status_code=400, detail="invalid_scope")
     if role is not None and role not in ALLOWED_ROLES:
-        raise HTTPException(status_code=400, detail="invalid role")
+        raise HTTPException(status_code=400, detail="invalid_role")
     if path is not None and path not in ALLOWED_PATHS:
-        raise HTTPException(status_code=400, detail="path must be current or all")
+        raise HTTPException(status_code=400, detail="invalid_path")
     if match_mode is not None and match_mode not in ALLOWED_MATCH_MODES:
-        raise HTTPException(status_code=400, detail="invalid match mode")
+        raise HTTPException(status_code=400, detail="invalid_match_mode")
 
 
 def _raise_query_errors(parsed) -> None:
     if parsed.errors:
-        raise HTTPException(status_code=400, detail="; ".join(parsed.errors))
+        raise HTTPException(status_code=400, detail={"code": "invalid_query", "reasons": parsed.errors})

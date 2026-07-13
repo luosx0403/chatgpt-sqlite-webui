@@ -1,10 +1,31 @@
-import type { ConversationSummary, Health, ImportJob, MatchMode, MessageItem, Page, PathMode, SearchFilters, SearchMessageHit, SortMode, Stats } from "../types";
+import type { ConversationPage, ConversationSummary, Health, ImportJob, MatchMode, MessageItem, MessagePage, PathMode, RawMessageResponse, SearchFilters, SearchMessageHit, SearchMessagePage, SortMode, Stats } from "../types";
+
+export class ApiError extends Error {
+  constructor(public readonly code: string, public readonly status: number) {
+    super(code);
+    this.name = "ApiError";
+  }
+}
+
+async function responseError(response: Response): Promise<ApiError> {
+  let code = `http_${response.status}`;
+  try {
+    const payload = await response.json() as { detail?: unknown; code?: unknown };
+    const nestedCode = payload.detail && typeof payload.detail === "object" && "code" in payload.detail
+      ? (payload.detail as { code?: unknown }).code
+      : undefined;
+    const detail = typeof payload.detail === "string" ? payload.detail : payload.code ?? nestedCode;
+    if (typeof detail === "string" && /^[a-z0-9_:-]+$/.test(detail)) code = detail;
+  } catch {
+    // Keep the stable HTTP fallback; never expose server prose in the UI.
+  }
+  return new ApiError(code, response.status);
+}
 
 async function request<T>(url: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal, headers: { Accept: "application/json" } });
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
+    throw await responseError(response);
   }
   return response.json() as Promise<T>;
 }
@@ -35,7 +56,7 @@ export function getConversations(args: {
   selectedId?: string | null;
   matchMode?: MatchMode;
   signal?: AbortSignal;
-}): Promise<Page<ConversationSummary>> {
+}): Promise<ConversationPage> {
   const query = params({
     q: args.q,
     sort: args.sort,
@@ -53,7 +74,7 @@ export function getConversations(args: {
     source: args.filters?.source,
     match_mode: args.matchMode
   });
-  return request<Page<ConversationSummary>>(`/api/conversations?${query}`, args.signal);
+  return request<ConversationPage>(`/api/conversations?${query}`, args.signal);
 }
 
 export function getConversation(id: string, signal?: AbortSignal): Promise<ConversationSummary> {
@@ -71,7 +92,7 @@ export function getMessages(args: {
   includeInternal?: boolean;
   matchMode?: MatchMode;
   signal?: AbortSignal;
-}): Promise<Page<MessageItem>> {
+}): Promise<MessagePage> {
   const query = params({
     q: args.q,
     path: args.path,
@@ -89,7 +110,7 @@ export function getMessages(args: {
     source: args.filters?.source,
     match_mode: args.matchMode
   });
-  return request<Page<MessageItem>>(`/api/conversations/${encodeURIComponent(args.id)}/messages?${query}`, args.signal);
+  return request<MessagePage>(`/api/conversations/${encodeURIComponent(args.id)}/messages?${query}`, args.signal);
 }
 
 export function getMessageHits(args: {
@@ -103,7 +124,7 @@ export function getMessageHits(args: {
   matchMode?: MatchMode;
   countTotal?: boolean;
   signal?: AbortSignal;
-}): Promise<Page<SearchMessageHit>> {
+}): Promise<SearchMessagePage> {
   const query = params({
     q: args.q,
     conversation_id: args.conversationId,
@@ -122,7 +143,7 @@ export function getMessageHits(args: {
     match_mode: args.matchMode,
     count_total: args.countTotal === false ? "false" : undefined
   });
-  return request<Page<SearchMessageHit>>(`/api/search/messages?${query}`, args.signal);
+  return request<SearchMessagePage>(`/api/search/messages?${query}`, args.signal);
 }
 
 export function exportUrl(id: string, format: "md" | "txt", path: PathMode, includeInternal = false): string {
@@ -130,8 +151,8 @@ export function exportUrl(id: string, format: "md" | "txt", path: PathMode, incl
   return `/api/conversations/${encodeURIComponent(id)}/export?${query}`;
 }
 
-export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal, maxChars = 50000): Promise<{ raw_message: unknown; raw_size?: number; truncated?: boolean; raw_text?: string }> {
-  return request<{ raw_message: unknown; raw_size?: number; truncated?: boolean; raw_text?: string }>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/raw?max_chars=${maxChars}`, signal);
+export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal, maxChars = 50000): Promise<RawMessageResponse> {
+  return request<RawMessageResponse>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/raw?max_chars=${maxChars}`, signal);
 }
 
 export async function uploadImportZip(file: File, signal?: AbortSignal): Promise<ImportJob> {
@@ -139,8 +160,7 @@ export async function uploadImportZip(file: File, signal?: AbortSignal): Promise
   form.set("file", file);
   const response = await fetch("/api/import/upload", { method: "POST", body: form, signal });
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
+    throw await responseError(response);
   }
   return response.json() as Promise<ImportJob>;
 }
@@ -149,6 +169,6 @@ export function getImportJob(jobId: string, signal?: AbortSignal): Promise<Impor
   return request<ImportJob>(`/api/import/jobs/${encodeURIComponent(jobId)}`, signal);
 }
 
-export function getImportJobs(signal?: AbortSignal): Promise<Page<ImportJob> | { items: ImportJob[] }> {
+export function getImportJobs(signal?: AbortSignal): Promise<{ items: ImportJob[] }> {
   return request<{ items: ImportJob[] }>("/api/import/jobs", signal);
 }

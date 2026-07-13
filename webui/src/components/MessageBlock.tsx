@@ -83,7 +83,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   const role = roleLabel(message.role, t);
   const text = message.display_text || message.render_text || message.content_text || "";
   const placeholder = `[non-text content: ${message.content_type || "empty"}]`;
-  const timestamp = formatDate(message.create_time || message.update_time);
+  const timestamp = formatDate(message.create_time ?? message.update_time);
   const shouldUseChat = layout === "chat";
   const isTechnicalPayload = looksLikeTechnicalPayload(message, text);
   const side = isTechnicalPayload ? "system" : chatSide(message);
@@ -231,6 +231,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
           });
         })()}
       </pre>
+      {message.highlight_ranges_truncated && <p className="hint">{t("highlightRangesTruncated")}</p>}
       {showRaw && (
         <>
           <pre className="raw-message">{message.raw_preview || t("noRawStored")}</pre>

@@ -13,6 +13,14 @@ from .utils import classify_file
 SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
 
 
+class NonFiniteJsonNumberError(ValueError):
+    """Raised when a JSON source contains non-standard NaN/Infinity tokens."""
+
+
+def _reject_non_finite_json_number(value: str) -> None:
+    raise NonFiniteJsonNumberError(f"non_finite_json_number:{value.casefold()}")
+
+
 @dataclass(frozen=True)
 class SourceEntry:
     source_path: str
@@ -100,7 +108,7 @@ def _logical_zip_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
-def _is_metadata_path(path: str) -> bool:
+def is_metadata_path(path: str) -> bool:
     logical = _logical_zip_path(path)
     parts = [part for part in logical.split("/") if part]
     if "__MACOSX" in parts:
@@ -121,7 +129,7 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
                     is_conversation_json=is_conversation_json_source(info.filename),
                 )
                 for info in zf.infolist()
-                if not info.is_dir() and not _is_metadata_path(info.filename)
+                if not info.is_dir() and not is_metadata_path(info.filename)
             ]
     elif input_source.kind == "json":
         name = input_source.path.name
@@ -140,7 +148,7 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
         for p in sorted(base.rglob("*")):
             if p.is_file():
                 rel = p.relative_to(base).as_posix()
-                if _is_metadata_path(rel):
+                if is_metadata_path(rel):
                     continue
                 entries.append(
                     SourceEntry(
@@ -178,24 +186,37 @@ def select_conversation_sources(entries: Iterable[SourceEntry]) -> list[SourceEn
 def _reject_duplicate_conversation_sources(entries: list[SourceEntry]) -> None:
     seen: set[str] = set()
     duplicates: set[str] = set()
+    seen_identities: set[tuple[str, int | None]] = set()
+    duplicate_identities: set[tuple[str, int | None]] = set()
     for entry in entries:
         logical = _logical_zip_path(entry.source_path)
         if logical in seen:
             duplicates.add(logical)
         seen.add(logical)
+        match = SHARD_RE.search(logical)
+        identity = ("shard", int(match.group(2))) if match else ("legacy", None)
+        if identity in seen_identities:
+            duplicate_identities.add(identity)
+        seen_identities.add(identity)
     if duplicates:
         raise ValueError("duplicate_conversation_json_source " + ",".join(sorted(duplicates)))
+    if duplicate_identities:
+        labels = [
+            f"shard:{number}" if kind == "shard" else "legacy"
+            for kind, number in sorted(duplicate_identities, key=str)
+        ]
+        raise ValueError("ambiguous_conversation_source_identity " + ",".join(labels))
 
 
 def load_json_from_source(input_source: InputSource, source_path: str) -> Any:
     if input_source.kind == "zip":
         with zipfile.ZipFile(input_source.path) as zf:
             with zf.open(source_path) as f:
-                return json.load(f)
+                return json.load(f, parse_constant=_reject_non_finite_json_number)
     if input_source.kind == "json":
         if source_path != input_source.path.name:
             raise ValueError("source_not_found")
         with input_source.path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            return json.load(f, parse_constant=_reject_non_finite_json_number)
     with (input_source.path / source_path).open("r", encoding="utf-8") as f:
-        return json.load(f)
+        return json.load(f, parse_constant=_reject_non_finite_json_number)

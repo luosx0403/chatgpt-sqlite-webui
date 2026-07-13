@@ -1,7 +1,7 @@
-# For reproducible local installs, create your own constraints file for the
-# target Python version, for example with `python -m pip freeze > constraints.txt`,
-# then install with `python -m pip install -r requirements-web.txt -c constraints.txt`.
-fastapi[standard]
-pydantic
-python-multipart
-uvicorn
+# Minimal local Web runtime plus FastAPI's test client dependency.
+# Tested on Python 3.12. For a fully repeatable tested install, use:
+# python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
+fastapi==0.136.1
+httpx==0.28.1
+python-multipart==0.0.28
+uvicorn==0.46.0

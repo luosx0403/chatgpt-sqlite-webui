@@ -7,8 +7,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from .current_path import resolve_effective_current_collection
 from .db import export_query, record_export
-from .utils import epoch_to_date_part, epoch_to_display, parse_date_boundary, safe_filename_part, sha256_bytes, write_bytes_if_changed
+from .utils import epoch_to_date_part, epoch_to_display, finite_float_or_none, parse_date_boundary, safe_filename_part, sha256_bytes, sha256_text, truncate_utf8, write_bytes_if_changed
+
+
+MAX_EXPORT_BASENAME_BYTES = 240
 
 
 def export_conversations(
@@ -75,42 +79,40 @@ def build_filename_map(conversations: list[sqlite3.Row], formats: list[str]) -> 
             if len(group) == 1:
                 result[(group[0]["conversation_id"], fmt)] = Path(base_name)
                 continue
-            stem = Path(base_name).stem
-            suffix = Path(base_name).suffix
             for idx, conv in enumerate(group, start=1):
-                result[(conv["conversation_id"], fmt)] = Path(f"{stem}_{idx:03d}{suffix}")
+                result[(conv["conversation_id"], fmt)] = Path(
+                    _base_filename(conv, fmt, collision_suffix=f"_{idx:03d}")
+                )
     return result
 
 
-def _base_filename(conv: sqlite3.Row, fmt: str) -> str:
-    date_part = epoch_to_date_part(conv["create_time"] or conv["update_time"])
-    title = safe_filename_part(conv["title"])
-    cid = safe_filename_part(str(conv["conversation_id"]), max_len=12)
-    return f"{date_part}_{title}_{cid}.{fmt}"
+def _base_filename(conv: sqlite3.Row, fmt: str, *, collision_suffix: str = "") -> str:
+    timestamp = conv["create_time"] if conv["create_time"] is not None else conv["update_time"]
+    date_part = epoch_to_date_part(timestamp)
+    title = safe_filename_part(conv["title"], max_len=2048)
+    raw_cid = str(conv["conversation_id"])
+    cid = safe_filename_part(raw_cid, max_len=512)
+    if len(cid.encode("utf-8")) > 96:
+        digest = sha256_text(raw_cid)[:16]
+        cid = truncate_utf8(cid, 79).rstrip("._ ") + "_" + digest
+    extension = f".{fmt}"
+    fixed = f"{date_part}__{cid}{collision_suffix}{extension}"
+    title_budget = MAX_EXPORT_BASENAME_BYTES - len(fixed.encode("utf-8"))
+    title = truncate_utf8(title, max(0, title_budget)).rstrip("._ ")
+    if not title:
+        title = "untitled"
+    filename = f"{date_part}_{title}_{cid}{collision_suffix}{extension}"
+    if len(filename.encode("utf-8")) > MAX_EXPORT_BASENAME_BYTES:
+        overflow = len(filename.encode("utf-8")) - MAX_EXPORT_BASENAME_BYTES
+        title = truncate_utf8(title, max(0, len(title.encode("utf-8")) - overflow)).rstrip("._ ") or "u"
+        filename = f"{date_part}_{title}_{cid}{collision_suffix}{extension}"
+    return filename
 
 
 def order_current_path(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> list[sqlite3.Row]:
-    by_id = {row["node_id"]: row for row in nodes}
-    current = conv["current_node"]
-    ordered: list[sqlite3.Row] = []
-    seen: set[str] = set()
-    while current and current in by_id and current not in seen:
-        seen.add(current)
-        row = by_id[current]
-        if row["is_on_current_path"]:
-            ordered.append(row)
-        current = row["parent_node_id"]
-    ordered.reverse()
-    if ordered:
-        return ordered
-    return sorted(
-        nodes,
-        key=lambda row: (
-            row["create_time"] is None,
-            row["create_time"] if row["create_time"] is not None else row["update_time"] if row["update_time"] is not None else 0,
-            row["node_id"],
-        ),
-    )
+    by_id = {str(row["node_id"]): row for row in nodes}
+    collection = resolve_effective_current_collection(conv["current_node"], nodes)
+    return [by_id[node_id] for node_id in collection.node_ids]
 
 
 def render_markdown(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
@@ -130,7 +132,8 @@ def render_markdown(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
         if not node["content_text"]:
             continue
         role = (node["role"] or "message").title()
-        timestamp = epoch_to_display(node["create_time"] or node["update_time"])
+        node_time = node["create_time"] if node["create_time"] is not None else node["update_time"]
+        timestamp = epoch_to_display(node_time)
         heading = f"## {role}" + (f" {timestamp}" if timestamp else "")
         lines.extend([heading, "", node["content_text"], ""])
     return "\n".join(lines).rstrip() + "\n"
@@ -151,7 +154,8 @@ def render_txt(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
         if not node["content_text"]:
             continue
         role = (node["role"] or "message").upper()
-        timestamp = epoch_to_display(node["create_time"] or node["update_time"])
+        node_time = node["create_time"] if node["create_time"] is not None else node["update_time"]
+        timestamp = epoch_to_display(node_time)
         lines.extend([f"{role} {timestamp}".strip(), "-" * 72, node["content_text"], ""])
     return "\n".join(lines).rstrip() + "\n"
 
@@ -160,14 +164,14 @@ def manifest_row(conv: sqlite3.Row, fmt: str, relative_path: Path, output_hash: 
     return {
         "aggregate_hash": conv["aggregate_hash"],
         "conversation_id": conv["conversation_id"],
-        "create_time": conv["create_time"],
+        "create_time": finite_float_or_none(conv["create_time"]),
         "current_node": conv["current_node"],
         "format": fmt,
         "output_hash": output_hash,
         "output_path": relative_path.as_posix(),
         "source_file": conv["source_file"],
         "title": conv["title"],
-        "update_time": conv["update_time"],
+        "update_time": finite_float_or_none(conv["update_time"]),
     }
 
 

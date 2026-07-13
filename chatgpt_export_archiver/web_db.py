@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import CORE_SCHEMA_COLUMNS, _drop_table_with_shadows, configure_bulk_write_connection
-from .search import normalize_search_text, search_fragment_match
+from .search import invalidate_capability_cache, normalize_search_text, search_fragment_match
 
 
 REQUIRED_TABLES = {
@@ -266,6 +266,7 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
         indexed_messages = conn.execute("SELECT COUNT(*) AS c FROM web_message_norm").fetchone()["c"]
         indexed_titles = conn.execute("SELECT COUNT(*) AS c FROM web_title_norm").fetchone()["c"]
         conn.commit()
+        invalidate_capability_cache(conn)
         return {
             "trigram_available": trigram_available,
             "indexed_messages": indexed_messages,
@@ -276,6 +277,7 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
     except Exception:
         if conn.in_transaction:
             conn.rollback()
+        invalidate_capability_cache(conn)
         raise
     finally:
         conn.close()

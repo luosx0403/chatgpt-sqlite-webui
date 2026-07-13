@@ -1,0 +1,20 @@
+# Tested transitive lock for CPython 3.12. Runtime code remains portable;
+# users on another supported Python version may install requirements-web.txt
+# without this platform-specific tested constraints file.
+annotated-doc==0.0.4
+anyio==4.13.0
+certifi==2026.2.25
+click==8.3.3
+fastapi==0.136.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.11
+pydantic==2.13.4
+pydantic-core==2.46.4
+python-multipart==0.0.28
+sniffio==1.3.1
+starlette==1.0.0
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+uvicorn==0.46.0

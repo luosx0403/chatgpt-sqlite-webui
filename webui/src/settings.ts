@@ -61,8 +61,13 @@ export function loadSettings(): Settings {
   }
 }
 
-export function saveSettings(settings: Settings) {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+export function saveSettings(settings: Settings): boolean {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function applySettings(settings: Settings) {

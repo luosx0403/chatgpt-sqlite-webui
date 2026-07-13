@@ -57,16 +57,16 @@ The database and exported Markdown or TXT files may still contain private conver
 
 ## Requirements
 
-- Python 3.10 or newer.
+- Python 3.10 or newer. Python 3.12 is the reproducible Web dependency test target.
 - SQLite with JSON1 and FTS5 enabled. Most current Python builds on macOS, Windows, and Linux include both.
 - Node.js and npm only if you want to rebuild the React Web UI or run frontend checks. The runnable delivery includes `webui/dist`, so normal local Web UI use does not require rebuilding the frontend.
-- For Web ZIP upload support, install the Web requirements from `requirements-web.txt`.
+- Core CLI commands use only Python's standard library and work without Web packages. To run the Web UI, including ZIP upload, install `requirements-web.txt`; the `web` command fails fast with an install hint when that profile is absent.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
 On Windows PowerShell:
@@ -75,7 +75,7 @@ On Windows PowerShell:
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
 On Windows cmd.exe:
@@ -84,7 +84,7 @@ On Windows cmd.exe:
 py -3 -m venv .venv
 .venv\Scripts\activate.bat
 python -m pip install -U pip
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
 ## Quick start
@@ -236,6 +236,8 @@ python chatgpt_archive.py web --port 8787
 
 The default reader layout is `chat`: user messages align right, assistant messages align left, and system/internal messages appear as collapsed disclosure notes. To use the older row-by-row technical layout, open Settings and choose `Classic`, or add `?layout=classic` or `?messageLayout=classic` to the Web UI URL.
 
+`path=current` uses one shared effective-current rule everywhere: a valid conversation-owned `current_node` and its parent chain win even when all raw flags are zero; otherwise a deterministic usable `is_on_current_path=1` leaf chain is selected; only when neither exists does that conversation fall back to all nodes. Responses keep the raw flag unchanged and expose `current_node_exists`, `current_collection_source`, `current_path_fallback_to_all`, `effective_path`, and per-node effective visibility. Broken parents and cycles terminate with deterministic diagnostics rather than recursive queries hanging.
+
 Reader copy and export actions follow the visible reader contract. `Copy current path conversation` fetches every page for the current reader path and respects the Show internal messages toggle, while ignoring the current search filters. `Copy visible` copies only the already loaded visible messages. Download links use the same current path and Show internal setting. Raw message access is a bounded larger raw preview through the per-message endpoint; truncated responses must render `raw_text` as plain preview text and the UI only shows that capped preview.
 
 Reader jump-to-hit requests with `around_node_id` use the same pagination collection as the reader: visible-only rows when Show internal is off, the full node collection when Show internal is on, and the effective all-node collection for damaged conversations with no current-path nodes.
@@ -243,6 +245,8 @@ Reader jump-to-hit requests with `around_node_id` use the same pagination collec
 The Web UI can be used in two ways. If the database already exists, pass it explicitly or let the default path be used. If the database does not exist, start the Web UI anyway, then use the import panel to upload a ChatGPT export ZIP. Upload imports are serialized so that only one SQLite writer runs in the process at a time.
 
 After a successful Web upload import, the backend runs the same core import pipeline as the CLI, then runs `verify`, `stats`, and `web-index`. The uploaded ZIP is a temporary server-side copy and is cleaned up independently from the original file on your disk.
+
+If the prebuilt React application cannot be served, the server's fallback HTML is an emergency, deliberately limited interface, not a substitute for the full reader. It has reduced search/reader controls and downloads exclude internal nodes unless explicitly requested. Rebuild `webui/dist` for the complete UI.
 
 ## Web upload security limits
 
@@ -262,9 +266,9 @@ When the Web UI is bound to a loopback address (`127.0.0.1`, `localhost`, `::1`)
 | `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | Max total ZIP members |
 | `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | unset | Set to `local` only on trusted non-loopback networks to use local defaults for unset upload limits |
 
-**Remote binding policy.** If the Web UI is bound to a non-loopback address (e.g. `0.0.0.0`, `::`, a LAN IP), the server applies conservative remote-safe defaults: 128 MiB compressed ZIP, 256 MiB per JSON member, 512 MiB total uncompressed, 200.0 compression ratio, 200 JSON members, and 10,000 total ZIP members. Setting `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` only allows explicit per-limit environment overrides above those remote-safe defaults; unset limits stay remote-safe. To restore the local large defaults for unset limits on a trusted LAN, set `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local`. Both remote modes expose the local archive browser and upload endpoint, so use them only on trusted networks.
+**Remote binding policy.** A non-loopback bind (for example `0.0.0.0`, `::`, or a LAN IP) is rejected unless `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`, `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true`, or `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` explicitly opts in. The server then warns that the archive browser is exposed and applies conservative remote-safe defaults: 128 MiB compressed ZIP, 256 MiB per JSON member, 512 MiB total uncompressed, 200.0 compression ratio, 200 JSON members, and 10,000 total ZIP members. `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` permits only explicitly configured per-limit overrides; unset limits stay remote-safe. `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` restores local large defaults for unset limits and is appropriate only on a trusted LAN. There is no authentication layer: the trust boundary is the network and host firewall. Upload writes enforce Origin/Sec-Fetch checks, but those checks do not make an untrusted network safe.
 
-`/api/schema` reports the current effective upload policy for the running host, including whether remote-safe, explicit remote override, or local-profile limits are active. ZIP size checks run before import, but direct JSON parsing, SQLite writes, and `web-index` rebuild still use memory, disk, and CPU proportional to decoded conversation JSON size. For very large archives, prefer a trusted local environment, CLI import, and enough disk and memory.
+`/api/schema` reports the current effective upload policy for the running host, including its multipart-body limit (ZIP byte limit plus bounded overhead), whether remote-safe, explicit remote override, or local-profile limits are active. The writer slot and receive-level body cap apply before multipart parsing. Multipart parsers may spool to disk and the import pipeline then owns a server-side temporary ZIP, so allow temporary disk headroom approaching two compressed copies plus database growth. ZIP checks run before import, but decoded JSON parsing, SQLite writes, and `web-index` rebuild still consume memory, disk, and CPU proportional to decoded JSON size. Remote uploads require a valid `Content-Length`; loopback chunked uploads are still bounded while streaming. For very large archives, prefer a trusted loopback environment, CLI import, and ample disk and memory.
 
 To raise a local limit for a legitimate large archive, set the corresponding variable before starting the Web UI:
 
@@ -334,11 +338,11 @@ The Web path should not require `webui/node_modules` in a runnable delivery beca
 
 ## Search syntax
 
-CLI search uses the project's safe query syntax, not raw SQLite query text. Use plain keywords, quoted phrases, `-term` exclusions, `OR`, and filters such as `role:user`, `source:zip`, `path:current`, `path:all`, `scope:title`, and `scope:message`. It prints conversation IDs, node IDs, and roles, not snippets.
+CLI search uses the project's safe query syntax, not raw SQLite query text. Plain terms use normalized substring `contains` matching and are ANDed; uppercase `OR` creates alternatives. Quoted phrases stay intact and `-term`/`-"quoted phrase"` exclude. `word` mode applies ASCII letter/digit/underscore boundaries; CJK text conservatively remains normalized contains matching. Filters include `role:user`, `source:zip`, `path:current`, `path:all`, `scope:title`, and `scope:message`; raw `path:` and `scope:` modifiers override matching UI selectors. It prints conversation IDs, node IDs, and roles, not snippets.
 
 Exclusions are conversation-level for conversation results: if any title or message in the selected search scope and path matches an excluded fragment, that conversation is not returned. `/api/search/messages` still returns only message hits that do not contain the excluded fragment. `path:current` follows the reader path per conversation; if a damaged archive has no current-path nodes at all, current-path search falls back to the same all-node view that the reader displays.
 
-Date filters such as `after:2026-05-01`, `before:2026-05-13`, `--from`, and `--to` use UTC calendar days, not your local time zone's calendar day. Start dates are inclusive at `00:00:00Z`; end dates include the full UTC day by using the next day's `00:00:00Z` as an exclusive upper bound, so fractional timestamps like `23:59:59.5Z` are included. The Web search box is limited to 500 characters; use advanced filters for longer structured queries.
+Date filters such as `after:2026-05-01`, `before:2026-05-13`, `--from`, and `--to` use UTC calendar days, not your local time zone's calendar day. Start dates are inclusive at `00:00:00Z`; end dates include the full UTC day by using the next day's `00:00:00Z` as an exclusive upper bound, so fractional timestamps like `23:59:59.5Z` are included. CLI export timestamps and deterministic filename dates use UTC; the browser displays timestamps in the browser's local time zone. The Web search box is limited to 500 characters; use advanced filters for longer structured queries. Browser Cmd/Ctrl+F sees only currently rendered virtual-list rows, so use archive search or Copy conversation for the whole conversation.
 
 ```bash
 python chatgpt_archive.py search --db archive/chatgpt_archive.db "python sqlite"
@@ -429,7 +433,7 @@ python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 
 ## Delivery notes
 
-A runnable delivery should include the Python sources, tests, docs, `requirements-web.txt`, frontend source and tests under `webui/src` and `webui/tests`, frontend config/package files, and built assets under `webui/dist`. It should not include `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, Python cache directories or bytecode, coverage/typecheck caches, `.DS_Store`, AppleDouble `._*` files, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, temporary logs, local acceptance logs, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, any `*.zip`, `conversations*.json`, real databases such as `*.db`, `*.sqlite`, and `*.sqlite3`, or SQLite sidecars such as `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm`, and `*.sqlite3-journal`. Directory checks allow the target root's own `.git` directory so a normal Git clone can be checked, but nested `.git` directories are forbidden; ZIP delivery checks forbid any `.git` entry.
+A runnable delivery should include the Python sources, tests, docs, `requirements-web.txt`, `constraints-web-py312.txt`, frontend source and tests under `webui/src` and `webui/tests`, frontend config/package files, and built assets under `webui/dist`. It should not include `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, Python cache directories or bytecode, coverage/typecheck caches, `.DS_Store`, AppleDouble `._*` files, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, temporary logs, local acceptance logs, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, any `*.zip`, `conversations*.json`, real databases such as `*.db`, `*.sqlite`, and `*.sqlite3`, or SQLite sidecars such as `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm`, and `*.sqlite3-journal`. Directory checks allow the target root's own `.git` directory so a normal Git clone can be checked, but nested `.git` directories are forbidden; ZIP delivery checks forbid any `.git` entry.
 
 A source-only delivery may omit `webui/dist`, but then the frontend must be rebuilt before serving the full React UI.
 
@@ -450,7 +454,7 @@ tools/                             Delivery and support scripts
 
 ## Database overview
 
-The main database stores conversations, mapping nodes, import runs, and warnings. The CLI FTS table is `message_fts`. Optional Web search helper tables include `web_message_norm`, `web_title_norm`, `web_message_trigram`, and `web_title_trigram` plus SQLite FTS5 shadow tables.
+The main database stores conversations, mapping nodes, import runs, and warnings. Complete raw JSON is retained for message objects only; conversation and mapping-node objects are normalized rather than preserved byte-for-byte. Input ZIP SHA-256 is optional, while per-entry SHA columns in `source_files`/`file_index` are reserved and currently unset. The CLI FTS table is `message_fts`. Optional Web search helper tables include `web_message_norm`, `web_title_norm`, `web_message_trigram`, and `web_title_trigram` plus SQLite FTS5 shadow tables.
 
 The project intentionally does not change the database schema during small robustness fixes unless a migration is explicitly planned and documented. Older databases with missing columns are rejected with `verify`/Web health `missing_columns` diagnostics instead of being silently migrated; back up the old database and re-import the original export into a new database when this happens.
 
@@ -461,3 +465,15 @@ The project intentionally does not change the database schema during small robus
 - Export parsing follows the observed OpenAI / ChatGPT export format. If the upstream export shape changes, `inspect` and tests should be updated before trusting a new import path.
 - Export file name parts are sanitized for Windows as well as Unix-like systems, including reserved device names such as `CON`, `AUX`, `COM1`, `LPT9`, `COM¹`, and `LPT²`, plus trailing dots and spaces.
 - Very large archives can take time to import, rebuild FTS, and build Web trigram indexes. Prefer the `--rebuild-fts` path for large imports.
+
+## Security and response contracts
+
+Loopback Web access accepts only `localhost`, `127.0.0.1`, `::1`, the explicit loopback bind host, and explicitly configured hosts. Non-loopback binds additionally require `CHATGPT_ARCHIVE_ALLOWED_HOSTS` (or `--allowed-hosts`) with the actual browser hostname or LAN IP; `*` is rejected. `CHATGPT_ARCHIVE_TRUSTED_PROXIES` (or `--trusted-proxies`) accepts proxy IPs/CIDRs. `Forwarded` and `X-Forwarded-*` are ignored unless the direct peer is trusted. Every request, including static UI and GET APIs, must have an allowed Host. Remote writes require a same-origin `Origin`; missing Origin is compatible only in the trusted loopback profile. Upload writes always reject `Sec-Fetch-Site: cross-site`.
+
+Import failures use stable preflight, source-scan, JSON-decode, top-level-contract, and transaction stages. Failed run summaries and stored warning counts describe the same persisted warning. A successful canonical commit is not described as unimported if later verify, stats, or optional Web-index work fails. Post-commit temporary-upload cleanup failures are non-fatal stable warnings and do not expose user paths.
+
+Non-standard JSON `NaN`/`Infinity` values are rejected. String non-finite timestamps become `NULL` with a warning. `verify` detects legacy non-finite timestamps, while APIs, stats, and exports remain finite-JSON safe. Effective-current responses expose cycle, missing-parent, cross-conversation-parent, and partial-chain diagnostics. `internal_hidden_count` is canonical; `technical_hidden_count` is a deprecated identical alias. Message search returns `total_exact=false` when `count_total=false`, making `total` a known lower bound. Around-node responses distinguish found, visible, effective-collection membership, and applied states.
+
+“Copy URL” always serializes explicit `match_mode`, `layout`, and `show_internal` values plus shareable search/reader state. Explicit URL values win over `localStorage`; omitted values may use local settings. This release uses `replaceState` and intentionally does not restore step-by-step search or selection history with browser Back/Forward.
+
+Release ZIP publication writes a temporary file, verifies a sorted size/SHA-256 manifest for every payload file, the exact member set and built assets, runs the delivery check, and only then atomically replaces the destination. Failure leaves the previous release unchanged.

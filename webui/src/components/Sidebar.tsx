@@ -36,6 +36,7 @@ export default function Sidebar(props: Props) {
   const querySyntax = analyzeQuerySyntax(props.query);
   const effectivePath = querySyntax.pathOverride || props.path;
   const effectiveScope = querySyntax.scopeOverride || props.filters.scope;
+  const hasSearchContext = Boolean(props.query || props.filters.role || props.filters.title || props.filters.exact || props.filters.exclude || props.filters.after || props.filters.before || props.filters.source);
   const updateFilter = (key: keyof SearchFilters, value: string) => {
     props.setFilters({ ...props.filters, [key]: value });
   };
@@ -60,7 +61,7 @@ export default function Sidebar(props: Props) {
         />
         <div className="controls-row">
           <select value={props.sort} onChange={(event) => props.setSort(event.target.value as SortMode)} aria-label={props.t("sort")}>
-            <option value="relevance">{props.t("relevance")}</option>
+            <option value="relevance">{hasSearchContext ? props.t("relevance") : props.t("newest")}</option>
             <option value="newest">{props.t("newest")}</option>
             <option value="oldest">{props.t("oldest")}</option>
             <option value="updated">{props.t("updated")}</option>
@@ -142,9 +143,9 @@ export default function Sidebar(props: Props) {
         {props.loading ? <SearchLoadingProgress label={props.t("loading")} /> : `${props.conversations.length} ${props.t("of")} ${props.total} ${props.t("conversations")}`}
       </div>
       {props.error && <div className="error-box">{props.error}</div>}
-      <div className="conversation-list" ref={listRef} onScroll={handleScroll} role="listbox" aria-label={props.t("conversations")}>
+      <div className="conversation-list" ref={listRef} onScroll={handleScroll} aria-label={props.t("conversations")}>
         {props.conversations.map((item, index) => {
-          const pathFallback = Boolean(item.current_path_fallback_to_all || (item.node_count && item.node_count > 0 && item.current_path_nodes === 0));
+          const pathFallback = Boolean(item.current_path_fallback_to_all);
           const hasSnippetBranch = item.snippets?.some((snippet) => snippet.is_on_current_path === false && !snippet.effective_visible_in_current_view && !snippet.current_path_fallback_to_all) ?? false;
           const badges = [
             (item.has_title_hits || item.title_match || item.reasons?.includes("title match")) ? props.t("titleHitBadge") : "",
@@ -161,7 +162,7 @@ export default function Sidebar(props: Props) {
             >
               <span className="conversation-title">{item.title || props.t("untitled")}</span>
               <span className="conversation-meta">
-                {shortDate(item.update_time || item.create_time)}
+                {shortDate(item.update_time ?? item.create_time)}
                 {item.hit_count ? ` · ${item.hit_count} ${props.t("hits")}` : ""}
               </span>
               {badges.length > 0 && (
@@ -196,7 +197,6 @@ function reasonLabel(t: (key: string) => string, reason: string): string {
     "exact phrase": t("reasonExactPhrase"),
     substring: t("reasonSubstring"),
     fts: t("reasonFts"),
-    "fuzzy title": t("reasonFuzzyTitle"),
     "source match": t("reasonSourceMatch"),
     "role filter": t("reasonRoleFilter"),
     "date filter": t("reasonDateFilter"),

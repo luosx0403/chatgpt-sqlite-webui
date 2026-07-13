@@ -57,16 +57,16 @@ ChatGPT Export Archiver 可以直接匯入 OpenAI / ChatGPT 官方 export ZIP，
 
 ## 系統需求
 
-- Python 3.10 或更新版本。
+- Python 3.10 或更新版本；Python 3.12 是 Web 依賴可重現安裝的測試目標。
 - SQLite 需要啟用 JSON1 與 FTS5。現行 macOS、Windows 與 Linux 上多數 Python 建置版本都已包含二者。
 - 只有在需要重新建置 React Web UI 或執行前端檢查時，才需要 Node.js 與 npm。runnable 交付包已包含 `webui/dist`，一般本機使用 Web UI 不需要重新建置前端。
-- 若要使用 Web ZIP 上傳功能，請安裝 `requirements-web.txt` 中的 Web 依賴套件。
+- 核心 CLI 只使用 Python 標準函式庫，沒有 Web 套件也能執行。若要啟動 Web UI（包括 ZIP 上傳），請安裝 `requirements-web.txt`；缺少此 profile 時，`web` 指令會立即失敗並顯示安裝提示。
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
 Windows PowerShell：
@@ -75,7 +75,7 @@ Windows PowerShell：
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
 Windows cmd.exe：
@@ -84,7 +84,7 @@ Windows cmd.exe：
 py -3 -m venv .venv
 .venv\Scripts\activate.bat
 python -m pip install -U pip
-python -m pip install -r requirements-web.txt
+python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
 ## 快速開始
@@ -236,6 +236,8 @@ python chatgpt_archive.py web --port 8787
 
 預設閱讀版面是 `chat`：user 訊息靠右，assistant 訊息靠左，system/internal 訊息以收合提示顯示。若要使用舊的逐列技術版面，可以在設定中選擇「經典逐列」，或在 Web UI URL 後加上 `?layout=classic` 或 `?messageLayout=classic`。
 
+所有入口共用同一套 `path=current` effective-current 規則：有效且屬於該對話的 `current_node` 與其父鏈優先，即使所有 raw flag 都為 0；否則選擇確定且可用的 `is_on_current_path=1` 葉鏈；兩者皆不存在時，該對話才 fallback 到 all。回應保留 raw flag 原義，並提供 `current_node_exists`、`current_collection_source`、`current_path_fallback_to_all`、`effective_path` 與逐節點 effective visibility。斷裂父鏈和 cycle 會有限且確定地診斷，不會讓遞迴查詢掛起。
+
 閱讀器複製與匯出動作遵守可見閱讀器契約。`複製目前路徑整段對話` 會依目前 reader 路徑抓取全部分頁，並遵守「顯示內部訊息」開關，同時忽略目前搜尋篩選。`複製目前可見` 只複製已載入的可見訊息。下載連結使用同樣的目前路徑與「顯示內部訊息」設定。Raw 訊息存取只透過單則訊息 endpoint 提供有上限的較大 raw 預覽；截斷回應必須把 `raw_text` 當作純文字預覽渲染，UI 只顯示這個 capped preview。
 
 reader 使用 `around_node_id` 跳轉到命中時，會使用與 reader 相同的分頁集合：Show internal 關閉時使用 visible-only rows，Show internal 開啟時使用完整 node collection；對沒有 current-path node 的損壞 conversation，使用 effective all-node collection。
@@ -243,6 +245,8 @@ reader 使用 `around_node_id` 跳轉到命中時，會使用與 reader 相同�
 Web UI 有兩種使用方式。如果資料庫已存在，可以明確傳入資料庫路徑，也可以使用預設路徑。如果資料庫不存在，也可以先啟動 Web UI，再用匯入面板上傳 ChatGPT 匯出 ZIP。上傳匯入會依序執行，同一進程內一次只允許一個 SQLite writer。
 
 Web 上傳匯入成功後，後端使用與 CLI 相同的核心 import pipeline，接著執行 `verify`、`stats` 與 `web-index`。上傳 ZIP 是伺服器端暫存副本，會獨立於你磁碟上的原始檔案進行清理。
+
+若無法提供預先建置的 React 應用，伺服器 fallback HTML 只是功能受限的緊急介面，不能替代完整 reader。它的搜尋與閱讀控制較少，下載預設排除 internal node；完整 UI 需重新建置 `webui/dist`。
 
 ## Web 上傳安全限制
 
@@ -262,9 +266,9 @@ Web 上傳會在讀取檔案前先保留 pending slot，因此大型上傳不能
 | `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | ZIP 內總 member 數上限 |
 | `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | 未設定 | 只在可信非 loopback 網路上設為 `local`，讓未設定的上傳限制使用本機預設值 |
 
-**遠端繫結策略。** 如果 Web UI 繫結到非 loopback 位址（如 `0.0.0.0`、`::`、區域網路 IP），伺服端會使用保守的 remote-safe 預設值：128 MiB 壓縮 ZIP、256 MiB 每 JSON member、512 MiB 總未壓縮、200.0 壓縮比、200 個 JSON member、10,000 個 ZIP 總 member。設定 `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` 只允許明確設定的單項限制超過這些 remote-safe 預設值；未設定的限制仍保持 remote-safe。若要在可信 LAN 上讓未設定限制恢復本機大預設值，設定 `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local`。兩種遠端模式都會暴露本機封存瀏覽器和上傳入口，因此只應在可信網路使用。
+**遠端繫結策略。** 繫結非 loopback 位址（例如 `0.0.0.0`、`::` 或 LAN IP）時，必須透過 `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` 或 `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` 明確 opt-in，否則啟動會被拒絕。啟用後會警告封存瀏覽器已暴露，並套用 128 MiB 壓縮 ZIP、每個 JSON member 256 MiB、總未壓縮 512 MiB、200 JSON members、10,000 ZIP members 的 remote-safe 預設值。`ALLOW_REMOTE_UPLOADS` 只放寬明確設定的限制；未設定項仍 remote-safe。`REMOTE_UPLOAD_PROFILE=local` 只適合可信 LAN。專案沒有認證層，邊界由可信網路與主機防火牆提供；Origin/Sec-Fetch 寫入保護不能讓不可信網路變安全。
 
-`/api/schema` 會回報目前執行主機的有效上傳策略，包括 remote-safe、明確遠端 override 或 local-profile 限制是否生效。ZIP 大小檢查會在匯入前執行，但直接 JSON 解析、SQLite 寫入和 `web-index` 重建仍會依解碼後的 conversation JSON 大小消耗記憶體、磁碟與 CPU。超大型封存建議在可信本機環境使用 CLI import，並準備足夠磁碟與記憶體。
+`/api/schema` 會回報有效上傳策略，包括 multipart body 上限（ZIP byte 上限加有限 overhead）與 remote profile。writer slot 和 receive-level body cap 在 multipart 解析前生效。parser 可能寫 spool，之後 pipeline 仍擁有伺服器暫存 ZIP，因此暫存磁碟應預留接近兩份壓縮副本再加資料庫成長。ZIP 檢查先執行，但 JSON 解碼、SQLite 寫入與 `web-index` 仍依解碼資料消耗記憶體、磁碟與 CPU。遠端上傳必須提供有效 `Content-Length`；loopback chunked 上傳仍受串流上限限制。
 
 如需為合法的超大型封存提高本機限制，在啟動 Web UI 前設定相應變數：
 
@@ -334,11 +338,11 @@ runnable 交付包中的 Web 路徑不應依賴 `webui/node_modules`，因為建
 
 ## 搜尋語法
 
-CLI 搜尋使用專案統一的安全查詢語法，不直接使用 SQLite 查詢文字。可以使用一般關鍵字、加引號的片語、`-term` 排除、`OR`，以及 `role:user`、`source:zip`、`path:current`、`path:all`、`scope:title`、`scope:message` 等篩選條件。輸出只包含 conversation ID、node ID 與角色，不包含 snippet。
+CLI 搜尋使用安全查詢語法，不直接使用 SQLite 查詢文字。一般詞使用 normalized substring `contains` 並預設 AND；大寫 `OR` 建立替代分支。引號保留片語，`-term`/`-"quoted phrase"` 表示排除。`word` 僅對 ASCII 字母、數字與底線套用邊界；CJK 無斷詞時保守維持 normalized contains。查詢中的 raw `path:`/`scope:` 會覆寫 UI 選擇器。
 
 排除詞對對話結果採用 conversation-level 語意：只要所選搜尋 scope 和 path 內任一標題或訊息命中排除片段，該 conversation 就不會返回。`/api/search/messages` 仍只返回本身不包含排除片段的訊息命中。`path:current` 會依每個 conversation 遵守 reader 路徑；如果損壞封存完全沒有 current-path node，current-path 搜尋會 fallback 到 reader 顯示的同一個 all-node 視圖。
 
-日期篩選（例如 `after:2026-05-01`、`before:2026-05-13`、`--from`、`--to`）使用 UTC 日曆日，而不是你本機時區的日曆日。起始日期包含當天 `00:00:00Z`；結束日期會用次日 `00:00:00Z` 作為排他上界，因此 `23:59:59.5Z` 這類小數秒時間戳仍包含在當天內。Web 搜尋框最多 500 個字元；更長的結構化條件請使用進階篩選。
+日期篩選使用 UTC 日曆日；起始包含 `00:00:00Z`，結束以隔天 `00:00:00Z` 為排他上界。CLI 匯出時間與確定性檔名日期使用 UTC；瀏覽器依瀏覽器本機時區顯示。Web 搜尋框最多 500 個字元。虛擬清單只渲染部分列，因此瀏覽器 Cmd/Ctrl+F 看不到未渲染訊息；整段搜尋請用封存搜尋或複製對話。
 
 ```bash
 python chatgpt_archive.py search --db archive/chatgpt_archive.db "python sqlite"
@@ -429,7 +433,7 @@ python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 
 ## 交付說明
 
-runnable delivery 應包含 Python 原始碼、測試、文件、`requirements-web.txt`、`webui/src` 與 `webui/tests` 下的前端原始碼與測試、前端設定/package 檔，以及 `webui/dist` 下的建置產物。不應包含 `webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python 快取目錄或 bytecode、coverage/typecheck 快取、`.DS_Store`、AppleDouble `._*` 檔、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、暫存紀錄檔、本機驗收紀錄檔、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任何 `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` 等真實資料庫檔，或 `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` 等 SQLite sidecar。目錄檢查允許目標根目錄自己的 `.git`，因此一般 Git clone 可以直接檢查；巢狀 `.git` 會失敗，ZIP delivery 中任何 `.git` 都會失敗。
+runnable delivery 應包含 Python 原始碼、測試、文件、`requirements-web.txt`、`constraints-web-py312.txt`、`webui/src` 與 `webui/tests` 下的前端原始碼與測試、前端設定/package 檔，以及 `webui/dist` 下的建置產物。不應包含 `webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python 快取目錄或 bytecode、coverage/typecheck 快取、`.DS_Store`、AppleDouble `._*` 檔、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、暫存紀錄檔、本機驗收紀錄檔、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任何 `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` 等真實資料庫檔，或 `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` 等 SQLite sidecar。目錄檢查允許目標根目錄自己的 `.git`，因此一般 Git clone 可以直接檢查；巢狀 `.git` 會失敗，ZIP delivery 中任何 `.git` 都會失敗。
 
 source-only delivery 可以省略 `webui/dist`，但之後需要先重新建置前端，才能提供完整 React UI。
 
@@ -450,7 +454,7 @@ tools/                             交付檢查與輔助腳本
 
 ## 資料庫概覽
 
-主資料庫保存 conversations、mapping nodes、import runs 與 warnings。CLI FTS 表是 `message_fts`。可選 Web 搜尋輔助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
+主資料庫保存 conversations、mapping nodes、import runs 與 warnings。message object 的 raw JSON 欄位按完整物件保留；conversation 與 mapping-node object 會正規化，不做逐位元組保存。輸入 ZIP SHA-256 可選，`source_files`/`file_index` 的逐 entry SHA 欄位目前保留但不填入。CLI FTS 表是 `message_fts`。可選 Web 搜尋輔助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
 除非已明確規劃並記錄 migration，否則專案不會在小型穩健性修復中修改資料庫 schema。缺少新欄位的舊資料庫會透過 `verify` 或 Web health 的 `missing_columns` 診斷被明確拒絕，而不會靜默 migration；遇到這種情況請先備份舊庫，再用原始匯出重新匯入到新資料庫。
 
@@ -461,3 +465,15 @@ tools/                             交付檢查與輔助腳本
 - 匯出解析遵循目前觀察到的 OpenAI / ChatGPT 匯出格式。如果上游匯出結構變更，應先更新 `inspect` 與測試，再信任新的匯入路徑。
 - 匯出檔名片段會同時依 Windows 和類 Unix 系統清理，包括 `CON`、`AUX`、`COM1`、`LPT9`、`COM¹`、`LPT²` 等保留裝置名稱，以及尾隨點和空格。
 - 超大型封存在匯入、重建 FTS 與建立 Web trigram 索引時都可能需要時間。大型匯入優先使用 `--rebuild-fts` 路徑。
+
+## 安全與回應契約
+
+Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bind host 與明確設定的 host。非 loopback bind 還必須透過 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定實際瀏覽器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）接受代理 IP/CIDR；只有直接連線來自受信代理時才讀取 `Forwarded` / `X-Forwarded-*`。靜態 UI、GET API 與全部請求都驗證 Host。遠端寫入必須有同源 `Origin`；只有可信 loopback profile 相容無 Origin 用戶端。上傳永遠拒絕 `Sec-Fetch-Site: cross-site`。
+
+匯入失敗使用穩定的輸入預檢、source scan、JSON decode、頂層契約與交易階段。失敗 run summary 的 warning 數與實際持久化 warning 一致。canonical commit 成功後，verify、stats 或可選 Web index 失敗不會被描述為「未匯入」。提交後的暫存上傳清理失敗是非致命穩定 warning，且不洩漏使用者路徑。
+
+非標準 JSON `NaN` / `Infinity` 會被拒絕；字串形式的非有限時間寫成 `NULL` 並記錄 warning。`verify` 會偵測舊資料庫非有限時間，API、stats 與 export 仍保證有限 JSON。Effective-current 回應提供 cycle、missing parent、cross-conversation parent 與 partial chain 診斷。`internal_hidden_count` 是正式統計，`technical_hidden_count` 只是已棄用的同值相容別名。`count_total=false` 時 message search 回傳 `total_exact=false`，此時 `total` 只是已知下界。around-node 回應區分目標是否存在、可見、屬於 effective collection 以及是否成功定位。
+
+「複製 URL」永遠明確寫入 `match_mode`、`layout`、`show_internal` 與可分享的搜尋/reader 狀態。URL 明確值優先於 `localStorage`，缺少值才可回退本機設定。本版本使用 `replaceState`，瀏覽器上一頁/下一頁不會還原逐步搜尋或選擇歷程。
+
+Release ZIP 先寫入目標目錄的暫存檔，核對每個 payload 檔案的排序 size/SHA-256 manifest、精確 member 集合與 dist asset，再執行 delivery check，最後才原子替換目標；任何失敗都保留舊 release。

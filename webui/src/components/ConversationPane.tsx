@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ConversationSummary, MatchMode, MessageItem, PathMode, SearchFilters, SearchMessageHit } from "../types";
 import { exportUrl, getMessageHits, getMessages } from "../api/client";
@@ -6,6 +6,7 @@ import { formatDate } from "../utils/format";
 import { analyzeQuerySyntax } from "../utils/querySyntax";
 import MessageBlock from "./MessageBlock";
 import type { Settings } from "../settings";
+import { isInteractiveTarget } from "../utils/interaction";
 
 const MAX_NAVIGABLE_HIT_MESSAGES = 1000;
 
@@ -17,22 +18,22 @@ interface Props {
   path: PathMode;
   setPath: (value: PathMode) => void;
   settings: Settings;
+  showInternal: boolean;
+  setShowInternal: (value: boolean) => void;
   t: (key: string) => string;
 }
 
-export default function ConversationPane({ conversation, query, filters, matchMode, path, setPath, settings, t }: Props) {
+export default function ConversationPane({ conversation, query, filters, matchMode, path, setPath, settings, showInternal, setShowInternal, t }: Props) {
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [messageTotal, setMessageTotal] = useState(0);
   const [visibleTotal, setVisibleTotal] = useState(0);
   const [emptyHiddenCount, setEmptyHiddenCount] = useState(0);
   const [internalHiddenCount, setInternalHiddenCount] = useState(0);
-  const [technicalHiddenCount, setTechnicalHiddenCount] = useState(0);
   const [currentPathFallbackToAll, setCurrentPathFallbackToAll] = useState(false);
   const [nextOffset, setNextOffset] = useState<number | null>(0);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [showInternal, setShowInternal] = useState(settings.showInternalDefault);
   const [hitItems, setHitItems] = useState<SearchMessageHit[]>([]);
   const [hitLimitReached, setHitLimitReached] = useState(false);
   const [hitIndex, setHitIndex] = useState(0);
@@ -43,6 +44,10 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const measureFrameRef = useRef<number | null>(null);
   const messageRequestRef = useRef(0);
   const hitRequestRef = useRef(0);
+  const messageControllerRef = useRef<AbortController | null>(null);
+  const hitControllerRef = useRef<AbortController | null>(null);
+  const copyControllerRef = useRef<AbortController | null>(null);
+  const copyRequestRef = useRef(0);
   const scrollRequestRef = useRef(0);
   const fallbackTargetsRef = useRef<Set<string>>(new Set());
   const replacementLoadRef = useRef(false);
@@ -60,15 +65,56 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     hasBodySearchText ||
     filters.role ||
     filters.title ||
+    filters.exact ||
     filters.exclude ||
     filters.after ||
     filters.before ||
     filters.source,
   ), [filters, hasBodySearchText, querySyntax.hasSearchContext]);
 
-  useEffect(() => {
-    setShowInternal(settings.showInternalDefault);
-  }, [conversation?.conversation_id, settings.showInternalDefault]);
+  const readerDataContextKey = JSON.stringify({
+    conversationId: conversation?.conversation_id ?? null,
+    effectivePath,
+    highlightQuery,
+    matchMode,
+    filters: effectiveFilters,
+    showInternal,
+    pageSize: settings.messagePageSize,
+  });
+  const readerLayoutContextKey = JSON.stringify({
+    layout: settings.messageLayout,
+    density: settings.density,
+    fontSize: settings.fontSize,
+    messageMaxWidth: settings.messageMaxWidth,
+  });
+  const readerDataContextRef = useRef(readerDataContextKey);
+  readerDataContextRef.current = readerDataContextKey;
+
+  useLayoutEffect(() => {
+    messageControllerRef.current?.abort();
+    hitControllerRef.current?.abort();
+    copyControllerRef.current?.abort();
+    messageRequestRef.current += 1;
+    hitRequestRef.current += 1;
+    copyRequestRef.current += 1;
+    setMessages([]);
+    setMessageTotal(0);
+    setVisibleTotal(0);
+    setEmptyHiddenCount(0);
+    setInternalHiddenCount(0);
+    setCurrentPathFallbackToAll(false);
+    setNextOffset(null);
+    setHasMore(false);
+    setHitItems([]);
+    setHitLimitReached(false);
+    setHitIndex(0);
+    setCopyBusy(null);
+    setCopyStatus("");
+    fallbackTargetsRef.current.clear();
+    missingHitWindowRef.current.clear();
+    replacementLoadRef.current = false;
+    scrollRequestRef.current += 1;
+  }, [readerDataContextKey]);
 
   useEffect(() => {
     fallbackTargetsRef.current.clear();
@@ -78,6 +124,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const loadMessages = useCallback((offset: number, append: boolean, aroundNodeId?: string) => {
     if (!conversation) return new AbortController();
     const controller = new AbortController();
+    const requestedContextKey = readerDataContextKey;
+    if (!append) messageControllerRef.current?.abort();
+    messageControllerRef.current = controller;
     const requestId = ++messageRequestRef.current;
     if (!append) replacementLoadRef.current = true;
     if (append) setLoadingMore(true);
@@ -85,46 +134,34 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     setError(null);
     getMessages({ id: conversation.conversation_id, q: highlightQuery, path: effectivePath, filters: effectiveFilters, offset, limit: settings.messagePageSize, aroundNodeId, includeInternal: showInternal, matchMode, signal: controller.signal })
       .then((page) => {
-        if (requestId !== messageRequestRef.current) return;
+        if (requestId !== messageRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
         setMessages((current) => append ? [...current, ...page.items] : page.items);
         setMessageTotal(page.total);
         setVisibleTotal(page.visible_total ?? page.total);
         setEmptyHiddenCount(page.empty_hidden_count ?? 0);
         setInternalHiddenCount(page.internal_hidden_count ?? 0);
-        setTechnicalHiddenCount(page.technical_hidden_count ?? 0);
         setCurrentPathFallbackToAll(Boolean(page.current_path_fallback_to_all || conversation.current_path_fallback_to_all));
         setHasMore(page.has_more);
         setNextOffset(page.next_offset);
       })
       .catch((err: Error) => {
-        if (err.name !== "AbortError" && requestId === messageRequestRef.current) setError(err.message);
+        if (err.name !== "AbortError" && requestId === messageRequestRef.current && readerDataContextRef.current === requestedContextKey) setError(t("requestFailed"));
       })
       .finally(() => {
-        if (requestId === messageRequestRef.current) {
+        if (requestId === messageRequestRef.current && readerDataContextRef.current === requestedContextKey) {
           if (!append) replacementLoadRef.current = false;
           setLoading(false);
           setLoadingMore(false);
         }
       });
     return controller;
-  }, [conversation?.conversation_id, conversation?.current_path_fallback_to_all, effectivePath, highlightQuery, matchMode, effectiveFiltersKey, settings.messagePageSize, showInternal]);
+  }, [conversation?.conversation_id, conversation?.current_path_fallback_to_all, effectivePath, highlightQuery, matchMode, effectiveFiltersKey, settings.messagePageSize, showInternal, readerDataContextKey, t]);
 
   useEffect(() => {
-    if (!conversation) {
-      setMessages([]);
-      setMessageTotal(0);
-      setVisibleTotal(0);
-      setEmptyHiddenCount(0);
-      setInternalHiddenCount(0);
-      setTechnicalHiddenCount(0);
-      setCurrentPathFallbackToAll(false);
-      setHasMore(false);
-      setNextOffset(null);
-      return;
-    }
+    if (!conversation) return;
     const controller = loadMessages(0, false);
     return () => controller.abort();
-  }, [conversation?.conversation_id, effectivePath, highlightQuery, loadMessages]);
+  }, [readerDataContextKey, loadMessages]);
 
   const visibleMessages = useMemo(
     () => messages.filter((message) => !message.is_empty_mapping_node && (showInternal || !message.is_internal)),
@@ -160,10 +197,13 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     setHitLimitReached(false);
     setHitIndex(0);
     const requestId = ++hitRequestRef.current;
+    const requestedContextKey = readerDataContextKey;
     if (!conversation || !searchActive) {
       return;
     }
     const controller = new AbortController();
+    hitControllerRef.current?.abort();
+    hitControllerRef.current = controller;
     const loadHits = async () => {
       const items: SearchMessageHit[] = [];
       let offset = 0;
@@ -180,16 +220,16 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     };
     loadHits()
       .then(({ items, reachedLimit }) => {
-        if (requestId !== hitRequestRef.current) return;
+        if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
         setHitItems(items);
         setHitLimitReached(reachedLimit);
         setHitIndex(0);
       })
       .catch((err: Error) => {
-        if (err.name !== "AbortError" && requestId === hitRequestRef.current) setHitItems([]);
+        if (err.name !== "AbortError" && requestId === hitRequestRef.current && readerDataContextRef.current === requestedContextKey) setHitItems([]);
       });
     return () => controller.abort();
-  }, [conversation?.conversation_id, effectivePath, highlightQuery, matchMode, effectiveFiltersKey, searchActive]);
+  }, [readerDataContextKey, searchActive]);
 
   const rowVirtualizer = useVirtualizer({
     count: visibleMessages.length,
@@ -233,13 +273,40 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     return () => observer.disconnect();
   }, [measureMessagesSoon]);
 
+  useLayoutEffect(() => {
+    const scroller = parentRef.current;
+    if (!scroller) return;
+    const scrollerTop = scroller.getBoundingClientRect().top;
+    const anchor = Array.from(scroller.querySelectorAll<HTMLElement>("[data-node-id]"))
+      .find((element) => element.getBoundingClientRect().bottom >= scrollerTop);
+    const anchorId = anchor?.dataset.nodeId;
+    const anchorOffset = anchor ? anchor.getBoundingClientRect().top - scrollerTop : 0;
+    rowVirtualizer.measure();
+    measureMessagesSoon();
+    const frame = window.requestAnimationFrame(() => {
+      if (!anchorId) return;
+      const nextAnchor = Array.from(scroller.querySelectorAll<HTMLElement>("[data-node-id]"))
+        .find((element) => element.dataset.nodeId === anchorId);
+      if (nextAnchor) {
+        scroller.scrollTop += nextAnchor.getBoundingClientRect().top - scrollerTop - anchorOffset;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [readerLayoutContextKey, rowVirtualizer, measureMessagesSoon]);
+
   const hiddenInternalHits = useMemo(() => hitItems.filter((hit) => hit.is_internal && !showInternal), [hitItems, showInternal]);
   const isCurrentFallbackHit = useCallback((hit: SearchMessageHit) => Boolean(hit.effective_visible_in_current_view || hit.current_path_fallback_to_all || currentPathFallbackToAll || conversation?.current_path_fallback_to_all), [conversation?.current_path_fallback_to_all, currentPathFallbackToAll]);
   const currentViewHits = useMemo(
     () => hitItems.filter((hit) => !(hit.is_internal && !showInternal) && !(effectivePath === "current" && !hit.is_on_current_path && !isCurrentFallbackHit(hit))),
     [hitItems, effectivePath, showInternal, isCurrentFallbackHit],
   );
-  const titleOnlyMatch = Boolean(searchActive && (conversation?.title_match || conversation?.has_title_hits || conversation?.reasons?.includes("title match")) && hitItems.length === 0);
+  const titleOnlyContext = Boolean(
+    filters.title ||
+    (effectiveScope === "title" && (querySyntax.hasBodyText || querySyntax.hasTitleText || filters.exact)),
+  );
+  const titleOnlyMatch = Boolean(searchActive && hitItems.length === 0 && (
+    titleOnlyContext || conversation?.title_match || conversation?.has_title_hits || conversation?.reasons?.includes("title match")
+  ));
   const hiddenSnippetInternal = Boolean(!showInternal && (conversation?.has_internal_hits || conversation?.snippets?.some((snippet) => snippet.is_internal)));
   const activeNode = currentViewHits[hitIndex]?.node_id || null;
   const activeIndex = useMemo(() => visibleMessages.findIndex((msg) => msg.node_id === activeNode), [visibleMessages, activeNode]);
@@ -347,14 +414,16 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     }
   }, [activeNode, activeIndex, loading, loadMessages]);
 
-  const copyText = async (text: string): Promise<boolean> => {
+  const copyText = async (text: string, expectedContextKey?: string, requestId?: number): Promise<boolean> => {
     try {
       if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(text);
+      if (expectedContextKey && (readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current)) return false;
       setCopyStatus(t("copied"));
       window.setTimeout(() => setCopyStatus(""), 1400);
       return true;
     } catch {
+      if (expectedContextKey && (readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current)) return false;
       setCopyStatus(t("copyFailed"));
       window.setTimeout(() => setCopyStatus(""), 1800);
       return false;
@@ -363,14 +432,14 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const messageText = (m: MessageItem) => m.display_text || m.render_text || m.content_text || "";
   const copyableMessages = (items: MessageItem[]) => items.filter((m) => !m.is_empty_mapping_node && messageText(m).trim());
   const formatMessagesForCopy = (items: MessageItem[]) => copyableMessages(items).map((m) => `${m.role || "message"}:\n${messageText(m)}`).join("\n\n");
-  const fetchMessagesForCopy = async (mode: "visible" | "conversation") => {
+  const fetchMessagesForCopy = async (mode: "visible" | "conversation", signal: AbortSignal) => {
     if (!conversation) return;
     if (mode === "visible") return visibleMessages;
     const allMessages: MessageItem[] = [];
     let offset = 0;
     const copyFilters: SearchFilters = { ...effectiveFilters, role: "", title: "", exact: "", exclude: "", after: "", before: "", source: "", scope: "all" };
     for (;;) {
-      const page = await getMessages({ id: conversation.conversation_id, q: "", path: effectivePath, filters: copyFilters, offset, limit: 300, includeInternal: showInternal, matchMode });
+      const page = await getMessages({ id: conversation.conversation_id, q: "", path: effectivePath, filters: copyFilters, offset, limit: 300, includeInternal: showInternal, matchMode, signal });
       allMessages.push(...page.items);
       if (!page.has_more || page.next_offset === null) break;
       offset = page.next_offset;
@@ -379,15 +448,23 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   };
   const runCopy = async (mode: "visible" | "conversation") => {
     if (copyBusy) return;
+    copyControllerRef.current?.abort();
+    const controller = new AbortController();
+    copyControllerRef.current = controller;
+    const requestedContextKey = readerDataContextKey;
+    const requestId = ++copyRequestRef.current;
     setCopyBusy(mode);
     setCopyStatus(t("preparingCopy"));
     try {
-      await copyText(formatMessagesForCopy(await fetchMessagesForCopy(mode) || []));
+      const copyItems = await fetchMessagesForCopy(mode, controller.signal) || [];
+      if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
+      await copyText(formatMessagesForCopy(copyItems), requestedContextKey, requestId);
     } catch {
+      if (controller.signal.aborted || readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
       setCopyStatus(mode === "conversation" ? t("copyConversationFailed") : t("copyFailed"));
       window.setTimeout(() => setCopyStatus(""), 1800);
     } finally {
-      setCopyBusy(null);
+      if (readerDataContextRef.current === requestedContextKey && requestId === copyRequestRef.current) setCopyBusy(null);
     }
   };
   const copyConversation = () => runCopy("conversation");
@@ -404,8 +481,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      if (isInteractiveTarget(event.target) || event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.key.toLowerCase() === "n") {
         event.preventDefault();
         jump(1);
@@ -422,6 +498,11 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     if (!hasMore || nextOffset === null || loading || loadingMore) return;
     loadMessages(nextOffset, true);
   };
+  const onMessageScroll = () => {
+    const node = parentRef.current;
+    if (!settings.autoLoadMore || !node || !hasMore || loading || loadingMore || nextOffset === null) return;
+    if (node.scrollHeight - node.scrollTop - node.clientHeight < 640) loadMessages(nextOffset, true);
+  };
 
   if (!conversation) {
     return <main className="reader empty-state">{query ? t("emptySearch") : t("selectConversation")}</main>;
@@ -430,14 +511,15 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const totalHitCount = hitItems.length;
   const hiddenInternalCount = hiddenInternalHits.length + (hiddenSnippetInternal && !hiddenInternalHits.length ? 1 : 0);
   const readerVisibleTotal = showInternal ? Math.max(0, messageTotal - emptyHiddenCount) : visibleTotal;
-  const nonTechnicalInternalHiddenCount = Math.max(0, internalHiddenCount - technicalHiddenCount);
   const hiddenNodeSummaryParts = [
     emptyHiddenCount > 0 ? `${emptyHiddenCount} ${t("emptyNodesHidden")}` : "",
-    !showInternal && technicalHiddenCount > 0 ? `${technicalHiddenCount} ${t("technicalMessagesHidden")}` : "",
-    !showInternal && nonTechnicalInternalHiddenCount > 0 ? `${nonTechnicalInternalHiddenCount} ${t("internalMessagesHidden")}` : "",
+    !showInternal && internalHiddenCount > 0 ? `${internalHiddenCount} ${t("internalMessagesHidden")}` : "",
   ].filter(Boolean);
   const hiddenNodeSummary = hiddenNodeSummaryParts.length ? ` · ${hiddenNodeSummaryParts.join(" · ")}` : "";
-  const filterOnlyMatch = Boolean(searchActive && !hasBodySearchText && !titleOnlyMatch && !totalHitCount && !hiddenInternalCount);
+  const filterOnlyMatch = Boolean(
+    searchActive && !hasBodySearchText && !titleOnlyMatch && !totalHitCount && !hiddenInternalCount &&
+    (filters.role || filters.source || filters.after || filters.before || querySyntax.hasFilterOnlyContext),
+  );
   const hitCounterText = searchActive
     ? filterOnlyMatch
       ? t("filterOnlyMatchNotice")
@@ -471,12 +553,13 @@ export default function ConversationPane({ conversation, query, filters, matchMo
           <button type="button" onClick={() => jump(-1)} disabled={!currentViewHits.length}>{t("prevHit")}</button>
           <button type="button" onClick={() => jump(1)} disabled={!currentViewHits.length}>{t("nextHit")}</button>
           <button type="button" onClick={copyVisible} disabled={Boolean(copyBusy)}>{copyBusy === "visible" ? t("preparingCopy") : t("copyVisible")}</button>
-          <button type="button" onClick={copyConversation} disabled={Boolean(copyBusy)}>{copyBusy === "conversation" ? t("preparingCopy") : t("copyConversation")}</button>
+          <button type="button" onClick={copyConversation} disabled={Boolean(copyBusy)}>{copyBusy === "conversation" ? t("preparingCopy") : effectivePath === "all" ? t("copyAllNodesConversation") : t("copyConversation")}</button>
           <a className="button-link" href={exportUrl(conversation.conversation_id, "md", effectivePath, showInternal)} title={t("downloadUsesCurrentReaderPath")}>{t("downloadMd")}</a>
           <a className="button-link" href={exportUrl(conversation.conversation_id, "txt", effectivePath, showInternal)} title={t("downloadUsesCurrentReaderPath")}>{t("downloadTxt")}</a>
         </div>
       </header>
       {error && <div className="error-box">{error}</div>}
+      {effectivePath === "current" && currentPathFallbackToAll && <div className="fallback-note" role="status">{t("currentPathFallbackAll")}</div>}
       <div className="hit-counter">{hitCounterText}{copyStatus ? ` · ${copyStatus}` : ""}</div>
       {(searchActive || querySyntax.pathOverride || querySyntax.scopeOverride || hiddenNodeSummaryParts.length > 0) && (
         <div className="search-visibility-notes" role="status">
@@ -496,7 +579,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
           {hiddenNodeSummaryParts.length > 0 && (
             <span>
               {hiddenNodeSummaryParts.join(" · ")}
-              {!showInternal && (internalHiddenCount > 0 || technicalHiddenCount > 0) && <button type="button" onClick={() => setShowInternal(true)}>{t("showInternalToView")}</button>}
+              {!showInternal && internalHiddenCount > 0 && <button type="button" onClick={() => setShowInternal(true)}>{t("showInternalToView")}</button>}
             </span>
           )}
         </div>
@@ -505,7 +588,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
         {loading ? t("loading") : `${t("showing")} ${visibleMessages.length} ${t("of")} ${readerVisibleTotal} ${t("visibleMessages")}${hiddenNodeSummary}`}
         {hasMore && <button type="button" onClick={loadMore} disabled={loadingMore}>{loadingMore ? t("loadingMore") : t("loadMoreMessages")}</button>}
       </div>
-      <div ref={parentRef} className="message-scroll" aria-label={t("messages")} data-message-layout={settings.messageLayout}>
+      <div ref={parentRef} className="message-scroll" aria-label={t("messages")} data-message-layout={settings.messageLayout} onScroll={onMessageScroll}>
         <div style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: "relative" }}>
           {rowVirtualizer.getVirtualItems().map((virtualRow) => {
             const message = visibleMessages[virtualRow.index];

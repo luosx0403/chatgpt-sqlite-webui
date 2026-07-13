@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import hashlib
 import io
+import logging
 import os
 import re
 import sqlite3
@@ -24,7 +25,7 @@ from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
 from chatgpt_export_archiver.scanner import list_source_entries, load_json_from_source, resolve_input
 from chatgpt_export_archiver.search import parse_query
-from chatgpt_export_archiver.utils import parse_date_boundary, safe_filename_part
+from chatgpt_export_archiver.utils import epoch_to_date_part, epoch_to_display, parse_date_boundary, safe_filename_part
 from chatgpt_export_archiver.web_db import connect_readonly, create_web_indexes
 from tools.check_delivery_clean import is_forbidden_member, main as delivery_clean_main
 from tools import clean_generated_artifacts
@@ -81,10 +82,11 @@ def write_zip(path: Path, files: dict[str, object]) -> None:
 
 
 def run_cli(args: list[str]) -> tuple[int, str]:
-    buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         code = main(args)
-    return code, buffer.getvalue()
+    return code, stdout.getvalue() + stderr.getvalue()
 
 
 def file_hashes(base: Path) -> dict[str, str]:
@@ -228,6 +230,33 @@ class ArchiverTests(unittest.TestCase):
         self.assertEqual(parse_date_boundary("1970-01-02", end_of_day=True), 172800)
         self.assertEqual(parse_query("", after="1970-01-02").after, 86400)
         self.assertEqual(parse_query("", before="1970-01-02").before, 172800)
+
+    def test_export_timestamp_is_utc_and_epoch_zero_is_not_missing(self):
+        from chatgpt_export_archiver.exporter import render_markdown, render_txt
+
+        previous_tz = os.environ.get("TZ")
+        zones = ("UTC0", "GMT+8") if hasattr(time, "tzset") else (None,)
+        try:
+            for zone in zones:
+                if zone is not None:
+                    os.environ["TZ"] = zone
+                    time.tzset()
+                self.assertEqual(epoch_to_display(0), "1970-01-01 00:00:00")
+                self.assertEqual(epoch_to_date_part(0), "1970-01-01")
+                conv_row = {
+                    "title": "Synthetic", "conversation_id": "epoch-zero", "create_time": 0,
+                    "update_time": 3600, "current_node": "n", "source_file": "synthetic.json",
+                }
+                node_row = {"role": "user", "create_time": 0, "update_time": 3600, "content_text": "synthetic"}
+                self.assertIn("## User 1970-01-01 00:00:00", render_markdown(conv_row, [node_row]))
+                self.assertIn("USER 1970-01-01 00:00:00", render_txt(conv_row, [node_row]))
+        finally:
+            if hasattr(time, "tzset"):
+                if previous_tz is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = previous_tz
+                time.tzset()
 
     def test_query_parser_keeps_quoted_modifier_values_and_escaped_phrases(self):
         parsed = parse_query('title:"foo bar" source:"conversations 1.json" role:"assistant" path:"all" scope:"title"')
@@ -635,6 +664,8 @@ class ArchiverTests(unittest.TestCase):
             keep_zip.write_bytes(b"zip")
             keep_jsonl = base / "import.jsonl"
             keep_jsonl.write_text("{}", encoding="utf-8")
+            keep_conversations = base / "conversations-000.json"
+            keep_conversations.write_text("[]", encoding="utf-8")
             keep_archive = base / "archive"
             keep_archive.mkdir()
             keep_exports = base / "exports"
@@ -650,6 +681,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertIn("webui/node_modules", output)
             self.assertIn("blocked_sensitive_paths", output)
             self.assertIn("archive.db", output)
+            self.assertIn("conversations-000.json", output)
             self.assertIn("exports", output)
             self.assertNotIn(str(base), output)
             self.assertTrue(pyc.exists())
@@ -674,6 +706,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertTrue(keep_sidecar.exists())
             self.assertTrue(keep_zip.exists())
             self.assertTrue(keep_jsonl.exists())
+            self.assertTrue(keep_conversations.exists())
             self.assertTrue(keep_archive.exists())
             self.assertTrue(keep_exports.exists())
             self.assertTrue(keep_log.exists())
@@ -771,6 +804,7 @@ class ArchiverTests(unittest.TestCase):
         env_names = []
         common_required = [
             "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS",
+            "CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS",
             "CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE",
             "CHATGPT_ARCHIVE_MAX_UPLOAD_BYTES",
             "CHATGPT_ARCHIVE_MAX_UPLOAD_JSON_MEMBER_BYTES",
@@ -807,6 +841,14 @@ class ArchiverTests(unittest.TestCase):
             "around_node_id",
             "visible-only rows",
             "effective all-node collection",
+            "current_collection_source",
+            "current_path_fallback_to_all",
+            "constraints-web-py312.txt",
+            "Content-Length",
+            "Cmd/Ctrl+F",
+            "normalized contains",
+            "path:",
+            "scope:",
             "CON",
             "COM¹",
             "LPT²",
@@ -893,7 +935,8 @@ class ArchiverTests(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(result.returncode, 2)
-            self.assertIn("ERROR:", result.stdout)
+            self.assertIn("ERROR:", result.stderr)
+            self.assertEqual(result.stdout, "")
 
     def test_inspect_and_scanner_errors_do_not_print_input_names_or_paths(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1058,7 +1101,22 @@ class ArchiverTests(unittest.TestCase):
             self.assertIn("database_not_found", output)
             self.assertNotIn(str(db), output)
             self.assertNotIn(db.name, output)
-            self.assertFalse(db.exists())
+        self.assertFalse(db.exists())
+
+    def test_core_only_cli_works_without_web_dependencies_and_web_fails_fast(self):
+        from chatgpt_export_archiver.cli import cmd_web
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "core.db"
+            self.assertEqual(main(["init", "--db", str(db)]), 0)
+            with mock.patch.dict(sys.modules, {"fastapi": None, "uvicorn": None}):
+                self.assertEqual(main(["stats", "--db", str(db)]), 0)
+                args = argparse.Namespace(
+                    db=str(db), host="127.0.0.1", port=8787,
+                    allow_fallback=False, log_level="warning",
+                )
+                with self.assertRaisesRegex(ValueError, "Missing Web dependency uvicorn"):
+                    cmd_web(args)
 
     def test_web_index_uses_bulk_write_connection_pragmas(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1299,7 +1357,82 @@ class ArchiverTests(unittest.TestCase):
             self.assertIn("duplicate_conversation_json_source", str(ctx.exception))
             code, output = run_cli(["import", "--db", str(base / "archive.db"), "--input", str(z), "--no-input-sha256"])
             self.assertEqual(code, 2)
-            self.assertIn("duplicate_conversation_json_source", output)
+            self.assertIn("ambiguous_conversation_sources", output)
+
+            ambiguous = base / "ambiguous-shards.zip"
+            write_zip(
+                ambiguous,
+                {
+                    "a/conversations-001.json": [conversation("first-shard")],
+                    r"b\conversations-1.json": [conversation("second-shard")],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "ambiguous_conversation_source_identity shard:1"):
+                list_source_entries(resolve_input(str(ambiguous), Path.cwd()))
+            code, output = run_cli(["import", "--db", str(base / "ambiguous.db"), "--input", str(ambiguous), "--no-input-sha256"])
+            self.assertEqual(code, 2)
+            self.assertIn("ambiguous_conversation_sources", output)
+
+    def test_import_file_strictness_rolls_back_malformed_shard_but_tolerates_bad_elements(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "archive.db"
+            initial = base / "initial.zip"
+            write_zip(initial, {"conversations.json": [conversation("keep-existing", title="Before")]})
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(initial), "--no-input-sha256"]), 0)
+            create_web_indexes(db)
+
+            mixed = base / "mixed.zip"
+            changed = conversation("keep-existing", title="Must Roll Back")
+            with zipfile.ZipFile(mixed, "w") as zf:
+                zf.writestr("conversations-000.json", json.dumps([changed]))
+                zf.writestr("conversations-001.json", "{not valid json")
+            code, output = run_cli(["--db", str(db), "import", "--input", str(mixed), "--no-input-sha256"])
+            self.assertEqual(code, 2)
+            self.assertIn("invalid_conversation_json", output)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT title FROM conversations WHERE conversation_id = 'keep-existing'").fetchone()[0], "Before")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM web_title_norm WHERE conversation_id = 'keep-existing'").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM web_message_norm WHERE conversation_id = 'keep-existing'").fetchone()[0], 4)
+                run = conn.execute("SELECT status, summary_json FROM import_runs ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual(run[0], "failed")
+                self.assertEqual(json.loads(run[1])["failure_code"], "invalid_conversation_json")
+            finally:
+                conn.close()
+
+            tolerant = base / "tolerant.zip"
+            write_zip(tolerant, {"conversations.json": [None, {}, {"id": "empty", "mapping": {}}, conversation("valid-after-bad")]})
+            code, output = run_cli(["--db", str(db), "import", "--input", str(tolerant), "--no-input-sha256"])
+            self.assertEqual(code, 0, output)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations WHERE conversation_id = 'valid-after-bad'").fetchone()[0], 1)
+                warning_types = {row[0] for row in conn.execute("SELECT warning_type FROM import_warnings WHERE import_run_id = (SELECT MAX(id) FROM import_runs)")}
+                self.assertIn("invalid_element_type", warning_types)
+                self.assertIn("empty_mapping", warning_types)
+            finally:
+                conn.close()
+
+            non_list = base / "non-list.zip"
+            with zipfile.ZipFile(non_list, "w") as zf:
+                zf.writestr("conversations.json", json.dumps({"id": "not-a-list"}))
+            code, output = run_cli(["--db", str(db), "import", "--input", str(non_list), "--no-input-sha256"])
+            self.assertEqual(code, 2)
+            self.assertIn("conversation_json_top_level_not_list", output)
+
+            no_source = base / "no-source.zip"
+            with zipfile.ZipFile(no_source, "w") as zf:
+                zf.writestr("other.json", json.dumps({"synthetic": True}))
+            code, output = run_cli(["--db", str(db), "import", "--input", str(no_source), "--no-input-sha256"])
+            self.assertEqual(code, 2)
+            self.assertIn("no_conversation_sources", output)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT title FROM conversations WHERE conversation_id = 'keep-existing'").fetchone()[0], "Before")
+                self.assertEqual(conn.execute("SELECT status FROM import_runs ORDER BY id DESC LIMIT 1").fetchone()[0], "failed")
+            finally:
+                conn.close()
 
     def test_scanner_ignores_macos_metadata_conversation_sources(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1387,6 +1520,32 @@ class ArchiverTests(unittest.TestCase):
             self.assertIn("selected_conversation_sources 1", output)
             self.assertIn("sharded true", output)
             self.assertIn("valid_conversations 1", output)
+
+    def test_inspect_uses_parser_conversation_id_precedence(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "conversations.json"
+            id_only = conversation("id-only")
+            id_only.pop("conversation_id")
+            conversation_id_only = conversation("ignored")
+            conversation_id_only.pop("id")
+            conversation_id_only["conversation_id"] = "conversation-id-only"
+            conflicting = conversation("primary-id")
+            conflicting["conversation_id"] = "secondary-id"
+            duplicate_fallback = conversation("ignored-too")
+            duplicate_fallback.pop("id")
+            duplicate_fallback["conversation_id"] = "conversation-id-only"
+            missing = conversation("missing")
+            missing.pop("id")
+            missing.pop("conversation_id")
+            source.write_text(
+                json.dumps([id_only, conversation_id_only, conflicting, duplicate_fallback, missing]),
+                encoding="utf-8",
+            )
+            code, output = run_cli(["inspect", "--input", str(source)])
+            self.assertEqual(code, 0, output)
+            self.assertIn("valid_conversations 4", output)
+            self.assertIn("invalid_elements 1", output)
+            self.assertIn("duplicate_conversation_ids 1", output)
 
     def test_graph_saves_all_nodes_exports_current_path_only(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1498,6 +1657,19 @@ class ArchiverTests(unittest.TestCase):
             for path in out.rglob("*"):
                 if path.is_file():
                     self.assertNotIn("exported_at", path.read_text(encoding="utf-8"))
+
+    def test_export_filename_preserves_epoch_zero_with_nullish_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            z = base / "epoch-zero.zip"
+            item = conversation("epoch-zero", title="Epoch Zero", create_time=0)
+            item["update_time"] = 1_700_000_000
+            write_zip(z, {"conversations.json": [item]})
+            db = base / "archive.db"
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
+            out = base / "exports"
+            self.assertEqual(main(["--db", str(db), "export", "--out", str(out), "--format", "md"]), 0)
+            self.assertTrue(any(path.name.startswith("1970-01-01_") for path in out.glob("*.md")))
 
     def test_reimport_same_zip_is_idempotent_for_data_tables(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1870,7 +2042,10 @@ class ArchiverTests(unittest.TestCase):
                 return Cursor()
 
         conn = FakeConn()
-        search_module._fts_message_rows(conn, parse_query("common"), "common*", None, 5)
+        with mock.patch.object(search_module, "_ensure_search_functions"), mock.patch.object(
+            search_module, "ensure_effective_current_views"
+        ):
+            search_module._fts_message_rows(conn, parse_query("common"), "common*", None, 5)
         normalized_sql = re.sub(r"\s+", " ", conn.sql)
         self.assertIn("ORDER BY bm25(message_fts) LIMIT ?", normalized_sql)
         self.assertEqual(conn.params, ["common*", 5])
@@ -2613,7 +2788,7 @@ class ArchiverTests(unittest.TestCase):
             namelist = {n.replace("\\", "/").rstrip("/") for n in _zf.ZipFile(output).namelist()}
             required = [
                 "README.md", "README.zh-CN.md", "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md",
-                "requirements-web.txt", "LICENSE", "AGENTS.md", "chatgpt_archive.py",
+                "requirements-web.txt", "constraints-web-py312.txt", "LICENSE", "AGENTS.md", "chatgpt_archive.py",
                 "chatgpt_export_archiver/search.py", "chatgpt_export_archiver/web_api.py",
                 "tests/test_archiver.py", "tests/test_web_api.py",
                 "tools/check_delivery_clean.py", "tools/clean_generated_artifacts.py", "tools/make_release_zip.py",
@@ -2624,6 +2799,9 @@ class ArchiverTests(unittest.TestCase):
             ]
             for path in required:
                 self.assertIn(path, namelist, f"missing {path}")
+            self.assertIn("manifest_files", result.stdout)
+            self.assertIn("manifest_sha256", result.stdout)
+            self.assertIn("dist_assets_verified", result.stdout)
             self.assertTrue(any(name.startswith("webui/dist/assets/") and name.endswith(".js") for name in namelist))
             self.assertTrue(any(name.startswith("webui/dist/assets/") and name.endswith(".css") for name in namelist))
             forbidden_markers = [
@@ -2642,8 +2820,269 @@ class ArchiverTests(unittest.TestCase):
                 capture_output=True, text=True,
             )
             self.assertEqual(delivery_check.returncode, 0, delivery_check.stdout or delivery_check.stderr)
+
+            dist_index = work / "webui" / "dist" / "index.html"
+            original_index = dist_index.read_text(encoding="utf-8")
+            dist_index.write_text(original_index.replace("</head>", '<script src="/assets/missing-release-asset.js"></script></head>'), encoding="utf-8")
+            missing_asset = _sp.run(
+                [_sys.executable, str(work / "tools" / "make_release_zip.py"), "--output", str(work_parent / "missing-asset.zip"), "--no-check"],
+                capture_output=True, text=True, cwd=work,
+            )
+            self.assertNotEqual(missing_asset.returncode, 0)
+            self.assertIn("dist_missing_assets", missing_asset.stdout)
+            dist_index.write_text(original_index, encoding="utf-8")
+
+            (work / "README.es-ES.md").unlink()
+            missing_required = _sp.run(
+                [_sys.executable, str(work / "tools" / "make_release_zip.py"), "--output", str(work_parent / "missing-required.zip"), "--no-check"],
+                capture_output=True, text=True, cwd=work,
+            )
+            self.assertNotEqual(missing_required.returncode, 0)
+            self.assertIn("required_release_paths_missing", missing_required.stdout)
+            self.assertIn("README.es-ES.md", missing_required.stdout)
         finally:
             _sh.rmtree(work_parent, ignore_errors=True)
+
+    def test_non_finite_json_and_timestamp_contracts_are_persisted(self):
+        for label, value in (("nan", float("nan")), ("positive", float("inf")), ("negative", float("-inf"))):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                source = base / "non-finite.zip"
+                payload = conversation(f"non-finite-{label}")
+                payload["create_time"] = value
+                with zipfile.ZipFile(source, "w") as archive:
+                    archive.writestr("conversations.json", json.dumps([payload], allow_nan=True))
+                db = base / "archive.db"
+                code, output = run_cli(["--db", str(db), "import", "--input", str(source), "--no-input-sha256"])
+                self.assertEqual(code, 2, output)
+                self.assertIn("non_finite_json_number", output)
+                conn = sqlite3.connect(db)
+                conn.row_factory = sqlite3.Row
+                try:
+                    run = conn.execute("SELECT status, summary_json FROM import_runs ORDER BY id DESC LIMIT 1").fetchone()
+                    summary = json.loads(run["summary_json"])
+                    self.assertEqual(run["status"], "failed")
+                    self.assertEqual(summary["failure_code"], "non_finite_json_number")
+                    warnings = conn.execute("SELECT warning_type FROM import_warnings WHERE import_run_id = ?", (summary["import_run_id"],)).fetchall()
+                    self.assertEqual([row["warning_type"] for row in warnings], ["non_finite_json_number"])
+                    self.assertEqual(summary["warnings"], len(warnings))
+                    self.assertEqual(summary["warnings_by_type"], [{"count": 1, "warning_type": "non_finite_json_number"}])
+                finally:
+                    conn.close()
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "string-non-finite.zip"
+            payload = conversation("string-non-finite")
+            payload["create_time"] = "Infinity"
+            payload["update_time"] = "NaN"
+            payload["mapping"]["u1"]["message"]["create_time"] = "-Infinity"
+            payload["mapping"]["u1"]["message"]["update_time"] = "NaN"
+            write_zip(source, {"conversations.json": [payload]})
+            db = base / "archive.db"
+            code, output = run_cli(["--db", str(db), "import", "--input", str(source), "--no-input-sha256"])
+            self.assertEqual(code, 0, output)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT create_time, update_time FROM conversations").fetchone(), (None, None))
+                self.assertEqual(conn.execute("SELECT create_time, update_time FROM conversation_nodes WHERE node_id = 'u1'").fetchone(), (None, None))
+                self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM import_warnings WHERE warning_type = 'non_finite_timestamp'").fetchone()[0], 4)
+            finally:
+                conn.close()
+
+    def test_import_preflight_and_transaction_failures_persist_consistent_runs(self):
+        cases = []
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            no_source = base / "no-source.zip"
+            with zipfile.ZipFile(no_source, "w") as archive:
+                archive.writestr("notes.txt", "synthetic")
+            ambiguous = base / "ambiguous.zip"
+            with zipfile.ZipFile(ambiguous, "w") as archive:
+                archive.writestr("a/conversations-001.json", "[]")
+                archive.writestr(r"b\conversations-1.json", "[]")
+            valid = base / "valid.zip"
+            write_zip(valid, {"conversations.json": [conversation("transaction-failure")]})
+            cases.extend([
+                ("no-source", no_source, None, "no_conversation_sources", "input_preflight"),
+                ("ambiguous", ambiguous, None, "ambiguous_conversation_sources", "source_scan"),
+                ("sqlite", valid, sqlite3.OperationalError("synthetic"), "import_transaction_failed", "transaction"),
+                ("unknown", valid, RuntimeError("synthetic"), "import_transaction_failed", "transaction"),
+            ])
+            for label, source, injected, code, stage in cases:
+                with self.subTest(label=label):
+                    db = base / f"{label}.db"
+                    patcher = (
+                        mock.patch("chatgpt_export_archiver.cli.upsert_conversations_batch", side_effect=injected)
+                        if injected is not None
+                        else contextlib.nullcontext()
+                    )
+                    with patcher:
+                        exit_code, output = run_cli(["--db", str(db), "import", "--input", str(source), "--no-input-sha256"])
+                    self.assertEqual(exit_code, 2, output)
+                    self.assertIn(code, output)
+                    conn = sqlite3.connect(db)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        run = conn.execute("SELECT id, status, summary_json FROM import_runs ORDER BY id DESC LIMIT 1").fetchone()
+                        summary = json.loads(run["summary_json"])
+                        warning_rows = conn.execute("SELECT warning_type FROM import_warnings WHERE import_run_id = ?", (run["id"],)).fetchall()
+                        self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+                    finally:
+                        conn.close()
+                    self.assertEqual(run["status"], "failed")
+                    self.assertEqual(summary["failure_code"], code)
+                    self.assertEqual(summary["failure_stage"], stage)
+                    self.assertEqual([row["warning_type"] for row in warning_rows], [code])
+                    self.assertEqual(summary["warnings"], 1)
+
+    def test_legacy_non_finite_stats_verify_and_export_are_safe(self):
+        from chatgpt_export_archiver.db import get_stats
+        from chatgpt_export_archiver.exporter import export_conversations
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "archive.db"
+            source = base / "finite.zip"
+            write_zip(source, {"conversations.json": [conversation("legacy-infinity")]})
+            self.assertEqual(run_cli(["--db", str(db), "import", "--input", str(source), "--no-input-sha256"])[0], 0)
+            conn = connect(db)
+            try:
+                conn.execute("UPDATE conversations SET create_time = ?, update_time = ?", (float("inf"), 1_700_000_100.0))
+                conn.execute("UPDATE conversation_nodes SET update_time = ? WHERE node_id = 'u1'", (float("-inf"),))
+                conn.commit()
+                stats = get_stats(conn)
+                self.assertEqual(stats["earliest_update_time"], 1_700_000_100.0)
+                verify = verify_database(conn)
+                self.assertFalse(verify["ok"])
+                self.assertEqual(verify["non_finite_timestamps"], 2)
+                result = export_conversations(conn, base / "exports", ["md", "txt"])
+                self.assertEqual(result["written"], 2)
+                for path in (base / "exports").iterdir():
+                    self.assertLessEqual(len(path.name.encode("utf-8")), 255)
+            finally:
+                conn.close()
+
+    def test_export_basenames_respect_utf8_component_budget_on_disk(self):
+        from chatgpt_export_archiver.exporter import MAX_EXPORT_BASENAME_BYTES, export_conversations
+
+        titles = [
+            "😀" * 80,
+            "汉字" * 100,
+            ("e\u0301" * 140),
+            "é" * 140,
+            "A" * 400,
+            "CON",
+            "AUX. ",
+            "NUL",
+            "COM¹.txt",
+            "LPT². ",
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "unicode.zip"
+            conversations = [conversation(f"unicode-{index}", title=title) for index, title in enumerate(titles)]
+            conversations.extend([
+                conversation("collision/a", title="same"),
+                conversation(r"collision\a", title="same"),
+            ])
+            write_zip(source, {"conversations.json": conversations})
+            db = base / "archive.db"
+            self.assertEqual(run_cli(["--db", str(db), "import", "--input", str(source), "--no-input-sha256"])[0], 0)
+            conn = connect(db)
+            try:
+                result = export_conversations(conn, base / "out", ["md", "txt"])
+                self.assertEqual(result["written"], len(conversations) * 2)
+            finally:
+                conn.close()
+            exported = [path for path in (base / "out").iterdir() if path.suffix in {".md", ".txt"}]
+            self.assertEqual(len(exported), len(conversations) * 2)
+            for path in exported:
+                self.assertLessEqual(len(path.name.encode("utf-8")), MAX_EXPORT_BASENAME_BYTES)
+                self.assertNotRegex(path.stem.rstrip(". ").casefold(), r"^(con|aux|nul|com[1-9]|lpt[1-9])$")
+            self.assertTrue(any("_001." in path.name for path in exported))
+            self.assertTrue(any("_002." in path.name for path in exported))
+
+    def test_logging_none_is_project_scoped_and_reconfigurable(self):
+        project_stream = io.StringIO()
+        third_party_stream = io.StringIO()
+        third_party = logging.getLogger("synthetic.third_party")
+        third_party.handlers.clear()
+        third_party.propagate = False
+        third_party.setLevel(logging.DEBUG)
+        third_party.addHandler(logging.StreamHandler(third_party_stream))
+        try:
+            configure_logging("none", stream=project_stream)
+            get_logger("scope").critical("project-critical")
+            third_party.error("third-error")
+            logging.getLogger("uvicorn.error").disabled = False
+            self.assertEqual(project_stream.getvalue(), "")
+            self.assertIn("third-error", third_party_stream.getvalue())
+            configure_logging("warning", stream=project_stream)
+            configure_logging("warning", stream=project_stream)
+            get_logger("scope").warning("project-warning")
+            self.assertEqual(project_stream.getvalue().count("project-warning"), 1)
+            self.assertFalse(logging.getLogger("uvicorn.error").disabled)
+        finally:
+            third_party.handlers.clear()
+
+    def test_release_failures_preserve_existing_output_and_clean_temp_files(self):
+        from tools import make_release_zip
+
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "release.zip"
+            original = b"previous-verified-release"
+            output.write_bytes(original)
+            failure_patches = [
+                mock.patch.object(make_release_zip, "_write_archive", side_effect=OSError("synthetic")),
+                mock.patch.object(make_release_zip, "_delivery_check", side_effect=ValueError("delivery_check_failed")),
+                mock.patch.object(make_release_zip.os, "replace", side_effect=OSError("replace failed")),
+            ]
+            for patcher in failure_patches:
+                output.write_bytes(original)
+                with self.subTest(patcher=repr(patcher)), patcher, self.assertRaises((OSError, ValueError)):
+                    make_release_zip.build_release(root, output, check=True)
+                self.assertEqual(output.read_bytes(), original)
+                self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp.zip")), [])
+
+            output.write_bytes(original)
+            with mock.patch.object(make_release_zip, "_manifest_bytes", return_value=b"[]\n"), self.assertRaisesRegex(
+                ValueError, "release_manifest_mismatch"
+            ):
+                make_release_zip.build_release(root, output, check=False)
+            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp.zip")), [])
+
+            original_write = make_release_zip._write_archive
+
+            def tampered_write(path, payload):
+                original_write(path, payload)
+                with zipfile.ZipFile(path) as archive:
+                    members = {name: archive.read(name) for name in archive.namelist()}
+                target = next(name for name in members if name != make_release_zip.MANIFEST_NAME)
+                members[target] = b"tampered-after-write"
+                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for name, data in members.items():
+                        archive.writestr(name, data)
+
+            output.write_bytes(original)
+            with mock.patch.object(make_release_zip, "_write_archive", side_effect=tampered_write), self.assertRaisesRegex(
+                ValueError, "release_hash_mismatch"
+            ):
+                make_release_zip.build_release(root, output, check=False)
+            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp.zip")), [])
+
+            manifest, _assets = make_release_zip.build_release(root, output, check=False)
+            with zipfile.ZipFile(output) as archive:
+                stored = json.loads(archive.read(make_release_zip.MANIFEST_NAME))
+                self.assertEqual(stored, manifest)
+                self.assertEqual(set(archive.namelist()), {item["path"] for item in manifest} | {make_release_zip.MANIFEST_NAME})
+                for item in manifest:
+                    data = archive.read(item["path"])
+                    self.assertEqual(len(data), item["size"])
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), item["sha256"])
 
 if __name__ == "__main__":
     unittest.main()

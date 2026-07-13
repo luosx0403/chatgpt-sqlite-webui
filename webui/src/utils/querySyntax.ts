@@ -6,13 +6,14 @@ export interface QuerySyntaxInfo {
   hasBodyText: boolean;
   hasSearchContext: boolean;
   hasTitleText: boolean;
+  hasFilterOnlyContext: boolean;
   pathOverride: PathMode | null;
   scopeOverride: SearchScope | null;
 }
 
 export function analyzeQuerySyntax(raw: string): QuerySyntaxInfo {
-  const text = raw.normalize("NFKC").toLocaleLowerCase().trim().replace(/\s+/g, " ");
-  const info: QuerySyntaxInfo = { hasBodyText: false, hasSearchContext: false, hasTitleText: false, pathOverride: null, scopeOverride: null };
+  const text = raw.normalize("NFKC").toLowerCase().trim().replace(/\s+/g, " ");
+  const info: QuerySyntaxInfo = { hasBodyText: false, hasSearchContext: false, hasTitleText: false, hasFilterOnlyContext: false, pathOverride: null, scopeOverride: null };
   if (!text) return info;
   for (const { token, quoted, negated, key } of queryTokens(text)) {
     if (!token) continue;
@@ -27,9 +28,10 @@ export function analyzeQuerySyntax(raw: string): QuerySyntaxInfo {
       continue;
     }
     if (key) {
-      const value = token.normalize("NFKC").toLocaleLowerCase();
+      const value = token.normalize("NFKC").toLowerCase();
       if (value && (key === "role" || key === "source" || key === "before" || key === "after")) {
         info.hasSearchContext = true;
+        info.hasFilterOnlyContext = true;
         continue;
       }
       if (value && key === "title") {
@@ -78,7 +80,7 @@ function queryTokens(text: string): Array<{ token: string; quoted: boolean; nega
     while (index < text.length && !/\s/.test(text[index]) && text[index] !== ":" && text[index] !== "\"") index += 1;
     const head = text.slice(start, index);
     if (index < text.length && text[index] === ":" && head) {
-      const rawKey = head.normalize("NFKC").toLocaleLowerCase();
+      const rawKey = head.normalize("NFKC").toLowerCase();
       if (KNOWN_MODIFIERS.has(rawKey)) {
         index += 1;
         if (index < text.length && text[index] === "\"") {

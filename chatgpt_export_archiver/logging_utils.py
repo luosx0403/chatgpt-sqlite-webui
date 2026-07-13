@@ -45,16 +45,19 @@ def configure_logging(
     """Configure project logging without changing structured CLI stdout."""
     parsed = parse_log_level(level)
     root = logging.getLogger("chatgpt_export_archiver")
+    # Undo legacy process-global suppression from older releases, then keep all
+    # subsequent configuration scoped to this project's logger tree.
+    logging.disable(logging.NOTSET)
+    root.disabled = False
     for handler in list(root.handlers):
         root.removeHandler(handler)
     root.propagate = False
 
     if parsed == "none":
-        logging.disable(logging.CRITICAL)
         root.setLevel(logging.CRITICAL + 1)
+        root.addHandler(logging.NullHandler())
         return
 
-    logging.disable(logging.NOTSET)
     root.setLevel(_LEVEL_MAP[parsed])
     formatter: logging.Formatter
     if json_logs:
