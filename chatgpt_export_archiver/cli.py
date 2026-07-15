@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .db import (
+    DatabaseMigrationError,
     begin_import_run,
     configure_import_connection,
     connect,
@@ -25,6 +26,7 @@ from .db import (
     migrate_database,
     optimize_after_import,
     recreate_import_rebuildable_indexes,
+    require_current_database_schema,
     record_source_entries,
     record_warning,
     record_warnings,
@@ -108,6 +110,36 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         return args.func(args)
+    except DatabaseMigrationError as exc:
+        print(f"ERROR: {exc.code}", file=sys.stderr)
+        for key in (
+            "current_database_schema_version",
+            "required_database_schema_version",
+        ):
+            if key in exc.detail:
+                print(f"{key} {exc.detail[key]}", file=sys.stderr)
+        for key in (
+            "missing_tables",
+            "missing_indexes",
+            "missing_triggers",
+            "missing_generation_rows",
+        ):
+            values = exc.detail.get(key)
+            if values:
+                print(f"{key} {','.join(str(value) for value in values)}", file=sys.stderr)
+        for key in (
+            "missing_columns",
+            "invalid_tables",
+            "invalid_indexes",
+            "invalid_triggers",
+            "invalid_generation_rows",
+            "object_type_mismatches",
+            "missing_foreign_keys",
+        ):
+            values = exc.detail.get(key)
+            if values:
+                print(f"{key} {','.join(sorted(str(value) for value in values))}", file=sys.stderr)
+        return 2
     except sqlite3.Error as exc:
         print(f"ERROR: {sqlite_runtime_error_code(exc)} error_type={type(exc).__name__}", file=sys.stderr)
         return 2
@@ -844,6 +876,7 @@ def _elapsed(start: float) -> float:
 def cmd_export(args: argparse.Namespace) -> int:
     conn = connect_existing(Path(args.db))
     try:
+        require_current_database_schema(conn)
         formats = ["md", "txt"] if args.format == "all" else [args.format]
         result = export_conversations(conn, Path(args.out), formats, args.from_date, args.to_date, args.force)
     finally:
@@ -859,6 +892,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 def cmd_stats(args: argparse.Namespace) -> int:
     conn = connect_existing_readonly(Path(args.db))
     try:
+        require_current_database_schema(conn)
         stats = get_stats(conn)
     finally:
         conn.close()
@@ -878,6 +912,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
         conn.close()
     print(f"ok {str(result['ok']).lower()}")
     print(f"schema_ok {str(result.get('schema_ok', True)).lower()}")
+    if result.get("database_error_code"):
+        print(f"database_error_code {result['database_error_code']}")
+    print(f"migration_required {str(bool(result.get('migration_required'))).lower()}")
+    print(f"current_database_schema_version {result.get('current_database_schema_version')}")
+    print(f"required_database_schema_version {result.get('required_database_schema_version')}")
     if result.get("missing_tables"):
         print(f"missing_tables {','.join(result['missing_tables'])}")
     if result.get("missing_columns"):
@@ -887,6 +926,19 @@ def cmd_verify(args: argparse.Namespace) -> int:
             for column in columns
         ]
         print(f"missing_columns {','.join(pairs)}")
+    for key in (
+        "invalid_tables",
+        "object_type_mismatches",
+        "invalid_indexes",
+        "invalid_triggers",
+        "invalid_generation_rows",
+        "missing_foreign_keys",
+    ):
+        if result.get(key):
+            print(f"{key} {','.join(sorted(result[key]))}")
+    for key in ("missing_indexes", "missing_triggers", "missing_generation_rows"):
+        if result.get(key):
+            print(f"{key} {','.join(result[key])}")
     print(f"integrity_check {result['integrity_check']}")
     print(f"latest_import_run_id {result['latest_import_run_id']}")
     print(f"latest_run_warnings {result['latest_run_warnings']}")
@@ -931,6 +983,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     conn = connect_existing_readonly(Path(args.db))
     try:
+        require_current_database_schema(conn)
         parsed = parse_query(args.query)
         if parsed.errors:
             print("invalid_query true")

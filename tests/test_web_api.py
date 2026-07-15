@@ -214,6 +214,8 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(health.status_code, 200)
         health_json = health.json()
         self.assertFalse(health_json["db_ready"])
+        self.assertEqual(health_json["readiness"], "database_missing_or_uninitialized")
+        self.assertEqual(health_json["database_error_code"], "database_not_ready")
         self.assertEqual(health_json["database"]["name"], "database")
         self.assertNotIn(db.name, json.dumps(health_json))
         stats = client.get("/api/stats").json()
@@ -260,6 +262,8 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(health["database"]["name"], "database")
         self.assertFalse(health["db_ready"])
         self.assertFalse(health["schema_compatible"])
+        self.assertEqual(health["readiness"], "schema_incompatible")
+        self.assertEqual(health["database_error_code"], "database_schema_incompatible")
         self.assertIn("conversations", health["missing_columns"])
         self.assertEqual(client.get("/api/stats").status_code, 409)
         self.assertEqual(client.get("/api/conversations").status_code, 409)
@@ -273,6 +277,65 @@ class WebApiTests(unittest.TestCase):
             detail = response.json()["detail"]
             self.assertFalse(detail["schema_compatible"])
             self.assertIn("missing_columns", detail)
+
+    def test_health_readiness_schema_newer_foreign_key_and_malformed_contracts(self):
+        from chatgpt_export_archiver.db import connect, init_db
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+
+            newer = base / "newer.db"
+            conn = connect(newer)
+            init_db(conn)
+            conn.execute("PRAGMA user_version = 999")
+            conn.commit()
+            conn.close()
+            build = self.make_build_dir(base)
+            newer_client = TestClient(create_app(newer, static_dir=build))
+            self.addCleanup(newer_client.close)
+            health = newer_client.get("/api/health").json()
+            self.assertEqual(health["readiness"], "schema_newer")
+            self.assertEqual(health["database_error_code"], "database_schema_newer")
+            response = newer_client.get("/api/conversations")
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.json()["detail"]["code"], "database_schema_newer")
+
+            damaged = base / "foreign.db"
+            conn = connect(damaged)
+            init_db(conn)
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                "INSERT INTO source_files(import_run_id, source_path, file_type) VALUES (999, 'synthetic', 'json')"
+            )
+            conn.commit()
+            conn.close()
+            damaged_client = TestClient(create_app(damaged, static_dir=build))
+            self.addCleanup(damaged_client.close)
+            health = damaged_client.get("/api/health").json()
+            self.assertEqual(health["readiness"], "foreign_key_violation")
+            self.assertEqual(health["database_error_code"], "database_foreign_key_violation")
+            self.assertGreater(health["foreign_key_violations"], 0)
+            sample = health["foreign_key_violation_samples"][0]
+            self.assertEqual(set(sample), {"table", "rowid", "parent_table", "constraint_index"})
+            response = damaged_client.get("/api/stats")
+            self.assertEqual(response.status_code, 409)
+            detail = response.json()["detail"]
+            self.assertEqual(detail["code"], "database_foreign_key_violation")
+            self.assertEqual(
+                set(detail["foreign_key_violation_sample"]),
+                {"table", "rowid", "parent_table", "constraint_index"},
+            )
+
+            malformed = base / "malformed.db"
+            malformed.write_bytes(b"synthetic-not-a-sqlite-database")
+            malformed_client = TestClient(create_app(malformed, static_dir=build))
+            self.addCleanup(malformed_client.close)
+            response = malformed_client.get("/api/health")
+            self.assertEqual(response.status_code, 200)
+            health = response.json()
+            self.assertEqual(health["readiness"], "database_malformed")
+            self.assertEqual(health["database_error_code"], "database_malformed")
+            self.assertNotIn(str(malformed), response.text)
 
     def test_web_upload_import_first_and_incremental(self):
         td = tempfile.TemporaryDirectory()
@@ -2539,6 +2602,9 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("&quot;", html)
         self.assertIn("&#39;", html)
         self.assertIn("&#96;", html)
+        self.assertIn("if(!r.ok)", html)
+        self.assertIn("Array.isArray(data.items)", html)
+        self.assertIn("database_migration_required", html)
 
     def test_react_build_served_when_present_not_fallback(self):
         td, _client, db = self.make_client()

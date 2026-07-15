@@ -300,6 +300,43 @@ class DatabaseMigrationError(ValueError):
 
     def __str__(self) -> str:
         return self.code
+
+
+def database_schema_error_code(status: dict[str, Any]) -> str | None:
+    """Map a schema status to the stable read/write dependency error code."""
+
+    if status.get("database_schema_newer"):
+        return "database_schema_newer"
+    if status.get("migration_required"):
+        return "database_migration_required"
+    if not status.get("schema_compatible"):
+        return "database_schema_incompatible"
+    return None
+
+
+def require_current_database_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Gate production reads without performing migration or other main DDL."""
+
+    status = database_schema_status(conn)
+    code = database_schema_error_code(status)
+    if code is not None:
+        raise DatabaseMigrationError(code, detail=status)
+    violation = conn.execute("PRAGMA foreign_key_check").fetchone()
+    if violation is not None:
+        raise DatabaseMigrationError(
+            "database_foreign_key_violation",
+            detail={
+                **status,
+                "foreign_key_violation": True,
+                "foreign_key_violation_sample": {
+                    "table": str(violation[0]),
+                    "rowid": violation[1],
+                    "parent_table": str(violation[2]),
+                    "constraint_index": int(violation[3]),
+                },
+            },
+        )
+    return status
 IMPORT_REBUILDABLE_INDEXES = (
     (
         "idx_nodes_conversation_path",
@@ -591,6 +628,24 @@ def ensure_fts(conn: sqlite3.Connection) -> bool:
         if is_fts5_capability_unavailable(exc):
             return False
         raise
+
+
+def detect_fts5_runtime(conn: sqlite3.Connection) -> bool:
+    """Probe whether this connection can actually rebuild an FTS5 table."""
+
+    table_name = f"__archive_fts5_probe_{id(conn):x}"
+    try:
+        conn.execute(f'CREATE VIRTUAL TABLE temp."{table_name}" USING fts5(value)')
+        return True
+    except sqlite3.OperationalError as exc:
+        if is_fts5_capability_unavailable(exc):
+            return False
+        raise
+    finally:
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS temp."{table_name}"')
+        except sqlite3.Error:
+            pass
 
 
 def begin_import_run(
@@ -1627,6 +1682,7 @@ def _line_names_web_index_table(line: str) -> bool:
 def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
     schema = check_core_schema(conn)
     message_fts_available = bool(schema.get("message_fts_available"))
+    fts5_rebuildable = detect_fts5_runtime(conn)
     integrity_lines = _run_integrity_check(conn)
     if len(integrity_lines) == 1 and integrity_lines[0] == "ok":
         integrity = "ok"
@@ -1634,9 +1690,9 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         integrity = "\n".join(integrity_lines)
     if not schema["schema_ok"]:
         return {
+            **schema,
             "schema_ok": False,
-            "missing_tables": schema["missing_tables"],
-            "missing_columns": schema.get("missing_columns", {}),
+            "database_error_code": database_schema_error_code(schema),
             "latest_import_run_id": None,
             "latest_run_warnings": 0,
             "total_warnings": 0,
@@ -1656,7 +1712,7 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             "optional_web_index_recovery_hint": "",
             "message_fts_available": message_fts_available,
             "message_fts_error": None if message_fts_available else "missing",
-            "message_fts_rebuildable": True,
+            "message_fts_rebuildable": fts5_rebuildable,
             "optional_message_fts_error": False,
             "optional_message_fts_recovery_hint": "",
             "warnings_by_type": [],
@@ -1745,7 +1801,13 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         if optional_message_fts_error:
             optional_message_fts_recovery_hint = "re-import with `--rebuild-fts` to rebuild optional message_fts"
     return {
+        **schema,
         "schema_ok": True,
+        "database_error_code": (
+            "database_foreign_key_violation"
+            if foreign_keys["foreign_key_violations"]
+            else None
+        ),
         "missing_tables": [],
         "latest_import_run_id": latest_run,
         "latest_run_warnings": latest_run_warnings,
@@ -1764,7 +1826,7 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         "optional_web_index_recovery_hint": optional_web_index_recovery_hint,
         "message_fts_available": message_fts_available and not optional_message_fts_error,
         "message_fts_error": "damaged" if optional_message_fts_error else (None if message_fts_available else "missing"),
-        "message_fts_rebuildable": True,
+        "message_fts_rebuildable": fts5_rebuildable,
         "optional_message_fts_error": optional_message_fts_error,
         "optional_message_fts_recovery_hint": optional_message_fts_recovery_hint,
         "warnings_by_type": warning_counts,

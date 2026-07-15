@@ -3460,8 +3460,19 @@ class ArchiverTests(unittest.TestCase):
             )
             code, output = run_cli(["--db", str(db), "verify"])
             self.assertEqual(code, 1)
+            self.assertIn("database_error_code database_foreign_key_violation", output)
             self.assertIn("foreign_key_violations ", output)
             self.assertIn("foreign_key_violation_table conversation_nodes", output)
+            export_dir = base / "must-not-exist"
+            for command in (
+                ["--db", str(db), "stats"],
+                ["--db", str(db), "search", "synthetic"],
+                ["--db", str(db), "export", "--out", str(export_dir)],
+            ):
+                command_code, command_output = run_cli(command)
+                self.assertEqual(command_code, 2)
+                self.assertIn("database_foreign_key_violation", command_output)
+            self.assertFalse(export_dir.exists())
 
     def test_parent_cycle_nodes_and_components_have_explicit_units(self):
         from chatgpt_export_archiver.db import parent_cycle_diagnostics
@@ -3854,11 +3865,23 @@ class ArchiverTests(unittest.TestCase):
             verify_code, verify_output = run_cli(["--db", str(db), "verify"])
             self.assertEqual(verify_code, 1)
             self.assertIn("schema_ok false", verify_output)
+            self.assertIn("database_error_code database_migration_required", verify_output)
+            self.assertIn("migration_required true", verify_output)
+            self.assertIn("current_database_schema_version 0", verify_output)
+            self.assertIn(f"required_database_schema_version {DATABASE_SCHEMA_VERSION}", verify_output)
             self.assertNotIn("no such index", verify_output)
-            self.assertEqual(run_cli(["--db", str(db), "stats"])[0], 0)
-            self.assertEqual(run_cli(["--db", str(db), "search", "synthetic"])[0], 0)
             legacy_exports = Path(td) / "legacy-exports"
-            self.assertEqual(run_cli(["--db", str(db), "export", "--out", str(legacy_exports)])[0], 0)
+            for command in (
+                ["--db", str(db), "stats"],
+                ["--db", str(db), "search", "synthetic"],
+                ["--db", str(db), "export", "--out", str(legacy_exports)],
+            ):
+                code, output = run_cli(command)
+                self.assertEqual(code, 2)
+                self.assertIn("database_migration_required", output)
+                self.assertIn("current_database_schema_version 0", output)
+                self.assertIn(f"required_database_schema_version {DATABASE_SCHEMA_VERSION}", output)
+            self.assertFalse(legacy_exports.exists())
 
             conn = connect(db)
             first = migrate_database(conn)
@@ -4156,6 +4179,31 @@ class ArchiverTests(unittest.TestCase):
             fresh = connect(db)
             self.assertFalse(web_index_status(fresh)["web_normalized_indexed"])
             fresh.close()
+
+    def test_readonly_cli_schema_newer_gate_precedes_queries_and_export_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "newer.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute("PRAGMA user_version = 999")
+            conn.commit()
+            conn.close()
+            output_dir = base / "must-not-exist"
+            for command in (
+                ["--db", str(db), "stats"],
+                ["--db", str(db), "search", "synthetic"],
+                ["--db", str(db), "export", "--out", str(output_dir)],
+            ):
+                code, output = run_cli(command)
+                self.assertEqual(code, 2)
+                self.assertIn("database_schema_newer", output)
+                self.assertIn("current_database_schema_version 999", output)
+                self.assertIn("required_database_schema_version ", output)
+            self.assertFalse(output_dir.exists())
+            code, output = run_cli(["--db", str(db), "verify"])
+            self.assertEqual(code, 1)
+            self.assertIn("database_error_code database_schema_newer", output)
 
     def test_migration_readonly_locked_and_foreign_key_failures_are_stable(self):
         from chatgpt_export_archiver.db import DatabaseMigrationError, migrate_database

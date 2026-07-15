@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import re
+import sqlite3
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,10 +14,16 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, Request, Response, UploadFile
 
 from .exporter import render_markdown, render_txt
-from .db import foreign_key_diagnostics
+from .db import (
+    DatabaseMigrationError,
+    database_schema_error_code,
+    foreign_key_diagnostics,
+    require_current_database_schema,
+)
 from .logging_utils import get_logger
 from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
 from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
+from .sqlite_errors import sqlite_runtime_error_code
 from .search import _has_normalized_title_norm, get_conversation, get_messages, list_conversations, normalize_search_text, parse_query, search_conversations, search_messages
 from .utils import finite_float_or_none, safe_filename_part
 from .web_db import (
@@ -337,9 +344,13 @@ def create_api_router(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail="database_not_ready") from exc
         try:
-            schema = check_schema(conn)
-            if not schema["ok"]:
-                raise HTTPException(status_code=409, detail=_schema_error_detail(schema))
+            try:
+                require_current_database_schema(conn)
+            except DatabaseMigrationError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_schema_error_detail(exc.detail, code=exc.code),
+                ) from exc
             yield conn
         finally:
             conn.close()
@@ -354,9 +365,13 @@ def create_api_router(
             yield None
             return
         try:
-            schema = check_schema(conn)
-            if not schema["ok"]:
-                raise HTTPException(status_code=409, detail=_schema_error_detail(schema))
+            try:
+                require_current_database_schema(conn)
+            except DatabaseMigrationError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_schema_error_detail(exc.detail, code=exc.code),
+                ) from exc
             yield conn
         finally:
             conn.close()
@@ -374,6 +389,8 @@ def create_api_router(
             return {
                 "ok": True,
                 "db_ready": False,
+                "readiness": "database_missing_or_uninitialized",
+                "database_error_code": "database_not_ready",
                 "database": {"name": "database", "exists": False},
                 "schema_version": API_SCHEMA_VERSION,
                 "api_schema_version": API_SCHEMA_VERSION,
@@ -394,10 +411,17 @@ def create_api_router(
             }
         try:
             conn = connect_readonly(db_path)
-        except ValueError:
+        except (ValueError, sqlite3.Error) as exc:
+            error_code = (
+                sqlite_runtime_error_code(exc)
+                if isinstance(exc, sqlite3.Error)
+                else "database_not_ready"
+            )
             return {
                 "ok": False,
                 "db_ready": False,
+                "readiness": _readiness_from_error_code(error_code),
+                "database_error_code": error_code,
                 "database": {"name": "database", "exists": db_path.exists()},
                 "schema_version": API_SCHEMA_VERSION,
                 "api_schema_version": API_SCHEMA_VERSION,
@@ -407,28 +431,66 @@ def create_api_router(
                 **access,
             }
         try:
-            schema = check_schema(conn)
-            web_status = web_index_status(conn)
-            fts5 = detect_fts5(conn)
-            fts_status = message_fts_status(conn, fts5_available=fts5)
-            trigram = detect_trigram(conn)
-            foreign_keys = foreign_key_diagnostics(conn) if schema["base_schema_compatible"] else {
-                "foreign_key_violations": 0,
-                "foreign_key_violations_by_table": [],
-                "foreign_key_violation_samples": [],
-            }
+            try:
+                schema = check_schema(conn)
+                web_status = web_index_status(conn)
+                fts5 = detect_fts5(conn)
+                fts_status = message_fts_status(conn, fts5_available=fts5)
+                trigram = detect_trigram(conn)
+                foreign_keys = foreign_key_diagnostics(conn) if schema["base_schema_compatible"] else {
+                    "foreign_key_violations": 0,
+                    "foreign_key_violations_by_table": [],
+                    "foreign_key_violation_samples": [],
+                }
+                conversation_count = (
+                    int(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
+                    if schema["schema_compatible"] and foreign_keys["foreign_key_violations"] == 0
+                    else 0
+                )
+            except sqlite3.Error as exc:
+                error_code = sqlite_runtime_error_code(exc)
+                return {
+                    "ok": False,
+                    "db_ready": False,
+                    "readiness": _readiness_from_error_code(error_code),
+                    "database_error_code": error_code,
+                    "database": {"name": "database", "exists": True},
+                    "schema_version": API_SCHEMA_VERSION,
+                    "api_schema_version": API_SCHEMA_VERSION,
+                    "current_database_schema_version": None,
+                    "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+                    "migration_required": False,
+                    "schema_compatible": False,
+                    **access,
+                }
         finally:
             conn.close()
+        schema_error = database_schema_error_code(schema)
+        if foreign_keys["foreign_key_violations"]:
+            database_error_code = "database_foreign_key_violation"
+        else:
+            database_error_code = schema_error
+        readiness = (
+            _readiness_from_error_code(database_error_code)
+            if database_error_code
+            else ("ready_with_data" if conversation_count else "ready_empty")
+        )
         return {
             "ok": schema["ok"] and foreign_keys["foreign_key_violations"] == 0,
             "db_ready": schema["ok"] and foreign_keys["foreign_key_violations"] == 0,
+            "readiness": readiness,
+            "database_error_code": database_error_code,
             "schema_compatible": schema["schema_compatible"],
             "missing_tables": schema["missing_tables"],
             "missing_columns": schema["missing_columns"],
             "missing_indexes": schema["missing_indexes"],
             "invalid_indexes": schema["invalid_indexes"],
+            "invalid_tables": schema["invalid_tables"],
+            "object_type_mismatches": schema["object_type_mismatches"],
             "missing_triggers": schema["missing_triggers"],
+            "invalid_triggers": schema["invalid_triggers"],
             "missing_generation_rows": schema["missing_generation_rows"],
+            "invalid_generation_rows": schema["invalid_generation_rows"],
             "missing_foreign_keys": schema["missing_foreign_keys"],
             "migration_required": schema["migration_required"],
             "current_database_schema_version": schema["current_database_schema_version"],
@@ -456,9 +518,13 @@ def create_api_router(
         except ValueError:
             return _empty_stats(db_ready=False)
         try:
-            schema = check_schema(conn)
-            if not schema["ok"]:
-                raise HTTPException(status_code=409, detail=_schema_error_detail(schema))
+            try:
+                require_current_database_schema(conn)
+            except DatabaseMigrationError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_schema_error_detail(exc.detail, code=exc.code),
+                ) from exc
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS conversations,
@@ -621,12 +687,13 @@ def create_api_router(
             "database_compatibility": {
                 "readonly_contract": "health and read endpoints inspect schema but never execute migration DDL",
                 "migration": "run the explicit CLI migrate command after creating and verifying an external backup; import initializes new databases and upgrades migratable databases, while web-index requires a current core schema",
-                "health_fields": ["schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "missing_tables", "missing_columns", "missing_indexes", "invalid_indexes", "missing_triggers", "missing_generation_rows", "missing_foreign_keys"],
-                "errors": ["database_not_ready", "database_migration_required", "database_schema_incompatible"],
+                "health_fields": ["readiness", "database_error_code", "schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "missing_tables", "missing_columns", "invalid_tables", "object_type_mismatches", "missing_indexes", "invalid_indexes", "missing_triggers", "invalid_triggers", "missing_generation_rows", "invalid_generation_rows", "missing_foreign_keys", "foreign_key_violations", "foreign_key_violation_samples"],
+                "readiness_states": ["database_missing_or_uninitialized", "migration_required", "schema_newer", "schema_incompatible", "foreign_key_violation", "database_malformed", "database_locked", "database_readonly_or_io", "ready_empty", "ready_with_data"],
+                "errors": ["database_not_ready", "database_migration_required", "database_schema_newer", "database_schema_incompatible", "database_foreign_key_violation"],
                 "optional_fts_fields": ["message_fts_available", "message_fts_rebuildable", "message_fts_error", "optional_message_fts_error", "optional_message_fts_recovery_hint"],
             },
             "stable_error_codes": [
-                "database_not_ready", "database_migration_required", "database_schema_incompatible", "invalid_job_id", "job_not_found",
+                "database_not_ready", "database_migration_required", "database_schema_newer", "database_schema_incompatible", "database_foreign_key_violation", "invalid_job_id", "job_not_found",
                 "database_malformed", "database_locked", "database_readonly", "database_io_error", "database_runtime_failure",
                 "conversation_not_found", "message_not_found", "invalid_export_format",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
@@ -1129,8 +1196,25 @@ def _empty_message_search_page(limit: int, offset: int, *, db_ready: bool) -> di
     }
 
 
-def _schema_error_detail(schema: dict[str, object]) -> dict[str, object]:
-    code = "database_migration_required" if schema.get("migration_required") else "database_schema_incompatible"
+def _readiness_from_error_code(code: str | None) -> str:
+    return {
+        "database_not_found": "database_missing_or_uninitialized",
+        "database_not_ready": "database_missing_or_uninitialized",
+        "database_migration_required": "migration_required",
+        "database_schema_newer": "schema_newer",
+        "database_schema_incompatible": "schema_incompatible",
+        "database_foreign_key_violation": "foreign_key_violation",
+        "database_malformed": "database_malformed",
+        "database_locked": "database_locked",
+        "database_readonly": "database_readonly_or_io",
+        "database_io_error": "database_readonly_or_io",
+    }.get(code or "", "schema_incompatible")
+
+
+def _schema_error_detail(
+    schema: dict[str, object], *, code: str | None = None
+) -> dict[str, object]:
+    code = code or database_schema_error_code(schema) or "database_schema_incompatible"
     return {
         "code": code,
         "schema_compatible": False,
@@ -1141,9 +1225,15 @@ def _schema_error_detail(schema: dict[str, object]) -> dict[str, object]:
         "missing_columns": schema.get("missing_columns", {}),
         "missing_indexes": schema.get("missing_indexes", []),
         "invalid_indexes": schema.get("invalid_indexes", {}),
+        "invalid_tables": schema.get("invalid_tables", {}),
+        "object_type_mismatches": schema.get("object_type_mismatches", {}),
         "missing_triggers": schema.get("missing_triggers", []),
+        "invalid_triggers": schema.get("invalid_triggers", {}),
         "missing_generation_rows": schema.get("missing_generation_rows", []),
+        "invalid_generation_rows": schema.get("invalid_generation_rows", {}),
         "missing_foreign_keys": schema.get("missing_foreign_keys", {}),
+        "foreign_key_violation": bool(schema.get("foreign_key_violation")),
+        "foreign_key_violation_sample": schema.get("foreign_key_violation_sample"),
     }
 
 

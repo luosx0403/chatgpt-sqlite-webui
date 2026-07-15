@@ -259,6 +259,29 @@ function importErrorLabel(t: (key: string) => string, code: string | null | unde
   return t("importError_unknown");
 }
 
+function archiveReadinessLabel(t: (key: string) => string, health: Health): string {
+  switch (health.readiness) {
+    case "migration_required":
+      return `${t("archiveMigrationRequired")} ${t("archiveSchemaVersions")}: ${health.current_database_schema_version ?? "?"} → ${health.required_database_schema_version ?? "?"}. ${t("archiveMigrationBackup")}`;
+    case "schema_newer": return t("archiveSchemaNewer");
+    case "schema_incompatible": return t("archiveSchemaIncompatible");
+    case "foreign_key_violation": return t("archiveForeignKeyViolation");
+    case "database_malformed": return t("archiveMalformed");
+    case "database_locked": return t("archiveLocked");
+    case "database_readonly_or_io": return t("archiveIoError");
+    default: return t("noArchiveYet");
+  }
+}
+
+function archiveImportBlocked(health: Health | null): boolean {
+  return Boolean(
+    health
+    && health.db_ready === false
+    && health.readiness !== "database_missing_or_uninitialized"
+    && health.readiness !== "migration_required"
+  );
+}
+
 export default function App() {
   const urlState = useRef(readUrlParams()).current;
   const [query, setQuery] = useState(urlState.query);
@@ -399,6 +422,16 @@ export default function App() {
   const loadConversationPage = useCallback((offset: number, append: boolean) => {
     if (!append) listControllerRef.current?.abort();
     const controller = new AbortController();
+    if (health?.db_ready === false) {
+      if (!append) {
+        setConversations([]);
+        setTotal(0);
+        setHasMore(false);
+        setNextOffset(null);
+        setSelected(null);
+      }
+      return controller;
+    }
     if (!append) listControllerRef.current = controller;
     const requestId = ++listRequestRef.current;
     const requestedSelectedId = selectedIdRef.current;
@@ -467,7 +500,7 @@ export default function App() {
         }
       });
     return controller;
-  }, [debouncedQuery, sort, path, matchMode, filtersKey, loadConversationDetail, settings.listPageSize, searchContextKey, t]);
+  }, [debouncedQuery, sort, path, matchMode, filtersKey, health?.db_ready, loadConversationDetail, settings.listPageSize, searchContextKey, t]);
 
   useEffect(() => {
     const controller = loadConversationPage(0, false);
@@ -533,7 +566,7 @@ export default function App() {
   };
 
   const startImport = () => {
-    if (!importFile || uploadingImport || (importJob && ["queued", "running"].includes(importJob.status))) return;
+    if (archiveImportBlocked(health) || !importFile || uploadingImport || (importJob && ["queued", "running"].includes(importJob.status))) return;
     setUploadingImport(true);
     setImportError(null);
     setPreflightCleanupWarning(false);
@@ -554,6 +587,7 @@ export default function App() {
     if (!stats) return t("appTitle");
     return `${stats.conversations.toLocaleString()} ${t("conversations")} · ${stats.nodes.toLocaleString()} ${t("nodes")}`;
   }, [stats, t]);
+  const importBlocked = archiveImportBlocked(health);
 
   return (
     <div className="app-shell">
@@ -617,7 +651,7 @@ export default function App() {
               type="button"
               data-testid="import-zip-button"
               onClick={() => importInputRef.current?.click()}
-              disabled={uploadingImport || Boolean(importJob && ["queued", "running"].includes(importJob.status))}
+              disabled={importBlocked || uploadingImport || Boolean(importJob && ["queued", "running"].includes(importJob.status))}
             >
               {t("importZip")}
             </button>
@@ -629,7 +663,7 @@ export default function App() {
               tabIndex={-1}
               type="file"
               accept=".zip,application/zip"
-              disabled={uploadingImport || Boolean(importJob && ["queued", "running"].includes(importJob.status))}
+              disabled={importBlocked || uploadingImport || Boolean(importJob && ["queued", "running"].includes(importJob.status))}
               onChange={(event) => setImportFile(event.currentTarget.files?.[0] ?? null)}
             />
             <button type="button" onClick={() => setHelpOpen(true)}>{t("searchHelp")}</button>
@@ -642,10 +676,10 @@ export default function App() {
         {storageWarning && <div className="storage-warning warning-text" role="status">{t("settingsStorageWarning")}</div>}
         {(importFile || importJob || importError || health?.db_ready === false) && (
           <div className="import-panel" data-testid="import-panel">
-            {health?.db_ready === false && <strong>{t("noArchiveYet")}</strong>}
+            {health?.db_ready === false && <strong data-testid={`archive-readiness-${health.readiness || "unknown"}`}>{archiveReadinessLabel(t, health)}</strong>}
             {importFile && <span>{t("importReady")}: {importFile.name} ({Math.round(importFile.size / 1024 / 1024)} MB)</span>}
             {importFile && (!importJob || !["queued", "running"].includes(importJob.status)) && (
-              <button type="button" data-testid="import-start-button" onClick={startImport} disabled={uploadingImport}>
+              <button type="button" data-testid="import-start-button" onClick={startImport} disabled={importBlocked || uploadingImport}>
                 {uploadingImport ? t("loading") : t("startImport")}
               </button>
             )}
@@ -661,7 +695,12 @@ export default function App() {
             )}
             {importError && <span className="error-text">{importError}</span>}
             {importJob?.error_code && <span className="error-text">{importErrorLabel(t, importJob.error_code)}</span>}
-            {importJob?.cleanup_warning && <span className="warning-text">{t("importCleanupWarning")}</span>}
+            {(importJob?.cleanup_warning || (importJob?.cleanup_warnings?.length ?? 0) > 0) && (
+              <span className="warning-text" data-testid="import-cleanup-warnings">
+                {t("importCleanupWarning")}
+                {(importJob?.cleanup_warnings?.length ?? 0) > 1 ? ` (${importJob?.cleanup_warnings.length})` : ""}
+              </span>
+            )}
             {preflightCleanupWarning && <span className="warning-text">{t("importCleanupWarning")}</span>}
           </div>
         )}

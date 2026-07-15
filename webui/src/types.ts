@@ -205,6 +205,19 @@ export interface Stats {
 export interface Health {
   ok: boolean;
   db_ready?: boolean;
+  readiness?:
+    | "database_missing_or_uninitialized"
+    | "migration_required"
+    | "schema_newer"
+    | "schema_incompatible"
+    | "foreign_key_violation"
+    | "database_malformed"
+    | "database_locked"
+    | "database_readonly_or_io"
+    | "ready_empty"
+    | "ready_with_data"
+    | UnknownApiEnum;
+  database_error_code?: string | null;
   database: { name: string; exists: boolean };
   schema_version: number;
   api_schema_version?: number;
@@ -214,6 +227,15 @@ export interface Health {
   schema_compatible?: boolean;
   missing_tables?: string[];
   missing_columns?: Record<string, string[]>;
+  invalid_tables?: Record<string, unknown>;
+  object_type_mismatches?: Record<string, { expected: string; actual: string }>;
+  missing_indexes?: string[];
+  invalid_indexes?: Record<string, unknown>;
+  missing_triggers?: string[];
+  invalid_triggers?: Record<string, unknown>;
+  missing_generation_rows?: string[];
+  invalid_generation_rows?: Record<string, unknown>;
+  missing_foreign_keys?: Record<string, Array<{ column: string; parent_table: string; parent_column: string; on_delete: string; on_update: string }>>;
   fts5_available?: boolean;
   message_fts_available?: boolean;
   message_fts_rebuildable?: boolean;
@@ -233,7 +255,7 @@ export interface Health {
   write_origin_required?: boolean;
   foreign_key_violations?: number;
   foreign_key_violations_by_table?: Array<{ table: string; count: number }>;
-  foreign_key_violation_samples?: Array<{ table: string; rowid: number | null; parent: string; constraint: number }>;
+  foreign_key_violation_samples?: Array<{ table: string; rowid: number | null; parent_table: string; constraint_index: number }>;
 }
 
 export interface ImportJob {
