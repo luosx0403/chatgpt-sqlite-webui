@@ -172,10 +172,21 @@ def _manifest_bytes(payload: dict[str, bytes]) -> bytes:
 
 
 def _write_archive(path: Path, payload: dict[str, bytes]) -> None:
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+    def write_member(archive: zipfile.ZipFile, relative: str, data: bytes) -> None:
+        info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+        info.create_system = 3
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = (0o100644 & 0xFFFF) << 16
+        info.internal_attr = 0
+        info.extra = b""
+        info.comment = b""
+        archive.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        archive.comment = b""
         for relative, data in payload.items():
-            archive.writestr(relative, data)
-        archive.writestr(MANIFEST_NAME, _manifest_bytes(payload))
+            write_member(archive, relative, data)
+        write_member(archive, MANIFEST_NAME, _manifest_bytes(payload))
     with path.open("r+b") as handle:
         os.fsync(handle.fileno())
 
