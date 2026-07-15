@@ -58,7 +58,7 @@ ChatGPT Export Archiver は、OpenAI / ChatGPT の公式 export ZIP を直接 SQ
 ## 必要条件
 
 - Python 3.10 以降。Web 依存関係の再現可能インストールは Python 3.12 で検証しています。
-- JSON1 と FTS5 が有効な SQLite。現在の macOS、Windows、Linux の多くの Python ビルドには通常含まれています。
+- JSON 対応 SQLite。FTS5 は任意で、利用不能または `message_fts` がない場合も安全な scan 検索を使えます。
 - React Web UI を再ビルドしたりフロントエンド検査を実行したりする場合のみ、Node.js と npm が必要です。runnable 配布には `webui/dist` が含まれるため、通常のローカル Web UI 利用ではフロントエンドの再ビルドは不要です。
 - コア CLI は Python 標準ライブラリだけで動作します。ZIP upload を含む Web UI を使う場合は `requirements-web.txt` をインストールしてください。この profile がなければ `web` command は install hint とともに即時失敗します。
 
@@ -266,7 +266,7 @@ Web UI が loopback アドレス（`127.0.0.1`、`localhost`、`::1`）にバイ
 | `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | ZIP 内の総 member 数の上限 |
 | `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | unset | 信頼できる非 loopback ネットワークでのみ `local` に設定し、未設定のアップロード制限にローカル既定値を使う |
 
-**リモートバインドポリシー。** 非 loopback へ bind するには、`CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true`、または `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` による明示的 opt-in が必要です。そうでなければ起動を拒否します。有効化時は archive browser 公開の警告と、128 MiB 圧縮 ZIP、256 MiB/JSON member、512 MiB 総非圧縮、200 JSON members、10,000 ZIP members の remote-safe 制限を適用します。`ALLOW_REMOTE_UPLOADS` は明示設定した制限だけを緩和し、未設定値は remote-safe のままです。認証層はなく、信頼境界はネットワークと firewall です。Origin/Sec-Fetch の書き込み保護だけで信頼できないネットワークが安全になるわけではありません。
+**リモートバインドポリシー。** 非 loopback は `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true`、または `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` による明示的 opt-in が必要です。remote-safe 既定値は 128 MiB ZIP、256 MiB/JSON member、512 MiB 総非圧縮、圧縮比 200.0、200 JSON members、10,000 ZIP members です。信頼済み loopback/local の圧縮比既定値は 1000.0 です。`ALLOW_REMOTE_UPLOADS` は明示設定した制限だけを緩和し、未設定値は remote-safe のままです。`REMOTE_UPLOAD_PROFILE=local` は未設定の全制限を local の大容量既定値へ戻すため、信頼済み LAN だけで使ってください。
 
 `/api/schema` は multipart body 上限（ZIP byte 上限と有限の overhead）を含む有効な policy を報告します。writer slot と receive-level body cap は multipart parse 前に動作します。parser の spool と pipeline の server-side temporary ZIP が重なるため、圧縮コピー約 2 個分と DB 増加分の一時 disk を見込んでください。JSON decode、SQLite write、`web-index` は展開サイズに比例して RAM/disk/CPU を使います。remote upload は有効な `Content-Length` が必須で、loopback chunked upload も streaming cap で制限されます。
 
@@ -456,7 +456,9 @@ tools/                             Delivery and support scripts
 
 メインデータベースは conversations、mapping nodes、import runs、warnings を保存します。message object だけが raw message JSON object を保持し、conversation と mapping-node object は正規化され、byte-for-byte 保存ではありません。入力 ZIP SHA-256 は任意で、`source_files`/`file_index` の entry SHA 列は予約済みですが現在は未設定です。CLI FTS テーブルは `message_fts` です。任意 Web 検索用の補助テーブルには `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram` と SQLite FTS5 shadow tables が含まれます。
 
-明示的に計画され文書化された migration がない限り、小さな堅牢性修正でデータベース schema を変更することはありません。新しい列が欠けている古いデータベースは、`verify` または Web health の `missing_columns` 診断で明確に拒否され、暗黙には migration されません。その場合は古い DB をバックアップし、元の export から新しい DB へ再インポートしてください。
+canonical DB は `PRAGMA user_version` で version 1 として管理されます。readonly CLI と Web request は migration DDL を実行しません。外部 backup を作成・検証してから `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db` を実行してください。完了前は health/API が `database_migration_required` を返します。FTS5 と Web 検索 index は任意で再構築可能です。
+
+Health と `verify` は任意の `message_fts` の欠落と破損を区別します。破損時は `optional_message_fts_error` と `--rebuild-fts` の復旧ヒントを返します。一般的な malformed、locked、readonly、I/O、SQL runtime failure は能力欠落として扱わず、`database_malformed`、`database_locked`、`database_readonly`、`database_io_error`、`database_runtime_failure` を使います。
 
 ## 既知の制限
 
@@ -470,13 +472,13 @@ tools/                             Delivery and support scripts
 
 Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では実際の browser hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS` で指定し、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES` は厳格な単一 edge proxy モデルです。未信頼 peer の forwarded header は無視し、信頼済み direct edge は client 値を上書きする必要があります。重複 Host/Forwarded、カンマ区切り chain、不正構文、`Forwarded` と `X-Forwarded-Host/Proto` の競合は拒否されます。全リクエストで Host を検証し、remote write は same-origin `Origin` が必要です。
 
-インポート失敗は、入力 preflight、source scan、JSON decode、top-level contract、transaction の安定した stage/code を使います。failed run summary の warning 数は保存済み warning と一致します。canonical commit 後の verify、stats、任意 Web index 失敗を「未インポート」とは表示しません。commit 後の一時 upload cleanup 失敗は非致命の安定 warning で、ユーザーパスを公開しません。
+失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
 
-非標準 JSON `NaN` / `Infinity` は拒否され、文字列の非有限 timestamp は warning とともに `NULL` になります。`verify` は旧 DB の非有限 timestamp を検出し、API、stats、export は有限 JSON を維持します。Effective-current は cycle、missing parent、cross-conversation parent、partial chain を診断します。`internal_hidden_count` が正式な値で、`technical_hidden_count` は同値の deprecated alias です。`count_total=false` の message search は `total_exact=false` を返し、`total` は既知の下限です。around-node は found、visible、effective collection membership、applied を区別します。
+既定 message API は完全な表示本文を `display_text` 一つだけ返し、`content_text`/`render_text` を重複しません。Effective-current、pagination、around-node の意味は維持されます。
 
 「URL をコピー」は `match_mode`、`layout`、`show_internal` と共有可能な search/reader state を必ず明示します。URL の明示値は `localStorage` より優先され、欠落値だけがローカル設定を使います。本版は `replaceState` を使い、ブラウザーの戻る/進むで段階的な検索・選択履歴を復元しません。
 
-Release ZIP は一時ファイルへ書き、全 payload のソート済み size/SHA-256 manifest、正確な member 集合、dist asset、delivery check を検証してから原子的に置換します。失敗時は既存 release を変更しません。
+Release ZIP は固定 member metadata で byte-reproducible に生成し、全 payload manifest と member hash を検証してから原子的に置換します。失敗時は既存 release を変更しません。
 
 Rollback summary は `attempted_*` とゼロの `committed_*` を分離します。failed run は新しい接続で永続化し、secondary persistence failure も明示します。pre-job cleanup failure は primary HTTP code を保持し、安全な `cleanup_warning`/`cleanup_error_type` を追加します。job ID は小文字 32 桁 hex のみです。
 

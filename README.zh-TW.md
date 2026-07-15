@@ -58,7 +58,7 @@ ChatGPT Export Archiver 可以直接匯入 OpenAI / ChatGPT 官方 export ZIP，
 ## 系統需求
 
 - Python 3.10 或更新版本；Python 3.12 是 Web 依賴可重現安裝的測試目標。
-- SQLite 需要啟用 JSON1 與 FTS5。現行 macOS、Windows 與 Linux 上多數 Python 建置版本都已包含二者。
+- SQLite 需要 JSON 支援。FTS5 是可選能力；不可用或缺少 `message_fts` 時仍使用安全掃描搜尋。
 - 只有在需要重新建置 React Web UI 或執行前端檢查時，才需要 Node.js 與 npm。runnable 交付包已包含 `webui/dist`，一般本機使用 Web UI 不需要重新建置前端。
 - 核心 CLI 只使用 Python 標準函式庫，沒有 Web 套件也能執行。若要啟動 Web UI（包括 ZIP 上傳），請安裝 `requirements-web.txt`；缺少此 profile 時，`web` 指令會立即失敗並顯示安裝提示。
 
@@ -266,7 +266,7 @@ Web 上傳會在讀取檔案前先保留 pending slot，因此大型上傳不能
 | `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | ZIP 內總 member 數上限 |
 | `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | 未設定 | 只在可信非 loopback 網路上設為 `local`，讓未設定的上傳限制使用本機預設值 |
 
-**遠端繫結策略。** 繫結非 loopback 位址（例如 `0.0.0.0`、`::` 或 LAN IP）時，必須透過 `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` 或 `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` 明確 opt-in，否則啟動會被拒絕。啟用後會警告封存瀏覽器已暴露，並套用 128 MiB 壓縮 ZIP、每個 JSON member 256 MiB、總未壓縮 512 MiB、200 JSON members、10,000 ZIP members 的 remote-safe 預設值。`ALLOW_REMOTE_UPLOADS` 只放寬明確設定的限制；未設定項仍 remote-safe。`REMOTE_UPLOAD_PROFILE=local` 只適合可信 LAN。專案沒有認證層，邊界由可信網路與主機防火牆提供；Origin/Sec-Fetch 寫入保護不能讓不可信網路變安全。
+**遠端繫結策略。** 非 loopback 需透過 `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` 或 `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` 明確 opt-in。remote-safe 預設為 128 MiB 壓縮 ZIP、每個 JSON member 256 MiB、總未壓縮 512 MiB、200.0 壓縮比、200 JSON members、10,000 ZIP members；可信 loopback/local 預設壓縮比是 1000.0。`ALLOW_REMOTE_UPLOADS` 只放寬明確設定的限制，未設定項仍 remote-safe；`REMOTE_UPLOAD_PROFILE=local` 會把所有未設定限制恢復為本機大型預設值，只適合可信 LAN。
 
 `/api/schema` 會回報有效上傳策略，包括 multipart body 上限（ZIP byte 上限加有限 overhead）與 remote profile。writer slot 和 receive-level body cap 在 multipart 解析前生效。parser 可能寫 spool，之後 pipeline 仍擁有伺服器暫存 ZIP，因此暫存磁碟應預留接近兩份壓縮副本再加資料庫成長。ZIP 檢查先執行，但 JSON 解碼、SQLite 寫入與 `web-index` 仍依解碼資料消耗記憶體、磁碟與 CPU。遠端上傳必須提供有效 `Content-Length`；loopback chunked 上傳仍受串流上限限制。
 
@@ -456,7 +456,9 @@ tools/                             交付檢查與輔助腳本
 
 主資料庫保存 conversations、mapping nodes、import runs 與 warnings。message object 的 raw JSON 欄位按完整物件保留；conversation 與 mapping-node object 會正規化，不做逐位元組保存。輸入 ZIP SHA-256 可選，`source_files`/`file_index` 的逐 entry SHA 欄位目前保留但不填入。CLI FTS 表是 `message_fts`。可選 Web 搜尋輔助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-除非已明確規劃並記錄 migration，否則專案不會在小型穩健性修復中修改資料庫 schema。缺少新欄位的舊資料庫會透過 `verify` 或 Web health 的 `missing_columns` 診斷被明確拒絕，而不會靜默 migration；遇到這種情況請先備份舊庫，再用原始匯出重新匯入到新資料庫。
+canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 1）。唯讀指令和 Web request 不執行 migration DDL。升級前先建立並驗證外部備份，再執行 `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`；完成前 health/API 回傳 `database_migration_required`。FTS5 `message_fts` 與 Web 搜尋表是可選且可重建的能力。
+
+Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回報 `optional_message_fts_error` 和 `--rebuild-fts` 復原提示；一般 malformed、locked、readonly、I/O 與 SQL 執行期錯誤不會被當成能力缺失，並使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
 ## 已知限制
 
@@ -470,13 +472,13 @@ tools/                             交付檢查與輔助腳本
 
 Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bind host 與明確設定的 host。非 loopback bind 還必須透過 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定實際瀏覽器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）採嚴格單 edge 模型：未受信直連的 forwarded header 會被忽略，受信直連 proxy 必須覆寫 client 值；重複 Host/Forwarded、逗號 proxy chain、非法語法及 `Forwarded` 與 `X-Forwarded-Host/Proto` 衝突會被拒絕。靜態 UI、GET API 與全部請求都驗證 Host。遠端寫入必須有同源 `Origin`；只有可信 loopback profile 相容無 Origin 用戶端。上傳永遠拒絕 `Sec-Fetch-Site: cross-site`。
 
-匯入失敗使用穩定的輸入預檢、source scan、JSON decode、頂層契約與交易階段。失敗 run summary 的 warning 數與實際持久化 warning 一致。canonical commit 成功後，verify、stats 或可選 Web index 失敗不會被描述為「未匯入」。提交後的暫存上傳清理失敗是非致命穩定 warning，且不洩漏使用者路徑。
+匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。
 
-非標準 JSON `NaN` / `Infinity` 會被拒絕；字串形式的非有限時間寫成 `NULL` 並記錄 warning。`verify` 會偵測舊資料庫非有限時間，API、stats 與 export 仍保證有限 JSON。Effective-current 回應提供 cycle、missing parent、cross-conversation parent 與 partial chain 診斷。`internal_hidden_count` 是正式統計，`technical_hidden_count` 只是已棄用的同值相容別名。`count_total=false` 時 message search 回傳 `total_exact=false`，此時 `total` 只是已知下界。around-node 回應區分目標是否存在、可見、屬於 effective collection 以及是否成功定位。
+非標準 JSON `NaN` / `Infinity` 會被拒絕。預設 message API 只回傳一份完整可見正文 `display_text`，不複製 `content_text`/`render_text`。Effective-current、分頁與 around-node 語義維持不變。
 
 「複製 URL」永遠明確寫入 `match_mode`、`layout`、`show_internal` 與可分享的搜尋/reader 狀態。URL 明確值優先於 `localStorage`，缺少值才可回退本機設定。本版本使用 `replaceState`，瀏覽器上一頁/下一頁不會還原逐步搜尋或選擇歷程。
 
-Release ZIP 先寫入目標目錄的暫存檔，核對每個 payload 檔案的排序 size/SHA-256 manifest、精確 member 集合與 dist asset，再執行 delivery check，最後才原子替換目標；任何失敗都保留舊 release。
+Release ZIP 使用固定 member metadata 產生可重現 bytes，並先寫入目標目錄暫存檔，核對每個 payload 的 size/SHA-256 manifest、精確 member 集合與 dist asset，再原子替換；任何失敗都保留舊 release。
 
 rollback summary 以 `attempted_*` 與歸零的 `committed_*` 區分已嘗試和已提交工作；失敗 run 使用新連線持久化並明確報告次要持久化失敗。pre-job 暫存清理失敗保留主要 HTTP 錯誤，另回傳安全的 `cleanup_warning`/`cleanup_error_type`。job 查詢只接受 32 位小寫十六進位 ID。
 

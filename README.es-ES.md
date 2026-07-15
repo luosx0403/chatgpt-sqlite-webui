@@ -58,7 +58,7 @@ La base de datos y los Markdown / TXT exportados pueden contener conversaciones 
 ## Requisitos
 
 - Python 3.10 o más reciente. Python 3.12 es el objetivo probado para instalaciones Web reproducibles.
-- SQLite con JSON1 y FTS5 habilitados. La mayoría de builds actuales de Python en macOS, Windows y Linux ya los incluyen.
+- SQLite con soporte JSON. FTS5 es opcional; si no está disponible o falta `message_fts`, se conserva la búsqueda segura por escaneo.
 - Node.js y npm solo si quieres reconstruir la Web UI en React o ejecutar comprobaciones de frontend. La entrega runnable incluye `webui/dist`, así que el uso local normal de la Web UI no requiere reconstruir el frontend.
 - La CLI principal usa solo la biblioteca estándar de Python. Para ejecutar la Web UI, incluida la subida ZIP, instala `requirements-web.txt`; sin ese perfil el comando `web` falla de inmediato con una indicación de instalación.
 
@@ -266,7 +266,7 @@ Cuando la Web UI está enlazada a una dirección loopback (`127.0.0.1`, `localho
 | `CHATGPT_ARCHIVE_MAX_UPLOAD_TOTAL_MEMBERS` | 100,000 | Número máx. total de miembros ZIP |
 | `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE` | unset | Ponlo en `local` solo en redes no loopback de confianza para usar valores locales por defecto en límites no definidos |
 
-**Política de enlace remoto.** Un bind no loopback requiere opt-in mediante `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`, `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` o `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local`; de lo contrario se rechaza el arranque. Al activarlo, el servidor avisa que expone el archivo y aplica límites remote-safe de 128 MiB ZIP, 256 MiB por JSON member, 512 MiB total sin comprimir, 200 JSON members y 10,000 ZIP members. `ALLOW_REMOTE_UPLOADS` solo relaja límites explícitos; los demás siguen remote-safe. `REMOTE_UPLOAD_PROFILE=local` es solo para una LAN de confianza. No hay autenticación: el límite de confianza es la red y el firewall. La protección Origin/Sec-Fetch de escrituras no vuelve segura una red no confiable.
+**Política de enlace remoto.** Un bind no loopback requiere `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`, `CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` o `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` como opt-in. Los valores remote-safe son 128 MiB ZIP, 256 MiB por JSON member, 512 MiB total sin comprimir, ratio 200.0, 200 JSON members y 10,000 ZIP members; el ratio loopback/local es 1000.0. `ALLOW_REMOTE_UPLOADS` solo relaja límites explícitos y los demás siguen remote-safe. `REMOTE_UPLOAD_PROFILE=local` restaura todos los límites no definidos a sus valores locales grandes y solo debe usarse en una LAN de confianza.
 
 `/api/schema` informa la política efectiva, incluido el límite multipart body (límite ZIP más overhead acotado). El writer slot y el body cap a nivel receive actúan antes del parseo multipart. El spool del parser puede coexistir con el ZIP temporal del pipeline: reserva casi dos copias comprimidas más el crecimiento de la DB. JSON decode, SQLite y `web-index` consumen RAM, disco y CPU según el tamaño decodificado. Las subidas remotas requieren `Content-Length`; las chunked de loopback siguen limitadas durante streaming.
 
@@ -456,7 +456,9 @@ tools/                             Delivery and support scripts
 
 La base principal almacena conversaciones, mapping nodes, import runs y warnings. Solo los objetos message conservan el objeto JSON raw del mensaje; conversation y mapping-node se normalizan, no se guardan byte por byte. El SHA-256 del ZIP de entrada es opcional y las columnas SHA por entry de `source_files`/`file_index` están reservadas y sin rellenar. La tabla FTS de CLI es `message_fts`. Las tablas auxiliares opcionales para búsqueda Web incluyen `web_message_norm`, `web_title_norm`, `web_message_trigram` y `web_title_trigram`, además de las shadow tables de SQLite FTS5.
 
-El proyecto evita cambiar el schema de la base de datos durante pequeñas correcciones de robustez, salvo que exista una migración planificada y documentada explícitamente. Las bases de datos antiguas a las que les falten columnas nuevas se rechazan con diagnósticos `missing_columns` en `verify` o Web health, sin migrarlas en silencio; en ese caso, haz una copia de seguridad de la base antigua y vuelve a importar el export original en una base nueva.
+La base canónica usa `PRAGMA user_version` (versión actual 1). Los comandos readonly y las solicitudes Web nunca ejecutan DDL de migración. Crea y verifica un backup externo y ejecuta `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`; hasta entonces health/API devuelve `database_migration_required`. FTS5 y los índices Web son capacidades opcionales y reconstruibles.
+
+Health y `verify` distinguen entre `message_fts` opcional ausente y dañado. El daño informa `optional_message_fts_error` con una indicación `--rebuild-fts`; los fallos generales malformed, locked, readonly, I/O y SQL runtime no se ocultan como capacidad ausente y usan `database_malformed`, `database_locked`, `database_readonly`, `database_io_error` o `database_runtime_failure`.
 
 ## Límites conocidos
 
@@ -470,13 +472,13 @@ El proyecto evita cambiar el schema de la base de datos durante pequeñas correc
 
 El Web loopback solo acepta `localhost`, `127.0.0.1`, `::1`, el host loopback explícito y hosts configurados. Un bind no loopback exige el hostname/IP LAN real en `CHATGPT_ARCHIVE_ALLOWED_HOSTS`; se rechaza `*`. `CHATGPT_ARCHIVE_TRUSTED_PROXIES` usa un modelo estricto de un solo proxy edge: se ignoran forwarded headers de pares no confiables y el edge directo confiable debe sobrescribir los valores del cliente. Se rechazan Host/Forwarded repetidos, cadenas con comas, sintaxis inválida y conflictos entre `Forwarded` y `X-Forwarded-Host/Proto`. Todas las solicitudes validan Host y las escrituras remotas requieren un `Origin` de mismo origen.
 
-Los fallos de importación usan etapas y códigos estables para preflight, escaneo de fuentes, decodificación JSON, contrato del nivel superior y transacción. El resumen del run fallido y las filas warning persistidas coinciden. Un commit canónico correcto no se describe como “no importado” si fallan después verify, stats o el índice Web opcional. Los fallos de limpieza temporal posteriores al commit son warnings no fatales y no exponen rutas del usuario.
+Los fallos incluyen una etapa source-read y códigos estables `upload_preflight_failed`, `input_source_open_failed`, `input_source_not_regular_file`, `source_read_failed`, `source_changed_during_read`, `invalid_conversation_encoding` y `json_integer_too_large`. La limpieza usa `cleanup_warnings` estructurado; `cleanup_warning` conserva solo el primer elemento por compatibilidad.
 
-Se rechazan `NaN` / `Infinity` JSON no estándar; los timestamps no finitos en cadenas se guardan como `NULL` con warning. `verify` detecta valores no finitos heredados y API, stats y export mantienen JSON finito. Effective-current informa cycle, missing parent, cross-conversation parent y partial chain. `internal_hidden_count` es el valor oficial; `technical_hidden_count` es un alias idéntico obsoleto. Con `count_total=false`, message search devuelve `total_exact=false` y `total` es solo un límite inferior conocido. Around-node distingue found, visible, pertenencia a effective collection y applied.
+La API de mensajes devuelve un único cuerpo visible completo, `display_text`, sin duplicar `content_text`/`render_text`. Se conservan las semánticas effective-current, pagination y around-node.
 
 “Copiar URL” siempre serializa `match_mode`, `layout`, `show_internal` y el estado compartible de búsqueda/lector. Los valores explícitos de URL tienen prioridad sobre `localStorage`; solo los ausentes usan ajustes locales. Esta versión usa `replaceState` y no restaura el historial paso a paso de búsquedas o selecciones con Atrás/Adelante.
 
-El Release ZIP se escribe en un temporal, verifica el manifest ordenado size/SHA-256 de cada payload, el conjunto exacto de members, assets dist y delivery check, y solo después sustituye atómicamente el destino. Un fallo conserva intacto el release anterior.
+El Release ZIP usa metadata fija para bytes reproducibles, verifica el manifest SHA-256 y los members, y solo después sustituye atómicamente el destino. Un fallo conserva intacto el release anterior.
 
 El resumen de rollback separa `attempted_*` de `committed_*` en cero. Un run fallido se persiste con una conexión nueva y se informa cualquier fallo secundario. Un fallo de limpieza pre-job conserva el error HTTP principal y añade `cleanup_warning`/`cleanup_error_type` seguros. Los ID de job solo aceptan 32 caracteres hexadecimales en minúscula.
 
