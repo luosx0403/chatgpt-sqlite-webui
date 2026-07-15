@@ -3606,6 +3606,51 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(client.get(f"/api/conversations?source={quote(long_source)}").status_code, 422)
         long_suggest = "x" * 101
         self.assertEqual(client.get(f"/api/search/suggest?q={quote(long_suggest)}").status_code, 422)
+        long_id = "x" * 513
+        self.assertEqual(client.get(f"/api/conversations/{quote(long_id)}").status_code, 422)
+        self.assertEqual(client.get(f"/api/conversations?selected_id={quote(long_id)}").status_code, 422)
+
+    def test_imported_maximum_ids_are_addressable_across_reader_raw_display_export_and_selected(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            conversation_id = "c" * 512
+            node_id = "n" * 512
+            message_id = "m" * 512
+            mapping = {
+                "root": root([node_id]),
+                node_id: {
+                    "id": node_id,
+                    "parent": "root",
+                    "children": [],
+                    "message": {
+                        "id": message_id,
+                        "author": {"role": "user"},
+                        "create_time": 1_700_000_001,
+                        "update_time": 1_700_000_001,
+                        "content": {"content_type": "text", "parts": ["synthetic maximum id body"]},
+                        "metadata": {},
+                    },
+                },
+            }
+            row = conv(conversation_id, "Maximum IDs", mapping, node_id, 1_700_000_000)
+            row["conversation_id"] = "exported-maximum"
+            archive = base / "input.zip"
+            write_zip(archive, [row])
+            db = base / "archive.db"
+            self.assertEqual(main(["--db", str(db), "import", "--input", str(archive), "--no-input-sha256"]), 0)
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            self.addCleanup(client.close)
+            cid = quote(conversation_id, safe="")
+            nid = quote(node_id, safe="")
+            self.assertEqual(client.get(f"/api/conversations/{cid}").status_code, 200)
+            selected = client.get(f"/api/conversations?limit=1&offset=99&selected_id={cid}").json()
+            self.assertEqual(selected["selected_item"]["conversation_id"], conversation_id)
+            messages = client.get(f"/api/conversations/{cid}/messages?path=all&around_node_id={nid}").json()
+            self.assertEqual(messages["items"][0]["node_id"], node_id)
+            self.assertEqual(client.get(f"/api/conversations/{cid}/messages/{nid}/raw").status_code, 200)
+            display = client.get(f"/api/conversations/{cid}/messages/{nid}/display?offset=0&limit=1024").json()
+            self.assertEqual(display["display_text"], "synthetic maximum id body")
+            self.assertEqual(client.get(f"/api/conversations/{cid}/export?format=txt&path=all").status_code, 200)
 
     def test_cli_search_does_not_enforce_api_length_limits(self):
         from chatgpt_export_archiver.search import parse_query
@@ -4889,6 +4934,7 @@ class WebApiTests(unittest.TestCase):
         self.addCleanup(client.close)
         cases = [
             ("invalid-json", {"conversations.json": b"[{"}, "invalid_conversation_json", "json_decode", "json_decode_failed"),
+            ("invalid-encoding", {"conversations.json": b"\xef\xbb\xbf\xef\xbb\xbf[]"}, "invalid_conversation_encoding", "json_decode", "json_decode_failed"),
             ("top-level", {"conversations.json": {"not": "a list"}}, "conversation_json_top_level_not_list", "top_level_contract", "top_level_contract_failed"),
             (
                 "mixed-shards",

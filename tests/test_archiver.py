@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import base64
 import contextlib
 import hashlib
 import io
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unicodedata
 import unittest
 import zipfile
@@ -26,7 +28,7 @@ from chatgpt_export_archiver.db import connect, export_query, init_db, verify_da
 from chatgpt_export_archiver.logging_utils import configure_logging, get_logger, parse_log_level
 from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
-from chatgpt_export_archiver.scanner import list_source_entries, load_json_from_source, resolve_input
+from chatgpt_export_archiver.scanner import iter_json_array_from_source, list_source_entries, load_json_from_source, resolve_input
 from chatgpt_export_archiver.search import parse_query
 from chatgpt_export_archiver.utils import epoch_to_date_part, epoch_to_display, parse_date_boundary, safe_filename_part
 from chatgpt_export_archiver.web_db import connect_readonly, create_web_indexes
@@ -1294,6 +1296,98 @@ class ArchiverTests(unittest.TestCase):
         payload = json.dumps(parsed.warnings[0].__dict__)
         self.assertNotIn("PRIVATE_TITLE", payload)
 
+    def test_canonical_id_limit_rejects_unaddressable_graph_ids_without_values_in_warnings(self):
+        accepted = "a" * 512
+        rejected = "b" * 513
+
+        valid = conversation(accepted, mapping={accepted: null_message_node(accepted, None, [])}, current_node=accepted)
+        valid["conversation_id"] = "exported-valid"
+        self.assertIsNone(validate_conversation_element(valid, "conversations.json", 0))
+        parsed = parse_conversation(valid, "conversations.json", 0)
+        self.assertEqual(len(parsed.conversation_id), 512)
+        self.assertEqual(len(parsed.nodes[0].node_id), 512)
+
+        cases = []
+        over_conversation = conversation(rejected)
+        over_conversation["conversation_id"] = "fallback-also-valid"
+        cases.append(("id", over_conversation))
+        for field in ("node_id", "parent", "children", "message_id", "current_node"):
+            item = conversation(f"over-{field}", mapping={"root": null_message_node("root", None, [])}, current_node="root")
+            if field == "node_id":
+                item["mapping"] = {rejected: null_message_node(rejected, None, [])}
+                item["current_node"] = rejected
+            elif field == "parent":
+                item["mapping"]["root"]["parent"] = rejected
+            elif field == "children":
+                item["mapping"]["root"]["children"] = [rejected]
+            elif field == "message_id":
+                item["mapping"]["root"] = message_node("root", None, "user", "synthetic", 1)
+                item["mapping"]["root"]["message"]["id"] = rejected
+            else:
+                item["current_node"] = rejected
+            cases.append((field, item))
+        for field, item in cases:
+            with self.subTest(field=field):
+                warning = validate_conversation_element(item, "conversations.json", 4)
+                self.assertIsNotNone(warning)
+                self.assertEqual(warning.warning_type, "canonical_id_too_long")
+                diagnostic = json.loads(warning.keys_json)
+                self.assertEqual(diagnostic["length"], 513)
+                self.assertEqual(diagnostic["limit"], 512)
+                self.assertNotIn(rejected, warning.keys_json)
+
+        numeric_valid = conversation(int("9" * 512))
+        numeric_valid["conversation_id"] = "numeric-valid"
+        self.assertIsNone(validate_conversation_element(numeric_valid, "conversations.json", 0))
+        numeric_over = conversation(int("8" * 513))
+        numeric_over["conversation_id"] = "numeric-fallback"
+        warning = validate_conversation_element(numeric_over, "conversations.json", 0)
+        self.assertEqual(warning.warning_type, "canonical_id_too_long")
+
+    def test_id_length_matrix_is_identical_for_standalone_directory_and_zip_imports(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            rows = []
+            expected_ids = set()
+            for length in (511, 512, 513, 600, 1000):
+                text_id = "s" * length
+                text_row = conversation(text_id, mapping={"root": null_message_node("root", None, [])}, current_node="root")
+                text_row["conversation_id"] = f"text-export-{length}"
+                rows.append(text_row)
+                numeric_id = int("9" * length)
+                numeric_row = conversation(numeric_id, mapping={"root": null_message_node("root", None, [])}, current_node="root")
+                numeric_row["conversation_id"] = f"numeric-export-{length}"
+                rows.append(numeric_row)
+                if length <= 512:
+                    expected_ids.update({text_id, str(numeric_id)})
+
+            encoded = json.dumps(rows).encode("utf-8")
+            for mode in ("json", "directory", "zip"):
+                root = base / mode
+                root.mkdir()
+                if mode == "zip":
+                    target = root / "input.zip"
+                    with zipfile.ZipFile(target, "w") as zf:
+                        zf.writestr("conversations.json", encoded)
+                else:
+                    json_path = root / "conversations.json"
+                    json_path.write_bytes(encoded)
+                    target = json_path if mode == "json" else root
+                db = base / f"{mode}.db"
+                code, output = run_cli(["--db", str(db), "import", "--input", str(target), "--no-input-sha256"])
+                self.assertEqual(code, 0, output)
+                conn = sqlite3.connect(db)
+                try:
+                    actual = {row[0] for row in conn.execute("SELECT conversation_id FROM conversations")}
+                    self.assertEqual(actual, expected_ids)
+                    self.assertTrue(all(len(value) <= 512 for value in actual))
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM import_warnings WHERE warning_type='canonical_id_too_long'").fetchone()[0],
+                        6,
+                    )
+                finally:
+                    conn.close()
+
     def test_malformed_conversations_do_not_insert_string_none_or_bind_bad_title(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -1362,6 +1456,146 @@ class ArchiverTests(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT input_kind FROM import_runs").fetchone()[0], "json")
             finally:
                 conn.close()
+
+    def test_streaming_json_and_bom_contract_are_identical_for_all_input_modes(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            encoded = json.dumps([conversation("bom-ok")], separators=(",", ":")).encode("utf-8")
+
+            def write_mode(mode: str, root: Path, payload: bytes) -> Path:
+                root.mkdir()
+                if mode == "zip":
+                    target = root / "input.zip"
+                    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as zf:
+                        zf.writestr("conversations.json", payload)
+                    return target
+                target = root / "conversations.json"
+                target.write_bytes(payload)
+                return target if mode == "json" else root
+
+            for mode in ("json", "directory", "zip"):
+                target = write_mode(mode, base / f"ok-{mode}", b"\xef\xbb\xbf" + encoded)
+                db = base / f"ok-{mode}.db"
+                code, output = run_cli(["--db", str(db), "import", "--input", str(target), "--no-input-sha256"])
+                self.assertEqual(code, 0, output)
+                conn = sqlite3.connect(db)
+                try:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 1)
+                finally:
+                    conn.close()
+
+            invalid_payloads = {
+                "repeated": b"\xef\xbb\xbf\xef\xbb\xbf[]",
+                "middle": b"[\xef\xbb\xbf]",
+                "utf16": b"\xff\xfe[\x00]\x00",
+                "invalid": b"[\xff]",
+            }
+            for label, payload in invalid_payloads.items():
+                for mode in ("json", "directory", "zip"):
+                    with self.subTest(label=label, mode=mode):
+                        target = write_mode(mode, base / f"bad-{label}-{mode}", payload)
+                        db = base / f"bad-{label}-{mode}.db"
+                        code, output = run_cli(["--db", str(db), "import", "--input", str(target), "--no-input-sha256"])
+                        self.assertNotEqual(code, 0)
+                        self.assertIn("invalid_conversation_encoding", output)
+                        conn = sqlite3.connect(db)
+                        try:
+                            self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+                        finally:
+                            conn.close()
+
+    def test_streaming_array_bounds_memory_and_late_syntax_error_rolls_back_batches(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source_json = base / "conversations.json"
+            source_json.write_text(
+                json.dumps([conversation(f"stream-{index}", mapping={"root": null_message_node("root", None, [])}, current_node="root") for index in range(3000)]),
+                encoding="utf-8",
+            )
+            source = resolve_input(str(source_json), base)
+            tracemalloc.start()
+            count = sum(1 for _ in iter_json_array_from_source(source, "conversations.json"))
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            self.assertEqual(count, 3000)
+            self.assertLess(peak, 8_000_000)
+
+            valid_prefix = ",".join(
+                json.dumps(conversation(f"rollback-{index}", mapping={"root": null_message_node("root", None, [])}, current_node="root"))
+                for index in range(250)
+            )
+            source_json.write_text(f"[{valid_prefix},{{\"broken\":]", encoding="utf-8")
+            db = base / "rollback.db"
+            code, output = run_cli(["--db", str(db), "import", "--input", str(source_json), "--no-input-sha256"])
+            self.assertNotEqual(code, 0)
+            self.assertIn("invalid_conversation_json", output)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT status FROM import_runs ORDER BY id DESC LIMIT 1").fetchone()[0], "failed")
+            finally:
+                conn.close()
+
+    def test_zip_member_source_read_failures_have_stable_codes_and_zero_commits(self):
+        encrypted_bytes = base64.b64decode(
+            "UEsDBAoACQAAADsq8Fwpu0wNDgAAAAIAAAASABwAY29udmVyc2F0aW9ucy5qc29uVVQJAAMB+VdqAflXanV4CwABBPUBAAAEFAAAAF+dhP2iZvJmd92wvlBKUEsHCCm7TA0OAAAAAgAAAFBLAQIeAwoACQAAADsq8Fwpu0wNDgAAAAIAAAASABgAAAAAAAEAAACkgQAAAABjb252ZXJzYXRpb25zLmpzb25VVAUAAwH5V2p1eAsAAQT1AQAABBQAAABQSwUGAAAAAAEAAQBYAAAAagAAAAAA"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+
+            def assert_failure(target: Path, label: str, patcher=None) -> None:
+                db = base / f"{label}.db"
+                context = patcher if patcher is not None else contextlib.nullcontext()
+                with context:
+                    code, output = run_cli(["--db", str(db), "import", "--input", str(target), "--no-input-sha256"])
+                self.assertNotEqual(code, 0, output)
+                self.assertIn(label, output)
+                conn = sqlite3.connect(db)
+                try:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+                finally:
+                    conn.close()
+
+            encrypted = base / "encrypted.zip"
+            encrypted.write_bytes(encrypted_bytes)
+            assert_failure(encrypted, "encrypted_zip_member_not_supported")
+
+            crc = base / "crc.zip"
+            with zipfile.ZipFile(crc, "w", compression=zipfile.ZIP_STORED) as zf:
+                zf.writestr("conversations.json", b"[]")
+            damaged = bytearray(crc.read_bytes())
+            name_length = int.from_bytes(damaged[26:28], "little")
+            extra_length = int.from_bytes(damaged[28:30], "little")
+            data_offset = 30 + name_length + extra_length
+            damaged[data_offset] ^= 0x01
+            crc.write_bytes(damaged)
+            assert_failure(crc, "zip_member_crc_failed")
+
+            missing = base / "missing.zip"
+            write_zip(missing, {"conversations.json": []})
+            real_getinfo = zipfile.ZipFile.getinfo
+            calls = {"count": 0}
+
+            def missing_on_read(zf, name):
+                calls["count"] += 1
+                if name == "conversations.json":
+                    raise KeyError(name)
+                return real_getinfo(zf, name)
+
+            assert_failure(missing, "zip_member_not_found", mock.patch.object(zipfile.ZipFile, "getinfo", missing_on_read))
+
+            changed = base / "changed.zip"
+            replacement = base / "replacement.zip"
+            write_zip(changed, {"conversations.json": []})
+            write_zip(replacement, {"conversations.json": [], "note.txt": "different identity"})
+            from chatgpt_export_archiver import cli as cli_module
+            real_iter = cli_module.iter_json_array_from_source
+
+            def replace_then_iter(source, source_path):
+                replacement.replace(changed)
+                return real_iter(source, source_path)
+
+            assert_failure(changed, "source_changed_during_read", mock.patch.object(cli_module, "iter_json_array_from_source", replace_then_iter))
 
     def test_duplicate_zip_conversation_json_members_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3231,7 +3465,7 @@ class ArchiverTests(unittest.TestCase):
                 (OSError("private OS detail"), "source_read_failed"),
             ):
                 with self.subTest(expected_code=expected_code), mock.patch.object(
-                    cli_module, "load_json_from_source", side_effect=error
+                    cli_module, "iter_json_array_from_source", side_effect=error
                 ):
                     with self.assertRaises(cli_module.ImportPipelineError) as caught:
                         cli_module.run_import_pipeline(

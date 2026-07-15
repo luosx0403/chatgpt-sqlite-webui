@@ -21,6 +21,7 @@ from .db import (
     require_current_database_schema,
 )
 from .logging_utils import get_logger
+from .identifiers import MAX_CANONICAL_ID_LENGTH
 from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
 from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
 from .sqlite_errors import sqlite_runtime_error_code
@@ -48,7 +49,7 @@ ALLOWED_PATHS = {"current", "all"}
 ALLOWED_MESSAGE_ORDERS = {"relevance", "display"}
 ALLOWED_MATCH_MODES = {"contains", "word"}
 MAX_DATE_PARAM_LENGTH = 64
-MAX_ID_PARAM_LENGTH = 512
+MAX_ID_PARAM_LENGTH = MAX_CANONICAL_ID_LENGTH
 JOB_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 
 DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024
@@ -688,9 +689,17 @@ def create_api_router(
                 "statuses": ["queued", "running", "succeeded", "failed", "postcheck_failed"],
                 "outcomes": ["queued", "import_running", "import_job_start_failed", "input_preflight_failed", "source_scan_failed", "source_read_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
                 "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index"],
-                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "invalid_conversation_encoding", "json_integer_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed"],
+                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
                 "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"]},
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
+            },
+            "import_contract": {
+                "top_level": "conversation JSON must be one array and is decoded one element at a time in a single import transaction",
+                "encoding": "UTF-8 only; exactly one leading UTF-8 BOM is accepted, while repeated, interior, UTF-16/32, mixed, and invalid encodings are rejected",
+                "canonical_id_max_chars": MAX_CANONICAL_ID_LENGTH,
+                "id_fields": ["conversation_id", "exported_conversation_id", "mapping_node_key", "node_id", "message_id", "current_node", "parent", "children"],
+                "overlong_id": "the conversation element is skipped with canonical_id_too_long; IDs are never truncated",
+                "zip_source_read_codes": ["encrypted_zip_member_not_supported", "zip_member_not_found", "source_changed_during_read", "zip_member_crc_failed", "zip_member_read_failed"],
             },
             "ui_state": {
                 "canonical_copy_url": ["match_mode", "layout", "show_internal", "sort", "path", "scope", "q", "role", "title", "exact", "exclude", "source", "after", "before", "selected conversation"],

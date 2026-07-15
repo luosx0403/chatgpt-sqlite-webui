@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from .identifiers import MAX_CANONICAL_ID_LENGTH, canonical_id_length, canonical_id_text
 from .utils import canonical_json, compact_json, sha256_text
 
 
@@ -109,6 +110,9 @@ def validate_conversation_element(value: Any, source_file: str, array_index: int
             keys_json=keys_json,
             raw_json=None,
         )
+    id_warning = _canonical_graph_id_warning(value, source_file, array_index)
+    if id_warning is not None:
+        return id_warning
     return None
 
 
@@ -126,7 +130,7 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
         raise ValueError("parse_conversation called with invalid conversation id")
     exported_id = _normalize_conversation_id(value.get("conversation_id"))
     mapping = value.get("mapping") or {}
-    current_node = str(value.get("current_node")) if value.get("current_node") is not None else None
+    current_node = canonical_id_text(value.get("current_node"))
     warnings: list[WarningRecord] = []
     title = _normalize_title(value.get("title"), source_file, array_index, warnings)
     current_path = _compute_current_path(mapping, current_node, source_file, array_index, warnings)
@@ -134,7 +138,9 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
     nodes: list[ParsedNode] = []
 
     for node_id, node in mapping.items():
-        node_key = str(node_id)
+        node_key = canonical_id_text(node_id)
+        if node_key is None:
+            raise ValueError("parse_conversation called with invalid node id")
         if not isinstance(node, dict):
             warnings.append(
                 WarningRecord(
@@ -149,7 +155,7 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
         message = node.get("message")
         message_dict = message if isinstance(message, dict) else None
         content_type, content_text, metadata = extract_message_content(message_dict)
-        message_id = str(message_dict.get("id")) if message_dict and message_dict.get("id") is not None else None
+        message_id = canonical_id_text(message_dict.get("id")) if message_dict else None
         author = message_dict.get("author") if message_dict else None
         author = author if isinstance(author, dict) else {}
         role = str(author.get("role")) if author.get("role") is not None else None
@@ -165,7 +171,7 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
             ParsedNode(
                 node_id=node_key,
                 conversation_id=conversation_id,
-                parent_node_id=str(node.get("parent")) if node.get("parent") is not None else None,
+                parent_node_id=canonical_id_text(node.get("parent")),
                 children_json=compact_json(children_value),
                 message_id=message_id,
                 role=role,
@@ -244,13 +250,48 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
 
 def _normalize_conversation_id(value: Any) -> str | None:
     """Return a usable conversation id, rejecting empty values and containers."""
-    if value is None or isinstance(value, (dict, list, tuple, set)):
-        return None
-    if isinstance(value, str):
-        value = value.strip()
-        return value or None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
+    return canonical_id_text(value, strip=True)
+
+
+def _canonical_graph_id_warning(
+    value: dict[str, Any], source_file: str, array_index: int
+) -> WarningRecord | None:
+    """Reject an entire conversation when any stored graph ID exceeds the API limit."""
+
+    candidates: list[tuple[str, Any, bool]] = [
+        ("id", value.get("id"), True),
+        ("conversation_id", value.get("conversation_id"), True),
+        ("current_node", value.get("current_node"), False),
+    ]
+    mapping = value.get("mapping")
+    if isinstance(mapping, dict):
+        for node_key, node in mapping.items():
+            candidates.append(("mapping_node_key", node_key, False))
+            if not isinstance(node, dict):
+                continue
+            candidates.append(("node_id", node.get("id"), False))
+            candidates.append(("parent", node.get("parent"), False))
+            children = node.get("children")
+            if isinstance(children, list):
+                candidates.extend(("children", child, False) for child in children)
+            message = node.get("message")
+            if isinstance(message, dict):
+                candidates.append(("message_id", message.get("id"), False))
+    for field, candidate, strip in candidates:
+        length = canonical_id_length(candidate, strip=strip)
+        if length is not None and length > MAX_CANONICAL_ID_LENGTH:
+            return WarningRecord(
+                source_file=source_file,
+                array_index=array_index,
+                warning_type="canonical_id_too_long",
+                keys_json=compact_json({
+                    "field": field,
+                    "length": length,
+                    "limit": MAX_CANONICAL_ID_LENGTH,
+                    "value_type": type(candidate).__name__,
+                }),
+                raw_json=None,
+            )
     return None
 
 
@@ -302,7 +343,10 @@ def _compute_current_path(
         parent = node.get("parent")
         if parent is None:
             break
-        parent_id = str(parent)
+        parent_id = canonical_id_text(parent)
+        if parent_id is None:
+            warnings.append(WarningRecord(source_file, array_index, "parent_invalid", compact_json([node_id]), None))
+            break
         if parent_id not in mapping:
             warnings.append(WarningRecord(source_file, array_index, "parent_missing", compact_json([node_id, parent_id]), None))
             break

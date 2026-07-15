@@ -344,6 +344,7 @@ export interface ApiSchemaResponse {
   search: Record<string, unknown>;
   suggest: Record<string, unknown>;
   upload: { effective_policy: Record<string, unknown>; [key: string]: unknown };
+  import_contract: Record<string, unknown>;
   jobs: {
     endpoints: string[];
     job_id: string;

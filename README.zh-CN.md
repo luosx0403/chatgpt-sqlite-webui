@@ -456,7 +456,7 @@ tools/                             交付检查和辅助脚本
 
 主数据库保存 conversations、mapping nodes、import runs 和 warnings。message object 的 raw JSON 字段按完整对象保留；conversation 和 mapping-node object 会规范化，不做逐字节原样保存。输入 ZIP SHA-256 是可选项，`source_files`/`file_index` 的逐 entry SHA 列为保留字段，目前不填充。CLI FTS 表是 `message_fts`。可选 Web 搜索辅助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-canonical 数据库使用 `PRAGMA user_version` 版本化（当前版本 1）。只读命令和 Web 请求绝不执行 migration DDL。升级旧库前先创建并验证外部备份，再运行 `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`；import writer 可在事务内升级可迁移数据库。完成前 health/API 返回 `database_migration_required`。FTS5 `message_fts` 与 Web 搜索表是可选、可重建能力，不属于 canonical 数据。
+canonical 数据库使用 `PRAGMA user_version` 版本化（当前版本 2）。只读命令和 Web 请求绝不执行 migration DDL。升级旧库前先创建并验证外部备份，再运行 `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`；import writer 可在事务内升级可迁移数据库。完成前 health/API 返回 `database_migration_required`。FTS5 `message_fts` 与 Web 搜索表是可选、可重建能力，不属于 canonical 数据。
 
 Health 与 `verify` 会区分可选 `message_fts` 缺失和损坏。损坏时报告 `optional_message_fts_error` 与 `--rebuild-fts` 恢复提示；通用的 malformed、locked、readonly、I/O 和 SQL 运行时错误不会被伪装成能力缺失，并使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
@@ -473,6 +473,8 @@ Health 与 `verify` 会区分可选 `message_fts` 缺失和损坏。损坏时报
 Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、显式 loopback bind host 和明确配置的 host。非 loopback bind 还必须用 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定实际浏览器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）采用严格单 edge 模型：未受信直连的 forwarded header 会被忽略，受信直连代理必须覆盖客户端值；重复 Host/Forwarded、逗号代理链、非法语法以及 `Forwarded` 与 `X-Forwarded-Host/Proto` 冲突会被拒绝。静态 UI、GET API 和全部请求都校验 Host。远程写入必须有同源 `Origin`；只有可信 loopback profile 兼容无 Origin 客户端。上传始终拒绝 `Sec-Fetch-Site: cross-site`。
 
 导入失败使用稳定的输入预检、source scan、source read、JSON decode、顶层契约和事务阶段。新增稳定 code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding` 和 `json_integer_too_large`。清理诊断使用结构化 `cleanup_warnings` 数组；旧 `cleanup_warning` 标量仅代表首项。任何响应都不泄漏临时路径。
+
+独立 JSON、目录成员和 ZIP 成员使用同一个有界、逐顶层数组元素的解码器，并处于同一导入事务。只接受文件开头恰好一个 UTF-8 BOM；重复或中间 BOM、UTF-16/32、混合编码和无效 UTF-8 都会拒绝。会话及图结构 ID 统一限制为 512 个字符，与全部 Web 寻址参数一致；超长 ID 会以不含内容的 warning 跳过该会话元素，绝不截断。ZIP source-read 会区分加密、缺失、读取期间变化、CRC 失败及其他读取失败。
 
 非标准 JSON `NaN` / `Infinity` 会被拒绝；字符串形式的非有限时间写成 `NULL` 并记录 warning。默认 message API 只返回一份完整用户正文 `display_text`，不再复制 `content_text`/`render_text` 别名。`verify` 会检测旧库非有限时间；effective-current、分页和 around-node 语义保持不变。
 

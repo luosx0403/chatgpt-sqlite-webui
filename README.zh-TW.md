@@ -456,7 +456,7 @@ tools/                             交付檢查與輔助腳本
 
 主資料庫保存 conversations、mapping nodes、import runs 與 warnings。message object 的 raw JSON 欄位按完整物件保留；conversation 與 mapping-node object 會正規化，不做逐位元組保存。輸入 ZIP SHA-256 可選，`source_files`/`file_index` 的逐 entry SHA 欄位目前保留但不填入。CLI FTS 表是 `message_fts`。可選 Web 搜尋輔助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 1）。唯讀指令和 Web request 不執行 migration DDL。升級前先建立並驗證外部備份，再執行 `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`；完成前 health/API 回傳 `database_migration_required`。FTS5 `message_fts` 與 Web 搜尋表是可選且可重建的能力。
+canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 2）。唯讀指令和 Web request 不執行 migration DDL。升級前先建立並驗證外部備份，再執行 `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`；完成前 health/API 回傳 `database_migration_required`。FTS5 `message_fts` 與 Web 搜尋表是可選且可重建的能力。
 
 Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回報 `optional_message_fts_error` 和 `--rebuild-fts` 復原提示；一般 malformed、locked、readonly、I/O 與 SQL 執行期錯誤不會被當成能力缺失，並使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
@@ -473,6 +473,8 @@ Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回
 Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bind host 與明確設定的 host。非 loopback bind 還必須透過 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定實際瀏覽器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）採嚴格單 edge 模型：未受信直連的 forwarded header 會被忽略，受信直連 proxy 必須覆寫 client 值；重複 Host/Forwarded、逗號 proxy chain、非法語法及 `Forwarded` 與 `X-Forwarded-Host/Proto` 衝突會被拒絕。靜態 UI、GET API 與全部請求都驗證 Host。遠端寫入必須有同源 `Origin`；只有可信 loopback profile 相容無 Origin 用戶端。上傳永遠拒絕 `Sec-Fetch-Site: cross-site`。
 
 匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。
+
+獨立 JSON、目錄成員與 ZIP 成員使用同一個有界、逐頂層陣列元素的解碼器，並位於同一匯入交易。只接受檔案開頭恰好一個 UTF-8 BOM；重複或中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。對話與圖結構 ID 統一限制為 512 個字元，與所有 Web 尋址參數一致；超長 ID 會用不含內容的 warning 跳過該對話元素，絕不截斷。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
 
 非標準 JSON `NaN` / `Infinity` 會被拒絕。預設 message API 只回傳一份完整可見正文 `display_text`，不複製 `content_text`/`render_text`。Effective-current、分頁與 around-node 語義維持不變。
 

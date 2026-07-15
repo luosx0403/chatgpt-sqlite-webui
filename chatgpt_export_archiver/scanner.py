@@ -6,15 +6,18 @@ import os
 import re
 import stat
 import zipfile
+import codecs
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable, Iterator
 
 from .utils import classify_file
 
 
 SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
 MAX_JSON_INTEGER_DIGITS = 1000
+JSON_STREAM_CHUNK_BYTES = 64 * 1024
 
 
 class NonFiniteJsonNumberError(ValueError):
@@ -23,6 +26,36 @@ class NonFiniteJsonNumberError(ValueError):
 
 class JsonIntegerTooLargeError(ValueError):
     """Raised when a JSON integer exceeds the project-stable digit budget."""
+
+
+class InvalidConversationEncodingError(ValueError):
+    """Raised for invalid UTF-8 or a BOM outside the single allowed prefix."""
+
+
+class EncryptedZipMemberError(ValueError):
+    pass
+
+
+class ZipMemberNotFoundError(ValueError):
+    pass
+
+
+class SourceChangedDuringReadError(ValueError):
+    pass
+
+
+class ZipMemberCrcError(ValueError):
+    pass
+
+
+class ZipMemberReadError(ValueError):
+    pass
+
+
+class ConversationJsonTopLevelError(ValueError):
+    def __init__(self, top_level_type: str):
+        super().__init__("conversation_json_top_level_not_list")
+        self.top_level_type = top_level_type
 
 
 def _reject_non_finite_json_number(value: str) -> None:
@@ -59,6 +92,16 @@ class InputSource:
     kind: str
     size: int
     delete_target: Path | None = None
+    identity: tuple[int, int, int, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.identity is None and self.kind in {"zip", "json"}:
+            object.__setattr__(self, "identity", _file_identity(self.path))
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    info = path.stat()
+    return (int(info.st_dev), int(info.st_ino), int(info.st_size), int(info.st_mtime_ns))
 
 
 def find_default_input(path: Path) -> InputSource:
@@ -236,22 +279,194 @@ def _reject_duplicate_conversation_sources(entries: list[SourceEntry]) -> None:
 
 
 def load_json_from_source(input_source: InputSource, source_path: str) -> Any:
-    load_options = {
-        "parse_constant": _reject_non_finite_json_number,
-        "parse_float": _parse_finite_json_float,
-        "parse_int": _parse_bounded_json_int,
-    }
+    return list(iter_json_array_from_source(input_source, source_path))
+
+
+def iter_json_array_from_source(input_source: InputSource, source_path: str) -> Iterator[Any]:
+    """Stream one top-level array element at a time through one UTF-8 contract."""
+
+    with _open_source_binary(input_source, source_path) as stream:
+        yield from _iter_json_array(_iter_utf8_chunks(stream))
+
+
+@contextmanager
+def _open_source_binary(input_source: InputSource, source_path: str) -> Iterator[BinaryIO]:
+    if input_source.kind in {"zip", "json"}:
+        try:
+            current_identity = _file_identity(input_source.path)
+        except OSError as exc:
+            raise SourceChangedDuringReadError("source_changed_during_read") from exc
+        if input_source.identity is not None and current_identity != input_source.identity:
+            raise SourceChangedDuringReadError("source_changed_during_read")
     if input_source.kind == "zip":
-        with zipfile.ZipFile(input_source.path) as zf:
-            with zf.open(source_path) as f:
-                return json.load(f, **load_options)
+        try:
+            zf = zipfile.ZipFile(input_source.path)
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise SourceChangedDuringReadError("source_changed_during_read") from exc
+        try:
+            try:
+                info = zf.getinfo(source_path)
+            except KeyError as exc:
+                raise ZipMemberNotFoundError("zip_member_not_found") from exc
+            if info.flag_bits & 0x1:
+                raise EncryptedZipMemberError("encrypted_zip_member_not_supported")
+            try:
+                member = zf.open(info, "r")
+            except RuntimeError as exc:
+                raise EncryptedZipMemberError("encrypted_zip_member_not_supported") from exc
+            except KeyError as exc:
+                raise ZipMemberNotFoundError("zip_member_not_found") from exc
+            try:
+                yield member
+            except zipfile.BadZipFile as exc:
+                if "CRC" in str(exc).upper():
+                    raise ZipMemberCrcError("zip_member_crc_failed") from exc
+                raise ZipMemberReadError("zip_member_read_failed") from exc
+            except (OSError, RuntimeError) as exc:
+                raise ZipMemberReadError("zip_member_read_failed") from exc
+            finally:
+                member.close()
+        finally:
+            zf.close()
+        return
     if input_source.kind == "json":
         if source_path != input_source.path.name:
-            raise ValueError("source_not_found")
-        with input_source.path.open("r", encoding="utf-8") as f:
-            return json.load(f, **load_options)
-    with _open_directory_source(input_source.path, source_path) as f:
-        return json.load(f, **load_options)
+            raise SourceChangedDuringReadError("source_changed_during_read")
+        try:
+            with input_source.path.open("rb") as stream:
+                yield stream
+        except FileNotFoundError as exc:
+            raise SourceChangedDuringReadError("source_changed_during_read") from exc
+        return
+    try:
+        with _open_directory_source(input_source.path, source_path, binary=True) as stream:
+            yield stream
+    except ValueError:
+        raise
+    except FileNotFoundError as exc:
+        raise SourceChangedDuringReadError("source_changed_during_read") from exc
+
+
+def _iter_utf8_chunks(stream: BinaryIO) -> Iterator[str]:
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    first = True
+    try:
+        while True:
+            data = stream.read(JSON_STREAM_CHUNK_BYTES)
+            if not data:
+                break
+            if first:
+                first = False
+                if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                    raise InvalidConversationEncodingError("invalid_conversation_encoding")
+                if data.startswith(codecs.BOM_UTF8):
+                    data = data[len(codecs.BOM_UTF8) :]
+                    if data.startswith(codecs.BOM_UTF8):
+                        raise InvalidConversationEncodingError("invalid_conversation_encoding")
+            text = decoder.decode(data, final=False)
+            if "\ufeff" in text:
+                raise InvalidConversationEncodingError("invalid_conversation_encoding")
+            if text:
+                yield text
+        tail = decoder.decode(b"", final=True)
+    except UnicodeDecodeError as exc:
+        raise InvalidConversationEncodingError("invalid_conversation_encoding") from exc
+    if "\ufeff" in tail:
+        raise InvalidConversationEncodingError("invalid_conversation_encoding")
+    if tail:
+        yield tail
+
+
+def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
+    decoder = json.JSONDecoder(
+        parse_constant=_reject_non_finite_json_number,
+        parse_float=_parse_finite_json_float,
+        parse_int=_parse_bounded_json_int,
+    )
+    chunks_iter = iter(chunks)
+    buffer = ""
+    position = 0
+    eof = False
+
+    def read_more() -> bool:
+        nonlocal buffer, eof
+        if eof:
+            return False
+        try:
+            buffer += next(chunks_iter)
+            return True
+        except StopIteration:
+            eof = True
+            return False
+
+    def skip_space() -> None:
+        nonlocal position
+        while position < len(buffer) and buffer[position] in " \t\r\n":
+            position += 1
+
+    while not buffer and read_more():
+        pass
+    skip_space()
+    while position >= len(buffer) and read_more():
+        skip_space()
+    if position >= len(buffer):
+        raise json.JSONDecodeError("Expecting value", buffer, position)
+    if buffer[position] != "[":
+        while True:
+            try:
+                scalar, end = decoder.raw_decode(buffer, position)
+                break
+            except json.JSONDecodeError:
+                if not read_more():
+                    raise
+        position = end
+        skip_space()
+        while read_more():
+            skip_space()
+        if position != len(buffer):
+            raise json.JSONDecodeError("Extra data", buffer, position)
+        raise ConversationJsonTopLevelError(type(scalar).__name__)
+    position += 1
+    expect_value = True
+    allow_end = True
+    while True:
+        skip_space()
+        while position >= len(buffer) and read_more():
+            skip_space()
+        if position >= len(buffer):
+            raise json.JSONDecodeError("Expecting value", buffer, position)
+        if expect_value and buffer[position] == "]" and allow_end:
+            position += 1
+            break
+        if not expect_value:
+            if buffer[position] == ",":
+                position += 1
+                expect_value = True
+                allow_end = False
+                continue
+            if buffer[position] == "]":
+                position += 1
+                break
+            raise json.JSONDecodeError("Expecting ',' delimiter", buffer, position)
+        while True:
+            try:
+                value, end = decoder.raw_decode(buffer, position)
+                break
+            except json.JSONDecodeError:
+                if not read_more():
+                    raise
+        position = end
+        yield value
+        expect_value = False
+        allow_end = True
+        if position > JSON_STREAM_CHUNK_BYTES:
+            buffer = buffer[position:]
+            position = 0
+    skip_space()
+    while read_more():
+        skip_space()
+    if position != len(buffer):
+        raise json.JSONDecodeError("Extra data", buffer, position)
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -291,7 +506,7 @@ def _walk_directory_without_links(base: Path) -> list[tuple[str, int]]:
     return results
 
 
-def _open_directory_source(base: Path, source_path: str):
+def _open_directory_source(base: Path, source_path: str, *, binary: bool = False):
     """Open a directory member without following a replaced path component."""
 
     logical = PurePosixPath(source_path.replace("\\", "/"))
@@ -316,7 +531,7 @@ def _open_directory_source(base: Path, source_path: str):
             if not stat.S_ISREG(info.st_mode):
                 os.close(file_fd)
                 raise ValueError("input_source_not_regular_file")
-            return os.fdopen(file_fd, "r", encoding="utf-8")
+            return os.fdopen(file_fd, "rb") if binary else os.fdopen(file_fd, "r", encoding="utf-8")
         except OSError as exc:
             if exc.errno in {getattr(os, "ELOOP", 62), 40}:
                 raise ValueError("input_symlink_not_allowed") from exc
@@ -337,4 +552,4 @@ def _open_directory_source(base: Path, source_path: str):
         candidate.resolve(strict=True).relative_to(base.resolve(strict=True))
     except (FileNotFoundError, ValueError) as exc:
         raise ValueError("input_source_outside_root") from exc
-    return candidate.open("r", encoding="utf-8")
+    return candidate.open("rb") if binary else candidate.open("r", encoding="utf-8")

@@ -39,13 +39,20 @@ from .exporter import export_conversations
 from .logging_utils import configure_logging, get_logger
 from .parser import WarningRecord, conversation_id_from_value, parse_conversation, validate_conversation_element
 from .scanner import (
+    ConversationJsonTopLevelError,
+    EncryptedZipMemberError,
     InputSource,
+    InvalidConversationEncodingError,
     JsonIntegerTooLargeError,
     NonFiniteJsonNumberError,
+    SourceChangedDuringReadError,
+    ZipMemberCrcError,
+    ZipMemberNotFoundError,
+    ZipMemberReadError,
     is_legacy_conversations_source,
     is_shard_conversation_source,
+    iter_json_array_from_source,
     list_source_entries,
-    load_json_from_source,
     resolve_input,
     select_conversation_sources,
 )
@@ -303,8 +310,18 @@ def _classify_source_load_error(exc: BaseException) -> tuple[str, str]:
         return "json_integer_too_large", "json_decode"
     if isinstance(exc, NonFiniteJsonNumberError):
         return "non_finite_json_number", "json_decode"
-    if isinstance(exc, UnicodeDecodeError):
+    if isinstance(exc, (UnicodeDecodeError, InvalidConversationEncodingError)):
         return "invalid_conversation_encoding", "json_decode"
+    if isinstance(exc, EncryptedZipMemberError):
+        return "encrypted_zip_member_not_supported", "source_read"
+    if isinstance(exc, ZipMemberNotFoundError):
+        return "zip_member_not_found", "source_read"
+    if isinstance(exc, SourceChangedDuringReadError):
+        return "source_changed_during_read", "source_read"
+    if isinstance(exc, ZipMemberCrcError):
+        return "zip_member_crc_failed", "source_read"
+    if isinstance(exc, ZipMemberReadError):
+        return "zip_member_read_failed", "source_read"
     if isinstance(exc, json.JSONDecodeError):
         return "invalid_conversation_json", "json_decode"
     raw_code = str(exc).split(" ", 1)[0] if isinstance(exc, ValueError) else ""
@@ -340,9 +357,24 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     valid_count = 0
     top_level_bad = 0
     for entry in selected:
+        source_valid = 0
+        source_invalid = 0
         try:
-            data = load_json_from_source(source, entry.source_path)
-        except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, UnicodeDecodeError, OSError, ValueError) as exc:
+            for idx, item in enumerate(iter_json_array_from_source(source, entry.source_path)):
+                warning = validate_conversation_element(item, entry.source_path, idx)
+                if warning:
+                    source_invalid += 1
+                    invalid_locations.append((Path(entry.source_path).name, idx, warning.warning_type))
+                    continue
+                source_valid += 1
+                conversation_id = conversation_id_from_value(item)
+                if conversation_id is not None:
+                    ids.append(conversation_id)
+        except ConversationJsonTopLevelError as exc:
+            top_level_bad += 1
+            print(f"source {Path(entry.source_path).name} top_level {exc.top_level_type} valid 0 invalid 0")
+            continue
+        except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, InvalidConversationEncodingError, OSError, ValueError) as exc:
             top_level_bad += 1
             code, stage = _classify_source_load_error(exc)
             print(
@@ -350,22 +382,6 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                 f"valid 0 invalid 0 error_code {code} stage {stage}"
             )
             continue
-        if not isinstance(data, list):
-            top_level_bad += 1
-            print(f"source {Path(entry.source_path).name} top_level {type(data).__name__} valid 0 invalid 0")
-            continue
-        source_valid = 0
-        source_invalid = 0
-        for idx, item in enumerate(data):
-            warning = validate_conversation_element(item, entry.source_path, idx)
-            if warning:
-                source_invalid += 1
-                invalid_locations.append((Path(entry.source_path).name, idx, warning.warning_type))
-                continue
-            source_valid += 1
-            conversation_id = conversation_id_from_value(item)
-            if conversation_id is not None:
-                ids.append(conversation_id)
         valid_count += source_valid
         print(f"source {Path(entry.source_path).name} top_level list valid {source_valid} invalid {source_invalid}")
     duplicate_count = len(ids) - len(set(ids))
@@ -600,9 +616,10 @@ def run_import_pipeline(
 
         parse_started = time.perf_counter()
         for source_index, entry in enumerate(selected):
+            parsed_conversations = []
             try:
-                data = load_json_from_source(source, entry.source_path)
-            except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, UnicodeDecodeError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                source_items = iter(iter_json_array_from_source(source, entry.source_path))
+            except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, InvalidConversationEncodingError, OSError, ValueError, zipfile.BadZipFile) as exc:
                 code, stage = _classify_source_load_error(exc)
                 summary["failure_code"] = code
                 raise ImportPipelineError(
@@ -611,22 +628,36 @@ def run_import_pipeline(
                     source_identifier=f"selected_source_{source_index}",
                     run_id=run_id,
                 ) from exc
-            if not isinstance(data, list):
-                summary["failure_code"] = "conversation_json_top_level_not_list"
-                raise ImportPipelineError(
-                    "conversation_json_top_level_not_list",
-                    stage="top_level_contract",
-                    source_identifier=f"selected_source_{source_index}",
-                    run_id=run_id,
-                    detail={"top_level_type": type(data).__name__},
-                )
-            parsed_conversations = []
-            for idx, item in enumerate(data):
+            idx = 0
+            while True:
+                try:
+                    item = next(source_items)
+                except StopIteration:
+                    break
+                except ConversationJsonTopLevelError as exc:
+                    summary["failure_code"] = "conversation_json_top_level_not_list"
+                    raise ImportPipelineError(
+                        "conversation_json_top_level_not_list",
+                        stage="top_level_contract",
+                        source_identifier=f"selected_source_{source_index}",
+                        run_id=run_id,
+                        detail={"top_level_type": exc.top_level_type},
+                    ) from exc
+                except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, InvalidConversationEncodingError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                    code, stage = _classify_source_load_error(exc)
+                    summary["failure_code"] = code
+                    raise ImportPipelineError(
+                        code,
+                        stage=stage,
+                        source_identifier=f"selected_source_{source_index}",
+                        run_id=run_id,
+                    ) from exc
                 warning = validate_conversation_element(item, entry.source_path, idx)
                 if warning:
                     record_warning(conn, run_id, warning)
                     summary["warnings"] += 1
                     summary["skipped_invalid_elements"] += 1
+                    idx += 1
                     continue
                 parsed = parse_conversation(item, entry.source_path, idx)
                 record_warnings(conn, run_id, parsed.warnings)
@@ -641,6 +672,7 @@ def run_import_pipeline(
                 parsed_conversations.append(parsed)
                 if len(parsed_conversations) >= 100:
                     flush_batch(parsed_conversations)
+                idx += 1
             flush_batch(parsed_conversations)
             notify("shard_complete")
         summary["parse_and_upsert_seconds"] = _elapsed(parse_started)

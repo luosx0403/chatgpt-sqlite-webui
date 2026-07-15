@@ -456,7 +456,7 @@ tools/                             Delivery and support scripts
 
 メインデータベースは conversations、mapping nodes、import runs、warnings を保存します。message object だけが raw message JSON object を保持し、conversation と mapping-node object は正規化され、byte-for-byte 保存ではありません。入力 ZIP SHA-256 は任意で、`source_files`/`file_index` の entry SHA 列は予約済みですが現在は未設定です。CLI FTS テーブルは `message_fts` です。任意 Web 検索用の補助テーブルには `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram` と SQLite FTS5 shadow tables が含まれます。
 
-canonical DB は `PRAGMA user_version` で version 1 として管理されます。readonly CLI と Web request は migration DDL を実行しません。外部 backup を作成・検証してから `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db` を実行してください。完了前は health/API が `database_migration_required` を返します。FTS5 と Web 検索 index は任意で再構築可能です。
+canonical DB は `PRAGMA user_version` で version 2 として管理されます。readonly CLI と Web request は migration DDL を実行しません。外部 backup を作成・検証してから `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db` を実行してください。完了前は health/API が `database_migration_required` を返します。FTS5 と Web 検索 index は任意で再構築可能です。
 
 Health と `verify` は任意の `message_fts` の欠落と破損を区別します。破損時は `optional_message_fts_error` と `--rebuild-fts` の復旧ヒントを返します。一般的な malformed、locked、readonly、I/O、SQL runtime failure は能力欠落として扱わず、`database_malformed`、`database_locked`、`database_readonly`、`database_io_error`、`database_runtime_failure` を使います。
 
@@ -473,6 +473,8 @@ Health と `verify` は任意の `message_fts` の欠落と破損を区別しま
 Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では実際の browser hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS` で指定し、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES` は厳格な単一 edge proxy モデルです。未信頼 peer の forwarded header は無視し、信頼済み direct edge は client 値を上書きする必要があります。重複 Host/Forwarded、カンマ区切り chain、不正構文、`Forwarded` と `X-Forwarded-Host/Proto` の競合は拒否されます。全リクエストで Host を検証し、remote write は same-origin `Origin` が必要です。
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
+
+単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ有界なトップレベル配列の要素単位デコーダーと単一のインポートトランザクションを使用します。先頭の UTF-8 BOM は 1 個だけ許可し、重複・途中の BOM、UTF-16/32、混在または不正な UTF-8 は拒否します。会話とグラフの ID は Web の全アドレス指定と同じ 512 文字上限で、超過 ID は切り詰めず、内容を含まない warning として会話要素をスキップします。ZIP 読み取りでは暗号化、欠落、読み取り中の変更、CRC 失敗、その他の失敗を区別します。
 
 既定 message API は完全な表示本文を `display_text` 一つだけ返し、`content_text`/`render_text` を重複しません。Effective-current、pagination、around-node の意味は維持されます。
 
