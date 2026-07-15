@@ -15,6 +15,7 @@ import unittest
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest import mock
 from urllib.parse import quote
 
@@ -3329,6 +3330,42 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(job.web_index["recovered_optional_web_index"])
         self.assertEqual(web_index.call_count, 1)
 
+    def test_web_job_exposes_bounded_index_build_progress(self):
+        from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upload = base / "upload.zip"
+            upload.write_bytes(b"synthetic")
+            manager = ImportJobManager(base / "archive.db")
+            job = ImportJob("job", base / "archive.db", upload, "synthetic.zip", upload.stat().st_size)
+            observed: list[dict[str, Any]] = []
+
+            def build_index(_path, *, progress_callback, **_kwargs):
+                progress_callback("scan_normalize_messages", {
+                    "build_stage": "scan_normalize_messages",
+                    "processed": 100,
+                    "total": 250,
+                    "complete": False,
+                    "batch_size": 100,
+                })
+                observed.append(job.snapshot())
+                return {"indexed_messages": 250, "atomic_publish": True}
+
+            with mock.patch("chatgpt_export_archiver.web_jobs.run_import_pipeline", return_value={"summary": {"valid_conversations": 1}}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.connect"), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.verify_database", return_value={"ok": True}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.get_stats", return_value={"conversations": 1}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.create_web_indexes", side_effect=build_index):
+                manager._run_job(job)
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(observed[0]["stage"], "web-index")
+            self.assertEqual(observed[0]["web_index"]["status"], "building")
+            self.assertEqual(observed[0]["web_index"]["processed"], 100)
+            self.assertEqual(observed[0]["web_index"]["total"], 250)
+            self.assertEqual(job.status, "succeeded")
+            self.assertTrue(job.web_index["atomic_publish"])
+
     def test_web_job_marks_postcheck_failed_without_rollback_implication(self):
         from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 
@@ -3732,6 +3769,22 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(schema["export"]["copy_endpoint"], "/api/conversations/{conversation_id}/copy")
         self.assertIn("default false", schema["export"]["include_internal"])
         self.assertIn("bounded server-side node batches", schema["export"]["streaming"])
+        self.assertEqual(
+            schema["web_index_build"]["stages"],
+            [
+                "scan_normalize_messages",
+                "normalize_titles",
+                "build_message_trigram",
+                "build_title_trigram",
+                "write_metadata",
+                "commit_swap",
+            ],
+        )
+        self.assertIn("processed", schema["web_index_build"]["progress"])
+        self.assertIn("rolls back", schema["web_index_build"]["publication"])
+        self.assertEqual(schema["jobs"]["web_index_progress"], [
+            "status", "build_stage", "processed", "total", "complete", "batch_size",
+        ])
 
     def test_schema_field_lists_match_actual_page_contracts(self):
         td, client, _db = self.make_client()

@@ -198,6 +198,8 @@ CLI 与 Web 导出默认使用有效当前路径，并且只包含可见消息�
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
+`web-index` 会按明确且可观察的阶段扫描并规范化消息、规范化标题、在支持时构建消息/标题 trigram 索引、写入 generation metadata，最后提交。每个数据阶段都使用有界 keyset 批次，并且每条消息只解析一次。重建位于单个原子 SQLite transaction 中：提交前，reader 继续看到旧的 current 可选索引；取消、generation/metadata 失败、SQLite 中断或磁盘错误会回滚全部替换对象。这个设计会在大型重建期间占用一个 writer slot，并可能使用临时磁盘；Web import job JSON 会报告当前构建阶段和 processed/total。
+
 启动 Web UI：
 
 ```bash

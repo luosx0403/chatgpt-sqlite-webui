@@ -1152,6 +1152,184 @@ class ArchiverTests(unittest.TestCase):
                 create_web_indexes(db)
             configure.assert_called_once()
 
+    def test_web_index_scale_is_batched_observable_and_resolves_once(self):
+        from chatgpt_export_archiver import web_db as web_db_module
+        from chatgpt_export_archiver.web_db import web_index_status
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "scale.db"
+            conn = connect(db)
+            init_db(conn)
+            count = 20_000
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES (?, ?, ?)",
+                ((f"c-{index:05d}", f"Synthetic title {index}", f"h-{index}") for index in range(count)),
+            )
+            conn.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_type, content_text) VALUES (?, ?, 'user', 'text', ?)",
+                ((f"c-{index:05d}", f"n-{index:05d}", f"Synthetic searchable body {index}") for index in range(count)),
+            )
+            conn.commit()
+            conn.close()
+
+            progress: list[tuple[str, dict[str, Any]]] = []
+            resolver_calls = 0
+            real_resolver = web_db_module.recover_message_display_text
+
+            def counted_resolver(*args, **kwargs):
+                nonlocal resolver_calls
+                resolver_calls += 1
+                return real_resolver(*args, **kwargs)
+
+            tracemalloc.start()
+            try:
+                with mock.patch.object(web_db_module, "recover_message_display_text", side_effect=counted_resolver):
+                    result = create_web_indexes(
+                        db,
+                        batch_size=127,
+                        progress_callback=lambda stage, state: progress.append((stage, dict(state))),
+                    )
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertEqual(result["indexed_messages"], count)
+            self.assertEqual(result["indexed_titles"], count)
+            self.assertEqual(result["batch_size"], 127)
+            self.assertTrue(result["atomic_publish"])
+            self.assertEqual(resolver_calls, count)
+            self.assertLess(peak, 96 * 1024 * 1024)
+            self.assertEqual({stage for stage, _state in progress}, set(result["progress_stages"]))
+            for stage in result["progress_stages"]:
+                states = [state for observed, state in progress if observed == stage]
+                self.assertTrue(states, stage)
+                self.assertEqual(states[0]["processed"], 0)
+                self.assertTrue(states[-1]["complete"])
+                self.assertEqual(states[-1]["processed"], states[-1]["total"])
+            check = connect_readonly(db)
+            try:
+                status = web_index_status(check)
+            finally:
+                check.close()
+            self.assertTrue(status["web_normalized_indexed"])
+            if result["trigram_available"]:
+                self.assertTrue(status["web_normalized_trigram_indexed"])
+
+    def test_web_index_cancel_and_failure_roll_back_to_old_current_index(self):
+        from chatgpt_export_archiver import web_db as web_db_module
+        from chatgpt_export_archiver.web_db import WebIndexBuildCancelled, web_index_status
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "atomic.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES (?, ?, ?)",
+                ((f"c-{index}", f"Title {index}", f"h-{index}") for index in range(30)),
+            )
+            conn.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_type, content_text) VALUES (?, ?, 'user', 'text', ?)",
+                ((f"c-{index}", f"n-{index}", f"body {index}") for index in range(30)),
+            )
+            conn.commit()
+            conn.close()
+            create_web_indexes(db, batch_size=7)
+
+            def snapshot():
+                check = connect_readonly(db)
+                try:
+                    return {
+                        "schema": [tuple(row) for row in check.execute(
+                            "SELECT name, type, sql FROM sqlite_master WHERE name LIKE 'web_%' ORDER BY name"
+                        )],
+                        "metadata": [tuple(row) for row in check.execute(
+                            "SELECT key, value FROM web_index_metadata ORDER BY key"
+                        )],
+                        "messages": [tuple(row) for row in check.execute(
+                            "SELECT conversation_id, node_id, content_norm FROM web_message_norm ORDER BY conversation_id, node_id"
+                        )],
+                        "titles": [tuple(row) for row in check.execute(
+                            "SELECT conversation_id, title_norm FROM web_title_norm ORDER BY conversation_id"
+                        )],
+                        "status": web_index_status(check),
+                    }
+                finally:
+                    check.close()
+
+            before = snapshot()
+            stop = {"requested": False}
+
+            def request_cancel(stage, state):
+                if stage == "scan_normalize_messages" and state["processed"] >= 7:
+                    stop["requested"] = True
+
+            with self.assertRaises(WebIndexBuildCancelled):
+                create_web_indexes(
+                    db,
+                    batch_size=7,
+                    progress_callback=request_cancel,
+                    cancel_check=lambda: stop["requested"],
+                )
+            self.assertEqual(snapshot(), before)
+            self.assertTrue(snapshot()["status"]["web_normalized_indexed"])
+
+            with mock.patch.object(
+                web_db_module,
+                "_canonical_generations",
+                side_effect=sqlite3.OperationalError("disk I/O error"),
+            ):
+                with self.assertRaises(sqlite3.OperationalError):
+                    create_web_indexes(db, batch_size=7)
+            self.assertEqual(snapshot(), before)
+
+    def test_optional_capability_metadata_propagates_runtime_sqlite_errors(self):
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.sqlite_errors import is_optional_search_capability_missing
+        from chatgpt_export_archiver.web_db import web_index_status
+
+        self.assertTrue(is_optional_search_capability_missing(sqlite3.OperationalError(
+            "malformed inverted index for FTS5 table main.web_message_trigram"
+        )))
+        self.assertTrue(is_optional_search_capability_missing(sqlite3.OperationalError(
+            "malformed inverted index for FTS5 table main.web_title_trigram"
+        )))
+        self.assertFalse(is_optional_search_capability_missing(sqlite3.OperationalError(
+            "database disk image is malformed"
+        )))
+
+        class Rows(list):
+            def fetchone(self):
+                return self[0] if self else None
+
+            def fetchall(self):
+                return list(self)
+
+        class MetadataFailureConnection:
+            def execute(self, sql, params=()):
+                normalized = " ".join(sql.split()).casefold()
+                if normalized.startswith("pragma main.schema_version"):
+                    return Rows([(1,)])
+                if "from sqlite_master" in normalized:
+                    return Rows([("web_index_metadata",)])
+                if normalized.startswith('pragma table_xinfo("web_index_metadata")'):
+                    return Rows([(0, "key"), (1, "value")])
+                if "select key, value from web_index_metadata" in normalized:
+                    raise sqlite3.OperationalError("database is locked")
+                raise AssertionError(sql)
+
+        fake = MetadataFailureConnection()
+        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+            search_module._connection_capabilities(fake)
+        schema = {
+            "web_index_metadata": True,
+            "web_message_norm": False,
+            "web_title_norm": False,
+            "web_message_trigram": False,
+            "web_title_trigram": False,
+        }
+        with mock.patch("chatgpt_export_archiver.web_db.check_schema", return_value=schema):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                web_index_status(fake)
+
     def test_legacy_single_file_imports(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -2865,6 +3043,7 @@ class ArchiverTests(unittest.TestCase):
             write_zip(z, {"conversations.json": [conversation("web-index-drop-output")]})
             code, output = run_cli(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"])
             self.assertEqual(code, 0, output)
+            self.assertEqual(run_cli(["--db", str(db), "web-index"])[0], 0)
 
             def fake_shadow_drop(conn, table):
                 if table == "web_message_trigram":
@@ -2873,11 +3052,17 @@ class ArchiverTests(unittest.TestCase):
 
             with mock.patch("chatgpt_export_archiver.web_db._drop_table_with_shadows", side_effect=fake_shadow_drop):
                 code, output = run_cli(["--db", str(db), "web-index"])
-            self.assertEqual(code, 0, output)
-            self.assertIn("drop_failures_count 1", output)
-            self.assertIn("drop_failure table=web_message_trigram_data error_type=OperationalError", output)
+            self.assertEqual(code, 2, output)
+            self.assertIn("ERROR: web_index_drop_failed", output)
             self.assertNotIn(str(base), output)
             self.assertNotIn(z.name, output)
+            conn = connect_readonly(db)
+            try:
+                from chatgpt_export_archiver.web_db import web_index_status
+
+                self.assertTrue(web_index_status(conn)["web_normalized_indexed"])
+            finally:
+                conn.close()
 
     def test_core_fts_unavailable_is_downgraded_but_other_errors_raise(self):
         from chatgpt_export_archiver.db import ensure_fts

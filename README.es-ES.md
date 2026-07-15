@@ -198,6 +198,8 @@ Reconstruye los índices opcionales de búsqueda Web:
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
+`web-index` ejecuta etapas explícitas y observables para escanear/normalizar mensajes, normalizar títulos, crear trigram de mensajes/títulos cuando están disponibles, escribir generation metadata y hacer commit. Cada etapa usa lotes keyset acotados y resuelve cada mensaje una sola vez. La reconstrucción vive en una única transacción SQLite atómica: los readers siguen viendo el índice opcional current anterior hasta el commit, y una cancelación, fallo de generation/metadata, interrupción SQLite o error de disco revierte todos los objetos de reemplazo. Durante una reconstrucción grande ocupa un writer slot y puede usar disco temporal; el JSON del Web import job expone la etapa y processed/total.
+
 Arranca la Web UI:
 
 ```bash

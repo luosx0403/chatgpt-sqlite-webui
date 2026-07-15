@@ -198,6 +198,8 @@ Rebuild optional Web search indexes:
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
+`web-index` scans and normalizes messages, normalizes titles, builds message/title trigram indexes when supported, writes generation metadata, and commits in explicit observable stages. Every data stage uses bounded keyset batches and resolves each message once. The rebuild stays in one atomic SQLite transaction: readers keep seeing the previous current optional index until commit, while cancellation, generation/metadata failure, SQLite interruption, or disk error rolls back all replacement objects. This intentionally holds one writer slot and may use temporary disk for the duration of a large rebuild; Web import-job JSON exposes the current build stage and processed/total counts.
+
 Start the Web UI:
 
 ```bash

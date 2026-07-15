@@ -63,6 +63,8 @@ function assertStaticFrontendContracts() {
   const stylesSource = fs.readFileSync(path.join(webRoot, "src/styles.css"), "utf8");
   const interactionSource = fs.readFileSync(path.join(webRoot, "src/utils/interaction.ts"), "utf8");
   assert.ok(appSource.includes('web_index_recovery: t("stageWebIndexRecovery")'), "web-index-recovery import stage should use a localized label");
+  assert.ok(appSource.includes('data-testid="web-index-progress"'), "Web index processed/total progress should be visible without exposing internal field names");
+  assert.ok(appSource.includes('scan_normalize_messages: t("webIndexStageScanMessages")'), "Web index build stages should use localized labels");
   assert.ok(appSource.includes("has_internal_hits: meta.has_internal_hits"), "selected conversation merge must preserve hidden/internal search metadata after detail load");
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
@@ -684,7 +686,22 @@ async function main() {
           await route.fulfill({
             status: 200,
             contentType: "application/json",
-            body: JSON.stringify({ job_id: jobId, status: "running", stage: "import", outcome: "import_running", canonical_commit_succeeded: false, elapsed_seconds: 1.6 }),
+            body: JSON.stringify({
+              job_id: jobId,
+              status: "running",
+              stage: "web-index",
+              outcome: "canonical_commit_succeeded",
+              canonical_commit_succeeded: true,
+              elapsed_seconds: 1.6,
+              web_index: {
+                status: "building",
+                build_stage: "scan_normalize_messages",
+                processed: 100,
+                total: 250,
+                complete: false,
+                batch_size: 100,
+              },
+            }),
           });
         } else {
           const jobId = new URL(route.request().url()).pathname.split("/").pop();
@@ -699,6 +716,8 @@ async function main() {
       }
     });
     await noDbPage.getByTestId("import-start-button").click();
+    await noDbPage.getByTestId("web-index-progress").waitFor({ state: "visible", timeout: 20_000 });
+    assert.ok((await noDbPage.getByTestId("web-index-progress").textContent())?.includes("Normalizing messages · 100/250"), "Web index progress should use a localized stage label and bounded counts");
     await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-status"]')?.textContent?.includes("succeeded"), undefined, { timeout: 60_000 });
     await noDbPage.waitForTimeout(1_500);
     assert.equal(maxActiveJobPolls, 1, "import job polling must be serial even when one response exceeds the polling interval");

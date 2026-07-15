@@ -3314,23 +3314,23 @@ def _connection_capabilities(conn: sqlite3.Connection) -> dict[str, Any]:
     tables = {str(row["name"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows}
     metadata: dict[str, str] = {}
     if "web_index_metadata" in tables:
-        try:
+        metadata_columns = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+            for row in conn.execute('PRAGMA table_xinfo("web_index_metadata")')
+        }
+        if {"key", "value"}.issubset(metadata_columns):
             metadata = {
                 str(row["key"] if isinstance(row, sqlite3.Row) else row[0]):
                 str(row["value"] if isinstance(row, sqlite3.Row) else row[1])
                 for row in conn.execute("SELECT key, value FROM web_index_metadata")
             }
-        except sqlite3.Error:
-            metadata = {}
-    try:
-        # A matching generation counter is trustworthy only while the managed
-        # trigger/table contract itself is current.  Import lazily to keep the
-        # low-level database module independent from search.
-        from .db import generation_schema_contract_is_current
+    # A matching generation counter is trustworthy only while the managed
+    # trigger/table contract itself is current. Import lazily to keep the
+    # low-level database module independent from search. Runtime SQLite errors
+    # propagate instead of masquerading as an optional-index miss.
+    from .db import generation_schema_contract_is_current
 
-        generation_schema_current = generation_schema_contract_is_current(conn)
-    except (sqlite3.Error, ValueError):
-        generation_schema_current = False
+    generation_schema_current = generation_schema_contract_is_current(conn)
     result = {
         "tables": tables,
         "metadata": metadata,
@@ -3379,22 +3379,16 @@ def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
     expected_generation = parse_nonnegative_integer(expected)
     if expected_generation is None:
         return False
-    try:
-        row = conn.execute(
-            "SELECT generation FROM archive_generations WHERE name = ?",
-            (name,),
-        ).fetchone()
-    except sqlite3.Error:
-        return False
+    row = conn.execute(
+        "SELECT generation FROM archive_generations WHERE name = ?",
+        (name,),
+    ).fetchone()
     if row is None:
         return False
-    try:
-        sqlite_type = conn.execute(
-            "SELECT typeof(generation) FROM archive_generations WHERE name = ?",
-            (name,),
-        ).fetchone()
-    except sqlite3.Error:
-        return False
+    sqlite_type = conn.execute(
+        "SELECT typeof(generation) FROM archive_generations WHERE name = ?",
+        (name,),
+    ).fetchone()
     return bool(
         sqlite_type is not None
         and str(sqlite_type[0]) == "integer"

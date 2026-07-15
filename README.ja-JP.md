@@ -198,6 +198,8 @@ CLI と Web のエクスポートは、有効な現在パスと表示メッセ�
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
+`web-index` は、メッセージの走査と正規化、タイトル正規化、対応時の message/title trigram 構築、generation metadata 書き込み、commit を明示的で観測可能な段階として実行します。各データ段階は上限付き keyset batch を使い、各メッセージを一度だけ解決します。再構築は単一の atomic SQLite transaction 内で行われ、commit までは reader が以前の current 任意インデックスを参照します。cancel、generation/metadata failure、SQLite interrupt、disk error は置換オブジェクト全体を rollback します。大規模再構築中は writer slot を 1 つ保持し、一時 disk を使う場合があります。Web import job JSON は現在の build stage と processed/total を公開します。
+
 Web UI を起動します。
 
 ```bash

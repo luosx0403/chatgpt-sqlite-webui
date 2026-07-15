@@ -293,7 +293,10 @@ class ImportJobManager:
                 if job.verify.get("optional_web_index_error"):
                     self._set_stage(job, "web-index-recovery")
                     try:
-                        web_index_result = create_web_indexes(self.db_path)
+                        web_index_result = create_web_indexes(
+                            self.db_path,
+                            progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
+                        )
                         web_index_result["recovered_optional_web_index"] = True
                         conn = connect(self.db_path)
                         try:
@@ -333,7 +336,10 @@ class ImportJobManager:
             self._set_stage(job, "web-index")
             if job.web_index is None:
                 try:
-                    web_index_result = create_web_indexes(self.db_path)
+                    web_index_result = create_web_indexes(
+                        self.db_path,
+                        progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
+                    )
                     with job._lock:
                         job.web_index = web_index_result
                 except Exception as exc:
@@ -418,6 +424,11 @@ class ImportJobManager:
         with job._lock:
             job.stage = stage
             job.summary = dict(summary)
+
+    def _web_index_progress(self, job: ImportJob, stage: str, progress: dict[str, Any]) -> None:
+        with job._lock:
+            job.stage = "web-index"
+            job.web_index = {"status": "building", "build_stage": stage, **progress}
 
 
 def make_upload_path() -> tuple[Path, Path]:

@@ -39,7 +39,7 @@ def is_optional_search_capability_missing(exc: sqlite3.Error) -> bool:
     match = re.fullmatch(r"no such table:\s*(?:main\.)?([a-z_][a-z0-9_]*)", sqlite_error_message(exc))
     if match and match.group(1) in OPTIONAL_SEARCH_OBJECTS | MESSAGE_FTS_OBJECTS:
         return True
-    return is_optional_message_fts_damaged(exc)
+    return is_optional_message_fts_damaged(exc) or is_optional_web_index_damaged(exc)
 
 
 def is_optional_message_fts_damaged(exc: sqlite3.Error) -> bool:
@@ -53,6 +53,16 @@ def is_optional_message_fts_damaged(exc: sqlite3.Error) -> bool:
     return (
         "malformed inverted index for fts5 table" in message
         and re.search(r"(?:^|\.)message_fts(?:\b|_)", message) is not None
+    )
+
+
+def is_optional_web_index_damaged(exc: sqlite3.Error) -> bool:
+    """Recognize corruption explicitly attributed to a rebuildable Web FTS table."""
+
+    message = sqlite_error_message(exc)
+    return (
+        "malformed inverted index for fts5 table" in message
+        and re.search(r"(?:^|\.)(?:web_message_trigram|web_title_trigram)(?:\b|_)", message) is not None
     )
 
 

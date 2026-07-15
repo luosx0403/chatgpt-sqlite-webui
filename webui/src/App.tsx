@@ -227,6 +227,24 @@ function importStageLabel(t: (key: string) => string, stage: string): string {
   return labels[normalized] || t("stageUnknown");
 }
 
+function webIndexProgressLabel(t: (key: string) => string, progress: Record<string, unknown>): string {
+  const labels: Record<string, string> = {
+    scan_normalize_messages: t("webIndexStageScanMessages"),
+    normalize_titles: t("webIndexStageNormalizeTitles"),
+    build_message_trigram: t("webIndexStageMessageTrigram"),
+    build_title_trigram: t("webIndexStageTitleTrigram"),
+    write_metadata: t("webIndexStageMetadata"),
+    commit_swap: t("webIndexStageCommit"),
+  };
+  const stage = labels[String(progress.build_stage || "")] || t("stageWebIndex");
+  const processed = Number.isFinite(Number(progress.processed)) ? Math.max(0, Number(progress.processed)) : 0;
+  const total = Number.isFinite(Number(progress.total)) ? Math.max(0, Number(progress.total)) : 0;
+  return t("webIndexProgress")
+    .replace("{stage}", stage)
+    .replace("{processed}", String(processed))
+    .replace("{total}", String(total));
+}
+
 function importErrorLabel(t: (key: string) => string, code: string | null | undefined): string {
   const direct = new Set([
     "no_conversation_sources",
@@ -697,7 +715,9 @@ export default function App() {
                 <span>{t("jobStage")}: {importStageLabel(t, importJob.stage)}</span>
                 <span>{t("jobElapsed")}: {importJob.elapsed_seconds.toFixed(1)}s</span>
                 {importJob.summary && <span>{String(importJob.summary.valid_conversations ?? 0)} {t("conversations")}</span>}
-                {importJob.web_index && <span>{t("webIndexOk")}</span>}
+                {importJob.web_index?.status === "building" ? (
+                  <span data-testid="web-index-progress">{webIndexProgressLabel(t, importJob.web_index)}</span>
+                ) : importJob.web_index ? <span>{t("webIndexOk")}</span> : null}
                 {["queued", "running"].includes(importJob.status) && <span>{t("importProgressVolatile")}</span>}
               </div>
             )}

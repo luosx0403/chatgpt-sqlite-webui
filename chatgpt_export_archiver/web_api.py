@@ -32,6 +32,7 @@ from .utils import finite_float_or_none, safe_filename_part
 from .web_db import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
+    WEB_INDEX_BUILD_STAGES,
     WEB_INDEX_FORMAT_VERSION,
     check_schema,
     connect_readonly,
@@ -635,6 +636,15 @@ def create_api_router(
                 "copy_endpoint": "/api/conversations/{conversation_id}/copy",
                 "streaming": "export and full-conversation copy use complete canonical display text from bounded server-side node batches and never accumulate reader page payloads",
             },
+            "web_index_build": {
+                "command": "python chatgpt_archive.py web-index --db <archive.db>",
+                "stages": list(WEB_INDEX_BUILD_STAGES),
+                "progress": ["build_stage", "processed", "total", "complete", "batch_size"],
+                "bounded": "canonical messages and titles plus optional trigram rows are processed with rowid keyset batches; each message display-text candidate is resolved once",
+                "publication": "one SQLite transaction keeps the previous current optional index visible until a short commit/swap; failure or cancellation rolls back all replacement objects and metadata",
+                "cancellation": "the production builder accepts a cancellation check and also installs a SQLite VM progress handler; CLI interruption rolls back the transaction",
+                "locking": "the single atomic build transaction holds one writer slot and may use SQLite temporary disk for the duration of a large rebuild",
+            },
             "search": {
                 "endpoints": ["/api/conversations", "/api/search/messages"],
                 "parameters": ["q", "title", "exact", "exclude", "role", "source", "after", "before", "scope", "path", "match_mode", "order", "conversation_id", "count_total"],
@@ -701,6 +711,7 @@ def create_api_router(
                 "statuses": ["queued", "running", "succeeded", "failed", "postcheck_failed"],
                 "outcomes": ["queued", "import_running", "import_job_start_failed", "input_preflight_failed", "source_scan_failed", "source_read_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
                 "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index"],
+                "web_index_progress": ["status", "build_stage", "processed", "total", "complete", "batch_size"],
                 "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
                 "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"]},
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
