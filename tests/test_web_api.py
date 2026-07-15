@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
 import zipfile
 from datetime import datetime, timezone
@@ -853,8 +854,7 @@ class WebApiTests(unittest.TestCase):
                         conn.close()
                     legacy_items = [item for item in page["items"] if item["node_id"].startswith("legacy-")]
                     self.assertEqual(len(legacy_items), 30)
-                    expected_calls = 33 if force_sql and not include_internal else 34
-                    self.assertEqual(calls["count"], expected_calls)
+                    self.assertEqual(calls["count"], 34 if include_internal else 33)
 
     def test_long_message_response_has_one_full_text_copy(self):
         td, client, db = self.make_client()
@@ -881,11 +881,24 @@ class WebApiTests(unittest.TestCase):
         response = client.get("/api/conversations/web-1/messages?path=all&include_internal=true&limit=20")
         page = response.json()
         by_id = {item["node_id"]: item for item in page["items"]}
-        self.assertEqual(by_id["u1"]["display_text"], canonical)
-        self.assertEqual(by_id["a1"]["display_text"], recovered)
+        returned = by_id["u1"]["display_text_returned_chars"]
+        self.assertLessEqual(returned, 65_536)
+        self.assertEqual(by_id["u1"]["display_text"], canonical[:returned])
+        self.assertTrue(by_id["u1"]["display_text_truncated"])
+        self.assertEqual(by_id["u1"]["display_text_total_chars"], len(canonical))
+        self.assertEqual(by_id["u1"]["display_text_returned_chars"], returned)
+        recovered_returned = by_id["a1"]["display_text_returned_chars"]
+        self.assertEqual(by_id["a1"]["display_text"], recovered[:recovered_returned])
+        self.assertTrue(by_id["a1"]["display_text_truncated"])
         self.assertNotIn("content_text", by_id["u1"])
         self.assertNotIn("render_text", by_id["u1"])
         self.assertLess(len(response.content), 260_000)
+        complete = client.get(f"/api/conversations/web-1/messages/u1/display?offset={returned}&limit=65536").json()
+        self.assertEqual(complete["display_text"], canonical[returned : returned + 65_536])
+        self.assertEqual(complete["has_more"], returned + 65_536 < len(canonical))
+        recovered_complete = client.get("/api/conversations/web-1/messages/a1/display?offset=0&limit=65536").json()
+        self.assertEqual(recovered_complete["display_text"], recovered[:65_536])
+        self.assertTrue(recovered_complete["has_more"])
 
     def test_raw_resolver_decode_counts_scale_once_per_row(self):
         from chatgpt_export_archiver import search as search_module
@@ -1018,8 +1031,8 @@ class WebApiTests(unittest.TestCase):
         self.assertLessEqual(len(item["raw_preview"]), 20_001)
         self.assertTrue(item["raw_preview_truncated"])
         normalized_sql = [re.sub(r"\s+", "", sql).lower() for sql in statements]
-        self.assertTrue(any("substr(n.raw_message_json,1,200001)" in sql for sql in normalized_sql))
-        self.assertFalse(any("selectn.raw_message_json" in sql for sql in normalized_sql))
+        self.assertTrue(any("substr(coalesce(raw_message_json,''),1," in sql for sql in normalized_sql))
+        self.assertFalse(any("selectraw_message_json" in sql for sql in normalized_sql))
 
     def test_full_raw_endpoint_is_explicit(self):
         td, client, _db = self.make_client()
@@ -1813,6 +1826,133 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(item["highlight_ranges_truncated"])
         hits = client.get(f"/api/search/messages?q={query}&conversation_id=highlight-cap&path=current").json()
         self.assertEqual(hits["total"], 1)
+
+    def test_reader_without_positive_text_never_allocates_utf16_highlight_spans(self):
+        from chatgpt_export_archiver import search as search_module
+
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        with mock.patch.object(
+            search_module,
+            "_normalized_with_utf16_spans",
+            side_effect=AssertionError("empty/filter/title reader normalized highlight text"),
+        ):
+            for query in (
+                "",
+                "?role=user",
+                "?title=Web%20One",
+                "?q=title%3AWeb",
+                "?q=role%3Auser",
+            ):
+                response = client.get(f"/api/conversations/web-1/messages{query}")
+                self.assertEqual(response.status_code, 200, query)
+                self.assertFalse(any(item["highlight_ranges"] for item in response.json()["items"]))
+
+    def test_reader_page_budgets_and_display_chunk_endpoint_are_bounded(self):
+        from chatgpt_export_archiver.db import connect, init_db
+        from chatgpt_export_archiver.search import get_messages
+
+        env = {
+            "CHATGPT_ARCHIVE_READER_MESSAGE_TEXT_CHARS": "8192",
+            "CHATGPT_ARCHIVE_READER_PAGE_TEXT_CHARS": "32768",
+            "CHATGPT_ARCHIVE_READER_PAGE_RAW_PREVIEW_CHARS": "4096",
+            "CHATGPT_ARCHIVE_READER_PAGE_RAW_RESOLVER_CHARS": "8192",
+            "CHATGPT_ARCHIVE_READER_PAGE_ESTIMATED_BYTES": "1048576",
+            "CHATGPT_ARCHIVE_READER_PAGE_HIGHLIGHT_CHARS": "4096",
+            "CHATGPT_ARCHIVE_READER_DISPLAY_CHUNK_CHARS": "4096",
+        }
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, env, clear=False):
+            base = Path(td)
+            db = base / "budget.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES ('budget', 'Budget', 'h')"
+            )
+            long_text = "🔥cafe\u0301" + ("x" * 20_000) + " tail-hit"
+            conn.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, message_id, role, content_text) VALUES ('budget', ?, ?, 'user', ?)",
+                ((f"n-{index:03d}", f"m-{index:03d}", long_text) for index in range(300)),
+            )
+            conn.execute(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, message_id, role, content_text, raw_message_json) VALUES ('budget', 'raw-large', 'raw-message', 'assistant', '', ?)",
+                ("{" + ("x" * 1_048_576) + "}",),
+            )
+            conn.commit()
+            response_sizes: dict[int, int] = {}
+            peak_bytes: dict[int, int] = {}
+            for requested_limit in (1, 30, 100, 300):
+                tracemalloc.start()
+                bounded_page = get_messages(
+                    conn,
+                    "budget",
+                    path="all",
+                    limit=requested_limit,
+                    offset=0,
+                    include_internal=True,
+                )
+                _, peak_bytes[requested_limit] = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+                encoded = json.dumps(bounded_page, ensure_ascii=False).encode("utf-8")
+                response_sizes[requested_limit] = len(encoded)
+                self.assertLessEqual(sum(len(item["display_text"]) for item in bounded_page["items"]), 32768)
+                self.assertLessEqual(sum(len(item["raw_preview"]) for item in bounded_page["items"]), 4096)
+                self.assertLessEqual(len(encoded), 1_200_000)
+            self.assertLess(peak_bytes[300], 12_000_000)
+            self.assertLess(response_sizes[300], response_sizes[1] * 350)
+            statements: list[str] = []
+            conn.set_trace_callback(statements.append)
+            page = get_messages(
+                conn,
+                "budget",
+                path="all",
+                limit=300,
+                offset=0,
+                highlight_query="tail-hit",
+                include_internal=True,
+            )
+            conn.set_trace_callback(None)
+            self.assertLessEqual(sum(len(item["display_text"]) for item in page["items"]), 32768)
+            self.assertLessEqual(sum(len(item["raw_preview"]) for item in page["items"]), 4096)
+            self.assertTrue(page["page_text_budget_exhausted"])
+            self.assertLessEqual(page["response_budget_estimated"], page["response_budget_limit"])
+            self.assertTrue(all(item["display_text_truncated"] for item in page["items"]))
+            self.assertTrue(all(item["display_text_total_chars"] == len(long_text) for item in page["items"]))
+            self.assertTrue(page["items"][0]["highlight_truncated"])
+            self.assertEqual(page["items"][0]["highlight_ranges"], [])
+            self.assertTrue(any("substr(COALESCE(content_text" in sql for sql in statements))
+            self.assertFalse(any(re.search(r"SELECT\s+content_text\s*,\s*raw_message_json", sql, re.I) for sql in statements))
+            raw_page = get_messages(
+                conn,
+                "budget",
+                path="all",
+                limit=1,
+                offset=300,
+                include_internal=True,
+            )
+            self.assertEqual(raw_page["items"][0]["node_id"], "raw-large")
+            self.assertTrue(raw_page["items"][0]["raw_preview_truncated"])
+            self.assertTrue(raw_page["items"][0]["display_text_truncated"])
+            conn.close()
+
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            self.addCleanup(client.close)
+            schema = client.get("/api/schema").json()
+            self.assertEqual(schema["messages"]["budgets"]["display_chunk_chars"], 4096)
+            first = client.get("/api/conversations/budget/messages/n-000/display?offset=0&limit=4096")
+            self.assertEqual(first.status_code, 200)
+            first_json = first.json()
+            self.assertEqual(first_json["returned_chars"], 4096)
+            self.assertTrue(first_json["has_more"])
+            second = client.get(
+                f"/api/conversations/budget/messages/n-000/display?offset={first_json['next_offset']}&limit=4096"
+            ).json()
+            self.assertEqual(second["offset"], 4096)
+            self.assertNotIn("raw_message_json", first.text)
+            raw = client.get("/api/conversations/budget/messages/raw-large/display?offset=0&limit=4096").json()
+            self.assertTrue(raw["resolver_input_truncated"])
+            self.assertFalse(raw["total_chars_exact"])
+            self.assertNotIn("x" * 1000, json.dumps(raw))
 
     def test_whitespace_collapsed_phrase_highlights_and_snippets(self):
         td = tempfile.TemporaryDirectory()
@@ -2906,9 +3046,13 @@ class WebApiTests(unittest.TestCase):
             page = get_messages(conn, "paged-conversation", path="all", limit=5, offset=10)
             self.assertEqual(page["total"], 501)
             self.assertEqual(len(page["items"]), 5)
-            node_selects = [stmt for stmt in statements if "FROM conversation_nodes" in stmt and "raw_message_json" in stmt]
-            self.assertTrue(any("LIMIT 5 OFFSET 10" in stmt for stmt in node_selects))
-            self.assertFalse(any("raw_message_json" in stmt and "LIMIT" not in stmt and "COUNT(" not in stmt for stmt in node_selects))
+            metadata_selects = [stmt for stmt in statements if "FROM conversation_nodes" in stmt and "raw_message_json" not in stmt]
+            hydration_selects = [stmt for stmt in statements if "FROM conversation_nodes" in stmt and "raw_message_json" in stmt]
+            self.assertTrue(any("LIMIT 5 OFFSET 10" in stmt for stmt in metadata_selects))
+            page_hydration = [stmt for stmt in hydration_selects if "node_id IN (" in stmt]
+            self.assertEqual(len(page_hydration), 1)
+            self.assertEqual(page_hydration[0].count("'n0"), 5)
+            self.assertFalse(any("SELECT raw_message_json" in stmt for stmt in hydration_selects))
         finally:
             conn.close()
 

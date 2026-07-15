@@ -240,6 +240,12 @@ const en = {
   helpFilterOnly: "Filter-only and exclude-only searches can select conversations. Message hits and reader highlights require a positive message-text term; role, source, and date filters do not create hit navigation by themselves.",
   queryLengthLimit: "Search input is limited to 500 characters; shorten the query or use advanced filters.",
   highlightRangesTruncated: "This message has more matches than the highlight preview can mark; hit navigation still includes the message.",
+  displayTextTruncated: "This message body is truncated by the reader resource budget.",
+  loadDisplayText: "Load full message body",
+  loadMoreDisplayText: "Load more message body",
+  displayTextLoading: "Loading message body...",
+  displayTextFailed: "The complete message body could not be loaded.",
+  activeHighlightUnavailable: "The active hit is outside the returned or scanned preview; load more text to locate it.",
 } as const;
 
 export type TranslationKey = keyof typeof en;
@@ -485,6 +491,12 @@ const zhHans: Dict = {
   helpFilterOnly: "仅筛选或仅排除可以筛选对话；只有正向消息正文词才会产生消息命中和 reader 高亮，角色、来源或日期本身不会创建命中导航。",
   queryLengthLimit: "搜索输入最多 500 个字符；请缩短查询或使用高级筛选。",
   highlightRangesTruncated: "这条消息的命中超过高亮预览上限；命中导航仍会包含该消息。",
+  displayTextTruncated: "这条消息正文已按 reader 资源预算截断。",
+  loadDisplayText: "加载完整消息正文",
+  loadMoreDisplayText: "继续加载消息正文",
+  displayTextLoading: "正在加载消息正文…",
+  displayTextFailed: "无法加载完整消息正文。",
+  activeHighlightUnavailable: "当前命中位于已返回或已扫描预览之外；请加载更多正文以定位。",
 };
 
 const zhHant: Dict = {
@@ -727,6 +739,12 @@ const zhHant: Dict = {
   helpFilterOnly: "僅篩選或僅排除可以篩選對話；只有正向訊息正文詞才會產生訊息命中與 reader 醒目提示，角色、來源或日期本身不會建立命中導覽。",
   queryLengthLimit: "搜尋輸入最多 500 個字元；請縮短查詢或使用進階篩選。",
   highlightRangesTruncated: "此訊息的命中超過醒目提示預覽上限；命中導覽仍會包含該訊息。",
+  displayTextTruncated: "此訊息正文已依 reader 資源預算截斷。",
+  loadDisplayText: "載入完整訊息正文",
+  loadMoreDisplayText: "繼續載入訊息正文",
+  displayTextLoading: "正在載入訊息正文…",
+  displayTextFailed: "無法載入完整訊息正文。",
+  activeHighlightUnavailable: "目前命中位於已回傳或已掃描預覽之外；請載入更多正文以定位。",
 };
 
 const ja: Dict = {

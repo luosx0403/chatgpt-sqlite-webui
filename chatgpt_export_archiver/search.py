@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import re
 import json
+import os
 import sqlite3
 import threading
 import unicodedata
+from array import array
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -30,6 +32,56 @@ MAX_QUERY_LENGTH = 500
 MAX_API_LIMIT = 100
 MAX_MESSAGE_LIMIT = 300
 MAX_AROUND_NODE_ROWS = 8000
+HIGHLIGHT_TERM_LIMIT = 10
+HIGHLIGHT_RANGE_LIMIT = 50
+HIGHLIGHT_MESSAGE_SCAN_CHARS = 100_000
+READER_MIN_TEXT_HYDRATION_CHARS = 4096
+
+
+@dataclass(frozen=True)
+class ReaderBudget:
+    message_display_chars: int = 65_536
+    page_display_chars: int = 524_288
+    page_raw_preview_chars: int = 65_536
+    page_raw_resolver_chars: int = 524_288
+    page_estimated_serialized_bytes: int = 2_097_152
+    page_highlight_scan_chars: int = 262_144
+    display_chunk_chars: int = 65_536
+
+
+_READER_BUDGET_ENV = {
+    "message_display_chars": "CHATGPT_ARCHIVE_READER_MESSAGE_TEXT_CHARS",
+    "page_display_chars": "CHATGPT_ARCHIVE_READER_PAGE_TEXT_CHARS",
+    "page_raw_preview_chars": "CHATGPT_ARCHIVE_READER_PAGE_RAW_PREVIEW_CHARS",
+    "page_raw_resolver_chars": "CHATGPT_ARCHIVE_READER_PAGE_RAW_RESOLVER_CHARS",
+    "page_estimated_serialized_bytes": "CHATGPT_ARCHIVE_READER_PAGE_ESTIMATED_BYTES",
+    "page_highlight_scan_chars": "CHATGPT_ARCHIVE_READER_PAGE_HIGHLIGHT_CHARS",
+    "display_chunk_chars": "CHATGPT_ARCHIVE_READER_DISPLAY_CHUNK_CHARS",
+}
+
+
+def reader_budget(environ: Mapping[str, str] | None = None) -> ReaderBudget:
+    source = os.environ if environ is None else environ
+    defaults = ReaderBudget()
+    values: dict[str, int] = {}
+    for field_name, env_name in _READER_BUDGET_ENV.items():
+        default = int(getattr(defaults, field_name))
+        raw = source.get(env_name)
+        try:
+            parsed = int(raw) if raw is not None else default
+        except (TypeError, ValueError):
+            parsed = default
+        values[field_name] = parsed if 1_024 <= parsed <= 64 * 1024 * 1024 else default
+    values["message_display_chars"] = min(values["message_display_chars"], values["page_display_chars"])
+    values["display_chunk_chars"] = min(values["display_chunk_chars"], 1_048_576)
+    values["page_display_chars"] = min(
+        values["page_display_chars"], values["page_estimated_serialized_bytes"] // 8
+    )
+    values["page_raw_preview_chars"] = min(
+        values["page_raw_preview_chars"], values["page_estimated_serialized_bytes"] // 32
+    )
+    values["message_display_chars"] = min(values["message_display_chars"], values["page_display_chars"])
+    return ReaderBudget(**values)
 _ALLOWED_ROLE_MODIFIER_VALUES = frozenset({"", "user", "assistant", "tool", "system", "developer", "tool/system", "tool_system"})
 _INTERNAL_ROLE_VALUES = frozenset({"system", "developer", "tool", "tool/system"})
 _API_STRING_MAX_LENGTHS = {
@@ -734,76 +786,32 @@ def get_messages(
     _ensure_search_functions(conn)
     limit = _bounded_limit(limit, MAX_MESSAGE_LIMIT)
     offset = max(0, offset)
+    budget = reader_budget()
     if around_node_id:
-        row_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM conversation_nodes WHERE conversation_id = ?",
-            (conversation_id,),
-        ).fetchone()["c"]
-        if row_count > MAX_AROUND_NODE_ROWS:
-            return _get_messages_around_node_sql(conn, conversation_id, path, limit, offset, highlight_query, highlight_parsed, match_mode, around_node_id, include_internal=include_internal)
-        rows = _conversation_rows(conn, conversation_id)
-        conversation = get_conversation(conn, conversation_id)
-        current_collection = resolve_effective_current_collection(
-            conversation.get("current_node") if conversation else None,
-            rows,
-        )
-        effective_ids = set(current_collection.node_ids)
-        ordered = _order_nodes_for_display(rows, path, conversation.get("current_node") if conversation else None)
-        target_found = any(str(row["node_id"]) == around_node_id for row in rows)
-        target_in_effective_collection = around_node_id in effective_ids
-        target_in_requested_collection = any(str(row["node_id"]) == around_node_id for row in ordered)
-        parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
-        conversation_excluded = _conversation_has_excluded_in_scope(conn, parsed, conversation_id)
-        total = len(ordered)
-        resolved_fields = _resolved_fields_by_node(ordered)
-        visibility_counts = _message_visibility_counts(ordered, resolved_fields)
-        current_path_fallback_to_all = _current_path_fallback_to_all_from_counts(conversation) if path == "current" else False
-        if not include_internal:
-            ordered = [
-                row for row in ordered
-                if not resolved_fields[str(row["node_id"])]["is_empty_mapping_node"]
-                and not resolved_fields[str(row["node_id"])]["is_internal"]
-            ]
-            total = len(ordered)
-        target_visible = any(str(row["node_id"]) == around_node_id for row in ordered)
-        index = next((idx for idx, row in enumerate(ordered) if row["node_id"] == around_node_id), None)
-        if index is not None:
-            offset = max(0, min(index, max(0, total - limit)))
-        else:
-            offset = 0
-        window = ordered[offset : offset + limit]
-        return _page_payload(
-            _message_page_items(
-                window,
-                parsed,
-                conversation,
-                path,
-                effective_ids,
-                conversation_excluded,
-                current_path_fallback_to_all,
-                resolved_fields,
-            ),
-            total,
+        return _get_messages_around_node_sql(
+            conn,
+            conversation_id,
+            path,
             limit,
             offset,
-            extra={
-                **visibility_counts,
-                **_path_metadata_extra(path, current_path_fallback_to_all, conversation),
-                "around_target_found": target_found,
-                "around_target_in_effective_collection": target_in_effective_collection,
-                "around_target_in_requested_collection": target_in_requested_collection,
-                "around_target_visible": target_visible,
-                "around_target_applied": index is not None,
-            },
+            highlight_query,
+            highlight_parsed,
+            match_mode,
+            around_node_id,
+            include_internal=include_internal,
+            budget=budget,
         )
     conversation = get_conversation(conn, conversation_id)
     current_path_fallback_to_all = _current_path_fallback_to_all_from_counts(conversation) if path == "current" else False
-    rows, total = _paged_conversation_rows(conn, conversation_id, path, limit, offset, include_internal=include_internal)
+    rows, total = _paged_conversation_rows(
+        conn, conversation_id, path, limit, offset, include_internal=include_internal, budget=budget
+    )
+
     effective_ids = _effective_node_ids_for_rows(conn, conversation_id, rows)
     parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
     conversation_excluded = _conversation_has_excluded_in_scope(conn, parsed, conversation_id)
-    return _page_payload(
-        _message_page_items(
+    budget_state: dict[str, Any] = {}
+    items = _message_page_items(
             rows,
             parsed,
             conversation,
@@ -811,17 +819,94 @@ def get_messages(
             effective_ids,
             conversation_excluded,
             current_path_fallback_to_all,
-        ),
+            budget=budget,
+            budget_state=budget_state,
+        )
+    return _page_payload(
+        items,
         total,
         limit,
         offset,
-        extra={**_message_visibility_counts_for_path(conn, conversation_id, path), **_path_metadata_extra(path, current_path_fallback_to_all, conversation)},
+        extra={
+            **_message_visibility_counts_for_path(conn, conversation_id, path),
+            **_path_metadata_extra(path, current_path_fallback_to_all, conversation),
+            **budget_state,
+        },
     )
 
 
+def get_message_display_chunk(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    node_id: str,
+    *,
+    offset: int,
+    limit: int,
+) -> dict[str, Any] | None:
+    """Return a bounded display-text chunk without exposing raw JSON."""
+
+    budget = reader_budget()
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), budget.display_chunk_chars))
+    row = conn.execute(
+        """
+        SELECT length(COALESCE(content_text, '')) AS content_total,
+               substr(COALESCE(content_text, ''), ?, ?) AS content_chunk,
+               substr(COALESCE(content_text, ''), 1, 64) AS content_prefix,
+               length(COALESCE(raw_message_json, '')) AS raw_total,
+               substr(COALESCE(raw_message_json, ''), 1, 200001) AS raw_bounded
+        FROM conversation_nodes
+        WHERE conversation_id = ? AND node_id = ?
+        """,
+        (offset + 1, limit + 1, conversation_id, node_id),
+    ).fetchone()
+    if row is None:
+        return None
+    content_total = int(row["content_total"] or 0)
+    content_prefix = str(row["content_prefix"] or "")
+    raw_total = int(row["raw_total"] or 0)
+    raw_bounded = str(row["raw_bounded"] or "")
+    resolver_input_truncated = raw_total > 200_000
+    if content_total and not _is_placeholder_text(content_prefix):
+        value = str(row["content_chunk"] or "")
+        chunk = value[:limit]
+        total_chars = content_total
+        total_exact = True
+        source = "canonical"
+    else:
+        canonical = str(row["content_chunk"] or "") if offset == 0 else content_prefix
+        recovered = recover_message_display_text(
+            canonical,
+            raw_bounded[:200_000] if not resolver_input_truncated else "",
+        )
+        total_chars = len(recovered)
+        total_exact = not resolver_input_truncated
+        chunk = recovered[offset : offset + limit]
+        source = "raw_fallback" if recovered != canonical else "canonical_placeholder"
+    return {
+        "conversation_id": conversation_id,
+        "node_id": node_id,
+        "display_text": chunk,
+        "offset": offset,
+        "returned_chars": len(chunk),
+        "total_chars": total_chars,
+        "total_chars_exact": total_exact,
+        "has_more": offset + len(chunk) < total_chars,
+        "next_offset": offset + len(chunk) if offset + len(chunk) < total_chars else None,
+        "max_chunk_chars": budget.display_chunk_chars,
+        "resolver_input_truncated": resolver_input_truncated,
+        "source": source,
+    }
+
+
 _MESSAGE_SIMPLE_COLUMNS = (
-    "node_id", "parent_node_id", "children_json", "message_id", "role", "author_name",
+    "node_id", "parent_node_id", "message_id", "role", "author_name",
     "create_time", "update_time", "content_type", "content_text", "content_hash", "is_on_current_path",
+)
+
+_READER_METADATA_COLUMNS = (
+    "node_id", "parent_node_id", "message_id", "role", "author_name",
+    "create_time", "update_time", "content_type", "content_hash", "is_on_current_path",
 )
 
 
@@ -834,6 +919,57 @@ def _message_select_columns(alias: str = "") -> str:
         ]
     )
     return ", ".join(columns)
+
+
+def _reader_metadata_select_columns(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return ", ".join(f"{prefix}{name}" for name in _READER_METADATA_COLUMNS)
+
+
+def _hydrate_reader_rows(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    rows: Sequence[sqlite3.Row],
+    budget: ReaderBudget,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    output = [dict(row) for row in rows]
+    count = len(output)
+    display_limit = max(
+        1,
+        min(
+            budget.message_display_chars,
+            max(READER_MIN_TEXT_HYDRATION_CHARS, budget.page_display_chars // count),
+        ),
+    )
+    raw_limit = max(1, min(200_000, budget.page_raw_resolver_chars // count))
+    node_ids = [str(row["node_id"]) for row in output]
+    placeholders = ",".join("?" for _ in node_ids)
+    text_rows = conn.execute(
+        f"""
+        SELECT node_id,
+               length(COALESCE(content_text, '')) AS content_text_total_chars,
+               substr(COALESCE(content_text, ''), 1, ?) AS content_text,
+               length(COALESCE(raw_message_json, '')) AS raw_message_total_chars,
+               substr(COALESCE(raw_message_json, ''), 1, ?) AS raw_message_json
+        FROM conversation_nodes
+        WHERE conversation_id = ? AND node_id IN ({placeholders})
+        """,
+        [display_limit + 1, raw_limit + 1, conversation_id, *node_ids],
+    ).fetchall()
+    by_id = {str(row["node_id"]): row for row in text_rows}
+    for row in output:
+        text_row = by_id[str(row["node_id"])]
+        content = str(text_row["content_text"] or "")
+        raw = str(text_row["raw_message_json"] or "")
+        row["content_text"] = content[:display_limit]
+        row["content_text_total_chars"] = int(text_row["content_text_total_chars"] or 0)
+        row["content_text_source_truncated"] = len(content) > display_limit
+        row["raw_message_json"] = raw[:raw_limit]
+        row["raw_message_total_chars"] = int(text_row["raw_message_total_chars"] or 0)
+        row["raw_message_source_truncated"] = len(raw) > raw_limit
+    return output
 
 
 def _conversation_rows(conn: sqlite3.Connection, conversation_id: str) -> list[sqlite3.Row]:
@@ -879,6 +1015,7 @@ def _get_messages_around_node_sql(
     match_mode: str,
     around_node_id: str,
     include_internal: bool = True,
+    budget: ReaderBudget | None = None,
 ) -> dict[str, Any]:
     """Use SQL display-order lookup instead of reading all rows for around_node_id."""
     parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
@@ -890,7 +1027,16 @@ def _get_messages_around_node_sql(
     else:
         offset = 0
     current_path_fallback_to_all = _current_path_fallback_to_all_from_counts(conversation) if path == "current" else False
-    rows, page_total = _paged_conversation_rows(conn, conversation_id, path, limit, offset, include_internal=include_internal)
+    budget = budget or reader_budget()
+    rows, page_total = _paged_conversation_rows(
+        conn,
+        conversation_id,
+        path,
+        limit,
+        offset,
+        include_internal=include_internal,
+        budget=budget,
+    )
     effective_ids = _effective_node_ids_for_rows(conn, conversation_id, rows)
     total = page_total
     visibility_counts = _message_visibility_counts_for_path(conn, conversation_id, path)
@@ -902,8 +1048,8 @@ def _get_messages_around_node_sql(
         include_internal=include_internal,
         applied=index is not None,
     )
-    return _page_payload(
-        _message_page_items(
+    budget_state: dict[str, Any] = {}
+    items = _message_page_items(
             rows,
             parsed,
             conversation,
@@ -911,7 +1057,11 @@ def _get_messages_around_node_sql(
             effective_ids,
             conversation_excluded,
             current_path_fallback_to_all,
-        ),
+            budget=budget,
+            budget_state=budget_state,
+        )
+    return _page_payload(
+        items,
         total,
         limit,
         offset,
@@ -919,6 +1069,7 @@ def _get_messages_around_node_sql(
             **visibility_counts,
             **_path_metadata_extra(path, current_path_fallback_to_all, conversation),
             **around_metadata,
+            **budget_state,
         },
     )
 
@@ -1059,7 +1210,9 @@ def _paged_conversation_rows(
     offset: int,
     *,
     include_internal: bool = True,
-) -> tuple[list[sqlite3.Row], int]:
+    budget: ReaderBudget | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    budget = budget or reader_budget()
     ensure_effective_current_views(conn, [conversation_id])
     visible_clause = "" if include_internal else f" AND {_sql_visible_message_condition('conversation_nodes')}"
     if path == "all":
@@ -1069,7 +1222,7 @@ def _paged_conversation_rows(
         ).fetchone()["c"]
         rows = conn.execute(
             f"""
-            SELECT {_message_select_columns()}
+            SELECT {_reader_metadata_select_columns()}
             FROM conversation_nodes
             WHERE conversation_id = ?{visible_clause}
             ORDER BY create_time IS NULL,
@@ -1079,7 +1232,7 @@ def _paged_conversation_rows(
             """,
             (conversation_id, limit, offset),
         ).fetchall()
-        return rows, total
+        return _hydrate_reader_rows(conn, conversation_id, rows, budget), total
 
     output_filter = "" if include_internal else f"AND {_sql_visible_message_condition('n')}"
     total = conn.execute(
@@ -1094,7 +1247,7 @@ def _paged_conversation_rows(
     ).fetchone()["c"]
     rows = conn.execute(
         f"""
-        SELECT {_message_select_columns('n')}
+        SELECT {_reader_metadata_select_columns('n')}
         FROM conversation_nodes n
         JOIN effective_current_nodes ec
           ON ec.conversation_id = n.conversation_id AND ec.node_id = n.node_id
@@ -1108,7 +1261,7 @@ def _paged_conversation_rows(
         """,
         (conversation_id, limit, offset),
     ).fetchall()
-    return rows, int(total or 0)
+    return _hydrate_reader_rows(conn, conversation_id, rows, budget), int(total or 0)
 
 
 def _page_collection_index(
@@ -2466,7 +2619,7 @@ def _resolved_fields_by_node(rows: Sequence[sqlite3.Row]) -> dict[str, dict[str,
 
 
 def _message_page_items(
-    rows: Sequence[sqlite3.Row],
+    rows: Sequence[Mapping[str, Any]],
     parsed: ParsedQuery,
     conversation: Mapping[str, Any] | None,
     path: str,
@@ -2474,14 +2627,35 @@ def _message_page_items(
     conversation_excluded: bool,
     current_path_fallback_to_all: bool,
     resolved_fields: dict[str, dict[str, Any]] | None = None,
+    budget: ReaderBudget | None = None,
+    budget_state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    resolved = resolved_fields or _resolved_fields_by_node(rows)
+    budget = budget or reader_budget()
+    state = budget_state if budget_state is not None else {}
+    resolved = resolved_fields or {}
     highlight_terms_for_query = _highlight_terms(parsed)
     has_positive_text = bool(parsed.terms or parsed.phrases or parsed.required_phrases)
     items: list[dict[str, Any]] = []
+    display_remaining = budget.page_display_chars
+    preview_remaining = budget.page_raw_preview_chars
+    highlight_remaining = budget.page_highlight_scan_chars
+    estimated_bytes = 0
     for row in rows:
         node_id = str(row["node_id"])
-        fields = resolved[node_id]
+        fields = dict(resolved.get(node_id) or _message_display_fields(row, budget.message_display_chars))
+        display_text = str(fields["display_text"] or "")
+        returned_display = display_text[:display_remaining]
+        if len(returned_display) < len(display_text):
+            fields["display_text_truncated"] = True
+        fields["display_text"] = returned_display
+        fields["display_text_returned_chars"] = len(returned_display)
+        display_remaining -= len(returned_display)
+        raw_preview = str(fields["raw_preview"] or "")
+        returned_preview = raw_preview[:preview_remaining]
+        if len(returned_preview) < len(raw_preview):
+            fields["raw_preview_truncated"] = True
+        fields["raw_preview"] = returned_preview
+        preview_remaining -= len(returned_preview)
         effective_visible = node_id in effective_ids
         terms = []
         if (
@@ -2493,10 +2667,20 @@ def _message_page_items(
                 parsed,
                 path,
                 effective_visible,
-                display_text=fields["display_text"],
+                display_text=returned_display,
             )
         ):
             terms = highlight_terms_for_query
+        scan_limit = min(len(returned_display), HIGHLIGHT_MESSAGE_SCAN_CHARS, highlight_remaining)
+        message_highlights, highlight_meta = _highlight_ranges_with_meta(
+            returned_display,
+            terms,
+            max_chars=scan_limit,
+        )
+        highlight_remaining -= int(highlight_meta["highlight_scanned_chars"])
+        if has_positive_text and fields.get("display_text_truncated"):
+            highlight_meta["highlight_truncated"] = True
+        estimated_bytes += len(returned_display.encode("utf-8")) + len(returned_preview.encode("utf-8")) + 512
         items.append(
             _message_payload(
                 row,
@@ -2504,25 +2688,46 @@ def _message_page_items(
                 current_path_fallback_to_all=current_path_fallback_to_all,
                 effective_visible_in_current_view=effective_visible,
                 fields=fields,
+                message_highlights=message_highlights,
+                highlight_meta=highlight_meta,
             )
         )
+    state.update(
+        {
+            "page_text_budget_exhausted": bool(
+                any(item.get("display_text_truncated") for item in items)
+                and display_remaining < budget.message_display_chars
+            ),
+            "page_preview_budget_exhausted": bool(
+                any(item.get("raw_preview_truncated") for item in items)
+                and preview_remaining < budget.page_raw_preview_chars
+            ),
+            "page_highlight_budget_exhausted": highlight_remaining == 0 and has_positive_text,
+            "response_budget_estimated": estimated_bytes,
+            "response_budget_limit": budget.page_estimated_serialized_bytes,
+            "response_budget_estimate_exhausted": estimated_bytes >= budget.page_estimated_serialized_bytes,
+        }
+    )
     return items
 
 
 def _message_payload(
-    row: sqlite3.Row,
-    terms: list[str],
+    row: Mapping[str, Any],
+    terms: list[tuple[str, str]],
     *,
     current_path_fallback_to_all: bool = False,
     effective_visible_in_current_view: bool | None = None,
     fields: dict[str, Any] | None = None,
+    message_highlights: list[dict[str, int]] | None = None,
+    highlight_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fields = fields or _message_display_fields(row)
-    message_highlights = highlight_ranges(fields["display_text"], terms)
+    if message_highlights is None:
+        message_highlights, highlight_meta = _highlight_ranges_with_meta(fields["display_text"], terms)
+    highlight_meta = highlight_meta or {}
     return {
         "node_id": row["node_id"],
         "parent_node_id": row["parent_node_id"],
-        "children_json": row["children_json"],
         "message_id": row["message_id"],
         "role": row["role"],
         "author_name": row["author_name"],
@@ -2530,8 +2735,12 @@ def _message_payload(
         "update_time": row["update_time"],
         "content_type": row["content_type"],
         "display_text": fields["display_text"],
+        "display_text_truncated": bool(fields.get("display_text_truncated")),
+        "display_text_total_chars": fields.get("display_text_total_chars", len(fields["display_text"])),
+        "display_text_total_chars_exact": bool(fields.get("display_text_total_chars_exact", True)),
+        "display_text_returned_chars": len(fields["display_text"]),
         "has_text": bool(fields["display_text"]),
-        "has_raw": bool(fields["raw_preview"]),
+        "has_raw": bool(fields.get("raw_size") or fields["raw_preview"]),
         "raw_preview": fields["raw_preview"],
         "raw_preview_truncated": fields["raw_preview_truncated"],
         "content_hash": row["content_hash"],
@@ -2545,35 +2754,65 @@ def _message_payload(
         "is_internal": fields["is_internal"],
         "is_empty_mapping_node": fields["is_empty_mapping_node"],
         "highlight_ranges": message_highlights,
-        "highlight_ranges_truncated": len(terms) > 10 or len(message_highlights) >= 50,
+        "highlight_ranges_truncated": bool(highlight_meta.get("highlight_truncated")),
+        "highlight_truncated": bool(highlight_meta.get("highlight_truncated")),
+        "highlight_scanned_chars": int(highlight_meta.get("highlight_scanned_chars", 0)),
+        "highlight_range_limit_reached": bool(highlight_meta.get("highlight_range_limit_reached")),
     }
 
 
-def _message_display_fields(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def _message_display_fields(
+    row: Mapping[str, Any], display_limit: int | None = None
+) -> dict[str, Any]:
+    row = dict(row)
     text = row["content_text"] or ""
     raw_message_json = row["raw_message_json"] or ""
+    content_total = int(row.get("content_text_total_chars", len(text)))
+    raw_total = int(row.get("raw_message_total_chars", len(raw_message_json)))
+    content_source_truncated = bool(row.get("content_text_source_truncated", content_total > len(text)))
+    raw_source_truncated = bool(row.get("raw_message_source_truncated", raw_total > len(raw_message_json)))
     parsed_message: Any = RAW_MESSAGE_NOT_PARSED
     parsed_ok = False
-    if raw_message_json and len(raw_message_json) <= 200_000:
+    if raw_message_json and not raw_source_truncated and len(raw_message_json) <= 200_000:
         try:
             parsed_message = json_loads(raw_message_json)
             parsed_ok = True
         except (TypeError, ValueError):
             parsed_message = None
     raw_preview = _raw_preview(raw_message_json, parsed_message=parsed_message, parsed_ok=parsed_ok)
-    display_text = recover_message_display_text(
+    resolved_display_text = recover_message_display_text(
         text,
         raw_message_json,
         parsed_message=parsed_message if parsed_message is not RAW_MESSAGE_NOT_PARSED else None,
     )
+    placeholder_text = _is_placeholder_text(text)
+    if text and not placeholder_text:
+        display_total = content_total
+        display_total_exact = True
+    elif resolved_display_text != text:
+        display_total = len(resolved_display_text)
+        display_total_exact = not raw_source_truncated
+    else:
+        display_total = content_total if text else len(resolved_display_text)
+        display_total_exact = not raw_source_truncated
+    display_text = resolved_display_text[:display_limit] if display_limit is not None else resolved_display_text
+    display_truncated = (
+        content_source_truncated
+        or (raw_source_truncated and (not text or placeholder_text))
+        or display_total > len(display_text)
+    )
     is_empty_mapping_node = not row["message_id"] and not display_text and not raw_preview
     is_technical = _is_internal_message(row["role"], row["content_type"], display_text)
-    raw_size = len(raw_message_json)
     return {
         "content_text": text,
         "display_text": display_text,
+        "display_text_truncated": display_truncated,
+        "display_text_total_chars": display_total,
+        "display_text_total_chars_exact": display_total_exact,
+        "display_text_returned_chars": len(display_text),
         "raw_preview": raw_preview,
-        "raw_preview_truncated": bool(raw_size and raw_size > 20000),
+        "raw_preview_truncated": bool(raw_total > len(raw_preview)),
+        "raw_size": raw_total,
         "is_empty_mapping_node": is_empty_mapping_node,
         "is_technical": is_technical,
         "is_internal": is_technical or is_empty_mapping_node,
@@ -2786,17 +3025,43 @@ def _highlight_terms(parsed: ParsedQuery) -> list[tuple[str, str]]:
 
 
 def highlight_ranges(text: str, terms: list[tuple[str, str]]) -> list[dict[str, int]]:
+    ranges, _meta = _highlight_ranges_with_meta(text, terms)
+    return ranges
+
+
+def _highlight_ranges_with_meta(
+    text: str,
+    terms: list[tuple[str, str]],
+    *,
+    max_chars: int = HIGHLIGHT_MESSAGE_SCAN_CHARS,
+) -> tuple[list[dict[str, int]], dict[str, Any]]:
+    # The early return is deliberately before normalization, UTF-16 encoding,
+    # or span allocation. Ordinary reader/filter/title-only pages take it.
+    if not text or not terms:
+        return [], {
+            "highlight_truncated": False,
+            "highlight_scanned_chars": 0,
+            "highlight_range_limit_reached": False,
+        }
+    scan_chars = max(0, min(len(text), int(max_chars)))
+    if scan_chars == 0:
+        return [], {
+            "highlight_truncated": True,
+            "highlight_scanned_chars": 0,
+            "highlight_range_limit_reached": False,
+        }
     # Web highlight ranges are consumed by JavaScript text.slice(), so offsets
     # are UTF-16 code units rather than Python code point indexes.
-    normalized, spans = _normalized_with_utf16_spans(text)
-    ranges = []
-    for term, match_mode in terms[:10]:
+    normalized, spans = _normalized_with_utf16_spans(text[:scan_chars])
+    ranges: list[dict[str, int]] = []
+    range_limit_reached = False
+    for term, match_mode in terms[:HIGHLIGHT_TERM_LIMIT]:
         needle = normalize_search_text(term)
         if not needle:
             continue
         start = 0
         token_spans = _word_token_spans(needle) if match_mode == "word" else []
-        while len(ranges) < 50:
+        while len(ranges) < HIGHLIGHT_RANGE_LIMIT:
             idx = normalized.find(needle, start)
             if idx < 0:
                 break
@@ -2804,9 +3069,12 @@ def highlight_ranges(text: str, terms: list[tuple[str, str]]) -> list[dict[str, 
                 start = idx + 1
                 continue
             end_idx = idx + len(needle) - 1
-            if idx < len(spans) and end_idx < len(spans):
-                ranges.append({"start": spans[idx][0], "end": spans[end_idx][1]})
+            if idx * 2 + 1 < len(spans) and end_idx * 2 + 1 < len(spans):
+                ranges.append({"start": int(spans[idx * 2]), "end": int(spans[end_idx * 2 + 1])})
             start = idx + max(1, len(needle))
+        if len(ranges) >= HIGHLIGHT_RANGE_LIMIT:
+            range_limit_reached = True
+            break
     ranges.sort(key=lambda item: (item["start"], -item["end"]))
     merged: list[dict[str, int]] = []
     for item in ranges:
@@ -2814,7 +3082,15 @@ def highlight_ranges(text: str, terms: list[tuple[str, str]]) -> list[dict[str, 
             merged.append(dict(item))
         else:
             merged[-1]["end"] = max(merged[-1]["end"], item["end"])
-    return merged
+    return merged, {
+        "highlight_truncated": bool(
+            scan_chars < len(text)
+            or len(terms) > HIGHLIGHT_TERM_LIMIT
+            or range_limit_reached
+        ),
+        "highlight_scanned_chars": scan_chars,
+        "highlight_range_limit_reached": range_limit_reached,
+    }
 
 
 def make_snippet(text: str, terms: list[tuple[str, str]], match_mode: str = "contains", radius: int = 80) -> str:
@@ -2856,12 +3132,37 @@ def _normalized_with_codepoint_spans(text: str) -> tuple[str, list[int]]:
     return "".join(pieces), spans
 
 
-def _normalized_with_utf16_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+def _normalized_with_utf16_spans(text: str) -> tuple[str, array[int]]:
+    """Normalize with compact interleaved UTF-16 start/end spans."""
+
     pieces: list[str] = []
-    spans: list[tuple[int, int]] = []
-    for normalized_char, _start, _end, utf16_start, utf16_end in _normalized_span_units(text):
-        pieces.append(normalized_char)
-        spans.append((utf16_start, utf16_end))
+    spans = array("I")
+    pending_space: tuple[int, int] | None = None
+    utf16_index = 0
+    index = 0
+    while index < len(text):
+        char_start = utf16_index
+        cluster = text[index]
+        utf16_index += _utf16_code_units(text[index])
+        index += 1
+        while index < len(text) and unicodedata.combining(text[index]):
+            cluster += text[index]
+            utf16_index += _utf16_code_units(text[index])
+            index += 1
+        normalized = unicodedata.normalize("NFKC", cluster).translate(NORMALIZE_TRANSLATION).casefold()
+        for normalized_char in normalized:
+            if normalized_char.isspace():
+                if pending_space is None:
+                    pending_space = (char_start, utf16_index)
+                else:
+                    pending_space = (pending_space[0], utf16_index)
+                continue
+            if pending_space is not None and pieces:
+                pieces.append(" ")
+                spans.extend(pending_space)
+            pending_space = None
+            pieces.append(normalized_char)
+            spans.extend((char_start, utf16_index))
     return "".join(pieces), spans
 
 

@@ -24,7 +24,7 @@ from .logging_utils import get_logger
 from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
 from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
 from .sqlite_errors import sqlite_runtime_error_code
-from .search import _has_normalized_title_norm, get_conversation, get_messages, list_conversations, normalize_search_text, parse_query, search_conversations, search_messages
+from .search import _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_messages
 from .utils import finite_float_or_none, safe_filename_part
 from .web_db import (
     DISPLAY_TEXT_RESOLVER_VERSION,
@@ -555,6 +555,7 @@ def create_api_router(
 
     @router.get("/schema")
     def schema_docs():
+        effective_reader_budget = reader_budget()
         return {
             "version": API_SCHEMA_VERSION,
             "versions": {
@@ -588,8 +589,20 @@ def create_api_router(
                 "filters": ["q", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "match_mode"],
                 "limits": {"conversation_id": MAX_ID_PARAM_LENGTH, "around_node_id": MAX_ID_PARAM_LENGTH, "q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH},
                 "raw": "message pages return raw_preview only; capped raw preview is available per message endpoint",
-                "item_fields": ["node_id", "parent_node_id", "children_json", "message_id", "role", "author_name", "create_time", "update_time", "content_type", "display_text", "has_text", "has_raw", "raw_preview", "raw_preview_truncated", "content_hash", "is_on_current_path", "effective_visible_in_current_view", "is_internal", "is_empty_mapping_node", "highlight_ranges", "highlight_ranges_truncated"],
-                "display_text_contract": "display_text is the single full user-visible resolved body; content_text and render_text are not returned by default",
+                "item_fields": ["node_id", "parent_node_id", "message_id", "role", "author_name", "create_time", "update_time", "content_type", "display_text", "display_text_truncated", "display_text_total_chars", "display_text_total_chars_exact", "display_text_returned_chars", "has_text", "has_raw", "raw_preview", "raw_preview_truncated", "content_hash", "is_on_current_path", "effective_visible_in_current_view", "is_internal", "is_empty_mapping_node", "highlight_ranges", "highlight_ranges_truncated", "highlight_scanned_chars", "highlight_range_limit_reached"],
+                "display_text_contract": "display_text is the bounded reader preview of the resolved user-visible body; use the display chunk endpoint for explicit expansion and copy",
+                "budgets": {
+                    "message_display_chars": effective_reader_budget.message_display_chars,
+                    "page_display_chars": effective_reader_budget.page_display_chars,
+                    "page_raw_preview_chars": effective_reader_budget.page_raw_preview_chars,
+                    "page_raw_resolver_chars": effective_reader_budget.page_raw_resolver_chars,
+                    "page_estimated_serialized_bytes": effective_reader_budget.page_estimated_serialized_bytes,
+                    "page_highlight_scan_chars": effective_reader_budget.page_highlight_scan_chars,
+                    "display_chunk_chars": effective_reader_budget.display_chunk_chars,
+                    "env": dict(_READER_BUDGET_ENV),
+                },
+                "page_budget_fields": ["page_text_budget_exhausted", "page_preview_budget_exhausted", "page_highlight_budget_exhausted", "response_budget_estimated", "response_budget_limit", "response_budget_estimate_exhausted"],
+                "display_endpoint": "/api/conversations/{conversation_id}/messages/{node_id}/display?offset=0&limit=65536",
                 "hidden_counts": {
                     "fields": ["visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"],
                     "contract": "internal_hidden_count is the one canonical non-empty internal-node count; technical_hidden_count is a deprecated exact alias retained for compatibility",
@@ -939,6 +952,25 @@ def create_api_router(
             around_node_id=around_node_id,
             include_internal=include_internal,
         )
+
+    @router.get("/conversations/{conversation_id}/messages/{node_id}/display")
+    def conversation_message_display(
+        conversation_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)],
+        node_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)],
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=1_048_576)] = 65_536,
+        conn=Depends(get_conn),
+    ):
+        item = get_message_display_chunk(
+            conn,
+            conversation_id,
+            node_id,
+            offset=offset,
+            limit=limit,
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="message_not_found")
+        return item
 
     @router.get("/conversations/{conversation_id}/messages/{node_id}/raw")
     def conversation_message_raw(

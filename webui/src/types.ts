@@ -72,6 +72,10 @@ export interface MessageItem {
   update_time: number | null;
   content_type: string | null;
   display_text: string;
+  display_text_truncated?: boolean;
+  display_text_total_chars?: number;
+  display_text_total_chars_exact?: boolean;
+  display_text_returned_chars?: number;
   has_text: boolean;
   has_raw: boolean;
   raw_preview: string;
@@ -85,6 +89,9 @@ export interface MessageItem {
   is_empty_mapping_node?: boolean;
   highlight_ranges: HighlightRange[];
   highlight_ranges_truncated?: boolean;
+  highlight_truncated?: boolean;
+  highlight_scanned_chars?: number;
+  highlight_range_limit_reached?: boolean;
   snippet?: string;
   title?: string | null;
   reasons?: string[];
@@ -164,6 +171,27 @@ export interface ConversationPage extends BasePage<ConversationSummary> {
 export interface MessagePage extends BasePage<MessageItem> {
   effective_path?: PathMode;
   current_path_fallback_to_all?: boolean;
+  page_text_budget_exhausted?: boolean;
+  page_preview_budget_exhausted?: boolean;
+  page_highlight_budget_exhausted?: boolean;
+  response_budget_estimated?: number;
+  response_budget_limit?: number;
+  response_budget_estimate_exhausted?: boolean;
+}
+
+export interface DisplayTextChunk {
+  conversation_id: string;
+  node_id: string;
+  display_text: string;
+  offset: number;
+  returned_chars: number;
+  total_chars: number;
+  total_chars_exact: boolean;
+  has_more: boolean;
+  next_offset: number | null;
+  max_chunk_chars: number;
+  resolver_input_truncated: boolean;
+  source: "canonical" | "raw_fallback" | "canonical_placeholder" | UnknownApiEnum;
 }
 
 export interface SearchMessagePage extends BasePage<SearchMessageHit> {

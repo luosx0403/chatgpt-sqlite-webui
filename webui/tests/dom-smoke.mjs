@@ -57,6 +57,7 @@ function assertStaticFrontendContracts() {
   const appSource = fs.readFileSync(path.join(webRoot, "src/App.tsx"), "utf8");
   const clientSource = fs.readFileSync(path.join(webRoot, "src/api/client.ts"), "utf8");
   const paneSource = fs.readFileSync(path.join(webRoot, "src/components/ConversationPane.tsx"), "utf8");
+  const messageBlockSource = fs.readFileSync(path.join(webRoot, "src/components/MessageBlock.tsx"), "utf8");
   const querySyntaxSource = fs.readFileSync(path.join(webRoot, "src/utils/querySyntax.ts"), "utf8");
   const i18nSource = fs.readFileSync(path.join(webRoot, "src/i18n.ts"), "utf8");
   const stylesSource = fs.readFileSync(path.join(webRoot, "src/styles.css"), "utf8");
@@ -66,6 +67,9 @@ function assertStaticFrontendContracts() {
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
   assert.ok(paneSource.includes("countTotal: false"), "reader hit navigation should request fast message-hit pages without exact total counts");
+  assert.ok(messageBlockSource.includes("getMessageDisplayChunk"), "truncated reader messages should have an explicit bounded expansion path");
+  assert.ok(messageBlockSource.includes("[messageIdentity, showRawDefault]"), "message content state should reset only for data identity/default changes");
+  assert.equal(messageBlockSource.includes("[messageIdentity, showRawDefault, layout]"), false, "pure layout changes must preserve message content state");
   assert.ok(paneSource.includes("readerDataContextKey"), "reader requests should use a data-only context key");
   assert.ok(paneSource.includes("readerLayoutContextKey"), "reader visual remeasure should use a separate layout context key");
   assert.ok(appSource.includes("canonicalShareUrl"), "Copy URL should use a canonical serializer");
@@ -232,6 +236,12 @@ function makeSyntheticConversations() {
     ),
   };
   conversations.push(conversation("dom-active-hit", "DOM Active Hit Conversation", longHitMapping, "long-hit", 1_950_000_000));
+
+  const longBodyMapping = {
+    root: root(["long-body"]),
+    "long-body": node("long-body", "root", "assistant", "Synthetic long body placeholder.", 1_950_100_001),
+  };
+  conversations.push(conversation("dom-long-body", "DOM Long Body Conversation", longBodyMapping, "long-body", 1_950_100_000));
 
   const titleOnlyMapping = {
     root: root(["u"]),
@@ -709,7 +719,7 @@ async function main() {
     run([
       ...pythonCommand(),
       "-c",
-      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = CASE WHEN node_id = 'branch' THEN 1 ELSE 0 END WHERE conversation_id = 'dom-branch-override'\"); conn.commit(); conn.close()",
+      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = CASE WHEN node_id = 'branch' THEN 1 ELSE 0 END WHERE conversation_id = 'dom-branch-override'\"); conn.execute(\"UPDATE conversation_nodes SET content_text = replace(hex(zeroblob(70000)), '00', 'L') || ' DOM-LONG-BODY-END', raw_message_json = NULL WHERE conversation_id = 'dom-long-body' AND node_id = 'long-body'\"); conn.commit(); conn.close()",
       db,
     ]);
     run([...pythonCommand(), "chatgpt_archive.py", "web-index", "--db", db]);
@@ -1124,6 +1134,21 @@ async function main() {
     const assistantBubble = await page.locator(".message-row-assistant .message").first().boundingBox();
     const userBubble = await page.locator(".message-row-user .message").first().boundingBox();
     assert.ok(assistantBubble && userBubble && userBubble.x > assistantBubble.x, "chat layout should align user messages to the right of assistant messages");
+
+    await page.goto(`${baseUrl}?conversation=dom-long-body`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    const displayRequestsBeforeExpand = await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/messages/long-body/display?")).length);
+    await page.getByRole("button", { name: "Load full message body" }).click();
+    await page.getByRole("button", { name: "Load more message body" }).click();
+    await page.waitForFunction(() => document.querySelector('[data-node-id="long-body"] .message-text')?.textContent?.includes("DOM-LONG-BODY-END"), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page.getByLabel("Message layout").selectOption("classic");
+    await page.getByRole("button", { name: "Close" }).click();
+    await page.locator(".message-scroll").evaluate((node) => { node.scrollTop = 0; });
+    await page.locator('[data-node-id="long-body"] .message-text').waitFor({ state: "visible", timeout: 20_000 });
+    assert.ok((await page.locator('[data-node-id="long-body"] .message-text').textContent())?.includes("DOM-LONG-BODY-END"), "layout changes must preserve expanded long message text");
+    const displayRequestsAfterLayout = await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/messages/long-body/display?")).length);
+    assert.equal(displayRequestsAfterLayout - displayRequestsBeforeExpand, 2, "long-body expansion should be chunked and layout must not refetch it");
 
     await page.goto(`${baseUrl}?conversation=dom-long&layout=classic`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
@@ -1582,7 +1607,17 @@ async function main() {
     await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 180"), undefined, { timeout: 20_000 });
     const expectedSequence = expectedSequenceHitIds();
     for (let idx = 0; idx <= 155; idx += 1) {
-      await waitForActiveNodeWithVisibleHighlight(page, expectedSequence[idx]);
+      try {
+        await waitForActiveNodeWithVisibleHighlight(page, expectedSequence[idx]);
+      } catch (error) {
+        const diagnostic = await page.evaluate(() => ({
+          activeNode: document.querySelector(".message-active")?.getAttribute("data-node-id") ?? null,
+          activeMarks: document.querySelectorAll(".message-active .search-highlight").length,
+          marks: document.querySelectorAll(".search-highlight").length,
+          pageMeta: document.querySelector(".message-page-meta")?.textContent ?? "",
+        }));
+        throw new Error(`sequence navigation failed at index=${idx} expected=${expectedSequence[idx]} diagnostic=${JSON.stringify(diagnostic)} cause=${error instanceof Error ? error.message : String(error)}`);
+      }
       if (idx < 155) await page.getByRole("button", { name: "Next hit" }).click();
     }
 

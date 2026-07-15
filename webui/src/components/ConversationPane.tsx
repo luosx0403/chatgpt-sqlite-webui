@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ConversationSummary, MatchMode, MessageItem, PathMode, SearchFilters, SearchMessageHit } from "../types";
-import { exportUrl, getMessageHits, getMessages } from "../api/client";
+import { exportUrl, getMessageDisplayChunk, getMessageHits, getMessages } from "../api/client";
 import { formatDate } from "../utils/format";
 import { analyzeQuerySyntax } from "../utils/querySyntax";
 import MessageBlock from "./MessageBlock";
@@ -87,6 +87,14 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     fontSize: settings.fontSize,
     messageMaxWidth: settings.messageMaxWidth,
   });
+  const messageStateContextRef = useRef({ dataKey: readerDataContextKey, epoch: 0 });
+  if (messageStateContextRef.current.dataKey !== readerDataContextKey) {
+    messageStateContextRef.current = {
+      dataKey: readerDataContextKey,
+      epoch: messageStateContextRef.current.epoch + 1,
+    };
+  }
+  const messageStateContextKey = `${messageStateContextRef.current.epoch}:${readerDataContextKey}`;
   const readerDataContextRef = useRef(readerDataContextKey);
   readerDataContextRef.current = readerDataContextKey;
 
@@ -430,8 +438,26 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     }
   };
   const messageText = (m: MessageItem) => m.display_text || "";
-  const copyableMessages = (items: MessageItem[]) => items.filter((m) => !m.is_empty_mapping_node && messageText(m).trim());
-  const formatMessagesForCopy = (items: MessageItem[]) => copyableMessages(items).map((m) => `${m.role || "message"}:\n${messageText(m)}`).join("\n\n");
+  const completeMessageText = async (message: MessageItem, signal: AbortSignal): Promise<string> => {
+    if (!message.display_text_truncated) return messageText(message);
+    let offset = 0;
+    let complete = "";
+    for (;;) {
+      const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 65536, signal);
+      complete += chunk.display_text;
+      if (!chunk.has_more || chunk.next_offset === null) return complete;
+      offset = chunk.next_offset;
+    }
+  };
+  const formatMessagesForCopy = async (items: MessageItem[], signal: AbortSignal): Promise<string> => {
+    const parts: string[] = [];
+    for (const message of items) {
+      if (message.is_empty_mapping_node) continue;
+      const complete = await completeMessageText(message, signal);
+      if (complete.trim()) parts.push(`${message.role || "message"}:\n${complete}`);
+    }
+    return parts.join("\n\n");
+  };
   const fetchMessagesForCopy = async (mode: "visible" | "conversation", signal: AbortSignal) => {
     if (!conversation) return;
     if (mode === "visible") return visibleMessages;
@@ -458,7 +484,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     try {
       const copyItems = await fetchMessagesForCopy(mode, controller.signal) || [];
       if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
-      await copyText(formatMessagesForCopy(copyItems), requestedContextKey, requestId);
+      const copyValue = await formatMessagesForCopy(copyItems, controller.signal);
+      if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
+      await copyText(copyValue, requestedContextKey, requestId);
     } catch {
       if (controller.signal.aborted || readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
       setCopyStatus(mode === "conversation" ? t("copyConversationFailed") : t("copyFailed"));
@@ -604,6 +632,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
                   <MessageBlock
                     message={message}
                     conversationId={conversation.conversation_id}
+                    stateContextKey={messageStateContextKey}
                     active={message.node_id === activeNode}
                     layout={settings.messageLayout}
                     showRawDefault={settings.showRawDefault}

@@ -1,4 +1,4 @@
-import type { ConversationPage, ConversationSummary, Health, ImportJob, MatchMode, MessageItem, MessagePage, PathMode, RawMessageResponse, SearchFilters, SearchMessageHit, SearchMessagePage, SortMode, Stats } from "../types";
+import type { ConversationPage, ConversationSummary, DisplayTextChunk, Health, ImportJob, MatchMode, MessageItem, MessagePage, PathMode, RawMessageResponse, SearchFilters, SearchMessageHit, SearchMessagePage, SortMode, Stats } from "../types";
 
 export class ApiError extends Error {
   constructor(
@@ -165,6 +165,17 @@ export function exportUrl(id: string, format: "md" | "txt", path: PathMode, incl
 
 export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal, maxChars = 50000): Promise<RawMessageResponse> {
   return request<RawMessageResponse>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/raw?max_chars=${maxChars}`, signal);
+}
+
+export function getMessageDisplayChunk(
+  conversationId: string,
+  nodeId: string,
+  offset = 0,
+  limit = 65536,
+  signal?: AbortSignal,
+): Promise<DisplayTextChunk> {
+  const query = params({ offset, limit });
+  return request<DisplayTextChunk>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/display?${query}`, signal);
 }
 
 export async function uploadImportZip(file: File, signal?: AbortSignal): Promise<ImportJob> {

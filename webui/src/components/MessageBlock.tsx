@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import type { HighlightRange, MessageItem } from "../types";
 import { formatDate, roleLabel } from "../utils/format";
-import { getRawMessage } from "../api/client";
+import { getMessageDisplayChunk, getRawMessage } from "../api/client";
 import type { MessageLayout } from "../settings";
 
 interface Props {
   message: MessageItem;
   conversationId: string;
+  stateContextKey: string;
   active: boolean;
   layout: MessageLayout;
   showRawDefault: boolean;
@@ -14,6 +15,42 @@ interface Props {
   onCopy: (text: string) => Promise<boolean>;
   onSizeMayChange: () => void;
   currentPathFallbackToAll?: boolean;
+}
+
+interface PreservedMessageState {
+  showRaw: boolean;
+  detailsOpen: boolean;
+  fullRaw: string;
+  fullRawTruncated: boolean;
+  expandedText: string | null;
+  displayNextOffset: number | null;
+}
+
+const preservedMessageStates = new Map<string, PreservedMessageState>();
+const PRESERVED_STATE_MAX_ENTRIES = 100;
+const PRESERVED_STATE_MAX_CHARS = 4 * 1024 * 1024;
+
+function preserveMessageState(key: string, state: PreservedMessageState, showRawDefault: boolean) {
+  if (
+    state.showRaw === showRawDefault &&
+    !state.detailsOpen &&
+    !state.fullRaw &&
+    !state.fullRawTruncated &&
+    state.expandedText === null
+  ) {
+    preservedMessageStates.delete(key);
+    return;
+  }
+  preservedMessageStates.delete(key);
+  preservedMessageStates.set(key, state);
+  let chars = 0;
+  for (const value of preservedMessageStates.values()) chars += value.fullRaw.length + (value.expandedText?.length ?? 0);
+  while (preservedMessageStates.size > PRESERVED_STATE_MAX_ENTRIES || chars > PRESERVED_STATE_MAX_CHARS) {
+    const oldest = preservedMessageStates.entries().next().value as [string, PreservedMessageState] | undefined;
+    if (!oldest) break;
+    preservedMessageStates.delete(oldest[0]);
+    chars -= oldest[1].fullRaw.length + (oldest[1].expandedText?.length ?? 0);
+  }
 }
 
 function pieces(text: string, ranges: HighlightRange[]) {
@@ -68,20 +105,32 @@ function looksLikeTechnicalPayload(message: MessageItem, text: string): boolean 
   return false;
 }
 
-export default function MessageBlock({ message, conversationId, active, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
-  const [showRaw, setShowRaw] = useState(showRawDefault);
-  const [detailsOpen, setDetailsOpen] = useState(false);
-  const [fullRaw, setFullRaw] = useState("");
-  const [fullRawTruncated, setFullRawTruncated] = useState(false);
+export default function MessageBlock({ message, conversationId, stateContextKey, active, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
+  const messageIdentity = `${conversationId}:${message.node_id}:${message.message_id || ""}:${message.content_hash || ""}`;
+  const preservedStateKey = `${stateContextKey}:${messageIdentity}:${showRawDefault ? "raw" : "plain"}`;
+  const savedState = preservedMessageStates.get(preservedStateKey);
+  const [showRaw, setShowRaw] = useState(() => savedState?.showRaw ?? showRawDefault);
+  const [detailsOpen, setDetailsOpen] = useState(() => savedState?.detailsOpen ?? false);
+  const [fullRaw, setFullRaw] = useState(() => savedState?.fullRaw ?? "");
+  const [fullRawTruncated, setFullRawTruncated] = useState(() => savedState?.fullRawTruncated ?? false);
   const [fullRawLoading, setFullRawLoading] = useState(false);
   const [fullRawError, setFullRawError] = useState("");
+  const [expandedText, setExpandedText] = useState<string | null>(() => savedState?.expandedText ?? null);
+  const [displayNextOffset, setDisplayNextOffset] = useState<number | null>(() => savedState?.displayNextOffset ?? 0);
+  const [displayLoading, setDisplayLoading] = useState(false);
+  const [displayError, setDisplayError] = useState("");
   const FULL_RAW_MAX_CHARS = 50000;
   const mountedRef = useRef(true);
   const measureFrameRef = useRef<number | null>(null);
   const rawControllerRef = useRef<AbortController | null>(null);
+  const displayControllerRef = useRef<AbortController | null>(null);
   const rawRequestIdRef = useRef(0);
+  const displayRequestIdRef = useRef(0);
+  const resetBaselineRef = useRef(false);
+  const bodyRef = useRef<HTMLPreElement | null>(null);
   const role = roleLabel(message.role, t);
-  const text = message.display_text || "";
+  const previewText = message.display_text || "";
+  const text = expandedText ?? previewText;
   const placeholder = `[non-text content: ${message.content_type || "empty"}]`;
   const timestamp = formatDate(message.create_time ?? message.update_time);
   const shouldUseChat = layout === "chat";
@@ -90,10 +139,50 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   const shouldCollapseDetails = shouldUseChat && isTechnicalPayload;
   const articleClass = `message ${roleClass(message.role)} ${message.is_internal ? "message-internal" : ""} ${active ? "message-active" : ""}`;
   const showBranchBadge = !message.effective_visible_in_current_view && !message.current_path_fallback_to_all && !currentPathFallbackToAll;
-  const messageIdentity = `${conversationId}:${message.node_id}:${message.message_id || ""}:${message.content_hash || ""}`;
+  const preservedStateRef = useRef<PreservedMessageState>({ showRaw, detailsOpen, fullRaw, fullRawTruncated, expandedText, displayNextOffset });
+  preservedStateRef.current = { showRaw, detailsOpen, fullRaw, fullRawTruncated, expandedText, displayNextOffset };
   const messageIdentityRef = useRef(messageIdentity);
   messageIdentityRef.current = messageIdentity;
-  const copy = () => { void onCopy(text || message.raw_preview || ""); };
+  const copy = async () => {
+    if (!message.display_text_truncated && expandedText === null) {
+      await onCopy(text || message.raw_preview || "");
+      return;
+    }
+    displayControllerRef.current?.abort();
+    const controller = new AbortController();
+    displayControllerRef.current = controller;
+    const requestId = ++displayRequestIdRef.current;
+    const requestIdentity = messageIdentity;
+    setDisplayLoading(true);
+    setDisplayError("");
+    try {
+      let offset = 0;
+      let complete = "";
+      while (true) {
+        const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal);
+        if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
+        complete += chunk.display_text;
+        if (!chunk.has_more || chunk.next_offset === null) break;
+        offset = chunk.next_offset;
+      }
+      setExpandedText(complete);
+      setDisplayNextOffset(null);
+      await onCopy(complete || message.raw_preview || "");
+    } catch (error) {
+      if (
+        mountedRef.current &&
+        requestId === displayRequestIdRef.current &&
+        requestIdentity === messageIdentityRef.current &&
+        !(error instanceof Error && error.name === "AbortError")
+      ) setDisplayError(t("displayTextFailed"));
+    } finally {
+      if (requestId === displayRequestIdRef.current && requestIdentity === messageIdentityRef.current) {
+        displayControllerRef.current = null;
+        setDisplayLoading(false);
+        notifySizeMayChange();
+      }
+    }
+  };
   const notifySizeMayChange = () => {
     if (measureFrameRef.current !== null) return;
     measureFrameRef.current = window.requestAnimationFrame(() => {
@@ -103,17 +192,24 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   };
   useEffect(() => {
     mountedRef.current = true;
+    if (savedState) notifySizeMayChange();
     return () => {
+      preserveMessageState(preservedStateKey, preservedStateRef.current, showRawDefault);
       mountedRef.current = false;
       rawControllerRef.current?.abort();
+      displayControllerRef.current?.abort();
       rawControllerRef.current = null;
       if (measureFrameRef.current !== null) {
         window.cancelAnimationFrame(measureFrameRef.current);
         measureFrameRef.current = null;
       }
     };
-  }, []);
+  }, [preservedStateKey]);
   useEffect(() => {
+    if (!resetBaselineRef.current) {
+      resetBaselineRef.current = true;
+      return;
+    }
     rawRequestIdRef.current += 1;
     rawControllerRef.current?.abort();
     rawControllerRef.current = null;
@@ -123,8 +219,15 @@ export default function MessageBlock({ message, conversationId, active, layout, 
     setFullRawTruncated(false);
     setFullRawLoading(false);
     setFullRawError("");
+    displayRequestIdRef.current += 1;
+    displayControllerRef.current?.abort();
+    displayControllerRef.current = null;
+    setExpandedText(null);
+    setDisplayNextOffset(0);
+    setDisplayLoading(false);
+    setDisplayError("");
     notifySizeMayChange();
-  }, [messageIdentity, showRawDefault, layout]);
+  }, [messageIdentity, showRawDefault]);
   useEffect(() => {
     if (active && shouldCollapseDetails) {
       setDetailsOpen(true);
@@ -194,6 +297,36 @@ export default function MessageBlock({ message, conversationId, active, layout, 
     });
     notifySizeMayChange();
   };
+  const loadDisplayText = async () => {
+    displayControllerRef.current?.abort();
+    const controller = new AbortController();
+    displayControllerRef.current = controller;
+    const requestId = ++displayRequestIdRef.current;
+    const requestIdentity = messageIdentity;
+    const offset = expandedText === null ? 0 : (displayNextOffset ?? 0);
+    setDisplayLoading(true);
+    setDisplayError("");
+    try {
+      const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal);
+      if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
+      setExpandedText((current) => offset === 0 ? chunk.display_text : `${current ?? ""}${chunk.display_text}`);
+      setDisplayNextOffset(chunk.next_offset);
+      if (!chunk.has_more) window.requestAnimationFrame(() => bodyRef.current?.focus());
+    } catch (error) {
+      if (
+        mountedRef.current &&
+        requestId === displayRequestIdRef.current &&
+        requestIdentity === messageIdentityRef.current &&
+        !(error instanceof Error && error.name === "AbortError")
+      ) setDisplayError(t("displayTextFailed"));
+    } finally {
+      if (requestId === displayRequestIdRef.current && requestIdentity === messageIdentityRef.current) {
+        displayControllerRef.current = null;
+        setDisplayLoading(false);
+        notifySizeMayChange();
+      }
+    }
+  };
 
   const header = (
       <header className="message-header">
@@ -212,7 +345,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
 
   const body = (
     <>
-      <pre className="message-text">
+      <pre ref={bodyRef} tabIndex={-1} className="message-text">
         {(() => {
           let markIndex = 0;
           return pieces(text || placeholder, message.highlight_ranges).map((part, index) => {
@@ -232,6 +365,18 @@ export default function MessageBlock({ message, conversationId, active, layout, 
         })()}
       </pre>
       {message.highlight_ranges_truncated && <p className="hint">{t("highlightRangesTruncated")}</p>}
+      {active && message.highlight_truncated && message.highlight_ranges.length === 0 && <p className="hint">{t("activeHighlightUnavailable")}</p>}
+      {(message.display_text_truncated || expandedText !== null) && (
+        <div className="hint">
+          {message.display_text_truncated && expandedText === null && <span>{t("displayTextTruncated")} </span>}
+          {(expandedText === null || displayNextOffset !== null) && (
+            <button type="button" onClick={loadDisplayText} disabled={displayLoading}>
+              {displayLoading ? t("displayTextLoading") : expandedText === null ? t("loadDisplayText") : t("loadMoreDisplayText")}
+            </button>
+          )}
+          {displayError && <span className="error-text">{displayError}</span>}
+        </div>
+      )}
       {showRaw && (
         <>
           <pre className="raw-message">{message.raw_preview || t("noRawStored")}</pre>
