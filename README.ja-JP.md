@@ -468,7 +468,7 @@ tools/                             Delivery and support scripts
 
 ## セキュリティとレスポンス契約
 
-Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では、実際のブラウザー hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（または `--allowed-hosts`）で指定する必要があり、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（または `--trusted-proxies`）は proxy IP/CIDR を指定します。直接接続元が信頼済み proxy の場合だけ `Forwarded` / `X-Forwarded-*` を利用します。静的 UI と GET API を含む全リクエストで Host を検証します。remote write には same-origin `Origin` が必要で、Origin なしは信頼済み loopback profile だけが許可します。upload write は `Sec-Fetch-Site: cross-site` を常に拒否します。
+Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では実際の browser hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS` で指定し、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES` は厳格な単一 edge proxy モデルです。未信頼 peer の forwarded header は無視し、信頼済み direct edge は client 値を上書きする必要があります。重複 Host/Forwarded、カンマ区切り chain、不正構文、`Forwarded` と `X-Forwarded-Host/Proto` の競合は拒否されます。全リクエストで Host を検証し、remote write は same-origin `Origin` が必要です。
 
 インポート失敗は、入力 preflight、source scan、JSON decode、top-level contract、transaction の安定した stage/code を使います。failed run summary の warning 数は保存済み warning と一致します。canonical commit 後の verify、stats、任意 Web index 失敗を「未インポート」とは表示しません。commit 後の一時 upload cleanup 失敗は非致命の安定 warning で、ユーザーパスを公開しません。
 
@@ -477,3 +477,11 @@ Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明
 「URL をコピー」は `match_mode`、`layout`、`show_internal` と共有可能な search/reader state を必ず明示します。URL の明示値は `localStorage` より優先され、欠落値だけがローカル設定を使います。本版は `replaceState` を使い、ブラウザーの戻る/進むで段階的な検索・選択履歴を復元しません。
 
 Release ZIP は一時ファイルへ書き、全 payload のソート済み size/SHA-256 manifest、正確な member 集合、dist asset、delivery check を検証してから原子的に置換します。失敗時は既存 release を変更しません。
+
+Rollback summary は `attempted_*` とゼロの `committed_*` を分離します。failed run は新しい接続で永続化し、secondary persistence failure も明示します。pre-job cleanup failure は primary HTTP code を保持し、安全な `cleanup_warning`/`cleanup_error_type` を追加します。job ID は小文字 32 桁 hex のみです。
+
+JSON は `NaN`/`Infinity` と `1e9999` のような overflow を拒否します。invalid timestamp は `NULL` と型だけの warning になります。`verify` は `foreign_key_check` を実行し、parent-cycle node と component を別々に数えます。effective-current は selected-chain と raw-flag の cycle/missing/cross-parent を分離します。
+
+message search page は常に `total_exact` を返します。empty DB または決定的な empty は true、通常の `count_total=false` probe は false で、conversation page はこの field を保証しません。around metadata は found、effective membership、requested membership、visible、applied を分離します。有界な valid raw text fallback は reader/search/highlight/copy/CLI/Web export で共通です。invalid、oversized、実際の non-text raw は placeholder のままです。
+
+filter-only/exclude-only は conversation を絞れますが、message hit、reader highlight、hit navigation には正の message text term が必要です。Copy URL は同じ applied search/list/selection context を使い、debounce 前の入力を古い selection と混ぜません。日本語とスペイン語 UI は partial translation と明示表示されます。release は collector とは独立した authoritative required-file list を先に検証し、必要な source/config/doc が欠ければ旧 ZIP を置換せず失敗します。

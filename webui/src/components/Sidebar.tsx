@@ -17,8 +17,6 @@ interface Props {
   setFilters: (value: SearchFilters) => void;
   conversations: ConversationSummary[];
   selectedId: string | null;
-  focusIndex: number;
-  setFocusIndex: (value: number) => void;
   onSelect: (id: string) => void;
   onLoadMore: () => void;
   loading: boolean;
@@ -144,7 +142,7 @@ export default function Sidebar(props: Props) {
       </div>
       {props.error && <div className="error-box">{props.error}</div>}
       <div className="conversation-list" ref={listRef} onScroll={handleScroll} aria-label={props.t("conversations")}>
-        {props.conversations.map((item, index) => {
+        {props.conversations.map((item) => {
           const pathFallback = Boolean(item.current_path_fallback_to_all);
           const hasSnippetBranch = item.snippets?.some((snippet) => snippet.is_on_current_path === false && !snippet.effective_visible_in_current_view && !snippet.current_path_fallback_to_all) ?? false;
           const badges = [
@@ -156,8 +154,7 @@ export default function Sidebar(props: Props) {
             <button
               type="button"
               key={item.conversation_id}
-              className={`conversation-item ${props.selectedId === item.conversation_id ? "selected" : ""} ${props.focusIndex === index ? "focused" : ""}`}
-              onFocus={() => props.setFocusIndex(index)}
+              className={`conversation-item ${props.selectedId === item.conversation_id ? "selected" : ""}`}
               onClick={() => props.onSelect(item.conversation_id)}
             >
               <span className="conversation-title">{item.title || props.t("untitled")}</span>

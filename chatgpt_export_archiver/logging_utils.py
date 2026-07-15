@@ -25,7 +25,7 @@ class _JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def parse_log_level(value: str) -> str:
@@ -45,9 +45,6 @@ def configure_logging(
     """Configure project logging without changing structured CLI stdout."""
     parsed = parse_log_level(level)
     root = logging.getLogger("chatgpt_export_archiver")
-    # Undo legacy process-global suppression from older releases, then keep all
-    # subsequent configuration scoped to this project's logger tree.
-    logging.disable(logging.NOTSET)
     root.disabled = False
     for handler in list(root.handlers):
         root.removeHandler(handler)

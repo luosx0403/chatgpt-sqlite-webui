@@ -44,7 +44,7 @@ def write_bytes_if_changed(path: Path, data: bytes, force: bool = False) -> bool
     files if a write is interrupted.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not force and path.exists() and path.read_bytes() == data:
+    if not force and path.exists() and _file_matches_bytes(path, data):
         return False
     fd: int | None = None
     tmp_name: str | None = None
@@ -68,6 +68,22 @@ def write_bytes_if_changed(path: Path, data: bytes, force: bool = False) -> bool
                 pass
 
 
+def _file_matches_bytes(path: Path, data: bytes, chunk_size: int = 1024 * 1024) -> bool:
+    """Compare an existing file without reading the old payload all at once."""
+
+    if path.stat().st_size != len(data):
+        return False
+    view = memoryview(data)
+    offset = 0
+    with path.open("rb") as existing:
+        while offset < len(data):
+            chunk = existing.read(min(chunk_size, len(data) - offset))
+            if not chunk or chunk != view[offset : offset + len(chunk)]:
+                return False
+            offset += len(chunk)
+        return existing.read(1) == b""
+
+
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -77,11 +93,11 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def compact_json(value: Any, max_chars: int | None = None) -> str:
-    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     if max_chars is not None and len(text) > max_chars:
         return text[:max_chars] + "...[truncated]"
     return text

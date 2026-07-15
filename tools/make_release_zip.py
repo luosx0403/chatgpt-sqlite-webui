@@ -23,23 +23,45 @@ INCLUDE_PATHS = [
     "AGENTS.md", ".gitignore", "requirements-web.txt", "constraints-web-py312.txt",
 ]
 
-REQUIRED_LEAF_PATHS = (
+AUTHORITATIVE_REQUIRED_FILES = (
     "chatgpt_archive.py",
+    "chatgpt_export_archiver/__init__.py",
     "chatgpt_export_archiver/current_path.py",
     "chatgpt_export_archiver/search.py",
     "chatgpt_export_archiver/exporter.py",
+    "chatgpt_export_archiver/logging_utils.py",
     "chatgpt_export_archiver/cli.py",
     "chatgpt_export_archiver/db.py",
     "chatgpt_export_archiver/parser.py",
     "chatgpt_export_archiver/scanner.py",
+    "chatgpt_export_archiver/utils.py",
     "chatgpt_export_archiver/web_api.py",
     "chatgpt_export_archiver/web_app.py",
     "chatgpt_export_archiver/web_db.py",
     "chatgpt_export_archiver/web_jobs.py",
+    "tools/benchmark_effective_current.py",
+    "tools/check_delivery_clean.py",
+    "tools/clean_generated_artifacts.py",
+    "tools/make_release_zip.py",
+    "webui/index.html",
+    "webui/tsconfig.json",
+    "webui/vite.config.ts",
     "webui/src/App.tsx",
+    "webui/src/api/client.ts",
     "webui/src/components/ConversationPane.tsx",
+    "webui/src/components/MessageBlock.tsx",
+    "webui/src/components/SearchHelp.tsx",
+    "webui/src/components/SettingsPanel.tsx",
     "webui/src/components/Sidebar.tsx",
+    "webui/src/hooks/useModalFocus.ts",
+    "webui/src/i18n.ts",
+    "webui/src/main.tsx",
+    "webui/src/settings.ts",
+    "webui/src/styles.css",
     "webui/src/types.ts",
+    "webui/src/utils/format.ts",
+    "webui/src/utils/interaction.ts",
+    "webui/src/utils/querySyntax.ts",
     "tests/test_archiver.py",
     "tests/test_web_api.py",
     "webui/tests/dom-smoke.mjs",
@@ -49,8 +71,13 @@ REQUIRED_LEAF_PATHS = (
     "constraints-web-py312.txt",
     "README.md", "README.zh-CN.md", "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md",
     "AGENTS.md",
+    "LICENSE",
+    ".gitignore",
     "webui/dist/index.html",
 )
+
+# Backward-compatible name for tests and local tooling that imported it.
+REQUIRED_LEAF_PATHS = AUTHORITATIVE_REQUIRED_FILES
 
 MANIFEST_NAME = "RELEASE-MANIFEST.json"
 
@@ -99,7 +126,7 @@ def _sha256(data: bytes) -> str:
 
 
 def _validate_required(root: Path) -> None:
-    missing = [path for path in REQUIRED_LEAF_PATHS if not (root / path).is_file()]
+    missing = [path for path in AUTHORITATIVE_REQUIRED_FILES if not (root / path).is_file()]
     missing.extend(path.rstrip("/") for path in INCLUDE_PATHS if path.endswith("/") and not (root / path).is_dir())
     if missing:
         raise ValueError("required_release_paths_missing " + " ".join(sorted(set(missing))))
@@ -197,6 +224,12 @@ def build_release(root: Path, output: Path, *, check: bool = True) -> tuple[list
     _validate_required(root)
     assets = _dist_assets(root)
     payload = _collect_payload(root)
+    authoritative_payload = set(AUTHORITATIVE_REQUIRED_FILES) | {
+        f"webui/dist/{asset}" for asset in assets
+    }
+    missing_payload = sorted(authoritative_payload - set(payload))
+    if missing_payload:
+        raise ValueError("required_release_payload_missing " + " ".join(missing_payload))
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp.zip", dir=output.parent)
     os.close(descriptor)

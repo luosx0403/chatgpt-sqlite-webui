@@ -468,7 +468,7 @@ tools/                             交付檢查與輔助腳本
 
 ## 安全與回應契約
 
-Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bind host 與明確設定的 host。非 loopback bind 還必須透過 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定實際瀏覽器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）接受代理 IP/CIDR；只有直接連線來自受信代理時才讀取 `Forwarded` / `X-Forwarded-*`。靜態 UI、GET API 與全部請求都驗證 Host。遠端寫入必須有同源 `Origin`；只有可信 loopback profile 相容無 Origin 用戶端。上傳永遠拒絕 `Sec-Fetch-Site: cross-site`。
+Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bind host 與明確設定的 host。非 loopback bind 還必須透過 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定實際瀏覽器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）採嚴格單 edge 模型：未受信直連的 forwarded header 會被忽略，受信直連 proxy 必須覆寫 client 值；重複 Host/Forwarded、逗號 proxy chain、非法語法及 `Forwarded` 與 `X-Forwarded-Host/Proto` 衝突會被拒絕。靜態 UI、GET API 與全部請求都驗證 Host。遠端寫入必須有同源 `Origin`；只有可信 loopback profile 相容無 Origin 用戶端。上傳永遠拒絕 `Sec-Fetch-Site: cross-site`。
 
 匯入失敗使用穩定的輸入預檢、source scan、JSON decode、頂層契約與交易階段。失敗 run summary 的 warning 數與實際持久化 warning 一致。canonical commit 成功後，verify、stats 或可選 Web index 失敗不會被描述為「未匯入」。提交後的暫存上傳清理失敗是非致命穩定 warning，且不洩漏使用者路徑。
 
@@ -477,3 +477,11 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bi
 「複製 URL」永遠明確寫入 `match_mode`、`layout`、`show_internal` 與可分享的搜尋/reader 狀態。URL 明確值優先於 `localStorage`，缺少值才可回退本機設定。本版本使用 `replaceState`，瀏覽器上一頁/下一頁不會還原逐步搜尋或選擇歷程。
 
 Release ZIP 先寫入目標目錄的暫存檔，核對每個 payload 檔案的排序 size/SHA-256 manifest、精確 member 集合與 dist asset，再執行 delivery check，最後才原子替換目標；任何失敗都保留舊 release。
+
+rollback summary 以 `attempted_*` 與歸零的 `committed_*` 區分已嘗試和已提交工作；失敗 run 使用新連線持久化並明確報告次要持久化失敗。pre-job 暫存清理失敗保留主要 HTTP 錯誤，另回傳安全的 `cleanup_warning`/`cleanup_error_type`。job 查詢只接受 32 位小寫十六進位 ID。
+
+JSON 會拒絕 `NaN`/`Infinity` 與 `1e9999` 等溢位數；無效 timestamp 寫入 `NULL` 並產生只含欄位和值類型的 warning。`verify` 執行 `foreign_key_check`，分別報告 parent-cycle node 與 component 數。effective-current 分開報告 selected-chain 與 raw-flag 的 cycle/missing/cross-parent 診斷。
+
+message search page 一律含 `total_exact`；空資料庫或可確定為空時是 true，`count_total=false` 的一般探測是 false；conversation page 不保證此欄位。around metadata 分開表示 found、effective-current membership、requested-path membership、visible 與 applied。空 canonical 或 legacy placeholder 可從有界且有效的 raw text 恢復，reader、兩種搜尋、highlight、copy、CLI/Web export 共用 resolver；非法、過大或真正非文字 raw 維持 placeholder。
+
+僅篩選和僅排除可篩選 conversation；只有正向訊息正文詞會產生 message hit、reader 醒目提示與 hit navigation。「複製 URL」使用同一個已套用的 search/list/selected context，不會混入 debounce 中的新輸入。日文與西班牙文在選擇器明確標為部分翻譯。release 收集前會驗證獨立的權威必要檔案清單，缺少任何必要 source/config/doc 都會失敗且不覆蓋舊 ZIP。

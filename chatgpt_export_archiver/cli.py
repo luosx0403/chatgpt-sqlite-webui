@@ -70,6 +70,23 @@ class ImportPipelineError(ValueError):
         self.run_id = run_id
         self.summary = dict(summary) if summary else None
         self.detail = dict(detail) if detail else {}
+        self.failure_persistence_failed = False
+        self.failure_persistence_error_type: str | None = None
+
+    def __str__(self) -> str:
+        parts = [self.code, f"stage={self.stage}"]
+        if self.run_id is not None:
+            parts.append(f"import_run_id={self.run_id}")
+        if self.failure_persistence_failed:
+            parts.extend(
+                [
+                    "failure_persistence_failed=true",
+                    f"failure_persistence_error_type={self.failure_persistence_error_type or 'UnknownError'}",
+                    f"original_failure_code={self.code}",
+                    f"original_failure_stage={self.stage}",
+                ]
+            )
+        return " ".join(parts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -289,6 +306,13 @@ def cmd_import(args: argparse.Namespace) -> int:
     for key in (
         "import_run_id",
         "source",
+        "attempted_valid_conversations",
+        "attempted_nodes",
+        "attempted_inserted_conversations",
+        "attempted_updated_conversations",
+        "attempted_unchanged_conversations",
+        "committed_conversations",
+        "committed_nodes",
         "valid_conversations",
         "nodes",
         "warnings",
@@ -368,6 +392,13 @@ def run_import_pipeline(
         "source": source.kind,
         "valid_conversations": 0,
         "nodes": 0,
+        "attempted_valid_conversations": 0,
+        "attempted_nodes": 0,
+        "attempted_inserted_conversations": 0,
+        "attempted_updated_conversations": 0,
+        "attempted_unchanged_conversations": 0,
+        "committed_conversations": 0,
+        "committed_nodes": 0,
         "warnings": 0,
         "skipped_invalid_elements": 0,
         "unchanged_conversations": 0,
@@ -401,6 +432,8 @@ def run_import_pipeline(
             progress_callback(stage, dict(summary))
 
     seen_conversation_ids: set[str] = set()
+    final_node_counts: dict[str, int] = {}
+    final_status_by_id: dict[str, str] = {}
 
     def record_duplicate_warning(parsed: Any) -> None:
         record_warning(
@@ -444,6 +477,8 @@ def run_import_pipeline(
             code = (
                 "ambiguous_conversation_sources"
                 if raw_code in {"duplicate_conversation_json_source", "ambiguous_conversation_source_identity"}
+                else raw_code
+                if raw_code in {"input_symlink_not_allowed", "input_source_outside_root"}
                 else "source_scan_failed"
             )
             summary["failure_code"] = code
@@ -459,9 +494,19 @@ def run_import_pipeline(
             if not batch:
                 return
             statuses = upsert_conversations_batch(conn, run_id, batch, skip_fts=rebuild_fts)
-            summary["unchanged_conversations"] += statuses["unchanged"]
-            summary["updated_conversations"] += statuses["updated"]
-            summary["inserted_conversations"] += statuses["inserted"]
+            summary["attempted_unchanged_conversations"] += statuses["unchanged"]
+            summary["attempted_updated_conversations"] += statuses["updated"]
+            summary["attempted_inserted_conversations"] += statuses["inserted"]
+            for conversation_id, status in statuses.get("outcomes", {}).items():
+                previous = final_status_by_id.get(conversation_id)
+                if previous == "inserted":
+                    final_status_by_id[conversation_id] = "inserted"
+                elif previous == "updated":
+                    final_status_by_id[conversation_id] = "updated"
+                elif previous == "unchanged" and status != "unchanged":
+                    final_status_by_id[conversation_id] = "updated"
+                else:
+                    final_status_by_id[conversation_id] = status
             batch.clear()
 
         parse_started = time.perf_counter()
@@ -481,6 +526,17 @@ def run_import_pipeline(
                 raise ImportPipelineError(
                     "non_finite_json_number",
                     stage="json_decode",
+                    source_identifier=f"selected_source_{source_index}",
+                    run_id=run_id,
+                ) from exc
+            except ValueError as exc:
+                raw_code = str(exc).split(" ", 1)[0]
+                if raw_code not in {"input_symlink_not_allowed", "input_source_outside_root"}:
+                    raise
+                summary["failure_code"] = raw_code
+                raise ImportPipelineError(
+                    raw_code,
+                    stage="source_scan",
                     source_identifier=f"selected_source_{source_index}",
                     run_id=run_id,
                 ) from exc
@@ -508,8 +564,9 @@ def run_import_pipeline(
                     record_duplicate_warning(parsed)
                 else:
                     seen_conversation_ids.add(parsed.conversation_id)
-                summary["valid_conversations"] += 1
-                summary["nodes"] += len(parsed.nodes)
+                summary["attempted_valid_conversations"] += 1
+                summary["attempted_nodes"] += len(parsed.nodes)
+                final_node_counts[parsed.conversation_id] = len(parsed.nodes)
                 parsed_conversations.append(parsed)
                 if len(parsed_conversations) >= 100:
                     flush_batch(parsed_conversations)
@@ -531,6 +588,19 @@ def run_import_pipeline(
             summary["optimize_after_import"] = optimize_after_import(conn)
             summary["pragma_optimize_seconds"] = _elapsed(pragma_started)
             notify("pragma_optimize_complete")
+        summary["valid_conversations"] = summary["attempted_valid_conversations"]
+        summary["committed_conversations"] = len(final_node_counts)
+        summary["committed_nodes"] = sum(final_node_counts.values())
+        summary["nodes"] = summary["committed_nodes"]
+        summary["inserted_conversations"] = sum(
+            status == "inserted" for status in final_status_by_id.values()
+        )
+        summary["updated_conversations"] = sum(
+            status == "updated" for status in final_status_by_id.values()
+        )
+        summary["unchanged_conversations"] = sum(
+            status == "unchanged" for status in final_status_by_id.values()
+        )
         summary["legacy_pre_commit_seconds"] = _elapsed(import_started)
         summary["wall_total_seconds"] = summary["legacy_pre_commit_seconds"]
         summary["total_import_seconds"] = summary["wall_total_seconds"]
@@ -572,7 +642,10 @@ def run_import_pipeline(
         except sqlite3.ProgrammingError:
             in_transaction = False
         if in_transaction:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         pipeline_error = exc if isinstance(exc, ImportPipelineError) else ImportPipelineError(
             "import_transaction_failed",
             stage="transaction",
@@ -580,35 +653,43 @@ def run_import_pipeline(
         )
         summary["failure_code"] = pipeline_error.code
         summary["failure_stage"] = pipeline_error.stage
+        summary["original_failure_code"] = pipeline_error.code
+        summary["original_failure_stage"] = pipeline_error.stage
+        summary["valid_conversations"] = 0
+        summary["nodes"] = 0
+        summary["committed_conversations"] = 0
+        summary["committed_nodes"] = 0
+        summary["inserted_conversations"] = 0
+        summary["updated_conversations"] = 0
+        summary["unchanged_conversations"] = 0
         summary["wall_total_seconds"] = _elapsed(import_started)
         summary["total_import_seconds"] = summary["wall_total_seconds"]
-        try:
-            record_warning(
-                conn,
-                run_id,
-                WarningRecord(
-                    pipeline_error.source_identifier,
-                    None,
-                    pipeline_error.code,
-                    compact_json({"stage": pipeline_error.stage, **pipeline_error.detail}),
-                    None,
-                ),
-            )
-            warning_rows = conn.execute(
-                """SELECT warning_type, COUNT(*) AS count
-                   FROM import_warnings WHERE import_run_id = ?
-                   GROUP BY warning_type ORDER BY warning_type""",
-                (run_id,),
-            ).fetchall()
-            summary["warnings"] = sum(int(row["count"]) for row in warning_rows)
-            summary["warnings_by_type"] = [dict(row) for row in warning_rows]
-            finish_import_run(conn, run_id, "failed", summary)
-        except Exception:
-            pass
         try:
             conn.close()
         except Exception:
             pass
+        summary["failure_persistence_failed"] = False
+        persistence_error = _persist_failed_import_run(
+            db_path,
+            run_id,
+            pipeline_error,
+            summary,
+        )
+        if persistence_error is not None:
+            pipeline_error.failure_persistence_failed = True
+            pipeline_error.failure_persistence_error_type = persistence_error
+            summary["failure_persistence_failed"] = True
+            summary["failure_persistence_error_type"] = persistence_error
+            LOGGER.error(
+                "failure_persistence_failed import_run_id=%s original_failure_code=%s "
+                "original_failure_stage=%s error_type=%s",
+                run_id,
+                pipeline_error.code,
+                pipeline_error.stage,
+                persistence_error,
+            )
+        else:
+            summary["failure_persistence_failed"] = False
         pipeline_error.run_id = run_id
         pipeline_error.summary = dict(summary)
         raise pipeline_error from exc if pipeline_error is not exc else None
@@ -645,6 +726,53 @@ def run_import_pipeline(
         summary["wall_total_seconds"],
     )
     return result
+
+
+def _persist_failed_import_run(
+    db_path: Path,
+    run_id: int,
+    pipeline_error: ImportPipelineError,
+    summary: dict[str, Any],
+) -> str | None:
+    """Persist rollback outcome on a fresh connection and report failure safely."""
+
+    failure_conn: sqlite3.Connection | None = None
+    try:
+        failure_conn = connect(db_path)
+        record_warning(
+            failure_conn,
+            run_id,
+            WarningRecord(
+                pipeline_error.source_identifier,
+                None,
+                pipeline_error.code,
+                compact_json({"stage": pipeline_error.stage, **pipeline_error.detail}),
+                None,
+            ),
+        )
+        warning_rows = failure_conn.execute(
+            """SELECT warning_type, COUNT(*) AS count
+               FROM import_warnings WHERE import_run_id = ?
+               GROUP BY warning_type ORDER BY warning_type""",
+            (run_id,),
+        ).fetchall()
+        summary["warnings"] = sum(int(row["count"]) for row in warning_rows)
+        summary["warnings_by_type"] = [dict(row) for row in warning_rows]
+        finish_import_run(failure_conn, run_id, "failed", summary)
+        return None
+    except Exception as persistence_exc:
+        if failure_conn is not None:
+            try:
+                failure_conn.rollback()
+            except Exception:
+                pass
+        return type(persistence_exc).__name__
+    finally:
+        if failure_conn is not None:
+            try:
+                failure_conn.close()
+            except Exception:
+                pass
 
 
 def _record_post_import_warning(db_path: Path, run_id: int, warning: WarningRecord, summary: dict[str, Any]) -> None:
@@ -728,6 +856,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"broken_parent_links {result['broken_parent_links']}")
     print(f"conversations_with_zero_nodes {result['conversations_with_zero_nodes']}")
     print(f"parent_cycles {result['parent_cycles']}")
+    print(f"parent_cycle_nodes {result.get('parent_cycle_nodes', result['parent_cycles'])}")
+    print(f"parent_cycle_components {result.get('parent_cycle_components', 0)}")
+    print(f"foreign_key_violations {result.get('foreign_key_violations', 0)}")
+    for item in result.get("foreign_key_violations_by_table", []):
+        print(f"foreign_key_violation_table {item['table']} count {item['count']}")
+    for item in result.get("foreign_key_violation_samples", []):
+        print(
+            "foreign_key_violation_sample "
+            f"table={item['table']} rowid={item['rowid']} "
+            f"parent_table={item['parent_table']} constraint_index={item['constraint_index']}"
+        )
     print(f"non_finite_timestamps {result.get('non_finite_timestamps', 0)}")
     for key, value in sorted(result.get("effective_current_diagnostics", {}).items()):
         print(f"effective_current_{key} {value}")

@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from .db import CORE_SCHEMA_COLUMNS, _drop_table_with_shadows, configure_bulk_write_connection
-from .search import invalidate_capability_cache, normalize_search_text, search_fragment_match
+from .parser import recover_message_display_text
+from .search import _derived_generation_is_current, invalidate_capability_cache, normalize_search_text, search_fragment_match
 
 
 REQUIRED_TABLES = {
@@ -31,6 +32,7 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
+    conn.create_function("web_display_text", 2, recover_message_display_text, deterministic=True)
     return conn
 
 
@@ -42,6 +44,7 @@ def connect_writable(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
+    conn.create_function("web_display_text", 2, recover_message_display_text, deterministic=True)
     return conn
 
 
@@ -89,12 +92,12 @@ def web_index_status(conn: sqlite3.Connection) -> dict[str, Any]:
             metadata = {}
     message_norm_normalized = schema["web_message_norm"] and (
         metadata.get("message_norm_text") == "normalized" or metadata.get("message_trigram_text") == "normalized"
-    )
+    ) and _derived_generation_is_current(conn, "message")
     title_norm_normalized = schema["web_title_norm"] and (
         metadata.get("title_norm_text") == "normalized" or metadata.get("title_trigram_text") == "normalized"
-    )
-    message_trigram_normalized = schema["web_message_trigram"] and metadata.get("message_trigram_text") == "normalized"
-    title_trigram_normalized = schema["web_title_trigram"] and metadata.get("title_trigram_text") == "normalized"
+    ) and _derived_generation_is_current(conn, "title")
+    message_trigram_normalized = schema["web_message_trigram"] and metadata.get("message_trigram_text") == "normalized" and _derived_generation_is_current(conn, "message")
+    title_trigram_normalized = schema["web_title_trigram"] and metadata.get("title_trigram_text") == "normalized" and _derived_generation_is_current(conn, "title")
     return {
         "web_normalized_indexed": bool(message_norm_normalized and title_norm_normalized),
         "web_normalized_trigram_indexed": bool(message_trigram_normalized and title_trigram_normalized),
@@ -198,9 +201,9 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             conn.execute(
                 """
                 INSERT INTO web_message_trigram(rowid, content_text)
-                SELECT rowid, web_norm(content_text)
+                SELECT rowid, web_norm(web_display_text(content_text, substr(raw_message_json, 1, 200001)))
                 FROM conversation_nodes
-                WHERE content_text IS NOT NULL AND content_text <> ''
+                WHERE web_display_text(content_text, substr(raw_message_json, 1, 200001)) <> ''
                 """
             )
             conn.execute(
@@ -239,9 +242,9 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
         conn.execute(
             """
             INSERT INTO web_message_norm(conversation_id, node_id, content_norm)
-            SELECT conversation_id, node_id, web_norm(content_text)
+            SELECT conversation_id, node_id, web_norm(web_display_text(content_text, substr(raw_message_json, 1, 200001)))
             FROM conversation_nodes
-            WHERE content_text IS NOT NULL AND content_text <> ''
+            WHERE web_display_text(content_text, substr(raw_message_json, 1, 200001)) <> ''
             """
         )
         conn.execute(
@@ -255,6 +258,17 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             ("message_norm_text", "normalized"),
             ("title_norm_text", "normalized"),
         ]
+        try:
+            generations = {
+                str(row["name"]): str(row["generation"])
+                for row in conn.execute("SELECT name, generation FROM archive_generations")
+            }
+        except sqlite3.Error:
+            generations = {}
+        if "message" in generations:
+            metadata.append(("message_generation", generations["message"]))
+        if "title" in generations:
+            metadata.append(("title_generation", generations["title"]))
         if trigram_available:
             metadata.extend(
                 [

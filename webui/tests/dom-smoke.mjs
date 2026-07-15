@@ -72,7 +72,8 @@ function assertStaticFrontendContracts() {
   for (const explicitParam of ['params.set("match_mode"', 'params.set("layout"', 'params.set("show_internal"']) {
     assert.ok(appSource.includes(explicitParam), `canonical Copy URL should explicitly include ${explicitParam}`);
   }
-  assert.ok(appSource.includes('activeElement?.closest(".sidebar")'), "conversation keyboard navigation should be restricted to the sidebar context");
+  assert.equal(appSource.includes("focusIndex"), false, "unreachable sidebar navigation state should be removed");
+  assert.ok(appSource.includes("appliedShareStateRef"), "Copy URL should serialize one accepted search/list/selection context");
   for (const selector of ["button", "a[href]", "summary", "[role='button']", "[role='menuitem']", "[tabindex]:not([tabindex='-1'])"]) {
     assert.ok(interactionSource.includes(selector), `interactive target helper should recognize ${selector}`);
   }
@@ -88,6 +89,8 @@ function assertStaticFrontendContracts() {
   assert.ok(i18nSource.includes("UTC calendar days"), "date filter UTC wording should be visible in search help");
   assert.ok(i18nSource.includes("preparingCopy"), "copy loading state should be localized");
   assert.ok(appSource.includes("importInputRef"), "successful upload should be able to clear the file input");
+  assert.ok(appSource.includes('data-testid="import-zip-button"'), "ZIP import should expose a visible keyboard-focusable button");
+  assert.ok(i18nSource.includes('PARTIAL_LANGUAGES = ["ja", "es"]'), "partial Japanese and Spanish coverage should be explicit");
   assert.ok(stylesSource.includes(".search-diagnostics-hint"), "diagnostics hint styles should target the current class");
   assert.equal(stylesSource.includes(".diagnostics-hint"), false, "stale diagnostics-hint selector should not return");
 }
@@ -745,6 +748,19 @@ async function main() {
       const apiPage = await (await fetch(new URL("/api/conversations?limit=5&sort=newest", baseUrl))).json();
       throw new Error(`initial conversation items did not render; health=${JSON.stringify(health)} api_count=${apiPage.items?.length ?? 0} diagnostics=${browserDiagnostics.join(" | ")}`);
     }
+    const importButton = page.getByTestId("import-zip-button");
+    await importButton.focus();
+    assert.equal(await importButton.evaluate((node) => node === document.activeElement), true, "visible Import ZIP button must receive keyboard focus");
+    assert.notEqual(await importButton.evaluate((node) => getComputedStyle(node).outlineStyle), "none", "Import ZIP button needs a visible focus ring");
+    await page.locator("#import-zip-input").evaluate((node) => {
+      node.click = () => { node.dataset.keyboardActivated = "true"; };
+    });
+    await page.keyboard.press("Enter");
+    assert.equal(await page.locator("#import-zip-input").getAttribute("data-keyboard-activated"), "true", "Enter on the visible Import ZIP button must activate the file chooser path");
+    await page.locator("#import-zip-input").evaluate((node) => { delete node.dataset.keyboardActivated; });
+    await page.keyboard.press("Space");
+    assert.equal(await page.locator("#import-zip-input").getAttribute("data-keyboard-activated"), "true", "Space on the visible Import ZIP button must activate the file chooser path");
+    assert.equal(await importButton.getAttribute("aria-label"), null, "visible Import ZIP text supplies the accessible name without a hidden override");
     const selectedBeforeInteractiveKeys = new URL(page.url()).searchParams.get("conversation");
     await page.evaluate(() => {
       const fixture = document.createElement("div");
@@ -1116,10 +1132,23 @@ async function main() {
     await page.goto(`${baseUrl}?conversation=dom-long&layout=classic&show_internal=true`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
     assert.equal(await page.getByLabel("Show internal messages").isChecked(), true, "shareable show_internal state should survive reload");
-    await page.locator("#global-search").fill("copy-url-live-query");
-    await page.getByRole("button", { name: "Copy URL" }).click();
+    await page.evaluate(() => {
+      window.__copiedText = "";
+      const input = document.querySelector("#global-search");
+      const copyButton = [...document.querySelectorAll("button")].find((button) => button.textContent === "Copy URL");
+      if (!(input instanceof HTMLInputElement) || !(copyButton instanceof HTMLButtonElement)) {
+        throw new Error("search input or Copy URL button missing");
+      }
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      if (!valueSetter) throw new Error("native input value setter missing");
+      valueSetter.call(input, "copy-url-live-query");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      copyButton.click();
+    });
+    await page.waitForFunction(() => typeof window.__copiedText === "string" && window.__copiedText.length > 0);
     const copiedUrl = await page.evaluate(() => window.__copiedText);
-    assert.equal(new URL(copiedUrl).searchParams.get("q"), "copy-url-live-query", "Copy URL must use the live query before debounce completes");
+    assert.equal(new URL(copiedUrl).searchParams.get("q"), null, "Copy URL before debounce must preserve the previously applied query");
+    assert.equal(new URL(copiedUrl).searchParams.get("conversation"), "dom-long", "copied selection must belong to the same applied search context");
     assert.equal(new URL(copiedUrl).searchParams.get("match_mode"), "contains", "Copy URL must serialize the sender's explicit default match mode");
     assert.equal(new URL(copiedUrl).searchParams.get("layout"), "classic");
     assert.equal(new URL(copiedUrl).searchParams.get("show_internal"), "true");
@@ -1129,9 +1158,7 @@ async function main() {
       localStorage.setItem("chatgptArchiveWeb.settings.v2", JSON.stringify({ messageLayout: "chat", showInternalDefault: false }));
     });
     const receiverPage = await receiverContext.newPage();
-    const receiverUrl = new URL(copiedUrl);
-    receiverUrl.searchParams.delete("q");
-    await receiverPage.goto(receiverUrl.toString(), { waitUntil: "networkidle" });
+    await receiverPage.goto(copiedUrl, { waitUntil: "networkidle" });
     await waitForCount(receiverPage, ".message", 1);
     assert.equal(await receiverPage.getByLabel("Whole word").isChecked(), false, "copied contains mode must beat recipient localStorage word mode");
     assert.equal(await receiverPage.getByLabel("Show internal messages").isChecked(), true, "copied internal visibility must beat recipient localStorage");
@@ -1589,7 +1616,7 @@ async function main() {
     await waitForCount(page, ".conversation-item", 5);
     const mobileToolbar = await page.getByTestId("top-toolbar").boundingBox();
     assert.ok(mobileToolbar && mobileToolbar.height >= 40, "390px layout must keep a mobile toolbar visible");
-    assert.ok(await page.locator('label[for="import-zip-input"]').isVisible(), "mobile toolbar must keep ZIP import accessible");
+    assert.ok(await page.getByTestId("import-zip-button").isVisible(), "mobile toolbar must keep ZIP import accessible");
     assert.ok(await page.getByRole("button", { name: "设置" }).isVisible(), "mobile toolbar must keep Settings accessible");
     assert.ok(await page.getByRole("button", { name: "搜索帮助" }).isVisible(), "mobile toolbar must keep Search Help accessible");
     await page.getByRole("button", { name: "设置" }).focus();

@@ -13,9 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest
 import zipfile
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from chatgpt_export_archiver.cli import build_parser, main
@@ -1500,6 +1502,66 @@ class ArchiverTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_directory_scanner_rejects_symlinks_and_scan_open_replacement(self):
+        from chatgpt_export_archiver.scanner import find_default_input
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            outside = base / "outside"
+            outside.mkdir()
+            outside_json = outside / "outside.json"
+            outside_json.write_text(json.dumps([conversation("outside")]), encoding="utf-8")
+
+            for link_kind in ("file", "directory", "chain", "broken"):
+                with self.subTest(link_kind=link_kind):
+                    root = base / f"root-{link_kind}"
+                    root.mkdir()
+                    if link_kind == "file":
+                        (root / "conversations.json").symlink_to(outside_json)
+                    elif link_kind == "directory":
+                        target_dir = outside / "members"
+                        target_dir.mkdir(exist_ok=True)
+                        (target_dir / "conversations-000.json").write_text("[]", encoding="utf-8")
+                        (root / "linked").symlink_to(target_dir, target_is_directory=True)
+                    elif link_kind == "chain":
+                        first = root / "first"
+                        first.symlink_to(outside_json)
+                        (root / "conversations.json").symlink_to(first)
+                    else:
+                        (root / "conversations.json").symlink_to(outside / "missing.json")
+                    source = resolve_input(str(root), base)
+                    with self.assertRaisesRegex(ValueError, "input_symlink_not_allowed"):
+                        list_source_entries(source)
+
+            root = base / "toctou"
+            root.mkdir()
+            member = root / "conversations.json"
+            member.write_text(json.dumps([conversation("inside")]), encoding="utf-8")
+            source = resolve_input(str(root), base)
+            entries = list_source_entries(source)
+            self.assertEqual([entry.source_path for entry in entries if entry.is_selected_conversation_source], ["conversations.json"])
+            member.rename(root / "original.json")
+            member.symlink_to(outside_json)
+            with self.assertRaisesRegex(ValueError, "input_symlink_not_allowed"):
+                load_json_from_source(source, "conversations.json")
+
+            for name in ("notes.txt", "other.json", "image.png", "empty"):
+                path = base / name
+                path.write_bytes(b"")
+                with self.assertRaisesRegex(ValueError, "input_not_supported"):
+                    find_default_input(path)
+            direct_link = base / "direct-link.json"
+            direct_link.symlink_to(outside_json)
+            with self.assertRaisesRegex(ValueError, "input_not_supported"):
+                find_default_input(direct_link)
+
+            normal = base / "normal"
+            normal.mkdir()
+            (normal / "conversations-000.json").write_text("[]", encoding="utf-8")
+            (normal / "conversations-001.json").write_text("[]", encoding="utf-8")
+            self.assertEqual(find_default_input(normal).kind, "directory")
+
     def test_default_input_keeps_ambiguous_json_selection_explicit(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -2832,7 +2894,9 @@ class ArchiverTests(unittest.TestCase):
             self.assertIn("dist_missing_assets", missing_asset.stdout)
             dist_index.write_text(original_index, encoding="utf-8")
 
-            (work / "README.es-ES.md").unlink()
+            missing_readme_path = work / "README.es-ES.md"
+            missing_readme_bytes = missing_readme_path.read_bytes()
+            missing_readme_path.unlink()
             missing_required = _sp.run(
                 [_sys.executable, str(work / "tools" / "make_release_zip.py"), "--output", str(work_parent / "missing-required.zip"), "--no-check"],
                 capture_output=True, text=True, cwd=work,
@@ -2840,6 +2904,35 @@ class ArchiverTests(unittest.TestCase):
             self.assertNotEqual(missing_required.returncode, 0)
             self.assertIn("required_release_paths_missing", missing_required.stdout)
             self.assertIn("README.es-ES.md", missing_required.stdout)
+            missing_readme_path.write_bytes(missing_readme_bytes)
+            # Every authoritative leaf is validated independently of what the
+            # collector happened to find, and a failure cannot replace the
+            # previously verified release.
+            from tools import make_release_zip as _release
+
+            existing_release = output.read_bytes()
+            for relative in (
+                "webui/vite.config.ts",
+                "webui/tsconfig.json",
+                "webui/index.html",
+                "LICENSE",
+                ".gitignore",
+                "chatgpt_export_archiver/logging_utils.py",
+                "chatgpt_export_archiver/utils.py",
+                "tools/benchmark_effective_current.py",
+                "tools/clean_generated_artifacts.py",
+            ):
+                target = work / relative
+                original = target.read_bytes()
+                target.unlink()
+                try:
+                    with self.subTest(missing_authoritative_leaf=relative), self.assertRaisesRegex(
+                        ValueError, "required_release_paths_missing"
+                    ):
+                        _release.build_release(work, output, check=False)
+                    self.assertEqual(output.read_bytes(), existing_release)
+                finally:
+                    target.write_bytes(original)
         finally:
             _sh.rmtree(work_parent, ignore_errors=True)
 
@@ -2890,6 +2983,54 @@ class ArchiverTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_large_exponent_json_and_invalid_timestamp_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            for token in ("1e9999", "-1e9999"):
+                source = base / f"overflow-{token[0]}.zip"
+                with zipfile.ZipFile(source, "w") as archive:
+                    archive.writestr("conversations.json", f'[{{"id":"overflow","x":{token}}}]')
+                code, output = run_cli([
+                    "--db", str(base / f"overflow-{token[0]}.db"),
+                    "import", "--input", str(source), "--no-input-sha256",
+                ])
+                self.assertEqual(code, 2, output)
+                self.assertIn("non_finite_json_number", output)
+
+            payload = conversation("finite-and-invalid")
+            payload["create_time"] = "abc"
+            payload["update_time"] = {"invalid": True}
+            payload["mapping"]["u1"]["message"]["create_time"] = []
+            payload["mapping"]["u1"]["message"]["update_time"] = {"invalid": True}
+            payload["mapping"]["a1"]["message"]["create_time"] = 1e308
+            payload["mapping"]["a1"]["message"]["update_time"] = 5e-324
+            payload["mapping"]["a1"]["message"]["metadata"]["finite"] = 1e308
+            source = base / "finite-invalid.zip"
+            write_zip(source, {"conversations.json": [payload]})
+            db = base / "finite-invalid.db"
+            code, output = run_cli([
+                "--db", str(db), "import", "--input", str(source), "--no-input-sha256",
+            ])
+            self.assertEqual(code, 0, output)
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            try:
+                warnings = conn.execute(
+                    "SELECT warning_type, keys_json, raw_json FROM import_warnings WHERE warning_type = 'invalid_timestamp'"
+                ).fetchall()
+                self.assertEqual(len(warnings), 4)
+                self.assertTrue(all(row["raw_json"] is None for row in warnings))
+                self.assertTrue(all(set(json.loads(row["keys_json"])) == {"field", "value_type"} for row in warnings))
+                node = conn.execute(
+                    "SELECT create_time, update_time, metadata_json, raw_message_json FROM conversation_nodes WHERE node_id = 'a1'"
+                ).fetchone()
+                self.assertEqual(node["create_time"], 1e308)
+                self.assertEqual(node["update_time"], 5e-324)
+                self.assertNotRegex(node["metadata_json"], r"(?:NaN|Infinity)")
+                self.assertNotRegex(node["raw_message_json"], r"(?:NaN|Infinity)")
+            finally:
+                conn.close()
+
     def test_import_preflight_and_transaction_failures_persist_consistent_runs(self):
         cases = []
         with tempfile.TemporaryDirectory() as td:
@@ -2936,6 +3077,109 @@ class ArchiverTests(unittest.TestCase):
                     self.assertEqual([row["warning_type"] for row in warning_rows], [code])
                     self.assertEqual(summary["warnings"], 1)
 
+    def test_mixed_shard_rollback_separates_attempted_and_committed_counts(self):
+        from chatgpt_export_archiver.cli import ImportPipelineError, run_import_pipeline
+
+        for valid_shard_count in (1, 2):
+            with self.subTest(valid_shard_count=valid_shard_count), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                source = base / "mixed.zip"
+                with zipfile.ZipFile(source, "w") as archive:
+                    for index in range(valid_shard_count):
+                        archive.writestr(
+                            f"conversations-{index:03d}.json",
+                            json.dumps([conversation(f"attempted-{index}")]),
+                        )
+                    archive.writestr(f"conversations-{valid_shard_count:03d}.json", "{")
+                db = base / "archive.db"
+                with self.assertRaises(ImportPipelineError) as caught:
+                    run_import_pipeline(db, str(source), cwd=base, no_input_sha256=True)
+                summary = caught.exception.summary
+                self.assertIsNotNone(summary)
+                self.assertEqual(summary["attempted_valid_conversations"], valid_shard_count)
+                self.assertEqual(summary["attempted_nodes"], valid_shard_count * 5)
+                self.assertEqual(summary["valid_conversations"], 0)
+                self.assertEqual(summary["nodes"], 0)
+                self.assertEqual(summary["committed_conversations"], 0)
+                self.assertEqual(summary["committed_nodes"], 0)
+                self.assertEqual(summary["inserted_conversations"], 0)
+                self.assertEqual(summary["updated_conversations"], 0)
+                self.assertEqual(summary["unchanged_conversations"], 0)
+                self.assertEqual(summary["attempted_inserted_conversations"], valid_shard_count)
+                conn = sqlite3.connect(db)
+                conn.row_factory = sqlite3.Row
+                try:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+                    run = conn.execute("SELECT status, summary_json FROM import_runs").fetchone()
+                    persisted = json.loads(run["summary_json"])
+                    self.assertEqual(run["status"], "failed")
+                    self.assertEqual(persisted["attempted_valid_conversations"], valid_shard_count)
+                    self.assertEqual(persisted["committed_conversations"], 0)
+                    self.assertFalse(persisted["failure_persistence_failed"])
+                finally:
+                    conn.close()
+
+    def test_failed_run_secondary_persistence_failures_are_explicit(self):
+        from chatgpt_export_archiver import cli as cli_module
+        from chatgpt_export_archiver.cli import ImportPipelineError
+
+        cases = ("warning", "finish", "open", "readonly", "locked", "io")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                source = base / "invalid.zip"
+                with zipfile.ZipFile(source, "w") as archive:
+                    archive.writestr("conversations.json", "{")
+                db = base / "archive.db"
+                real_connect = cli_module.connect
+                patches: list[Any] = []
+                if case == "open":
+                    calls = {"count": 0}
+
+                    def connect_then_fail(path):
+                        calls["count"] += 1
+                        if calls["count"] >= 2:
+                            raise OSError("synthetic open failure")
+                        return real_connect(path)
+
+                    patches.append(mock.patch.object(cli_module, "connect", side_effect=connect_then_fail))
+                elif case == "finish":
+                    patches.append(
+                        mock.patch.object(
+                            cli_module,
+                            "finish_import_run",
+                            side_effect=sqlite3.OperationalError("synthetic commit failure"),
+                        )
+                    )
+                else:
+                    message = {
+                        "warning": "synthetic warning write failure",
+                        "readonly": "attempt to write a readonly database",
+                        "locked": "database is locked",
+                        "io": "disk I/O error",
+                    }[case]
+                    patches.append(
+                        mock.patch.object(
+                            cli_module,
+                            "record_warning",
+                            side_effect=sqlite3.OperationalError(message),
+                        )
+                    )
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaises(ImportPipelineError) as caught:
+                        cli_module.run_import_pipeline(db, str(source), cwd=base, no_input_sha256=True)
+                error = caught.exception
+                self.assertEqual(error.code, "invalid_conversation_json")
+                self.assertEqual(error.stage, "json_decode")
+                self.assertTrue(error.failure_persistence_failed)
+                self.assertIn(error.failure_persistence_error_type, {"OperationalError", "OSError"})
+                self.assertTrue(error.summary["failure_persistence_failed"])
+                self.assertEqual(error.summary["original_failure_code"], "invalid_conversation_json")
+                self.assertEqual(error.summary["original_failure_stage"], "json_decode")
+                self.assertIn("failure_persistence_failed=true", str(error))
+
     def test_legacy_non_finite_stats_verify_and_export_are_safe(self):
         from chatgpt_export_archiver.db import get_stats
         from chatgpt_export_archiver.exporter import export_conversations
@@ -2962,6 +3206,137 @@ class ArchiverTests(unittest.TestCase):
                     self.assertLessEqual(len(path.name.encode("utf-8")), 255)
             finally:
                 conn.close()
+
+    def test_verify_reports_foreign_key_violations_and_cli_fails_safely(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "foreign-keys.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                "INSERT INTO source_files(import_run_id, source_path, file_type) VALUES (999, 'synthetic', 'json')"
+            )
+            conn.execute(
+                "INSERT INTO import_warnings(import_run_id, source_file, warning_type, created_at) VALUES (999, 'synthetic', 'synthetic', 'now')"
+            )
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, aggregate_hash, last_import_run_id) VALUES ('orphan-run', 'h', 999)"
+            )
+            conn.execute(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, last_import_run_id) VALUES ('missing-conversation', 'node', 999)"
+            )
+            conn.execute(
+                "INSERT INTO file_index(import_run_id, source_path, file_type) VALUES (999, 'synthetic', 'json')"
+            )
+            conn.commit()
+            result = verify_database(conn)
+            conn.close()
+            self.assertFalse(result["ok"])
+            self.assertGreaterEqual(result["foreign_key_violations"], 6)
+            self.assertEqual(
+                {item["table"] for item in result["foreign_key_violations_by_table"]},
+                {"source_files", "import_warnings", "conversations", "conversation_nodes", "file_index"},
+            )
+            self.assertLessEqual(len(result["foreign_key_violation_samples"]), 20)
+            self.assertTrue(
+                all(
+                    set(item) == {"table", "rowid", "parent_table", "constraint_index"}
+                    for item in result["foreign_key_violation_samples"]
+                )
+            )
+            code, output = run_cli(["--db", str(db), "verify"])
+            self.assertEqual(code, 1)
+            self.assertIn("foreign_key_violations ", output)
+            self.assertIn("foreign_key_violation_table conversation_nodes", output)
+
+    def test_parent_cycle_nodes_and_components_have_explicit_units(self):
+        from chatgpt_export_archiver.db import parent_cycle_diagnostics
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        fixtures = {
+            "self": [("a", "a")],
+            "two": [("a", "b"), ("b", "a"), ("tail", "a")],
+            "three": [("a", "b"), ("b", "c"), ("c", "a")],
+            "two-components": [("a", "b"), ("b", "a"), ("c", "d"), ("d", "c")],
+        }
+        expected = {
+            "self": (1, 1),
+            "two": (2, 1),
+            "three": (3, 1),
+            "two-components": (4, 2),
+        }
+        for conversation_id, pairs in fixtures.items():
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, aggregate_hash) VALUES (?, ?)",
+                (conversation_id, conversation_id),
+            )
+            conn.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id) VALUES (?, ?, ?)",
+                ((conversation_id, node_id, parent_id) for node_id, parent_id in pairs),
+            )
+        for conversation_id, (nodes, components) in expected.items():
+            scoped = sqlite3.connect(":memory:")
+            scoped.row_factory = sqlite3.Row
+            init_db(scoped)
+            scoped.execute(
+                "INSERT INTO conversations(conversation_id, aggregate_hash) VALUES (?, ?)",
+                (conversation_id, conversation_id),
+            )
+            scoped.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id) VALUES (?, ?, ?)",
+                ((conversation_id, node_id, parent_id) for node_id, parent_id in fixtures[conversation_id]),
+            )
+            diagnostics = parent_cycle_diagnostics(scoped)
+            verify = verify_database(scoped)
+            scoped.close()
+            self.assertEqual(diagnostics["parent_cycle_nodes"], nodes)
+            self.assertEqual(diagnostics["parent_cycle_components"], components)
+            self.assertEqual(verify["parent_cycles"], nodes)
+            self.assertEqual(verify["parent_cycle_nodes"], nodes)
+            self.assertEqual(verify["parent_cycle_components"], components)
+        conn.close()
+
+    def test_verify_effective_diagnostics_uses_batched_queries_not_per_conversation(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        count = 20_000
+        conn.executemany(
+            "INSERT INTO conversations(conversation_id, current_node, aggregate_hash) VALUES (?, ?, ?)",
+            ((f"verify-{index}", f"node-{index}", f"hash-{index}") for index in range(count)),
+        )
+        conn.executemany(
+            "INSERT INTO conversation_nodes(conversation_id, node_id, is_on_current_path) VALUES (?, ?, 0)",
+            ((f"verify-{index}", f"node-{index}") for index in range(count)),
+        )
+        conn.commit()
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        try:
+            result = verify_database(conn)
+        finally:
+            conn.set_trace_callback(None)
+            conn.close()
+        self.assertTrue(result["ok"])
+        selects = [
+            sql for sql in statements
+            if sql.lstrip().upper().startswith(("SELECT", "WITH", "PRAGMA"))
+        ]
+        self.assertLess(len(selects), 100)
+        self.assertFalse(
+            any(
+                "WHERE ec.conversation_id =" in sql
+                and "effective_current_nodes ec" in sql
+                for sql in statements
+            )
+        )
+        self.assertEqual(
+            result["effective_current_diagnostics"]["flags_missing_current_chain_nodes"],
+            count,
+        )
 
     def test_export_basenames_respect_utf8_component_budget_on_disk(self):
         from chatgpt_export_archiver.exporter import MAX_EXPORT_BASENAME_BYTES, export_conversations
@@ -3003,6 +3378,80 @@ class ArchiverTests(unittest.TestCase):
             self.assertTrue(any("_001." in path.name for path in exported))
             self.assertTrue(any("_002." in path.name for path in exported))
 
+    def test_export_filename_plan_is_globally_unique_across_collision_groups(self):
+        from chatgpt_export_archiver.exporter import export_conversations
+
+        collision_ids = [
+            "a/b",
+            r"a\b",
+            "a_b_001",
+            "Case",
+            "case",
+            "é",
+            "e\u0301",
+            "😀" * 70 + "/x",
+            "😀" * 70 + r"\x",
+        ]
+        payloads = []
+        sentinels: dict[str, str] = {}
+        for index, conversation_id in enumerate(collision_ids):
+            sentinel = f"SYNTHETIC_SENTINEL_{index:02d}"
+            item = conversation(conversation_id, title="same", create_time=1_700_000_000)
+            item["mapping"]["u1"]["message"]["content"]["parts"] = [sentinel]
+            payloads.append(item)
+            sentinels[conversation_id] = sentinel
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "collisions.zip"
+            write_zip(source, {"conversations.json": payloads})
+            db = base / "archive.db"
+            self.assertEqual(
+                run_cli(["--db", str(db), "import", "--input", str(source), "--no-input-sha256"])[0],
+                0,
+            )
+            output = base / "output"
+            output.mkdir()
+            # A historical leftover must not affect this run's deterministic plan.
+            (output / "unrelated-old.md").write_text("old", encoding="utf-8")
+            conn = connect(db)
+            try:
+                first = export_conversations(conn, output, ["md", "txt"])
+                manifest_first = (output / "manifest.jsonl").read_bytes()
+                second = export_conversations(conn, output, ["txt", "md"])
+                manifest_second = (output / "manifest.jsonl").read_bytes()
+            finally:
+                conn.close()
+
+            self.assertEqual(first["written"], len(payloads) * 2)
+            self.assertEqual(second["skipped_unchanged"], len(payloads) * 2)
+            self.assertEqual(manifest_first, manifest_second)
+            rows = [json.loads(line) for line in manifest_first.splitlines()]
+            paths = [row["output_path"] for row in rows]
+            collision_keys = [unicodedata.normalize("NFC", path).casefold() for path in paths]
+            self.assertEqual(len(rows), len(payloads) * 2)
+            self.assertEqual(len(collision_keys), len(set(collision_keys)))
+            self.assertEqual(len({(row["conversation_id"], row["format"]) for row in rows}), len(rows))
+            self.assertTrue(all(len(Path(path).name.encode("utf-8")) <= 240 for path in paths))
+            self.assertTrue(all(Path(path).suffix in {".md", ".txt"} for path in paths))
+            for row in rows:
+                body = (output / row["output_path"]).read_text(encoding="utf-8")
+                self.assertIn(sentinels[row["conversation_id"]], body)
+
+    def test_write_bytes_if_changed_streams_existing_file_comparison(self):
+        from chatgpt_export_archiver.utils import write_bytes_if_changed
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "large.bin"
+            original = (b"synthetic-block-" * 100_000) + b"end"
+            path.write_bytes(original)
+            original_stat = path.stat()
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("read_bytes forbidden")):
+                self.assertFalse(write_bytes_if_changed(path, original))
+                self.assertTrue(write_bytes_if_changed(path, original[:-1] + b"X"))
+            self.assertNotEqual(path.stat().st_mtime_ns, original_stat.st_mtime_ns)
+            self.assertEqual(path.read_bytes(), original[:-1] + b"X")
+
     def test_logging_none_is_project_scoped_and_reconfigurable(self):
         project_stream = io.StringIO()
         third_party_stream = io.StringIO()
@@ -3025,6 +3474,52 @@ class ArchiverTests(unittest.TestCase):
             self.assertFalse(logging.getLogger("uvicorn.error").disabled)
         finally:
             third_party.handlers.clear()
+
+    def test_logging_configuration_preserves_host_global_disable_and_other_loggers(self):
+        project_logger = get_logger("host-state")
+        third_party = logging.getLogger("synthetic.host.third_party")
+        uvicorn_logger = logging.getLogger("uvicorn.error")
+        saved_disable = logging.root.manager.disable
+        saved_third = (third_party.level, third_party.disabled, third_party.propagate, list(third_party.handlers))
+        saved_uvicorn = (uvicorn_logger.level, uvicorn_logger.disabled, uvicorn_logger.propagate, list(uvicorn_logger.handlers))
+        try:
+            for global_disable in (logging.CRITICAL, logging.NOTSET):
+                with self.subTest(global_disable=global_disable):
+                    logging.disable(global_disable)
+                    stream = io.StringIO()
+                    third_stream = io.StringIO()
+                    third_party.handlers[:] = [logging.StreamHandler(third_stream)]
+                    third_party.setLevel(logging.DEBUG)
+                    third_party.disabled = False
+                    third_party.propagate = False
+                    uvicorn_before = (uvicorn_logger.level, uvicorn_logger.disabled, uvicorn_logger.propagate, tuple(uvicorn_logger.handlers))
+
+                    configure_logging("warning", stream=stream)
+                    self.assertEqual(logging.root.manager.disable, global_disable)
+                    configure_logging("none", stream=stream)
+                    self.assertEqual(logging.root.manager.disable, global_disable)
+                    project_logger.critical("project-none")
+                    self.assertEqual(stream.getvalue(), "")
+                    configure_logging("warning", stream=stream)
+                    configure_logging("warning", stream=stream)
+                    project_logger.warning("project-warning")
+                    third_party.error("third-error")
+                    self.assertEqual(logging.root.manager.disable, global_disable)
+                    if global_disable == logging.NOTSET:
+                        self.assertEqual(stream.getvalue().count("project-warning"), 1)
+                        self.assertIn("third-error", third_stream.getvalue())
+                    else:
+                        self.assertNotIn("project-warning", stream.getvalue())
+                    self.assertEqual(
+                        (uvicorn_logger.level, uvicorn_logger.disabled, uvicorn_logger.propagate, tuple(uvicorn_logger.handlers)),
+                        uvicorn_before,
+                    )
+        finally:
+            logging.disable(saved_disable)
+            third_party.level, third_party.disabled, third_party.propagate = saved_third[:3]
+            third_party.handlers[:] = saved_third[3]
+            uvicorn_logger.level, uvicorn_logger.disabled, uvicorn_logger.propagate = saved_uvicorn[:3]
+            uvicorn_logger.handlers[:] = saved_uvicorn[3]
 
     def test_release_failures_preserve_existing_output_and_clean_temp_files(self):
         from tools import make_release_zip

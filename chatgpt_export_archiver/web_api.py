@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +13,13 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, Request, Response, UploadFile
 
 from .exporter import render_markdown, render_txt
+from .db import foreign_key_diagnostics
 from .logging_utils import get_logger
 from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
-from .search import get_conversation, get_messages, list_conversations, normalize_search_text, parse_query, search_conversations, search_messages
+from .search import _has_normalized_title_norm, get_conversation, get_messages, list_conversations, normalize_search_text, parse_query, search_conversations, search_messages
 from .utils import finite_float_or_none, safe_filename_part
 from .web_db import check_schema, connect_readonly, detect_fts5, detect_trigram, web_index_status
-from .web_jobs import ImportJobManager, cleanup_upload_dir, make_upload_path
+from .web_jobs import ImportJobManager, ImportJobStartError, cleanup_upload_dir, make_upload_path
 
 LOGGER = get_logger("web_api")
 
@@ -29,6 +31,7 @@ ALLOWED_MESSAGE_ORDERS = {"relevance", "display"}
 ALLOWED_MATCH_MODES = {"contains", "word"}
 MAX_DATE_PARAM_LENGTH = 64
 MAX_ID_PARAM_LENGTH = 512
+JOB_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 
 DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024
 DEFAULT_MAX_UPLOAD_JSON_MEMBER_BYTES = 64 * 1024 * 1024 * 1024
@@ -381,10 +384,15 @@ def create_api_router(
             web_status = web_index_status(conn)
             fts5 = detect_fts5(conn)
             trigram = detect_trigram(conn)
+            foreign_keys = foreign_key_diagnostics(conn) if schema["ok"] else {
+                "foreign_key_violations": 0,
+                "foreign_key_violations_by_table": [],
+                "foreign_key_violation_samples": [],
+            }
         finally:
             conn.close()
         return {
-            "ok": schema["ok"],
+            "ok": schema["ok"] and foreign_keys["foreign_key_violations"] == 0,
             "db_ready": schema["ok"],
             "schema_compatible": schema["schema_compatible"],
             "missing_tables": schema["missing_tables"],
@@ -394,6 +402,7 @@ def create_api_router(
             "fts5_available": fts5,
             "message_fts_available": schema["message_fts"],
             "trigram_available": trigram,
+            **foreign_keys,
             **access,
             **web_status,
         }
@@ -443,7 +452,9 @@ def create_api_router(
         return {
             "version": 2,
             "pagination": {
-                "fields": ["items", "total", "total_exact", "limit", "offset", "has_more", "next_offset"],
+                "conversation_page": ["items", "total", "limit", "offset", "has_more", "next_offset"],
+                "message_page": ["items", "total", "limit", "offset", "has_more", "next_offset"],
+                "message_search_page": ["items", "total", "total_exact", "limit", "offset", "has_more", "next_offset"],
                 "total_exact": "true means total is an exact count; false means total is only the known lower bound from the current page probe",
             },
             "conversations": {
@@ -454,7 +465,7 @@ def create_api_router(
                 "match_mode": ["contains", "word"],
                 "date": "after/before use UTC calendar days as YYYY-MM-DD; before is exclusive (next-day 00:00:00 UTC)",
                 "selection": ["selected_id", "selected_in_results", "selected_item"],
-                "response": ["total", "items", "has_more", "next_offset", "selected_in_results", "selected_item", "node_count", "current_path_nodes", "current_node_exists", "current_collection_source", "current_path_fallback_to_all", "effective_path", "cycle_detected", "missing_parent", "cross_conversation_parent", "partial_chain", "raw_flag_leaf_count"],
+                "response": ["total", "items", "has_more", "next_offset", "selected_in_results", "selected_item", "node_count", "current_path_nodes", "current_node_exists", "current_collection_source", "current_path_fallback_to_all", "effective_path", "cycle_detected", "missing_parent", "cross_conversation_parent", "partial_chain", "raw_flag_leaf_count", "selected_chain_cycle_detected", "raw_flag_cycle_detected", "selected_chain_missing_parent", "raw_flag_missing_parent", "selected_chain_cross_conversation_parent", "raw_flag_cross_conversation_parent"],
                 "diagnostics": "best-effort search diagnostics; see search.diagnostics",
             },
             "messages": {
@@ -468,12 +479,12 @@ def create_api_router(
                     "fields": ["visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"],
                     "contract": "internal_hidden_count is the one canonical non-empty internal-node count; technical_hidden_count is a deprecated exact alias retained for compatibility",
                 },
-                "path_metadata": ["current_node_exists", "current_collection_source", "effective_path", "current_path_fallback_to_all", "effective_visible_in_current_view", "cycle_detected", "missing_parent", "cross_conversation_parent", "partial_chain", "raw_flag_leaf_count"],
+                "path_metadata": ["current_node_exists", "current_collection_source", "effective_path", "current_path_fallback_to_all", "effective_visible_in_current_view", "cycle_detected", "missing_parent", "cross_conversation_parent", "partial_chain", "raw_flag_leaf_count", "selected_chain_cycle_detected", "raw_flag_cycle_detected", "selected_chain_missing_parent", "raw_flag_missing_parent", "selected_chain_cross_conversation_parent", "raw_flag_cross_conversation_parent"],
                 "highlight": "highlight_ranges use UTF-16 code-unit offsets for JS text.slice(); highlight_ranges_truncated discloses the bounded preview cap",
                 "match_mode": ["contains", "word"],
                 "around_node_id": {
                     "description": "optional scroll-to-node; include_internal=false computes offset in the visible-only reader pagination collection, include_internal=true uses the full node collection, and path=current with no current-path nodes uses the effective all collection",
-                    "response": ["around_target_found", "around_target_visible", "around_target_in_effective_collection", "around_target_applied"],
+                    "response": ["around_target_found", "around_target_in_effective_collection", "around_target_in_requested_collection", "around_target_visible", "around_target_applied"],
                 },
             },
             "raw": {
@@ -493,6 +504,7 @@ def create_api_router(
                 "parameters": ["q", "title", "exact", "exclude", "role", "source", "after", "before", "scope", "path", "match_mode", "order", "conversation_id", "count_total"],
                 "message_order": ["relevance", "display"],
                 "count_total": "boolean; false disables the exact count and returns total_exact=false with a known lower-bound total",
+                "filter_only": "filter-only and exclude-only queries may filter conversation results; message hits and reader highlights require a positive message-text term, and role/source/date filters alone do not create hit navigation",
                 "raw_query_override": "path: and scope: modifiers in q override sidebar path/scope selectors",
                 "diagnostics": {
                     "fields": [
@@ -538,17 +550,19 @@ def create_api_router(
                     "trusted_proxies": list(trust.trusted_proxies),
                     "missing_origin_write_allowed": trust.allow_missing_origin_for_writes,
                     "origin": "writes require a trusted Host and a same-origin Origin in remote mode; loopback permits non-browser clients without Origin",
-                    "forwarded_headers": "ignored unless the direct client IP matches CHATGPT_ARCHIVE_TRUSTED_PROXIES",
+                    "forwarded_headers": "strict edge-proxy model: ignored from untrusted peers; a trusted direct edge must overwrite client values and provide at most one Forwarded element or one X-Forwarded-Host/Proto value; duplicates, chains, malformed syntax, and conflicts are rejected",
                 },
                 "limits_note": "ZIP size checks run before import; JSON parsing, SQLite writes, and web-index rebuild still consume memory, disk, and CPU proportional to decoded conversation JSON size.",
             },
             "jobs": {
                 "endpoints": ["/api/import/jobs", "/api/import/jobs/{job_id}"],
+                "job_id": "lowercase 32-character hexadecimal UUID; invalid syntax returns invalid_job_id and a valid unknown ID returns job_not_found",
                 "statuses": ["queued", "running", "succeeded", "failed", "postcheck_failed"],
                 "outcomes": ["queued", "import_running", "input_preflight_failed", "source_scan_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
-                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "cleanup_warning", "summary", "verify", "stats", "web_index"],
-                "failure_codes": ["no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed"],
+                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "summary", "verify", "stats", "web_index"],
+                "failure_codes": ["import_job_start_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed"],
                 "cleanup_warnings": ["upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"],
+                "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type"],
             },
             "ui_state": {
                 "canonical_copy_url": ["match_mode", "layout", "show_internal", "sort", "path", "scope", "q", "role", "title", "exact", "exclude", "source", "after", "before", "selected conversation"],
@@ -557,11 +571,11 @@ def create_api_router(
             },
             "database_compatibility": "older databases are checked but are not automatically migrated; re-import the original export into a new database when required columns are missing",
             "stable_error_codes": [
-                "database_not_ready", "database_schema_incompatible", "job_not_found",
+                "database_not_ready", "database_schema_incompatible", "invalid_job_id", "job_not_found",
                 "conversation_not_found", "message_not_found", "invalid_export_format",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
-                "host_not_allowed", "import_job_active", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required",
+                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required",
                 "upload_invalid_content_length", "upload_multipart_body_too_large", "upload_too_large",
                 "uploaded_file_not_zip", "uploaded_file_invalid_zip", "upload_zip_no_conversation_sources",
                 "upload_zip_ambiguous_conversation_sources", "upload_zip_too_many_members",
@@ -626,6 +640,7 @@ def create_api_router(
             raise HTTPException(status_code=409, detail="import_job_active")
         upload_dir: Path | None = None
         transferred = False
+        primary_http_error: HTTPException | None = None
         filename = file.filename or "upload.zip"
         try:
             if not filename.lower().endswith(".zip"):
@@ -646,17 +661,40 @@ def create_api_router(
             _validate_upload_zip_members(upload_path, policy)
             try:
                 job = manager.start_import(upload_path, filename=Path(filename.replace("\\", "/")).name, size=size)
+            except ImportJobStartError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": exc.code, "error_type": exc.error_type},
+                ) from exc
             except RuntimeError as exc:
-                raise HTTPException(status_code=409, detail="import_job_active") from exc
+                detail = "import_job_active" if manager.has_running_job() else "import_job_start_failed"
+                raise HTTPException(status_code=409 if detail == "import_job_active" else 503, detail=detail) from exc
             transferred = True
             request.state.upload_slot_transferred = True
             return job.snapshot()
+        except HTTPException as exc:
+            primary_http_error = exc
+            raise
         finally:
             if not transferred:
                 manager.release_pending_upload_slot()
                 if upload_dir is not None:
                     cleanup = cleanup_upload_dir(upload_dir)
                     if not cleanup["ok"]:
+                        if primary_http_error is not None:
+                            primary_code = (
+                                primary_http_error.detail.get("code")
+                                if isinstance(primary_http_error.detail, dict)
+                                else str(primary_http_error.detail)
+                            )
+                            detail = dict(primary_http_error.detail) if isinstance(primary_http_error.detail, dict) else {"code": primary_code}
+                            detail.update(
+                                {
+                                    "cleanup_warning": "temporary_upload_cleanup_failed",
+                                    "cleanup_error_type": cleanup["error_type"] or "PathStillExists",
+                                }
+                            )
+                            primary_http_error.detail = detail
                         LOGGER.warning(
                             "upload_preflight_cleanup_failed error_type=%s path_still_exists=%s",
                             cleanup["error_type"] or "none",
@@ -671,6 +709,8 @@ def create_api_router(
 
     @router.get("/import/jobs/{job_id}")
     def import_job(job_id: str):
+        if JOB_ID_PATTERN.fullmatch(job_id) is None:
+            raise HTTPException(status_code=400, detail="invalid_job_id")
         job = manager.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job_not_found")
@@ -856,7 +896,7 @@ def create_api_router(
         parsed = parse_query(q, path_default=path, role=role, title=title, scope=scope, exact=exact, exclude=exclude, after=after, before=before, source=source, match_mode=match_mode, enforce_api_limits=True)
         _raise_query_errors(parsed)
         if conn is None:
-            return _empty_page(limit, offset, selected_id=None, db_ready=False)
+            return _empty_message_search_page(limit, offset, db_ready=False)
         return search_messages(conn, parsed, limit=limit, offset=offset, conversation_id=conversation_id, order=order, count_total=count_total)
 
     @router.get("/search/suggest")
@@ -864,7 +904,7 @@ def create_api_router(
         if conn is None:
             return {"items": []}
         normalized = normalize_search_text(q)
-        if _table_exists(conn, "web_title_norm") and normalized:
+        if _has_normalized_title_norm(conn) and normalized:
             rows = conn.execute(
                 """
                 SELECT c.conversation_id, c.title
@@ -974,6 +1014,19 @@ def _empty_page(limit: int, offset: int, *, selected_id: str | None, db_ready: b
         "has_more": False,
         "next_offset": None,
         "selected_in_results": False if selected_id else None,
+    }
+
+
+def _empty_message_search_page(limit: int, offset: int, *, db_ready: bool) -> dict[str, object]:
+    return {
+        "db_ready": db_ready,
+        "items": [],
+        "total": 0,
+        "total_exact": True,
+        "limit": limit,
+        "offset": offset,
+        "has_more": False,
+        "next_offset": None,
     }
 
 

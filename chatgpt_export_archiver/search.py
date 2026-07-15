@@ -15,7 +15,7 @@ from .current_path import (
     ensure_effective_current_views,
     resolve_effective_current_collection,
 )
-from .parser import extract_message_content
+from .parser import extract_message_content, recover_message_display_text
 from .utils import compact_json
 
 
@@ -150,6 +150,11 @@ def _is_word_char(char: str) -> bool:
 
 def _ensure_search_functions(conn: sqlite3.Connection) -> None:
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
+    conn.create_function("web_display_text", 2, recover_message_display_text, deterministic=True)
+
+
+def _sql_display_text(alias: str = "n") -> str:
+    return f"web_display_text({alias}.content_text, substr({alias}.raw_message_json, 1, 200001))"
 
 
 def parse_query(
@@ -581,17 +586,15 @@ def search_messages(
     count_total: bool = True,
 ) -> dict[str, Any]:
     _ensure_search_functions(conn)
-    if parsed.path == "current":
-        ensure_effective_current_views(conn, [conversation_id] if conversation_id else None)
-    else:
-        ensure_effective_current_views(conn, [])
     limit = _bounded_limit(limit, max_page_limit)
     offset = max(0, offset)
     if parsed.scope == "title":
-        return _page_payload([], 0, limit, offset, extra={"total_exact": bool(count_total)})
+        return _page_payload([], 0, limit, offset, extra={"total_exact": True})
     has_message_text = bool(parsed.phrases or parsed.terms or parsed.required_phrases)
     if not has_message_text:
-        return _page_payload([], 0, limit, offset, extra={"total_exact": bool(count_total)})
+        return _page_payload([], 0, limit, offset, extra={"total_exact": True})
+    if parsed.path == "current":
+        ensure_effective_current_views(conn, [conversation_id] if conversation_id else None)
     try:
         rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, count_total=count_total)
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=True)
@@ -627,12 +630,10 @@ def search_conversations(
     selected_id: str | None = None,
 ) -> dict[str, Any]:
     _ensure_search_functions(conn)
-    if parsed.path == "current":
-        ensure_effective_current_views(conn, None)
-    else:
-        ensure_effective_current_views(conn, [])
     if not parsed.has_search_context():
         return list_conversations(conn, limit=limit, offset=offset, sort=sort, after=parsed.after, before=parsed.before, selected_id=selected_id)
+    if parsed.path == "current":
+        ensure_effective_current_views(conn, None)
     limit = _bounded_limit(limit, MAX_API_LIMIT)
     offset = max(0, offset)
     try:
@@ -724,7 +725,8 @@ def get_messages(
         effective_ids = set(current_collection.node_ids)
         ordered = _order_nodes_for_display(rows, path, conversation.get("current_node") if conversation else None)
         target_found = any(str(row["node_id"]) == around_node_id for row in rows)
-        target_in_collection = any(str(row["node_id"]) == around_node_id for row in ordered)
+        target_in_effective_collection = around_node_id in effective_ids
+        target_in_requested_collection = any(str(row["node_id"]) == around_node_id for row in ordered)
         parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
         conversation_excluded = _conversation_has_excluded_in_scope(conn, parsed, conversation_id)
         total = len(ordered)
@@ -757,7 +759,8 @@ def get_messages(
                 **visibility_counts,
                 **_path_metadata_extra(path, current_path_fallback_to_all, conversation),
                 "around_target_found": target_found,
-                "around_target_in_effective_collection": target_in_collection,
+                "around_target_in_effective_collection": target_in_effective_collection,
+                "around_target_in_requested_collection": target_in_requested_collection,
                 "around_target_visible": target_visible,
                 "around_target_applied": index is not None,
             },
@@ -796,7 +799,7 @@ def _message_select_columns(alias: str = "") -> str:
     columns = [f"{prefix}{name}" for name in _MESSAGE_SIMPLE_COLUMNS]
     columns.extend(
         [
-            f"substr({prefix}raw_message_json, 1, 20001) AS raw_message_json",
+            f"substr({prefix}raw_message_json, 1, 200001) AS raw_message_json",
             f"length({prefix}raw_message_json) AS raw_message_size",
         ]
     )
@@ -909,11 +912,13 @@ def _around_target_metadata(
         (conversation_id, node_id),
     ).fetchone()
     found = row is not None
-    in_collection = bool(found and (path == "all" or row["effective_visible"]))
-    visible = bool(in_collection and (include_internal or row["reader_visible"]))
+    in_effective_collection = bool(found and row["effective_visible"])
+    in_requested_collection = bool(found and (path == "all" or in_effective_collection))
+    visible = bool(in_requested_collection and (include_internal or row["reader_visible"]))
     return {
         "around_target_found": found,
-        "around_target_in_effective_collection": in_collection,
+        "around_target_in_effective_collection": in_effective_collection,
+        "around_target_in_requested_collection": in_requested_collection,
         "around_target_visible": visible,
         "around_target_applied": bool(applied and visible),
     }
@@ -999,6 +1004,13 @@ def _path_metadata_extra(
         "missing_parent": bool(conversation and conversation.get("missing_parent")),
         "cross_conversation_parent": bool(conversation and conversation.get("cross_conversation_parent")),
         "partial_chain": bool(conversation and conversation.get("partial_chain")),
+        "raw_flag_leaf_count": int(conversation.get("raw_flag_leaf_count", 0)) if conversation else 0,
+        "selected_chain_cycle_detected": bool(conversation and conversation.get("selected_chain_cycle_detected")),
+        "raw_flag_cycle_detected": bool(conversation and conversation.get("raw_flag_cycle_detected")),
+        "selected_chain_missing_parent": bool(conversation and conversation.get("selected_chain_missing_parent")),
+        "raw_flag_missing_parent": bool(conversation and conversation.get("raw_flag_missing_parent")),
+        "selected_chain_cross_conversation_parent": bool(conversation and conversation.get("selected_chain_cross_conversation_parent")),
+        "raw_flag_cross_conversation_parent": bool(conversation and conversation.get("raw_flag_cross_conversation_parent")),
     }
 
 
@@ -1236,16 +1248,17 @@ def _message_search_base_select(
           ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
     """ if has_norm else ""
     effective_expression = _current_path_condition("n") if parsed.path == "current" else "0"
+    display_text = _sql_display_text("n")
     sql = f"""
         SELECT n.conversation_id, n.node_id, n.role, n.create_time, n.update_time,
-               n.content_type, n.content_text, n.is_on_current_path,
+               n.content_type, {display_text} AS content_text, n.is_on_current_path,
                CASE WHEN {effective_expression} THEN 1 ELSE 0 END AS effective_visible_in_current_view,
                c.title, c.create_time AS conversation_create_time, c.update_time AS conversation_update_time,
                c.current_node, c.source_file, {score_expr} AS bm25_score, ? AS match_reason
         FROM {source_sql}
         JOIN conversations c ON c.conversation_id = n.conversation_id
         {norm_join}
-        WHERE n.content_text IS NOT NULL AND n.content_text <> '' {where}
+        WHERE {display_text} <> '' {where}
     """
     return sql, [reason] + source_params + params
 
@@ -1722,7 +1735,7 @@ def _message_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, 
         FROM {source_sql}
         JOIN conversations c ON c.conversation_id = n.conversation_id
         {norm_join}
-        WHERE n.content_text IS NOT NULL AND n.content_text <> '' {where}
+        WHERE {_sql_display_text('n')} <> '' {where}
         GROUP BY n.conversation_id
         """,
         source_params + params,
@@ -1978,47 +1991,48 @@ def _message_text_filter(parsed: ParsedQuery, has_norm: bool) -> tuple[str, list
             continue
         norm = normalize_search_text(frag)
         if parsed.match_mode == "word":
-            column = "mn.content_norm" if has_norm else "n.content_text"
+            column = "mn.content_norm" if has_norm else _sql_display_text("n")
             positive_clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([norm if has_norm else frag, parsed.match_mode])
         elif has_norm:
             positive_clauses.append("instr(mn.content_norm, ?) > 0")
             params.append(norm)
         else:
-            positive_clauses.append("web_search_match(n.content_text, ?, ?) > 0")
+            positive_clauses.append(f"web_search_match({_sql_display_text('n')}, ?, ?) > 0")
             params.extend([frag, parsed.match_mode])
     for frag in parsed.required_phrases:
         if not frag:
             continue
         norm = normalize_search_text(frag)
         if parsed.match_mode == "word":
-            column = "mn.content_norm" if has_norm else "n.content_text"
+            column = "mn.content_norm" if has_norm else _sql_display_text("n")
             required_clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([norm if has_norm else frag, parsed.match_mode])
         elif has_norm:
             required_clauses.append("instr(mn.content_norm, ?) > 0")
             params.append(norm)
         else:
-            required_clauses.append("web_search_match(n.content_text, ?, ?) > 0")
+            required_clauses.append(f"web_search_match({_sql_display_text('n')}, ?, ?) > 0")
             params.extend([frag, parsed.match_mode])
     for frag in parsed.exclude:
         norm = normalize_search_text(frag)
         if parsed.match_mode == "word":
-            column = "mn.content_norm" if has_norm else "n.content_text"
+            column = "mn.content_norm" if has_norm else _sql_display_text("n")
             exclude_clauses.append(f"web_search_match({column}, ?, ?) = 0")
             params.extend([norm if has_norm else frag, parsed.match_mode])
         elif has_norm:
             exclude_clauses.append("instr(mn.content_norm, ?) = 0")
             params.append(norm)
         else:
-            exclude_clauses.append("web_search_match(n.content_text, ?, ?) = 0")
+            exclude_clauses.append(f"web_search_match({_sql_display_text('n')}, ?, ?) = 0")
             params.extend([frag, parsed.match_mode])
     clauses = []
     if positive_clauses:
         clauses.append("(" + (" OR ".join(positive_clauses) if parsed.or_mode else " AND ".join(positive_clauses)) + ")")
     clauses.extend(required_clauses)
     clauses.extend(exclude_clauses)
-    clauses.append("NOT (trim(COALESCE(n.content_text, '')) LIKE '[non-text content:%' OR trim(COALESCE(n.content_text, '')) LIKE '[non-text part:%')")
+    display_text = _sql_display_text("n")
+    clauses.append(f"NOT (trim({display_text}) LIKE '[non-text content:%' OR trim({display_text}) LIKE '[non-text part:%')")
     return (" AND " + " AND ".join(clauses) if clauses else ""), params
 
 
@@ -2099,19 +2113,18 @@ def _conversation_level_exclude_clauses(parsed: ParsedQuery, frag: str) -> tuple
         params.extend([frag, parsed.match_mode])
     if parsed.scope != "title":
         exclude_path_clause = f"AND {_current_path_condition('en')}" if parsed.path == "current" else ""
-        clauses.append((
-            """
+        clauses.append(
+            f"""
             NOT EXISTS (
                 SELECT 1
                 FROM conversation_nodes en
                 WHERE en.conversation_id = c.conversation_id
                   {exclude_path_clause}
-                  AND en.content_text IS NOT NULL
-                  AND en.content_text <> ''
-                  AND web_search_match(en.content_text, ?, ?) > 0
+                  AND {_sql_display_text('en')} <> ''
+                  AND web_search_match({_sql_display_text('en')}, ?, ?) > 0
             )
             """
-        ).replace("{exclude_path_clause}", exclude_path_clause))
+        )
         params.extend([frag, parsed.match_mode])
     return clauses, params
 
@@ -2411,10 +2424,7 @@ def _message_payload(
 def _message_display_fields(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     text = row["content_text"] or ""
     raw_preview = _raw_preview(row["raw_message_json"])
-    raw_text = ""
-    if (not text or _is_placeholder_text(text)) and row["raw_message_json"]:
-        raw_text = _text_from_raw_message(row["raw_message_json"])
-    display_text = raw_text or text
+    display_text = recover_message_display_text(text, row["raw_message_json"])
     is_empty_mapping_node = not row["message_id"] and not display_text and not raw_preview
     is_technical = _is_internal_message(row["role"], row["content_type"], display_text)
     keys = row.keys()
@@ -2463,7 +2473,7 @@ def _message_row_matches_highlight(
         for title_filter in (parsed.title, parsed.required_title):
             if title_filter and not _fragment_matches(conversation.get("title") or "", title_filter, parsed.match_mode):
                 return False
-    text = row["content_text"] or ""
+    text = recover_message_display_text(row["content_text"], row["raw_message_json"])
     if not text or _is_placeholder_text(text):
         return False
     for excluded in parsed.exclude:
@@ -2481,14 +2491,7 @@ def _message_row_matches_highlight(
 
 
 def _text_from_raw_message(raw_message_json: str) -> str:
-    try:
-        message = json_loads(raw_message_json)
-    except ValueError:
-        return ""
-    if not isinstance(message, dict):
-        return ""
-    _content_type, text, _notes = extract_message_content(message)
-    return text
+    return recover_message_display_text("", raw_message_json)
 
 
 def _raw_preview(raw_message_json: str | None, limit: int = 20000) -> str:
@@ -2574,6 +2577,13 @@ def _conversation_summary_with_counts(row: sqlite3.Row, counts: dict[str, int]) 
         "missing_parent": bool(counts.get("missing_parent", False)),
         "cross_conversation_parent": bool(counts.get("cross_conversation_parent", False)),
         "partial_chain": bool(counts.get("partial_chain", False)),
+        "raw_flag_leaf_count": int(counts.get("raw_flag_leaf_count", 0)),
+        "selected_chain_cycle_detected": bool(counts.get("selected_chain_cycle_detected", False)),
+        "raw_flag_cycle_detected": bool(counts.get("raw_flag_cycle_detected", False)),
+        "selected_chain_missing_parent": bool(counts.get("selected_chain_missing_parent", False)),
+        "raw_flag_missing_parent": bool(counts.get("raw_flag_missing_parent", False)),
+        "selected_chain_cross_conversation_parent": bool(counts.get("selected_chain_cross_conversation_parent", False)),
+        "raw_flag_cross_conversation_parent": bool(counts.get("raw_flag_cross_conversation_parent", False)),
     }
 
 
@@ -2593,6 +2603,16 @@ def _add_counts_and_path_metadata(conn: sqlite3.Connection, items: list[dict[str
         item["missing_parent"] = bool(item_counts.get("missing_parent", False))
         item["cross_conversation_parent"] = bool(item_counts.get("cross_conversation_parent", False))
         item["partial_chain"] = bool(item_counts.get("partial_chain", False))
+        item["raw_flag_leaf_count"] = int(item_counts.get("raw_flag_leaf_count", 0))
+        for field in (
+            "selected_chain_cycle_detected",
+            "raw_flag_cycle_detected",
+            "selected_chain_missing_parent",
+            "raw_flag_missing_parent",
+            "selected_chain_cross_conversation_parent",
+            "raw_flag_cross_conversation_parent",
+        ):
+            item[field] = bool(item_counts.get(field, False))
 
 
 def _order_nodes_for_display(rows: list[sqlite3.Row], path: str, current_node: str | None = None) -> list[sqlite3.Row]:
@@ -2796,26 +2816,42 @@ def _web_index_metadata_value(conn: sqlite3.Connection, key: str) -> str | None:
     return _connection_capabilities(conn)["metadata"].get(key)
 
 
+def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
+    if not _table_exists(conn, "archive_generations"):
+        return False
+    expected = _web_index_metadata_value(conn, f"{name}_generation")
+    if expected is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT generation FROM archive_generations WHERE name = ?",
+            (name,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None and str(row[0]) == expected
+
+
 def _has_normalized_message_norm(conn: sqlite3.Connection) -> bool:
     return _table_exists(conn, "web_message_norm") and (
         _web_index_metadata_value(conn, "message_norm_text") == "normalized"
         or _web_index_metadata_value(conn, "message_trigram_text") == "normalized"
-    )
+    ) and _derived_generation_is_current(conn, "message")
 
 
 def _has_normalized_title_norm(conn: sqlite3.Connection) -> bool:
     return _table_exists(conn, "web_title_norm") and (
         _web_index_metadata_value(conn, "title_norm_text") == "normalized"
         or _web_index_metadata_value(conn, "title_trigram_text") == "normalized"
-    )
+    ) and _derived_generation_is_current(conn, "title")
 
 
 def _has_normalized_message_trigram(conn: sqlite3.Connection) -> bool:
-    return _table_exists(conn, "web_message_trigram") and _web_index_metadata_value(conn, "message_trigram_text") == "normalized"
+    return _table_exists(conn, "web_message_trigram") and _web_index_metadata_value(conn, "message_trigram_text") == "normalized" and _derived_generation_is_current(conn, "message")
 
 
 def _has_normalized_title_trigram(conn: sqlite3.Connection) -> bool:
-    return _table_exists(conn, "web_title_trigram") and _web_index_metadata_value(conn, "title_trigram_text") == "normalized"
+    return _table_exists(conn, "web_title_trigram") and _web_index_metadata_value(conn, "title_trigram_text") == "normalized" and _derived_generation_is_current(conn, "title")
 
 
 def _limit_clause(limit: int | None) -> tuple[str, list[int]]:

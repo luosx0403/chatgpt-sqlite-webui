@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
+import stat
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from .utils import classify_file
@@ -19,6 +22,13 @@ class NonFiniteJsonNumberError(ValueError):
 
 def _reject_non_finite_json_number(value: str) -> None:
     raise NonFiniteJsonNumberError(f"non_finite_json_number:{value.casefold()}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        _reject_non_finite_json_number(value)
+    return number
 
 
 @dataclass(frozen=True)
@@ -40,6 +50,9 @@ class InputSource:
 
 
 def find_default_input(path: Path) -> InputSource:
+    path = path.expanduser()
+    if path.is_symlink():
+        raise ValueError("input_not_supported")
     path = path.resolve()
     if path.is_file():
         if path.suffix.lower() == ".zip":
@@ -47,11 +60,15 @@ def find_default_input(path: Path) -> InputSource:
         elif is_conversation_json_source(path.name):
             kind = "json"
         else:
-            kind = "directory"
+            raise ValueError("input_not_supported")
         return InputSource(path=path, kind=kind, size=path.stat().st_size, delete_target=path)
     zips = sorted(path.glob("*.zip"))
+    if any(candidate.is_symlink() for candidate in zips):
+        raise ValueError("input_symlink_not_allowed")
     if not zips:
         json_files = sorted([p for p in path.glob("conversations*.json") if is_conversation_json_source(p.name)])
+        if any(candidate.is_symlink() for candidate in json_files):
+            raise ValueError("input_symlink_not_allowed")
         if not json_files:
             raise ValueError("no_zip_file_found")
         if len(json_files) > 1:
@@ -145,20 +162,18 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
     else:
         base = input_source.path
         entries = []
-        for p in sorted(base.rglob("*")):
-            if p.is_file():
-                rel = p.relative_to(base).as_posix()
-                if is_metadata_path(rel):
-                    continue
-                entries.append(
-                    SourceEntry(
-                        source_path=rel,
-                        file_type=classify_file(rel),
-                        size=p.stat().st_size,
-                        extension=p.suffix.lower(),
-                        is_conversation_json=is_conversation_json_source(rel),
-                    )
+        for rel, size in _walk_directory_without_links(base):
+            if is_metadata_path(rel):
+                continue
+            entries.append(
+                SourceEntry(
+                    source_path=rel,
+                    file_type=classify_file(rel),
+                    size=size,
+                    extension=Path(rel).suffix.lower(),
+                    is_conversation_json=is_conversation_json_source(rel),
                 )
+            )
     selected = set(e.source_path for e in select_conversation_sources(entries))
     return [
         SourceEntry(
@@ -209,14 +224,104 @@ def _reject_duplicate_conversation_sources(entries: list[SourceEntry]) -> None:
 
 
 def load_json_from_source(input_source: InputSource, source_path: str) -> Any:
+    load_options = {
+        "parse_constant": _reject_non_finite_json_number,
+        "parse_float": _parse_finite_json_float,
+    }
     if input_source.kind == "zip":
         with zipfile.ZipFile(input_source.path) as zf:
             with zf.open(source_path) as f:
-                return json.load(f, parse_constant=_reject_non_finite_json_number)
+                return json.load(f, **load_options)
     if input_source.kind == "json":
         if source_path != input_source.path.name:
             raise ValueError("source_not_found")
         with input_source.path.open("r", encoding="utf-8") as f:
-            return json.load(f, parse_constant=_reject_non_finite_json_number)
-    with (input_source.path / source_path).open("r", encoding="utf-8") as f:
-        return json.load(f, parse_constant=_reject_non_finite_json_number)
+            return json.load(f, **load_options)
+    with _open_directory_source(input_source.path, source_path) as f:
+        return json.load(f, **load_options)
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def _walk_directory_without_links(base: Path) -> list[tuple[str, int]]:
+    results: list[tuple[str, int]] = []
+
+    def visit(directory: Path) -> None:
+        try:
+            children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise ValueError("input_source_scan_failed") from exc
+        for entry in children:
+            path = Path(entry.path)
+            if _is_link_or_reparse(path):
+                raise ValueError("input_symlink_not_allowed")
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("input_source_scan_failed") from exc
+            if stat.S_ISDIR(info.st_mode):
+                visit(path)
+            elif stat.S_ISREG(info.st_mode):
+                results.append((path.relative_to(base).as_posix(), int(info.st_size)))
+
+    visit(base)
+    return results
+
+
+def _open_directory_source(base: Path, source_path: str):
+    """Open a directory member without following a replaced path component."""
+
+    logical = PurePosixPath(source_path.replace("\\", "/"))
+    if logical.is_absolute() or not logical.parts or any(part in {"", ".", ".."} for part in logical.parts):
+        raise ValueError("input_source_outside_root")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if nofollow and os.open in os.supports_dir_fd:
+        descriptors: list[int] = []
+        try:
+            current_fd = os.open(base, os.O_RDONLY | directory_flag | nofollow)
+            descriptors.append(current_fd)
+            for component in logical.parts[:-1]:
+                current_fd = os.open(
+                    component,
+                    os.O_RDONLY | directory_flag | nofollow,
+                    dir_fd=current_fd,
+                )
+                descriptors.append(current_fd)
+            file_fd = os.open(logical.parts[-1], os.O_RDONLY | nofollow, dir_fd=current_fd)
+            info = os.fstat(file_fd)
+            if not stat.S_ISREG(info.st_mode):
+                os.close(file_fd)
+                raise ValueError("input_source_not_regular_file")
+            return os.fdopen(file_fd, "r", encoding="utf-8")
+        except OSError as exc:
+            if exc.errno in {getattr(os, "ELOOP", 62), 40}:
+                raise ValueError("input_symlink_not_allowed") from exc
+            raise ValueError("input_source_open_failed") from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    # Portable fallback: reject every reparse component immediately before
+    # opening and verify the resolved target remains under the root.
+    candidate = base.joinpath(*logical.parts)
+    current = base
+    for component in logical.parts:
+        current = current / component
+        if _is_link_or_reparse(current):
+            raise ValueError("input_symlink_not_allowed")
+    try:
+        candidate.resolve(strict=True).relative_to(base.resolve(strict=True))
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError("input_source_outside_root") from exc
+    return candidate.open("r", encoding="utf-8")

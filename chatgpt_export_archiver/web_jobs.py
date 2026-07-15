@@ -59,6 +59,7 @@ class ImportJob:
     web_index: dict[str, Any] | None = None
     error: str | None = None
     error_code: str | None = None
+    error_type: str | None = None
     outcome: str = "queued"
     canonical_commit_succeeded: bool = False
     cleanup_warning: str | None = None
@@ -85,9 +86,19 @@ class ImportJob:
                 "web_index": dict(self.web_index) if self.web_index is not None else None,
                 "error": self.error,
                 "error_code": self.error_code,
+                "error_type": self.error_type,
                 "cleanup_warning": self.cleanup_warning,
                 "log_tail": list(self.logs)[-100:],
             }
+
+
+class ImportJobStartError(RuntimeError):
+    """Safe failure raised when a worker thread cannot be constructed/started."""
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__("import_job_start_failed")
+        self.code = "import_job_start_failed"
+        self.error_type = error_type
 
 
 class ImportJobManager:
@@ -131,8 +142,15 @@ class ImportJobManager:
             job = ImportJob(job_id=job_id, db_path=self.db_path, upload_path=upload_path, filename=filename, size=size)
             self._jobs[job_id] = job
             self._running_job_id = job_id
-        thread = threading.Thread(target=self._run_job, args=(job,), name=f"chatgpt-import-{job_id[:8]}", daemon=True)
-        thread.start()
+        try:
+            thread = threading.Thread(target=self._run_job, args=(job,), name=f"chatgpt-import-{job_id[:8]}", daemon=True)
+            thread.start()
+        except Exception as exc:
+            with self._lock:
+                if self._running_job_id == job_id:
+                    self._running_job_id = None
+                self._jobs.pop(job_id, None)
+            raise ImportJobStartError(type(exc).__name__) from exc
         return job
 
     def get(self, job_id: str) -> ImportJob | None:
@@ -186,6 +204,27 @@ class ImportJobManager:
             job.error = error_code
 
     def _run_job(self, job: ImportJob) -> None:
+        """Protect the complete worker entry, including initial state/log setup."""
+
+        try:
+            self._run_job_body(job)
+        except Exception as exc:
+            # This guard covers failures before _run_job_body reaches its own
+            # pipeline try/finally (for example a patched stage/log setup).
+            with job._lock:
+                job.status = "failed"
+                job.stage = "job_setup"
+                job.outcome = "import_job_start_failed"
+                job.error_code = "import_job_start_failed"
+                job.error = "import_job_start_failed"
+                job.error_type = type(exc).__name__
+        finally:
+            with self._lock:
+                still_owned = self._running_job_id == job.job_id
+            if still_owned:
+                self._finalize_job(job)
+
+    def _run_job_body(self, job: ImportJob) -> None:
         with job._lock:
             job.status = "running"
             job.outcome = "import_running"
@@ -298,6 +337,7 @@ class ImportJobManager:
             }
             with job._lock:
                 job.summary = dict(exc.summary) if exc.summary is not None else job.summary
+                job.error_type = exc.failure_persistence_error_type
             self._set_outcome(
                 job,
                 status="failed",
@@ -311,9 +351,15 @@ class ImportJobManager:
             self._set_stage(job, "transaction")
             self._log(job, "error", f"import_failed error_type={type(exc).__name__}")
         finally:
-            with job._lock:
-                job.finished_at = time.time()
-            unlink_error: str | None = None
+            self._finalize_job(job)
+
+    def _finalize_job(self, job: ImportJob) -> None:
+        """Best-effort upload cleanup with unconditional writer-slot release."""
+
+        with job._lock:
+            job.finished_at = job.finished_at or time.time()
+        unlink_error: str | None = None
+        try:
             try:
                 job.upload_path.unlink()
             except FileNotFoundError:
@@ -322,7 +368,10 @@ class ImportJobManager:
                 unlink_error = type(exc).__name__
                 with job._lock:
                     job.cleanup_warning = "upload_file_unlink_failed"
-                self._log(job, "warning", f"upload_file_unlink_failed error_type={unlink_error}")
+                try:
+                    self._log(job, "warning", f"upload_file_unlink_failed error_type={unlink_error}")
+                except Exception:
+                    pass
             cleanup = cleanup_upload_dir(job.upload_path.parent)
             if not cleanup["ok"]:
                 with job._lock:
@@ -331,13 +380,17 @@ class ImportJobManager:
                         if cleanup["error_type"]
                         else "upload_directory_cleanup_incomplete"
                     )
-                self._log(
-                    job,
-                    "warning",
-                    "upload_directory_cleanup_failed "
-                    f"error_type={cleanup['error_type'] or 'path_still_exists'} "
-                    f"file_unlink_error_type={unlink_error or 'none'}",
-                )
+                try:
+                    self._log(
+                        job,
+                        "warning",
+                        "upload_directory_cleanup_failed "
+                        f"error_type={cleanup['error_type'] or 'path_still_exists'} "
+                        f"file_unlink_error_type={unlink_error or 'none'}",
+                    )
+                except Exception:
+                    pass
+        finally:
             with self._lock:
                 if self._running_job_id == job.job_id:
                     self._running_job_id = None

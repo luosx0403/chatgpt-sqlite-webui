@@ -342,6 +342,59 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("upload_too_large", response.text)
         self.assertFalse(upload_dir.exists())
 
+    def test_web_preflight_cleanup_failure_is_structured_without_masking_primary_error(self):
+        from chatgpt_export_archiver import web_api
+        from chatgpt_export_archiver.web_jobs import ImportJobStartError
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
+        self.addCleanup(client.close)
+        cleanup_failure = {
+            "ok": False,
+            "error_type": "PermissionError",
+            "path_still_exists": True,
+            "partial_cleanup": False,
+        }
+
+        with mock.patch.object(web_api, "cleanup_upload_dir", return_value=cleanup_failure):
+            invalid_zip = client.post(
+                "/api/import/upload",
+                files={"file": ("invalid.zip", b"not a zip", "application/zip")},
+            )
+        self.assertEqual(invalid_zip.status_code, 400)
+        self.assertEqual(invalid_zip.json()["detail"], {
+            "code": "uploaded_file_invalid_zip",
+            "cleanup_warning": "temporary_upload_cleanup_failed",
+            "cleanup_error_type": "PermissionError",
+        })
+        self.assertNotIn(str(base), invalid_zip.text)
+
+        no_source = base / "no-source.zip"
+        write_zip_members(no_source, {"README.txt": b"synthetic"})
+        with mock.patch.object(web_api, "cleanup_upload_dir", return_value=cleanup_failure):
+            response = client.post(
+                "/api/import/upload",
+                files={"file": ("no-source.zip", no_source.read_bytes(), "application/zip")},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["code"], "upload_zip_no_conversation_sources")
+        self.assertEqual(response.json()["detail"]["cleanup_warning"], "temporary_upload_cleanup_failed")
+
+        valid = base / "valid.zip"
+        write_zip(valid, [conv("start-failure", "Synthetic", {"root": root([])}, "root", 1_700_000_000)])
+        with mock.patch.object(web_api.ImportJobManager, "start_import", side_effect=ImportJobStartError("RuntimeError")), \
+             mock.patch.object(web_api, "cleanup_upload_dir", return_value=cleanup_failure):
+            response = client.post(
+                "/api/import/upload",
+                files={"file": ("valid.zip", valid.read_bytes(), "application/zip")},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"]["code"], "import_job_start_failed")
+        self.assertEqual(response.json()["detail"]["error_type"], "RuntimeError")
+        self.assertEqual(response.json()["detail"]["cleanup_warning"], "temporary_upload_cleanup_failed")
+
     def test_web_upload_rejects_zip_bomb_like_conversation_member(self):
         from chatgpt_export_archiver import web_api
         from chatgpt_export_archiver.web_api import UploadPolicy
@@ -663,7 +716,8 @@ class WebApiTests(unittest.TestCase):
         self.assertLessEqual(len(item["raw_preview"]), 20_001)
         self.assertTrue(item["raw_preview_truncated"])
         normalized_sql = [re.sub(r"\s+", "", sql).lower() for sql in statements]
-        self.assertTrue(any("substr(n.raw_message_json,1,20001)" in sql for sql in normalized_sql))
+        self.assertTrue(any("substr(n.raw_message_json,1,200001)" in sql for sql in normalized_sql))
+        self.assertFalse(any("selectn.raw_message_json" in sql for sql in normalized_sql))
 
     def test_full_raw_endpoint_is_explicit(self):
         td, client, _db = self.make_client()
@@ -831,6 +885,21 @@ class WebApiTests(unittest.TestCase):
             "content": {"content_type": "text", "parts": ["placeholder raw readable text"]},
             "metadata": {},
         }
+        internal_raw = {
+            "id": "msg-internal-raw",
+            "author": {"role": "system"},
+            "content": {"content_type": "text", "parts": ["internal recoverable sentinel"]},
+            "metadata": {},
+        }
+        huge_raw = json.dumps({
+            "id": "msg-huge",
+            "content": {"content_type": "text", "parts": ["huge raw sentinel " + ("x" * 200_100)]},
+        })
+        real_non_text_raw = json.dumps({
+            "id": "msg-real-non-text",
+            "author": {"role": "user"},
+            "content": {"content_type": "image_asset_pointer", "asset_pointer": "synthetic-asset"},
+        })
         conn = sqlite3.connect(db)
         try:
             conn.execute(
@@ -847,21 +916,95 @@ class WebApiTests(unittest.TestCase):
                 """,
                 ("web-3", "placeholder-raw", "root", "[]", "msg-placeholder", "user", 1_720_000_005, 1_720_000_005, "text", "[non-text content: image]", None, 0, json.dumps(placeholder_raw, ensure_ascii=False)),
             )
+            conn.executemany(
+                """
+                INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id, children_json, message_id, role, create_time, update_time, content_type, content_text, content_hash, is_on_current_path, raw_message_json)
+                VALUES('web-3', ?, 'root', '[]', ?, ?, ?, ?, ?, ?, NULL, 0, ?)
+                """,
+                [
+                    ("invalid-raw", "msg-invalid", "user", 1_720_000_006, 1_720_000_006, "legacy", "[non-text content: legacy]", "{invalid raw sentinel"),
+                    ("huge-raw", "msg-huge", "user", 1_720_000_007, 1_720_000_007, "legacy", "[non-text content: legacy]", huge_raw),
+                    ("real-non-text", "msg-real-non-text", "user", 1_720_000_008, 1_720_000_008, "image_asset_pointer", "[non-text content: image_asset_pointer]", real_non_text_raw),
+                    ("internal-raw", "msg-internal-raw", "system", 1_720_000_009, 1_720_000_009, "text", "[non-text content: legacy]", json.dumps(internal_raw)),
+                ],
+            )
+            conn.execute("UPDATE conversations SET current_node = 'placeholder-raw' WHERE conversation_id = 'web-3'")
             conn.commit()
         finally:
             conn.close()
 
         page = client.get("/api/conversations/web-3/messages?path=all&limit=20").json()
         self.assertEqual(page["empty_hidden_count"], 1)
-        self.assertEqual(page["internal_hidden_count"], 3)
-        self.assertEqual(page["technical_hidden_count"], 3)
-        self.assertEqual(page["visible_total"], 3)
+        self.assertEqual(page["internal_hidden_count"], 4)
+        self.assertEqual(page["technical_hidden_count"], 4)
+        self.assertEqual(page["visible_total"], 6)
         by_node = {item["node_id"]: item for item in page["items"]}
         self.assertEqual(by_node["raw-only"]["display_text"], "raw-only readable text")
         self.assertFalse(by_node["raw-only"]["is_empty_mapping_node"])
         self.assertEqual(by_node["placeholder-raw"]["display_text"], "placeholder raw readable text")
         visible = [item for item in page["items"] if not item["is_empty_mapping_node"] and not item["is_internal"]]
-        self.assertEqual({item["node_id"] for item in visible}, {"a3", "raw-only", "placeholder-raw"})
+        self.assertEqual(
+            {item["node_id"] for item in visible},
+            {"a3", "raw-only", "placeholder-raw", "invalid-raw", "huge-raw", "real-non-text"},
+        )
+        self.assertEqual(by_node["invalid-raw"]["display_text"], "[non-text content: legacy]")
+        self.assertEqual(by_node["huge-raw"]["display_text"], "[non-text content: legacy]")
+        self.assertEqual(by_node["real-non-text"]["display_text"], "[non-text content: image_asset_pointer]")
+
+        current_raw_only = client.get("/api/search/messages?q=raw-only%20readable&path=current").json()
+        self.assertEqual(current_raw_only["items"], [])
+        all_raw_only = client.get("/api/search/messages?q=raw-only%20readable&path=all").json()
+        self.assertEqual([item["node_id"] for item in all_raw_only["items"]], ["raw-only"])
+        for rejected_needle in ("invalid raw sentinel", "huge raw sentinel", "synthetic-asset"):
+            self.assertEqual(
+                client.get(f"/api/search/messages?q={quote(rejected_needle)}&path=all").json()["items"],
+                [],
+            )
+        internal_hidden = client.get("/api/conversations/web-3/messages?path=all&include_internal=false&q=internal%20recoverable%20sentinel").json()
+        self.assertNotIn("internal-raw", {item["node_id"] for item in internal_hidden["items"]})
+        internal_visible = client.get("/api/conversations/web-3/messages?path=all&include_internal=true&q=internal%20recoverable%20sentinel").json()
+        internal_item = next(item for item in internal_visible["items"] if item["node_id"] == "internal-raw")
+        self.assertEqual(internal_item["display_text"], "internal recoverable sentinel")
+        self.assertTrue(internal_item["highlight_ranges"])
+        self.assertNotIn(
+            "internal recoverable sentinel",
+            client.get("/api/conversations/web-3/export?format=txt&path=all&include_internal=false").text,
+        )
+        self.assertIn(
+            "internal recoverable sentinel",
+            client.get("/api/conversations/web-3/export?format=txt&path=all&include_internal=true").text,
+        )
+
+        message_hits = client.get(
+            f"/api/search/messages?q={quote('placeholder raw readable')}&path=all"
+        ).json()
+        self.assertEqual([item["node_id"] for item in message_hits["items"]], ["placeholder-raw"])
+        conversation_hits = client.get(
+            f"/api/conversations?q={quote('placeholder raw readable')}&path=all"
+        ).json()
+        self.assertEqual([item["conversation_id"] for item in conversation_hits["items"]], ["web-3"])
+        highlighted = client.get(
+            f"/api/conversations/web-3/messages?path=all&q={quote('placeholder raw readable')}&limit=20"
+        ).json()
+        target = next(item for item in highlighted["items"] if item["node_id"] == "placeholder-raw")
+        self.assertTrue(target["highlight_ranges"])
+        web_export = client.get("/api/conversations/web-3/export?format=txt&path=current")
+        self.assertIn("placeholder raw readable text", web_export.text)
+
+        from chatgpt_export_archiver.db import connect
+        from chatgpt_export_archiver.exporter import export_conversations
+
+        output = Path(td.name) / "legacy-export"
+        export_conn = connect(db)
+        try:
+            export_conversations(export_conn, output, ["md", "txt"])
+        finally:
+            export_conn.close()
+        manifest = [json.loads(line) for line in (output / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
+        web3_paths = [output / row["output_path"] for row in manifest if row["conversation_id"] == "web-3"]
+        self.assertEqual(len(web3_paths), 2)
+        for exported_path in web3_paths:
+            self.assertIn("placeholder raw readable text", exported_path.read_text(encoding="utf-8"))
 
     def test_web_export_respects_reader_internal_visibility(self):
         td, client, _db = self.make_client()
@@ -2990,9 +3133,78 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("visible-only reader pagination collection", schema["messages"]["around_node_id"]["description"])
         self.assertEqual(
             schema["messages"]["around_node_id"]["response"],
-            ["around_target_found", "around_target_visible", "around_target_in_effective_collection", "around_target_applied"],
+            ["around_target_found", "around_target_in_effective_collection", "around_target_in_requested_collection", "around_target_visible", "around_target_applied"],
         )
         self.assertIn("effective all collection", schema["messages"]["around_node_id"]["description"])
+
+    def test_schema_field_lists_match_actual_page_contracts(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        schema = client.get("/api/schema").json()
+        conversation_page = client.get("/api/conversations?limit=1").json()
+        selected_page = client.get("/api/conversations?limit=1&offset=99&selected_id=web-1").json()
+        conversation_fields = (
+            set(conversation_page)
+            | set(conversation_page["items"][0])
+            | set(selected_page)
+            | set(selected_page.get("selected_item", {}))
+        )
+        self.assertTrue(set(schema["conversations"]["response"]) <= conversation_fields)
+        self.assertEqual(
+            set(schema["pagination"]["conversation_page"]),
+            {"items", "total", "limit", "offset", "has_more", "next_offset"},
+        )
+        self.assertTrue(set(schema["pagination"]["conversation_page"]) <= set(conversation_page))
+        self.assertNotIn("total_exact", conversation_page)
+
+        message_page = client.get(
+            "/api/conversations/web-1/messages?path=all&include_internal=true&around_node_id=b1&limit=2"
+        ).json()
+        message_fields = set(message_page) | set(message_page["items"][0])
+        self.assertTrue(set(schema["messages"]["path_metadata"]) <= message_fields)
+        self.assertTrue(set(schema["messages"]["around_node_id"]["response"]) <= set(message_page))
+        self.assertTrue(set(schema["pagination"]["message_page"]) <= set(message_page))
+
+        search_page = client.get("/api/search/messages?q=python&limit=1").json()
+        self.assertTrue(set(schema["pagination"]["message_search_page"]) <= set(search_page))
+        self.assertIsInstance(search_page["total_exact"], bool)
+
+        types_source = (Path(__file__).resolve().parents[1] / "webui/src/types.ts").read_text(encoding="utf-8")
+        for field in (
+            "cycle_detected",
+            "missing_parent",
+            "cross_conversation_parent",
+            "partial_chain",
+            "raw_flag_leaf_count",
+            "raw_flag_cycle_detected",
+            "around_target_in_requested_collection",
+        ):
+            self.assertIn(field, types_source)
+
+    def test_empty_database_message_search_pagination_and_job_id_contract(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        client = TestClient(create_app(base / "missing.db", static_dir=self.make_build_dir(base)))
+        self.addCleanup(client.close)
+        for count_total in ("true", "false"):
+            page = client.get(f"/api/search/messages?q=synthetic&count_total={count_total}&offset=99").json()
+            self.assertEqual(page["total"], 0)
+            self.assertTrue(page["total_exact"])
+            self.assertEqual(page["offset"], 99)
+            self.assertFalse(page["has_more"])
+            self.assertIsNone(page["next_offset"])
+        conversation_page = client.get("/api/conversations").json()
+        self.assertNotIn("total_exact", conversation_page)
+
+        for invalid in ("short", "A" * 32, "g" * 32, "0" * 31, "0" * 33, "x" * 129, "%01" + "0" * 31):
+            with self.subTest(invalid_job_id=invalid):
+                response = client.get(f"/api/import/jobs/{invalid}")
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json()["detail"], "invalid_job_id")
+        missing = client.get("/api/import/jobs/" + "0" * 32)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["detail"], "job_not_found")
 
     def test_suggest_no_db_returns_empty_items(self):
         td = tempfile.TemporaryDirectory()
@@ -3008,6 +3220,44 @@ class WebApiTests(unittest.TestCase):
         self.addCleanup(td.cleanup)
         long_q = "x" * 101
         self.assertEqual(client.get(f"/api/search/suggest?q={quote(long_q)}").status_code, 422)
+
+    def test_suggest_rejects_stale_or_legacy_title_norm_and_matches_canonical_normalization(self):
+        from chatgpt_export_archiver.db import connect
+        from chatgpt_export_archiver.search import invalidate_capability_cache
+        from chatgpt_export_archiver.web_db import create_web_indexes
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = connect(db)
+        conn.execute("UPDATE conversations SET title = ? WHERE conversation_id = 'web-1'", ("Ｆｕｌｌｗｉｄｔｈ Ｉｎｔｅｌ café ﬁ CJK短词",))
+        conn.commit()
+        conn.close()
+        create_web_indexes(db)
+        for query in ("Intel", "cafe\u0301", "fi", "CJK短"):
+            with self.subTest(current_index_query=query):
+                items = client.get(f"/api/search/suggest?q={quote(query)}").json()["items"]
+                self.assertEqual(items[0]["conversation_id"], "web-1")
+
+        # Canonical mutation increments the durable generation.  The old
+        # normalized table still exists, but suggest must ignore it.
+        conn = connect(db)
+        conn.execute("UPDATE conversations SET title = 'NEW CANONICAL NEEDLE' WHERE conversation_id = 'web-1'")
+        conn.commit()
+        conn.close()
+        invalidate_capability_cache()
+        items = client.get("/api/search/suggest?q=canonical").json()["items"]
+        self.assertEqual(items[0]["conversation_id"], "web-1")
+
+        # A legacy/raw-lower table without metadata is also untrusted.
+        conn = connect(db)
+        conn.execute("DROP TABLE web_index_metadata")
+        conn.execute("DELETE FROM web_title_norm")
+        conn.execute("INSERT INTO web_title_norm(conversation_id, title_norm) VALUES ('web-1', 'stale')")
+        conn.commit()
+        conn.close()
+        invalidate_capability_cache()
+        items = client.get("/api/search/suggest?q=canonical").json()["items"]
+        self.assertEqual(items[0]["conversation_id"], "web-1")
 
     def test_upload_policy_detects_loopback_and_remote(self):
         from chatgpt_export_archiver.web_api import _get_upload_policy
@@ -3054,6 +3304,64 @@ class WebApiTests(unittest.TestCase):
         manager.release_pending_upload_slot()
         self.assertTrue(manager.acquire_pending_upload_slot())
         manager.release_pending_upload_slot()
+
+    def test_import_thread_constructor_and_start_failures_release_writer_slot(self):
+        from chatgpt_export_archiver.web_jobs import ImportJobManager, ImportJobStartError
+
+        for failure_point in ("constructor", "start"):
+            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                upload_dir = base / "upload"
+                upload_dir.mkdir()
+                upload = upload_dir / "upload.zip"
+                upload.write_bytes(b"synthetic")
+                manager = ImportJobManager(base / "archive.db")
+                self.assertTrue(manager.acquire_pending_upload_slot())
+                if failure_point == "constructor":
+                    patcher = mock.patch(
+                        "chatgpt_export_archiver.web_jobs.threading.Thread",
+                        side_effect=RuntimeError("synthetic constructor failure"),
+                    )
+                else:
+                    fake_thread = mock.Mock()
+                    fake_thread.start.side_effect = RuntimeError("synthetic start failure")
+                    patcher = mock.patch(
+                        "chatgpt_export_archiver.web_jobs.threading.Thread",
+                        return_value=fake_thread,
+                    )
+                with patcher, self.assertRaises(ImportJobStartError) as caught:
+                    manager.start_import(upload, filename="synthetic.zip", size=9)
+                self.assertEqual(caught.exception.code, "import_job_start_failed")
+                self.assertEqual(caught.exception.error_type, "RuntimeError")
+                self.assertFalse(manager.has_running_job())
+                self.assertEqual(manager.list_jobs(), [])
+                self.assertTrue(manager.acquire_pending_upload_slot())
+                manager.release_pending_upload_slot()
+
+    def test_import_worker_setup_failure_is_terminal_cleans_upload_and_releases_slot(self):
+        from chatgpt_export_archiver.web_jobs import ImportJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upload_dir = base / "upload"
+            upload_dir.mkdir()
+            upload = upload_dir / "upload.zip"
+            upload.write_bytes(b"synthetic")
+            manager = ImportJobManager(base / "archive.db")
+            with mock.patch.object(manager, "_set_stage", side_effect=RuntimeError("synthetic setup")):
+                job = manager.start_import(upload, filename="synthetic.zip", size=9)
+                deadline = time.time() + 5
+                while manager.has_running_job() and time.time() < deadline:
+                    time.sleep(0.01)
+            snapshot = job.snapshot()
+            self.assertEqual(snapshot["status"], "failed")
+            self.assertEqual(snapshot["stage"], "job_setup")
+            self.assertEqual(snapshot["error_code"], "import_job_start_failed")
+            self.assertEqual(snapshot["error_type"], "RuntimeError")
+            self.assertFalse(upload_dir.exists())
+            self.assertFalse(manager.has_running_job())
+            self.assertTrue(manager.acquire_pending_upload_slot())
+            manager.release_pending_upload_slot()
 
     def test_message_hidden_counts_fast_path_matches_row_path(self):
         from chatgpt_export_archiver.search import _message_visibility_counts, _message_visibility_counts_for_path
@@ -3729,6 +4037,7 @@ class WebApiTests(unittest.TestCase):
             previous = node_id
         mapping["target"] = node("target", previous, "user", "visible-around-target needle", 1_700_700_500, ["tail"])
         mapping["tail"] = node("tail", "target", "assistant", "visible tail after target", 1_700_700_501)
+        mapping["off-current"] = node("off-current", "root", "user", "off current target", 1_700_700_502)
         write_zip(z, [conv("around-visible-prefix", "Around Visible Prefix", mapping, "tail", 1_700_700_000)])
         db = base / "archive.db"
         self.assertEqual(main(["--db", str(db), "import", "--input", str(z), "--no-input-sha256"]), 0)
@@ -3740,6 +4049,8 @@ class WebApiTests(unittest.TestCase):
                 current_visible = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=0, around_node_id="target", include_internal=False)
                 hidden_target = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=999, around_node_id="h050", include_internal=False)
                 full_nodes = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=0, around_node_id="target", include_internal=True)
+                off_current_all = get_messages(conn, "around-visible-prefix", path="all", limit=5, offset=0, around_node_id="off-current", include_internal=True)
+                off_current_current = get_messages(conn, "around-visible-prefix", path="current", limit=5, offset=0, around_node_id="off-current", include_internal=True)
             for page in (all_visible, current_visible):
                 with self.subTest(path=page["effective_path"]):
                     self.assertGreater(page["total"], 0)
@@ -3758,6 +4069,14 @@ class WebApiTests(unittest.TestCase):
             self.assertFalse(hidden_target["around_target_applied"])
             self.assertGreater(full_nodes["total"], current_visible["total"])
             self.assertIn("target", [item["node_id"] for item in full_nodes["items"]])
+            self.assertFalse(off_current_all["around_target_in_effective_collection"])
+            self.assertTrue(off_current_all["around_target_in_requested_collection"])
+            self.assertTrue(off_current_all["around_target_visible"])
+            self.assertTrue(off_current_all["around_target_applied"])
+            self.assertFalse(off_current_current["around_target_in_effective_collection"])
+            self.assertFalse(off_current_current["around_target_in_requested_collection"])
+            self.assertFalse(off_current_current["around_target_visible"])
+            self.assertFalse(off_current_current["around_target_applied"])
 
             writer = sqlite3.connect(db)
             try:
@@ -3886,7 +4205,12 @@ class WebApiTests(unittest.TestCase):
             await send({"type": "http.response.start", "status": 204, "headers": []})
             await send({"type": "http.response.body", "body": b""})
 
-        async def invoke(client_ip: str, headers: list[tuple[bytes, bytes]]):
+        async def invoke(
+            client_ip: str,
+            headers: list[tuple[bytes, bytes]],
+            *,
+            allowed_hosts: tuple[str, ...] = ("archive.lan",),
+        ):
             sent = []
 
             async def receive():
@@ -3896,7 +4220,7 @@ class WebApiTests(unittest.TestCase):
                 sent.append(message)
 
             policy = WebTrustPolicy(
-                allowed_hosts=("archive.lan",),
+                allowed_hosts=allowed_hosts,
                 trusted_proxies=("10.0.0.0/24",),
                 remote=True,
                 allow_missing_origin_for_writes=False,
@@ -3922,7 +4246,27 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(trusted[0]["status"], 204)
         ignored_bad_forward = asyncio.run(invoke("192.0.2.10", [(b"host", b"archive.lan"), (b"x-forwarded-host", b"evil.example")]))
         self.assertEqual(ignored_bad_forward[0]["status"], 204)
-        self.assertEqual(calls, 2)
+        injected_prefix = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b"host=evil.example, host=archive.lan;proto=http")]))
+        self.assertEqual(injected_prefix[0]["status"], 400)
+        two_hops = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b"for=192.0.2.1;host=archive.lan, for=10.0.0.7;host=archive.lan")]))
+        self.assertEqual(two_hops[0]["status"], 400)
+        conflicting = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b"host=archive.lan;proto=https"), (b"x-forwarded-host", b"evil.example"), (b"x-forwarded-proto", b"http")]))
+        self.assertEqual(conflicting[0]["status"], 400)
+        repeated_host = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"host", b"archive.lan"), (b"forwarded", b"host=archive.lan")]))
+        self.assertEqual(repeated_host[0]["status"], 400)
+        repeated_forwarded = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b"host=archive.lan"), (b"forwarded", b"proto=http")]))
+        self.assertEqual(repeated_forwarded[0]["status"], 400)
+        matching_families = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b"host=archive.lan;proto=http"), (b"x-forwarded-host", b"archive.lan"), (b"x-forwarded-proto", b"http")]))
+        self.assertEqual(matching_families[0]["status"], 204)
+        normalized_default_port = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b"host=archive.lan:80;proto=http"), (b"x-forwarded-host", b"archive.lan"), (b"x-forwarded-proto", b"http")]))
+        self.assertEqual(normalized_default_port[0]["status"], 204)
+        quoted_ipv6 = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b'for="[2001:db8::2]";host="[2001:db8::1]:443";proto=https')], allowed_hosts=("2001:db8::1",)))
+        self.assertEqual(quoted_ipv6[0]["status"], 204)
+        invalid_port = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b"host=archive.lan:99999;proto=https")]))
+        self.assertEqual(invalid_port[0]["status"], 400)
+        invalid_syntax = asyncio.run(invoke("10.0.0.8", [(b"host", b"internal"), (b"forwarded", b'host="archive.lan;proto=https')]))
+        self.assertEqual(invalid_syntax[0]["status"], 400)
+        self.assertEqual(calls, 5)
 
     def test_legacy_non_finite_database_is_json_safe_across_web_endpoints(self):
         td, client, db = self.make_client()
@@ -4072,6 +4416,12 @@ class WebApiTests(unittest.TestCase):
             "missing-parent": ("a", [("a", "gone", 0)], set()),
             "cross-parent": ("a", [("a", "foreign", 0)], {"foreign"}),
             "multiple-leaves": ("missing", [("root", None, 1), ("a", "root", 1), ("b", "root", 1)], set()),
+            "raw-cycle-two": ("missing", [("a", "b", 1), ("b", "a", 1)], set()),
+            "raw-cycle-three": ("missing", [("a", "c", 1), ("b", "a", 1), ("c", "b", 1)], set()),
+            "raw-cycle-with-leaf": ("missing", [("a", "b", 1), ("b", "a", 1), ("leaf", None, 1)], set()),
+            "raw-cycle-with-leaves": ("missing", [("a", "b", 1), ("b", "a", 1), ("leaf-a", None, 1), ("leaf-b", None, 1)], set()),
+            "valid-current-stray-raw-cycle": ("cur", [("root", None, 0), ("cur", "root", 0), ("a", "b", 1), ("b", "a", 1)], set()),
+            "no-current-no-flags": (None, [("root", None, 0)], set()),
             "empty": (None, [], set()),
         }
         conn = sqlite3.connect(":memory:")
@@ -4117,6 +4467,26 @@ class WebApiTests(unittest.TestCase):
                     self.assertEqual(sql_result["partial_chain"], python_result.partial_chain)
                     self.assertEqual(sql_result["current_path_nodes"], python_result.raw_flag_count)
                     self.assertEqual(sql_result["raw_flag_leaf_count"], python_result.raw_flag_leaf_count)
+                    for field in (
+                        "selected_chain_cycle_detected",
+                        "raw_flag_cycle_detected",
+                        "selected_chain_missing_parent",
+                        "raw_flag_missing_parent",
+                        "selected_chain_cross_conversation_parent",
+                        "raw_flag_cross_conversation_parent",
+                    ):
+                        self.assertEqual(sql_result[field], getattr(python_result, field))
+
+            for cid in (
+                "raw-cycle-two",
+                "raw-cycle-three",
+                "raw-cycle-with-leaf",
+                "raw-cycle-with-leaves",
+                "valid-current-stray-raw-cycle",
+            ):
+                self.assertTrue(metadata[cid]["raw_flag_cycle_detected"])
+                self.assertTrue(metadata[cid]["cycle_detected"])
+            self.assertEqual(metadata["valid-current-stray-raw-cycle"]["current_collection_source"], "current_node")
 
             conn.executemany(
                 "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES (?, ?, ?, ?)",
@@ -4152,6 +4522,117 @@ class WebApiTests(unittest.TestCase):
                 self.assertEqual(chain.execute("SELECT COUNT(*) FROM effective_current_nodes").fetchone()[0], depth)
                 self.assertFalse(effective_current_metadata(chain, ["chain"])["chain"]["partial_chain"])
                 chain.close()
+
+    def test_single_conversation_effective_scope_uses_indexed_plan_and_bounded_vm_work(self):
+        from chatgpt_export_archiver.current_path import (
+            _SCOPED_EFFECTIVE_CURRENT_SQL,
+            ensure_effective_current_views,
+            invalidate_effective_current_cache,
+        )
+        from chatgpt_export_archiver.db import init_db
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        conversation_count = 20_000
+        conn.executemany(
+            "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES (?, 'scale', ?, ?)",
+            ((f"scale-{index}", f"n{index}-4", f"hash-{index}") for index in range(conversation_count)),
+        )
+        conn.executemany(
+            "INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id, is_on_current_path) VALUES (?, ?, ?, 0)",
+            (
+                (f"scale-{index}", f"n{index}-{node_index}", f"n{index}-{node_index - 1}" if node_index else None)
+                for index in range(conversation_count)
+                for node_index in range(5)
+            ),
+        )
+        conn.commit()
+        steps = [0]
+        conn.set_progress_handler(lambda: (steps.__setitem__(0, steps[0] + 1), 0)[1], 1)
+        try:
+            ensure_effective_current_views(conn, ["scale-0"])
+        finally:
+            conn.set_progress_handler(None, 0)
+        self.assertLess(steps[0], 10_000)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM effective_current_scope").fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM effective_current_nodes").fetchone()[0], 5)
+        plan = "\n".join(
+            str(row[3])
+            for row in conn.execute("EXPLAIN QUERY PLAN " + _SCOPED_EFFECTIVE_CURRENT_SQL)
+        )
+        self.assertIn("SCAN scope", plan)
+        self.assertIn("SEARCH c USING INDEX", plan)
+        self.assertIn("idx_nodes_conversation_flag_parent", plan)
+        self.assertFalse(any(line.startswith("SCAN c ") for line in plan.splitlines()))
+
+        # Invalid current + no raw flags takes the per-conversation fallback,
+        # but unrelated nodes still must not affect the work bound.
+        conn.execute("UPDATE conversations SET current_node = 'missing' WHERE conversation_id = 'scale-0'")
+        invalidate_effective_current_cache(conn)
+        fallback_steps = [0]
+        conn.set_progress_handler(lambda: (fallback_steps.__setitem__(0, fallback_steps[0] + 1), 0)[1], 1)
+        try:
+            ensure_effective_current_views(conn, ["scale-0"])
+        finally:
+            conn.set_progress_handler(None, 0)
+            conn.close()
+        self.assertLess(fallback_steps[0], 10_000)
+
+    def test_empty_and_filter_only_search_defer_effective_current_materialization(self):
+        from chatgpt_export_archiver import current_path as current_path_module
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.db import init_db
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        conn.executemany(
+            "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES (?, ?, ?, ?)",
+            ((f"empty-{index}", "synthetic", f"n{index}", f"h{index}") for index in range(100)),
+        )
+        conn.executemany(
+            "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_text, is_on_current_path) VALUES (?, ?, 'user', 'synthetic', 0)",
+            ((f"empty-{index}", f"n{index}") for index in range(100)),
+        )
+        conn.commit()
+        scopes: list[tuple[str, ...] | None] = []
+        real_ensure = current_path_module.ensure_effective_current_views
+
+        def spy(connection, ids):
+            normalized = None if ids is None else tuple(sorted(str(value) for value in ids))
+            scopes.append(normalized)
+            return real_ensure(connection, ids)
+
+        with (
+            mock.patch.object(current_path_module, "ensure_effective_current_views", side_effect=spy),
+            mock.patch.object(search_module, "ensure_effective_current_views", side_effect=spy),
+        ):
+            for parsed in (
+                search_module.parse_query(""),
+                search_module.parse_query("synthetic", scope="title"),
+                search_module.parse_query("role:user"),
+                search_module.parse_query("", exclude="synthetic"),
+            ):
+                scopes.clear()
+                page = search_module.search_messages(conn, parsed, limit=20)
+                self.assertEqual(page["items"], [])
+                self.assertEqual(page["total"], 0)
+                self.assertTrue(page["total_exact"])
+                self.assertEqual(scopes, [])
+
+            scopes.clear()
+            page = search_module.search_conversations(
+                conn,
+                search_module.parse_query(""),
+                limit=20,
+                selected_id="empty-99",
+            )
+            self.assertEqual(len(page["items"]), 20)
+            self.assertNotIn(None, scopes)
+            self.assertTrue(scopes)
+            self.assertLessEqual(max(len(scope or ()) for scope in scopes), 21)
+        conn.close()
 
     def test_effective_current_cache_invalidates_after_same_connection_graph_mutations(self):
         from chatgpt_export_archiver.current_path import ensure_effective_current_views
@@ -4254,6 +4735,12 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(off_current["around_target_found"])
         self.assertFalse(off_current["around_target_in_effective_collection"])
         self.assertFalse(off_current["around_target_applied"])
+        off_current_all = client.get("/api/conversations/web-1/messages?path=all&include_internal=true&around_node_id=b1&limit=1").json()
+        self.assertTrue(off_current_all["around_target_found"])
+        self.assertFalse(off_current_all["around_target_in_effective_collection"])
+        self.assertTrue(off_current_all["around_target_in_requested_collection"])
+        self.assertTrue(off_current_all["around_target_visible"])
+        self.assertTrue(off_current_all["around_target_applied"])
         missing = client.get("/api/conversations/web-1/messages?path=all&around_node_id=missing&limit=1").json()
         self.assertFalse(missing["around_target_found"])
         self.assertFalse(missing["around_target_applied"])

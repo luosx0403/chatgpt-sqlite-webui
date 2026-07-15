@@ -90,12 +90,16 @@ select, button, .button-link {
   color: inherit;
   cursor: pointer;
 }
-.hidden-file-input {
+.visually-hidden-file-input {
   position: absolute;
   inline-size: 1px;
   block-size: 1px;
-  opacity: 0;
-  pointer-events: none;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 .import-panel {
   display: flex;

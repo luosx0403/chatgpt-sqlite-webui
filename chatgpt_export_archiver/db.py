@@ -23,6 +23,13 @@ IMPORT_REBUILDABLE_INDEXES = (
             ON conversation_nodes(conversation_id, is_on_current_path)
         """,
     ),
+    (
+        "idx_nodes_conversation_flag_parent",
+        """
+        CREATE INDEX IF NOT EXISTS idx_nodes_conversation_flag_parent
+            ON conversation_nodes(conversation_id, is_on_current_path, parent_node_id)
+        """,
+    ),
 )
 
 
@@ -197,8 +204,43 @@ def init_db(conn: sqlite3.Connection) -> bool:
             FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
         );
 
+        CREATE TABLE IF NOT EXISTS archive_generations (
+            name TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO archive_generations(name, generation) VALUES ('title', 0);
+        INSERT OR IGNORE INTO archive_generations(name, generation) VALUES ('message', 0);
+
+        CREATE TRIGGER IF NOT EXISTS archive_title_generation_insert
+        AFTER INSERT ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
+        END;
+        CREATE TRIGGER IF NOT EXISTS archive_title_generation_update
+        AFTER UPDATE OF title ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
+        END;
+        CREATE TRIGGER IF NOT EXISTS archive_title_generation_delete
+        AFTER DELETE ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
+        END;
+        CREATE TRIGGER IF NOT EXISTS archive_message_generation_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
+        END;
+        DROP TRIGGER IF EXISTS archive_message_generation_update;
+        CREATE TRIGGER archive_message_generation_update
+        AFTER UPDATE OF content_text, raw_message_json ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
+        END;
+        CREATE TRIGGER IF NOT EXISTS archive_message_generation_delete
+        AFTER DELETE ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
+        END;
+
         CREATE INDEX IF NOT EXISTS idx_nodes_conversation_path
             ON conversation_nodes(conversation_id, is_on_current_path);
+        CREATE INDEX IF NOT EXISTS idx_nodes_conversation_flag_parent
+            ON conversation_nodes(conversation_id, is_on_current_path, parent_node_id);
         CREATE INDEX IF NOT EXISTS idx_conversations_times
             ON conversations(create_time, update_time);
         CREATE INDEX IF NOT EXISTS idx_warnings_run
@@ -490,10 +532,10 @@ def upsert_conversations_batch(
     conversations: list[ParsedConversation],
     *,
     skip_fts: bool = False,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Upsert a shard worth of conversations with batched node and FTS writes."""
     if not conversations:
-        return {"inserted": 0, "updated": 0, "unchanged": 0}
+        return {"inserted": 0, "updated": 0, "unchanged": 0, "outcomes": {}}
     # Deterministic duplicate policy: within a batch, the last occurrence wins.
     # The import pipeline also records duplicate_conversation_id warnings.
     conversations = _dedupe_conversations_last_wins(conversations)
@@ -528,6 +570,11 @@ def upsert_conversations_batch(
         "inserted": len(inserted),
         "updated": len(updated),
         "unchanged": len(unchanged),
+        "outcomes": {
+            **{conv.conversation_id: "inserted" for conv in inserted},
+            **{conv.conversation_id: "updated" for conv in updated},
+            **{conv.conversation_id: "unchanged" for conv in unchanged},
+        },
     }
 
 
@@ -937,6 +984,11 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             "broken_parent_links": 0,
             "conversations_with_zero_nodes": 0,
             "parent_cycles": 0,
+            "parent_cycle_nodes": 0,
+            "parent_cycle_components": 0,
+            "foreign_key_violations": 0,
+            "foreign_key_violations_by_table": [],
+            "foreign_key_violation_samples": [],
             "non_finite_timestamps": 0,
             "effective_current_diagnostics": {},
             "integrity_check": integrity,
@@ -1005,7 +1057,10 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             ).fetchall()
         ]
     total_warnings = conn.execute("SELECT COUNT(*) AS c FROM import_warnings").fetchone()["c"]
-    cycles = count_parent_cycles(conn)
+    cycle_diagnostics = parent_cycle_diagnostics(conn)
+    cycle_nodes = cycle_diagnostics["parent_cycle_nodes"]
+    cycle_components = cycle_diagnostics["parent_cycle_components"]
+    foreign_keys = foreign_key_diagnostics(conn)
     non_finite_timestamps = 0
     for table in ("conversations", "conversation_nodes"):
         for row in conn.execute(f"SELECT create_time, update_time FROM {table}"):
@@ -1028,7 +1083,10 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         "missing_current_node": missing_current,
         "broken_parent_links": broken_parent,
         "conversations_with_zero_nodes": zero_node,
-        "parent_cycles": cycles,
+        "parent_cycles": cycle_nodes,
+        "parent_cycle_nodes": cycle_nodes,
+        "parent_cycle_components": cycle_components,
+        **foreign_keys,
         "non_finite_timestamps": non_finite_timestamps,
         "effective_current_diagnostics": effective_diagnostics,
         "integrity_check": integrity,
@@ -1036,7 +1094,35 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         "optional_web_index_recovery_hint": optional_web_index_recovery_hint,
         "warnings_by_type": warning_counts,
         "latest_warnings_by_type": latest_warning_counts,
-        "ok": missing_current == 0 and broken_parent == 0 and zero_node == 0 and cycles == 0 and non_finite_timestamps == 0 and integrity == "ok",
+        "ok": missing_current == 0 and broken_parent == 0 and zero_node == 0 and cycle_nodes == 0 and foreign_keys["foreign_key_violations"] == 0 and non_finite_timestamps == 0 and integrity == "ok",
+    }
+
+
+def foreign_key_diagnostics(conn: sqlite3.Connection, *, sample_limit: int = 20) -> dict[str, Any]:
+    """Return bounded, content-free ``PRAGMA foreign_key_check`` diagnostics."""
+
+    rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+    counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    for row in rows:
+        table = str(row[0])
+        counts[table] = counts.get(table, 0) + 1
+        if len(samples) < sample_limit:
+            samples.append(
+                {
+                    "table": table,
+                    "rowid": row[1],
+                    "parent_table": str(row[2]),
+                    "constraint_index": int(row[3]),
+                }
+            )
+    return {
+        "foreign_key_violations": len(rows),
+        "foreign_key_violations_by_table": [
+            {"table": table, "count": count}
+            for table, count in sorted(counts.items())
+        ],
+        "foreign_key_violation_samples": samples,
     }
 
 
@@ -1047,6 +1133,19 @@ def _effective_current_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
     conversation_ids = [str(row["conversation_id"]) for row in conversation_rows]
     ensure_effective_current_views(conn, None)
     metadata = effective_current_metadata(conn, conversation_ids)
+    current_chains_with_unflagged_nodes = {
+        str(row[0])
+        for row in conn.execute(
+            """SELECT DISTINCT ec.conversation_id
+               FROM effective_current_nodes ec
+               JOIN effective_current_meta em
+                 ON em.conversation_id = ec.conversation_id
+               JOIN conversation_nodes n
+                 ON n.conversation_id = ec.conversation_id AND n.node_id = ec.node_id
+               WHERE em.current_collection_source = 'current_node'
+                 AND n.is_on_current_path = 0"""
+        )
+    }
     counts = {
         "selected_current_node": 0,
         "selected_raw_flags": 0,
@@ -1067,18 +1166,8 @@ def _effective_current_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
         counts[f"selected_{source}"] += 1
         if source == "current_node" and int(item.get("current_path_nodes") or 0) == 0:
             counts["valid_current_node_zero_flags"] += 1
-        if source == "current_node":
-            missing_flag = conn.execute(
-                """SELECT 1
-                   FROM effective_current_nodes ec
-                   JOIN conversation_nodes n
-                     ON n.conversation_id = ec.conversation_id AND n.node_id = ec.node_id
-                   WHERE ec.conversation_id = ? AND n.is_on_current_path = 0
-                   LIMIT 1""",
-                (conversation_id,),
-            ).fetchone()
-            if missing_flag:
-                counts["flags_missing_current_chain_nodes"] += 1
+        if conversation_id in current_chains_with_unflagged_nodes:
+            counts["flags_missing_current_chain_nodes"] += 1
         if int(item.get("raw_flag_leaf_count") or 0) > 1:
             counts["multiple_flag_leaves"] += 1
         if source == "raw_flags" and conversation["current_node"]:
@@ -1095,11 +1184,18 @@ def _effective_current_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def count_parent_cycles(conn: sqlite3.Connection) -> int:
+    """Compatibility alias returning the number of nodes in parent cycles."""
+
+    return parent_cycle_diagnostics(conn)["parent_cycle_nodes"]
+
+
+def parent_cycle_diagnostics(conn: sqlite3.Connection) -> dict[str, int]:
     rows = conn.execute(
         "SELECT conversation_id, node_id, parent_node_id FROM conversation_nodes WHERE parent_node_id IS NOT NULL"
     ).fetchall()
     parents = {(row["conversation_id"], row["node_id"]): row["parent_node_id"] for row in rows}
     cycle_nodes: set[tuple[str, str]] = set()
+    cycle_components = 0
     checked: set[tuple[str, str]] = set()
     for start in parents:
         if start in checked:
@@ -1110,13 +1206,17 @@ def count_parent_cycles(conn: sqlite3.Connection) -> int:
         while current is not None and current not in checked:
             if current in seen_at:
                 cycle_nodes.update(path[seen_at[current] :])
+                cycle_components += 1
                 break
             seen_at[current] = len(path)
             path.append(current)
             parent = parents.get(current)
             current = (current[0], parent) if parent is not None else None
         checked.update(path)
-    return len(cycle_nodes)
+    return {
+        "parent_cycle_nodes": len(cycle_nodes),
+        "parent_cycle_components": cycle_components,
+    }
 
 
 def export_query(conn: sqlite3.Connection, start_ts: float | None, end_ts: float | None) -> list[sqlite3.Row]:

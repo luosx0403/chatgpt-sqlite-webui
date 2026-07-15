@@ -23,6 +23,12 @@ class EffectiveCurrentCollection:
     partial_chain: bool = False
     raw_flag_count: int = 0
     raw_flag_leaf_count: int = 0
+    selected_chain_cycle_detected: bool = False
+    raw_flag_cycle_detected: bool = False
+    selected_chain_missing_parent: bool = False
+    raw_flag_missing_parent: bool = False
+    selected_chain_cross_conversation_parent: bool = False
+    raw_flag_cross_conversation_parent: bool = False
 
 
 def _row_value(row: Mapping[str, Any], key: str) -> Any:
@@ -61,6 +67,53 @@ def _walk_parent_chain(
     return reversed_ids, cycle, missing_parent, terminal_parent
 
 
+def _raw_flag_topology_diagnostics(
+    by_id: Mapping[str, Mapping[str, Any]],
+    flag_ids: set[str],
+    foreign_ids: set[str],
+) -> tuple[bool, bool, bool]:
+    """Diagnose every raw-flag component, including components with no leaf."""
+
+    parents = {
+        node_id: (
+            str(parent)
+            if (parent := _row_value(by_id[node_id], "parent_node_id")) not in (None, "")
+            else None
+        )
+        for node_id in flag_ids
+    }
+    cycle = False
+    state: dict[str, int] = {}
+    for start in sorted(flag_ids):
+        current: str | None = start
+        trail: list[str] = []
+        positions: dict[str, int] = {}
+        while current in flag_ids and state.get(current, 0) == 0:
+            if current in positions:
+                cycle = True
+                break
+            positions[current] = len(trail)
+            trail.append(current)
+            current = parents.get(current)
+        if current in positions:
+            cycle = True
+        for node_id in trail:
+            state[node_id] = 2
+
+    missing = False
+    cross = False
+    for parent in parents.values():
+        if parent is None or parent in flag_ids:
+            continue
+        if parent not in by_id and parent in foreign_ids:
+            cross = True
+        else:
+            # A local but unflagged parent is ineligible for a raw-flag chain;
+            # a wholly absent parent is likewise incomplete.
+            missing = True
+    return cycle, missing, cross
+
+
 def resolve_effective_current_collection(
     current_node: str | None,
     rows: Sequence[RowT],
@@ -85,6 +138,7 @@ def resolve_effective_current_collection(
     current_key = str(current_node) if current_node not in (None, "") else None
     current_exists = bool(current_key and current_key in by_id)
     foreign_ids = {str(value) for value in foreign_node_ids}
+    raw_cycle, raw_missing, raw_cross = _raw_flag_topology_diagnostics(by_id, flag_ids, foreign_ids)
 
     if current_exists and current_key is not None:
         node_ids, cycle, missing_parent, terminal_parent = _walk_parent_chain(
@@ -93,18 +147,27 @@ def resolve_effective_current_collection(
         if node_ids:
             cross_parent = bool(terminal_parent and terminal_parent not in by_id and terminal_parent in foreign_ids)
             missing_parent = missing_parent and not cross_parent
+            combined_cycle = cycle or raw_cycle
+            combined_missing = missing_parent or raw_missing
+            combined_cross = cross_parent or raw_cross
             return EffectiveCurrentCollection(
                 tuple(node_ids),
                 "current_node",
                 True,
                 False,
                 "current",
-                cycle_detected=cycle,
-                missing_parent=missing_parent,
-                cross_conversation_parent=cross_parent,
-                partial_chain=cycle or missing_parent or cross_parent,
+                cycle_detected=combined_cycle,
+                missing_parent=combined_missing,
+                cross_conversation_parent=combined_cross,
+                partial_chain=combined_cycle or combined_missing or combined_cross,
                 raw_flag_count=len(flag_ids),
                 raw_flag_leaf_count=len(flag_leaves),
+                selected_chain_cycle_detected=cycle,
+                raw_flag_cycle_detected=raw_cycle,
+                selected_chain_missing_parent=missing_parent,
+                raw_flag_missing_parent=raw_missing,
+                selected_chain_cross_conversation_parent=cross_parent,
+                raw_flag_cross_conversation_parent=raw_cross,
             )
 
     for leaf in flag_leaves:
@@ -114,18 +177,27 @@ def resolve_effective_current_collection(
         if node_ids:
             cross_parent = bool(terminal_parent and terminal_parent not in by_id and terminal_parent in foreign_ids)
             missing_parent = missing_parent and not cross_parent
+            combined_cycle = cycle or raw_cycle
+            combined_missing = missing_parent or raw_missing
+            combined_cross = cross_parent or raw_cross
             return EffectiveCurrentCollection(
                 tuple(node_ids),
                 "raw_flags",
                 current_exists,
                 False,
                 "current",
-                cycle_detected=cycle,
-                missing_parent=missing_parent,
-                cross_conversation_parent=cross_parent,
-                partial_chain=cycle or missing_parent or cross_parent,
+                cycle_detected=combined_cycle,
+                missing_parent=combined_missing,
+                cross_conversation_parent=combined_cross,
+                partial_chain=combined_cycle or combined_missing or combined_cross,
                 raw_flag_count=len(flag_ids),
                 raw_flag_leaf_count=len(flag_leaves),
+                selected_chain_cycle_detected=cycle,
+                raw_flag_cycle_detected=raw_cycle,
+                selected_chain_missing_parent=missing_parent,
+                raw_flag_missing_parent=raw_missing,
+                selected_chain_cross_conversation_parent=cross_parent,
+                raw_flag_cross_conversation_parent=raw_cross,
             )
 
     all_ids = tuple(
@@ -151,6 +223,13 @@ def resolve_effective_current_collection(
         "all" if all_ids else "current",
         raw_flag_count=len(flag_ids),
         raw_flag_leaf_count=len(flag_leaves),
+        cycle_detected=raw_cycle,
+        missing_parent=raw_missing,
+        cross_conversation_parent=raw_cross,
+        partial_chain=raw_cycle or raw_missing or raw_cross,
+        raw_flag_cycle_detected=raw_cycle,
+        raw_flag_missing_parent=raw_missing,
+        raw_flag_cross_conversation_parent=raw_cross,
     )
 
 
@@ -177,6 +256,12 @@ _EFFECTIVE_CURRENT_TABLES_SQL = (
            missing_parent INTEGER NOT NULL,
            cross_conversation_parent INTEGER NOT NULL,
            partial_chain INTEGER NOT NULL
+           ,selected_chain_cycle_detected INTEGER NOT NULL
+           ,raw_flag_cycle_detected INTEGER NOT NULL
+           ,selected_chain_missing_parent INTEGER NOT NULL
+           ,raw_flag_missing_parent INTEGER NOT NULL
+           ,selected_chain_cross_conversation_parent INTEGER NOT NULL
+           ,raw_flag_cross_conversation_parent INTEGER NOT NULL
        )""",
     """CREATE TEMP TABLE IF NOT EXISTS effective_current_cache_state (
            scope_mode TEXT NOT NULL,
@@ -191,11 +276,12 @@ WITH RECURSIVE
 valid_current AS (
     SELECT c.conversation_id, n.node_id, n.parent_node_id, n.node_id AS leaf_node_id
     FROM effective_current_scope scope
-    JOIN conversations c ON c.conversation_id = scope.conversation_id
-    JOIN conversation_nodes n
-      ON n.conversation_id = c.conversation_id
-     AND n.node_id = c.current_node
-    WHERE c.current_node IS NOT NULL AND c.current_node <> ''
+    CROSS JOIN conversations c
+    CROSS JOIN conversation_nodes n
+    WHERE c.conversation_id = scope.conversation_id
+      AND n.conversation_id = c.conversation_id
+      AND n.node_id = c.current_node
+      AND c.current_node IS NOT NULL AND c.current_node <> ''
 ),
 current_walk(conversation_id, node_id, parent_node_id, leaf_node_id) AS (
     SELECT conversation_id, node_id, parent_node_id, leaf_node_id
@@ -211,17 +297,18 @@ flag_leaf_candidates AS (
     SELECT n.conversation_id, n.node_id, n.parent_node_id,
            row_number() OVER (PARTITION BY n.conversation_id ORDER BY n.node_id) AS leaf_rank
     FROM effective_current_scope scope
-    JOIN conversation_nodes n ON n.conversation_id = scope.conversation_id
-    WHERE n.is_on_current_path = 1
+    CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_flag_parent
+    WHERE n.conversation_id = scope.conversation_id
+      AND n.is_on_current_path = 1
+      AND NOT EXISTS (
+          SELECT 1 FROM valid_current vc WHERE vc.conversation_id = scope.conversation_id
+      )
       AND NOT EXISTS (
           SELECT 1
-          FROM conversation_nodes child
+          FROM conversation_nodes child INDEXED BY idx_nodes_conversation_flag_parent
           WHERE child.conversation_id = n.conversation_id
             AND child.is_on_current_path = 1
             AND child.parent_node_id = n.node_id
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM valid_current vc WHERE vc.conversation_id = n.conversation_id
       )
 ),
 flag_walk(conversation_id, node_id, parent_node_id, leaf_node_id) AS (
@@ -254,8 +341,9 @@ SELECT conversation_id, node_id, parent_node_id, leaf_node_id, source
 FROM chosen_chain
 UNION ALL
 SELECT n.conversation_id, n.node_id, n.parent_node_id, NULL, 'fallback_all'
-FROM conversation_nodes n
-JOIN fallback_conversations f ON f.conversation_id = n.conversation_id;
+FROM fallback_conversations f
+CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_path
+WHERE n.conversation_id = f.conversation_id;
 """
 
 
@@ -398,6 +486,58 @@ def ensure_effective_current_views(
             cross = bool(owners)
             missing = not cross
         diagnostics[conversation_id] = (cycle, missing, cross)
+
+    # Diagnose the complete raw-flag topology separately from the selected
+    # chain. In particular, a closed cycle has no leaf and therefore never
+    # appears in ``membership`` above.
+    topology_rows = conn.execute(
+        """SELECT n.conversation_id, n.node_id, n.parent_node_id, n.is_on_current_path
+           FROM effective_current_scope scope
+           CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_path
+           WHERE n.conversation_id = scope.conversation_id"""
+    ).fetchall()
+    topology_by_conversation: dict[str, list[sqlite3.Row]] = {}
+    local_ids_by_conversation: dict[str, set[str]] = {}
+    unresolved_flag_parents: set[str] = set()
+    for row in topology_rows:
+        conversation_id = str(row[0])
+        topology_by_conversation.setdefault(conversation_id, []).append(row)
+        local_ids_by_conversation.setdefault(conversation_id, set()).add(str(row[1]))
+    for conversation_id, rows in topology_by_conversation.items():
+        local_ids = local_ids_by_conversation[conversation_id]
+        for row in rows:
+            parent = row[2]
+            if bool(row[3]) and parent not in (None, "") and str(parent) not in local_ids:
+                unresolved_flag_parents.add(str(parent))
+    raw_parent_owners: dict[str, set[str]] = {}
+    unresolved_list = sorted(unresolved_flag_parents)
+    for offset in range(0, len(unresolved_list), 400):
+        batch = unresolved_list[offset : offset + 400]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            f"SELECT node_id, conversation_id FROM conversation_nodes WHERE node_id IN ({placeholders})",
+            batch,
+        ):
+            raw_parent_owners.setdefault(str(row[0]), set()).add(str(row[1]))
+    raw_diagnostics: dict[str, tuple[bool, bool, bool]] = {}
+    for conversation_id, rows in topology_by_conversation.items():
+        by_id = {str(row[1]): row for row in rows}
+        # Adapt positional SQL rows to the shared topology helper.
+        adapted = {
+            node_id: {
+                "node_id": node_id,
+                "parent_node_id": row[2],
+                "is_on_current_path": row[3],
+            }
+            for node_id, row in by_id.items()
+        }
+        flag_ids = {node_id for node_id, row in adapted.items() if bool(row["is_on_current_path"])}
+        foreign_ids = {
+            parent_id
+            for parent_id, owners in raw_parent_owners.items()
+            if conversation_id not in owners and bool(owners)
+        }
+        raw_diagnostics[conversation_id] = _raw_flag_topology_diagnostics(adapted, flag_ids, foreign_ids)
     if node_records:
         conn.executemany(
             """INSERT INTO effective_current_nodes(
@@ -416,16 +556,19 @@ def ensure_effective_current_views(
                           SUM(CASE WHEN n.is_on_current_path = 1 THEN 1 ELSE 0 END) AS raw_flag_count,
                           MAX(CASE WHEN n.node_id = c.current_node THEN 1 ELSE 0 END) AS current_node_exists
                    FROM effective_current_scope scope
-                   JOIN conversations c ON c.conversation_id = scope.conversation_id
-                   LEFT JOIN conversation_nodes n ON n.conversation_id = c.conversation_id
+                   CROSS JOIN conversations c
+                   LEFT JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_path
+                     ON n.conversation_id = c.conversation_id
+                   WHERE c.conversation_id = scope.conversation_id
                    GROUP BY scope.conversation_id
                ), raw_leaf_stats AS (
                    SELECT n.conversation_id, COUNT(*) AS raw_flag_leaf_count
                    FROM effective_current_scope scope
-                   JOIN conversation_nodes n ON n.conversation_id = scope.conversation_id
-                   WHERE n.is_on_current_path = 1
+                   CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_flag_parent
+                   WHERE n.conversation_id = scope.conversation_id
+                     AND n.is_on_current_path = 1
                      AND NOT EXISTS (
-                         SELECT 1 FROM conversation_nodes child
+                         SELECT 1 FROM conversation_nodes child INDEXED BY idx_nodes_conversation_flag_parent
                          WHERE child.conversation_id = n.conversation_id
                            AND child.is_on_current_path = 1
                            AND child.parent_node_id = n.node_id
@@ -447,7 +590,15 @@ def ensure_effective_current_views(
         source = source_by_conversation.get(conversation_id, "fallback_all")
         node_count = int(stats[1] or 0)
         fallback = source == "fallback_all" and node_count > 0
-        cycle, missing, cross = diagnostics.get(conversation_id, (False, False, False))
+        selected_cycle, selected_missing, selected_cross = diagnostics.get(
+            conversation_id, (False, False, False)
+        )
+        raw_cycle, raw_missing, raw_cross = raw_diagnostics.get(
+            conversation_id, (False, False, False)
+        )
+        cycle = selected_cycle or raw_cycle
+        missing = selected_missing or raw_missing
+        cross = selected_cross or raw_cross
         meta_records.append(
             (
                 conversation_id,
@@ -462,12 +613,18 @@ def ensure_effective_current_views(
                 int(missing),
                 int(cross),
                 int(cycle or missing or cross),
+                int(selected_cycle),
+                int(raw_cycle),
+                int(selected_missing),
+                int(raw_missing),
+                int(selected_cross),
+                int(raw_cross),
             )
         )
     if meta_records:
         conn.executemany(
             """INSERT INTO effective_current_meta VALUES (
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                )""",
             meta_records,
         )
@@ -505,6 +662,12 @@ def effective_current_metadata(conn: sqlite3.Connection, conversation_ids: Itera
             "missing_parent": bool(row["missing_parent"]),
             "cross_conversation_parent": bool(row["cross_conversation_parent"]),
             "partial_chain": bool(row["partial_chain"]),
+            "selected_chain_cycle_detected": bool(row["selected_chain_cycle_detected"]),
+            "raw_flag_cycle_detected": bool(row["raw_flag_cycle_detected"]),
+            "selected_chain_missing_parent": bool(row["selected_chain_missing_parent"]),
+            "raw_flag_missing_parent": bool(row["raw_flag_missing_parent"]),
+            "selected_chain_cross_conversation_parent": bool(row["selected_chain_cross_conversation_parent"]),
+            "raw_flag_cross_conversation_parent": bool(row["raw_flag_cross_conversation_parent"]),
         }
         for row in rows
     }

@@ -338,6 +338,33 @@ def extract_message_content(message: dict[str, Any] | None) -> tuple[str | None,
     return content_type, "", notes
 
 
+def recover_message_display_text(
+    content_text: str | None,
+    raw_message_json: str | None,
+    *,
+    max_raw_chars: int = 200_000,
+) -> str:
+    """Resolve legacy placeholder text without parsing unbounded raw payloads."""
+
+    canonical = content_text or ""
+    stripped = canonical.strip()
+    placeholder = stripped.startswith("[non-text content:") or stripped.startswith("[non-text part:")
+    if canonical and not placeholder:
+        return canonical
+    if not raw_message_json or len(raw_message_json) > max_raw_chars:
+        return canonical
+    try:
+        message = json.loads(raw_message_json)
+    except (TypeError, json.JSONDecodeError):
+        return canonical
+    if not isinstance(message, dict):
+        return canonical
+    _content_type, recovered, _notes = extract_message_content(message)
+    if _content_type not in (None, "", "text", "multimodal_text", "code"):
+        return canonical
+    return recovered or canonical
+
+
 def _extract_part_text(part: Any, notes: list[str], depth: int = 0) -> str:
     if depth > 8:
         notes.append("max_depth_reached")
@@ -417,6 +444,16 @@ def _to_float(
     try:
         number = float(value)
     except (TypeError, ValueError):
+        if warnings is not None:
+            warnings.append(
+                WarningRecord(
+                    source_file,
+                    array_index,
+                    "invalid_timestamp",
+                    compact_json({"field": field, "value_type": type(value).__name__}),
+                    None,
+                )
+            )
         return None
     if math.isfinite(number):
         return number

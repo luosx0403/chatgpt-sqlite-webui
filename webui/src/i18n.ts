@@ -1,8 +1,6 @@
 export type Language = "system" | "en" | "zh-Hans" | "zh-Hant" | "ja" | "es";
 
-type Dict = Record<string, string>;
-
-const en: Dict = {
+const en = {
   appTitle: "ChatGPT Archive",
   localOnly: "Local only · 127.0.0.1 by default",
   remoteAccessEnabled: "Trusted-network access explicitly enabled",
@@ -172,6 +170,7 @@ const en: Dict = {
   importError_stats_failed: "The archive was imported, but summary statistics could not be refreshed.",
   importError_web_index_failed: "The archive was imported, but the optional Web search index could not be built.",
   importError_import_job_active: "Another import or upload is already active. Wait for it to finish and try again.",
+  importError_import_job_start_failed: "The local import worker could not start. Try again.",
   importError_upload_zip_no_conversation_sources: "The ZIP does not contain a supported conversations JSON file.",
   importError_upload_zip_ambiguous_conversation_sources: "The ZIP contains ambiguous or duplicate conversation sources.",
   importError_upload_origin_not_allowed: "This page is not allowed to upload to the local archive server.",
@@ -188,8 +187,8 @@ const en: Dict = {
   english: "English",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
-  japanese: "日本語",
-  spanish: "Español",
+  japanese: "日本語 (partial translation)",
+  spanish: "Español (partial translation)",
   theme: "Theme",
   light: "Light",
   dark: "Dark",
@@ -222,9 +221,13 @@ const en: Dict = {
   helpOverrides: "Raw path: and scope: modifiers in the query override the matching sidebar selectors.",
   helpBrowserFind: "Browser Cmd/Ctrl+F sees only rows currently rendered by the virtual reader; use archive search for the whole conversation.",
   helpAdvanced: "Advanced filters in the sidebar generate the same backend query. Browser Back/Forward does not restore step-by-step search or selection history.",
+  helpFilterOnly: "Filter-only and exclude-only searches can select conversations. Message hits and reader highlights require a positive message-text term; role, source, and date filters do not create hit navigation by themselves.",
   queryLengthLimit: "Search input is limited to 500 characters; shorten the query or use advanced filters.",
   highlightRangesTruncated: "This message has more matches than the highlight preview can mark; hit navigation still includes the message.",
-};
+} as const;
+
+export type TranslationKey = keyof typeof en;
+type Dict = Record<TranslationKey, string>;
 
 const zhHans: Dict = {
   appTitle: "ChatGPT 归档",
@@ -396,6 +399,7 @@ const zhHans: Dict = {
   importError_stats_failed: "归档已导入，但摘要统计无法刷新。",
   importError_web_index_failed: "归档已导入，但可选的 Web 搜索索引无法建立。",
   importError_import_job_active: "已有导入或上传正在运行，请等待完成后重试。",
+  importError_import_job_start_failed: "本机导入工作线程无法启动，请重试。",
   importError_upload_zip_no_conversation_sources: "ZIP 中没有受支持的对话 JSON 文件。",
   importError_upload_zip_ambiguous_conversation_sources: "ZIP 中含有歧义或重复的对话来源。",
   importError_upload_origin_not_allowed: "此页面无权向本地归档服务器上传。",
@@ -412,8 +416,8 @@ const zhHans: Dict = {
   english: "English",
   simplifiedChinese: "简体中文",
   traditionalChinese: "繁體中文",
-  japanese: "日本語",
-  spanish: "Español",
+  japanese: "日本語（部分翻译）",
+  spanish: "Español（部分翻译）",
   theme: "主题",
   light: "浅色",
   dark: "深色",
@@ -446,6 +450,7 @@ const zhHans: Dict = {
   helpOverrides: "查询里的 raw path: 和 scope: 会覆盖侧栏对应选择器。",
   helpBrowserFind: "浏览器 Cmd/Ctrl+F 只能看到虚拟 reader 当前渲染的行；整段会话请使用归档搜索。",
   helpAdvanced: "侧栏高级筛选会生成同样的后端查询；浏览器前进/后退不会恢复逐步搜索或选择历史。",
+  helpFilterOnly: "仅筛选或仅排除可以筛选对话；只有正向消息正文词才会产生消息命中和 reader 高亮，角色、来源或日期本身不会创建命中导航。",
   queryLengthLimit: "搜索输入最多 500 个字符；请缩短查询或使用高级筛选。",
   highlightRangesTruncated: "这条消息的命中超过高亮预览上限；命中导航仍会包含该消息。",
 };
@@ -620,6 +625,7 @@ const zhHant: Dict = {
   importError_stats_failed: "封存已匯入，但摘要統計無法重新整理。",
   importError_web_index_failed: "封存已匯入，但可選的 Web 搜尋索引無法建立。",
   importError_import_job_active: "已有匯入或上傳正在執行，請等待完成後重試。",
+  importError_import_job_start_failed: "本機匯入工作執行緒無法啟動，請重試。",
   importError_upload_zip_no_conversation_sources: "ZIP 中沒有支援的對話 JSON 檔案。",
   importError_upload_zip_ambiguous_conversation_sources: "ZIP 中含有歧義或重複的對話來源。",
   importError_upload_origin_not_allowed: "此頁面無權向本機封存伺服器上傳。",
@@ -636,8 +642,8 @@ const zhHant: Dict = {
   english: "English",
   simplifiedChinese: "簡體中文",
   traditionalChinese: "繁體中文",
-  japanese: "日本語",
-  spanish: "Español",
+  japanese: "日本語（部分翻譯）",
+  spanish: "Español（部分翻譯）",
   theme: "主題",
   light: "淺色",
   dark: "深色",
@@ -670,6 +676,7 @@ const zhHant: Dict = {
   helpOverrides: "查詢中的 raw path: 與 scope: 會覆寫側欄對應選擇器。",
   helpBrowserFind: "瀏覽器 Cmd/Ctrl+F 只看得到虛擬 reader 目前渲染的列；整段對話請用封存搜尋。",
   helpAdvanced: "側欄進階篩選會產生相同的後端查詢；瀏覽器上一頁/下一頁不會還原逐步搜尋或選擇歷程。",
+  helpFilterOnly: "僅篩選或僅排除可以篩選對話；只有正向訊息正文詞才會產生訊息命中與 reader 醒目提示，角色、來源或日期本身不會建立命中導覽。",
   queryLengthLimit: "搜尋輸入最多 500 個字元；請縮短查詢或使用進階篩選。",
   highlightRangesTruncated: "此訊息的命中超過醒目提示預覽上限；命中導覽仍會包含該訊息。",
 };
@@ -743,8 +750,8 @@ const ja: Dict = {
   helpAdvanced: "サイドバーの詳細フィルターも同じバックエンド検索になります。ブラウザーの戻る/進むは段階的な検索・選択履歴を復元しません。",
   queryLengthLimit: "検索入力は 500 文字までです。短くするか詳細フィルターを使ってください。",
   highlightRangesTruncated: "このメッセージの一致数は highlight preview の上限を超えています。hit navigation には引き続き含まれます。",
-  japanese: "日本語",
-  spanish: "Español",
+  japanese: "日本語（部分翻訳）",
+  spanish: "Español（部分翻訳）",
 };
 
 const es: Dict = {
@@ -816,8 +823,8 @@ const es: Dict = {
   helpAdvanced: "Los filtros avanzados generan la misma consulta. Atrás/Adelante no restaura el historial paso a paso de búsquedas o selecciones.",
   queryLengthLimit: "La búsqueda está limitada a 500 caracteres; acorta la consulta o usa filtros avanzados.",
   highlightRangesTruncated: "Este mensaje supera el límite de resaltado de vista previa; la navegación de hits todavía incluye el mensaje.",
-  japanese: "日本語",
-  spanish: "Español",
+  japanese: "日本語 (traducción parcial)",
+  spanish: "Español (traducción parcial)",
 };
 
 const dictionaries: Record<Exclude<Language, "system">, Dict> = {
@@ -827,6 +834,8 @@ const dictionaries: Record<Exclude<Language, "system">, Dict> = {
   ja,
   es,
 };
+
+export const PARTIAL_LANGUAGES = ["ja", "es"] as const;
 
 export function detectLanguage(languages: readonly string[] = navigator.languages): Exclude<Language, "system"> {
   for (const raw of languages) {
@@ -844,6 +853,6 @@ export function createTranslator(language: Language) {
   const dict = dictionaries[resolved] || en;
   return {
     language: resolved,
-    t: (key: string) => dict[key] || en[key] || key,
+    t: (key: string) => dict[key as TranslationKey] || en[key as TranslationKey] || key,
   };
 }

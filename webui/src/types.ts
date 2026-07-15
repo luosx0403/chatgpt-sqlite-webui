@@ -32,6 +32,13 @@ export interface ConversationSummary {
   missing_parent?: boolean;
   cross_conversation_parent?: boolean;
   partial_chain?: boolean;
+  raw_flag_leaf_count?: number;
+  selected_chain_cycle_detected?: boolean;
+  raw_flag_cycle_detected?: boolean;
+  selected_chain_missing_parent?: boolean;
+  raw_flag_missing_parent?: boolean;
+  selected_chain_cross_conversation_parent?: boolean;
+  raw_flag_cross_conversation_parent?: boolean;
   hit_count?: number;
   snippets?: SearchSnippet[];
   reasons?: string[];
@@ -116,7 +123,6 @@ export interface HighlightRange {
 export interface BasePage<T> {
   items: T[];
   total: number;
-  total_exact?: boolean;
   limit: number;
   offset: number;
   has_more: boolean;
@@ -134,9 +140,21 @@ export interface BasePage<T> {
   current_path_fallback_to_all?: boolean;
   current_node_exists?: boolean;
   current_collection_source?: "current_node" | "raw_flags" | "fallback_all" | UnknownApiEnum;
+  cycle_detected?: boolean;
+  missing_parent?: boolean;
+  cross_conversation_parent?: boolean;
+  partial_chain?: boolean;
+  raw_flag_leaf_count?: number;
+  selected_chain_cycle_detected?: boolean;
+  raw_flag_cycle_detected?: boolean;
+  selected_chain_missing_parent?: boolean;
+  raw_flag_missing_parent?: boolean;
+  selected_chain_cross_conversation_parent?: boolean;
+  raw_flag_cross_conversation_parent?: boolean;
   around_target_found?: boolean;
   around_target_visible?: boolean;
   around_target_in_effective_collection?: boolean;
+  around_target_in_requested_collection?: boolean;
   around_target_applied?: boolean;
 }
 
@@ -151,6 +169,7 @@ export interface MessagePage extends BasePage<MessageItem> {
 }
 
 export interface SearchMessagePage extends BasePage<SearchMessageHit> {
+  total_exact: boolean;
   effective_path?: PathMode;
   current_path_fallback_to_all?: boolean;
 }
@@ -206,13 +225,16 @@ export interface Health {
   allowed_hosts?: string[];
   trusted_proxies?: string[];
   write_origin_required?: boolean;
+  foreign_key_violations?: number;
+  foreign_key_violations_by_table?: Array<{ table: string; count: number }>;
+  foreign_key_violation_samples?: Array<{ table: string; rowid: number | null; parent: string; constraint: number }>;
 }
 
 export interface ImportJob {
   job_id: string;
   status: "queued" | "running" | "succeeded" | "failed" | "postcheck_failed";
   stage: string;
-  outcome: "queued" | "import_running" | "input_preflight_failed" | "source_scan_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "succeeded";
+  outcome: "queued" | "import_running" | "import_job_start_failed" | "input_preflight_failed" | "source_scan_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "succeeded";
   canonical_commit_succeeded: boolean;
   filename: string;
   size: number;
@@ -226,6 +248,7 @@ export interface ImportJob {
   web_index: Record<string, unknown> | null;
   error: string | null;
   error_code: string | null;
+  error_type: string | null;
   cleanup_warning: string | null;
   log_tail: string[];
 }
@@ -241,15 +264,38 @@ export interface RawMessageResponse {
 
 export interface ApiSchemaResponse {
   version: number;
-  pagination: { fields: string[] };
-  conversations: Record<string, unknown>;
-  messages: Record<string, unknown>;
+  pagination: {
+    conversation_page: string[];
+    message_page: string[];
+    message_search_page: string[];
+    total_exact: string;
+  };
+  conversations: {
+    endpoint: string;
+    filters: string[];
+    response: string[];
+    [key: string]: unknown;
+  };
+  messages: {
+    endpoint: string;
+    path_metadata: string[];
+    around_node_id: { description: string; response: string[] };
+    [key: string]: unknown;
+  };
   raw: Record<string, unknown>;
   export: Record<string, unknown>;
   search: Record<string, unknown>;
   suggest: Record<string, unknown>;
   upload: { effective_policy: Record<string, unknown>; [key: string]: unknown };
-  jobs: Record<string, unknown>;
+  jobs: {
+    endpoints: string[];
+    job_id: string;
+    fields: string[];
+    failure_codes: string[];
+    cleanup_warnings: string[];
+    preflight_cleanup_error: string[];
+    [key: string]: unknown;
+  };
   stable_error_codes: string[];
   provenance: Record<string, string>;
 }

@@ -9,7 +9,7 @@ export default function SearchHelp({ open, t, onClose }: Props) {
   if (!open) return null;
   const rows = [
     "helpPlain", "helpOr", "helpPhrase", "helpExclude", "helpCjk", "helpRole",
-    "helpTitle", "helpDate", "helpSource", "helpOverrides", "helpBrowserFind", "helpAdvanced",
+    "helpTitle", "helpDate", "helpSource", "helpFilterOnly", "helpOverrides", "helpBrowserFind", "helpAdvanced",
   ];
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>

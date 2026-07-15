@@ -1,7 +1,12 @@
 import type { ConversationPage, ConversationSummary, Health, ImportJob, MatchMode, MessageItem, MessagePage, PathMode, RawMessageResponse, SearchFilters, SearchMessageHit, SearchMessagePage, SortMode, Stats } from "../types";
 
 export class ApiError extends Error {
-  constructor(public readonly code: string, public readonly status: number) {
+  constructor(
+    public readonly code: string,
+    public readonly status: number,
+    public readonly cleanupWarning: string | null = null,
+    public readonly cleanupErrorType: string | null = null,
+  ) {
     super(code);
     this.name = "ApiError";
   }
@@ -9,6 +14,8 @@ export class ApiError extends Error {
 
 async function responseError(response: Response): Promise<ApiError> {
   let code = `http_${response.status}`;
+  let cleanupWarning: string | null = null;
+  let cleanupErrorType: string | null = null;
   try {
     const payload = await response.json() as { detail?: unknown; code?: unknown };
     const nestedCode = payload.detail && typeof payload.detail === "object" && "code" in payload.detail
@@ -16,10 +23,15 @@ async function responseError(response: Response): Promise<ApiError> {
       : undefined;
     const detail = typeof payload.detail === "string" ? payload.detail : payload.code ?? nestedCode;
     if (typeof detail === "string" && /^[a-z0-9_:-]+$/.test(detail)) code = detail;
+    if (payload.detail && typeof payload.detail === "object") {
+      const structured = payload.detail as { cleanup_warning?: unknown; cleanup_error_type?: unknown };
+      if (typeof structured.cleanup_warning === "string") cleanupWarning = structured.cleanup_warning;
+      if (typeof structured.cleanup_error_type === "string") cleanupErrorType = structured.cleanup_error_type;
+    }
   } catch {
     // Keep the stable HTTP fallback; never expose server prose in the UI.
   }
-  return new ApiError(code, response.status);
+  return new ApiError(code, response.status, cleanupWarning, cleanupErrorType);
 }
 
 async function request<T>(url: string, signal?: AbortSignal): Promise<T> {

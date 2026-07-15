@@ -468,7 +468,7 @@ tools/                             交付检查和辅助脚本
 
 ## 安全与响应契约
 
-Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、显式 loopback bind host 和明确配置的 host。非 loopback bind 还必须用 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定实际浏览器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）接受代理 IP/CIDR；只有直接连接来自受信代理时才读取 `Forwarded` / `X-Forwarded-*`。静态 UI、GET API 和全部请求都校验 Host。远程写入必须有同源 `Origin`；只有可信 loopback profile 兼容无 Origin 客户端。上传始终拒绝 `Sec-Fetch-Site: cross-site`。
+Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、显式 loopback bind host 和明确配置的 host。非 loopback bind 还必须用 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定实际浏览器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）采用严格单 edge 模型：未受信直连的 forwarded header 会被忽略，受信直连代理必须覆盖客户端值；重复 Host/Forwarded、逗号代理链、非法语法以及 `Forwarded` 与 `X-Forwarded-Host/Proto` 冲突会被拒绝。静态 UI、GET API 和全部请求都校验 Host。远程写入必须有同源 `Origin`；只有可信 loopback profile 兼容无 Origin 客户端。上传始终拒绝 `Sec-Fetch-Site: cross-site`。
 
 导入失败使用稳定的输入预检、source scan、JSON decode、顶层契约和事务阶段。失败 run summary 的 warning 数与实际持久化 warning 一致。canonical commit 成功后，verify、stats 或可选 Web index 失败不会被描述为“未导入”。提交后的临时上传清理失败是非致命稳定 warning，且不泄漏用户路径。
 
@@ -477,3 +477,11 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、显式 loopback bind 
 “复制 URL”始终显式写入 `match_mode`、`layout`、`show_internal` 及可共享搜索/reader 状态。URL 显式值优先于 `localStorage`，缺失值才可回退本地设置。本版本使用 `replaceState`，浏览器前进/后退不会恢复逐步搜索或选择历史。
 
 Release ZIP 先写目标目录的临时文件，核对每个 payload 文件的排序 size/SHA-256 manifest、精确 member 集合和 dist asset，再运行 delivery check，最后才原子替换目标；任何失败都保留旧 release。
+
+回滚摘要用 `attempted_*` 与归零的 `committed_*` 区分已尝试和已提交工作；失败 run 用新连接持久化，并明确报告二次持久化失败。pre-job 临时目录清理失败保留主要 HTTP 错误，同时返回安全的 `cleanup_warning`/`cleanup_error_type`。job 查询只接受 32 位小写十六进制 ID。
+
+JSON 会拒绝 `NaN`/`Infinity` 和 `1e9999` 等溢出数；无效 timestamp 写入 `NULL` 并产生只含字段与值类型的 warning。`verify` 执行 `foreign_key_check`，分别报告 parent-cycle 节点数和 component 数。effective-current 会分别报告 selected-chain 与 raw-flag 的 cycle/missing/cross-parent 诊断。
+
+message search page 始终包含 `total_exact`；空库或可确定为空时为 true，`count_total=false` 的普通探测为 false；conversation page 不承诺该字段。around metadata 分开表示 found、effective-current membership、requested-path membership、visible 与 applied。空 canonical 或 legacy placeholder 可从有界、有效的 raw text 恢复，reader、两类搜索、highlight、copy、CLI/Web export 使用同一 resolver；非法、过大或真实非文本 raw 保持 placeholder。
+
+仅筛选和仅排除可筛选 conversation；只有正向消息正文词才产生 message hit、reader 高亮和 hit navigation。“复制 URL”使用同一个已应用的搜索/list/selected context，不会混合 debounce 中的新输入。日语和西班牙语在选择器中明确标为部分翻译。release 在收集前验证独立的权威必要文件清单，任何必要源码、配置或文档缺失都会失败且不会覆盖旧 ZIP。

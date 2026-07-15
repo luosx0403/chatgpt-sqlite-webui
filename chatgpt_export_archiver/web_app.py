@@ -42,8 +42,33 @@ def _host_name(value: str) -> str | None:
         return None
 
 
+def _normalized_authority(value: str, scheme: str) -> str | None:
+    if not value or value != value.strip() or any(ord(char) < 32 for char in value):
+        return None
+    try:
+        parsed = urlsplit("//" + value)
+        if parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
+            return None
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    hostname = hostname.casefold()
+    if port in ({"http": 80, "https": 443}.get(scheme), None):
+        port = None
+    authority_host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{authority_host}:{port}" if port is not None else authority_host
+
+
 class TrustedAccessMiddleware:
-    """Validate Host globally and honor forwarded headers only from trusted peers."""
+    """Validate Host using a strict single-hop trusted edge-proxy contract.
+
+    A trusted edge must overwrite client-supplied forwarding headers. Repeated
+    headers, comma chains, malformed quoted values, or conflicting Forwarded
+    and X-Forwarded values are rejected instead of guessing which hop to trust.
+    """
 
     def __init__(self, app, *, policy: WebTrustPolicy) -> None:
         self.app = app
@@ -51,8 +76,11 @@ class TrustedAccessMiddleware:
         self._proxy_networks = tuple(ipaddress.ip_network(value, strict=False) for value in policy.trusted_proxies)
 
     @staticmethod
-    def _headers(scope) -> dict[str, str]:
-        return {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope.get("headers", [])}
+    def _headers(scope) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for key, value in scope.get("headers", []):
+            result.setdefault(key.decode("latin-1").lower(), []).append(value.decode("latin-1"))
+        return result
 
     def _trusted_proxy(self, scope) -> bool:
         client = scope.get("client")
@@ -65,46 +93,117 @@ class TrustedAccessMiddleware:
         return any(address in network for network in self._proxy_networks)
 
     @staticmethod
-    def _forwarded_values(headers: dict[str, str]) -> tuple[str | None, str | None]:
-        host = None
-        proto = None
-        forwarded = headers.get("forwarded", "").split(",", 1)[0]
-        for item in forwarded.split(";"):
-            key, separator, value = item.strip().partition("=")
-            if not separator:
-                continue
-            clean = value.strip().strip('"')
-            if key.casefold() == "host":
-                host = clean
-            elif key.casefold() == "proto":
-                proto = clean
-        host = host or headers.get("x-forwarded-host", "").split(",", 1)[0].strip() or None
-        proto = proto or headers.get("x-forwarded-proto", "").split(",", 1)[0].strip() or None
-        return host, proto
+    def _split_forwarded_element(value: str) -> list[str] | None:
+        parts: list[str] = []
+        current: list[str] = []
+        quoted = False
+        escaped = False
+        for char in value:
+            if escaped:
+                current.append(char)
+                escaped = False
+            elif char == "\\" and quoted:
+                escaped = True
+            elif char == '"':
+                quoted = not quoted
+                current.append(char)
+            elif char == "," and not quoted:
+                return None
+            elif char == ";" and not quoted:
+                parts.append("".join(current).strip())
+                current = []
+            else:
+                current.append(char)
+        if quoted or escaped:
+            return None
+        parts.append("".join(current).strip())
+        return parts
+
+    @classmethod
+    def _forwarded_values(cls, headers: dict[str, list[str]]) -> tuple[str | None, str | None, bool]:
+        for name in ("forwarded", "x-forwarded-host", "x-forwarded-proto"):
+            if len(headers.get(name, [])) > 1:
+                return None, None, False
+
+        forwarded_host: str | None = None
+        forwarded_proto: str | None = None
+        raw_forwarded = headers.get("forwarded", [])
+        if raw_forwarded:
+            parts = cls._split_forwarded_element(raw_forwarded[0])
+            if parts is None:
+                return None, None, False
+            seen: set[str] = set()
+            for item in parts:
+                key, separator, raw_value = item.partition("=")
+                key = key.strip().casefold()
+                raw_value = raw_value.strip()
+                if not separator or not key or key in seen or not raw_value:
+                    return None, None, False
+                seen.add(key)
+                if raw_value.startswith('"'):
+                    if len(raw_value) < 2 or not raw_value.endswith('"'):
+                        return None, None, False
+                    clean = raw_value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+                elif '"' in raw_value or any(char.isspace() for char in raw_value):
+                    return None, None, False
+                else:
+                    clean = raw_value
+                if key == "host":
+                    forwarded_host = clean
+                elif key == "proto":
+                    forwarded_proto = clean.casefold()
+
+        x_host_values = headers.get("x-forwarded-host", [])
+        x_proto_values = headers.get("x-forwarded-proto", [])
+        x_host = x_host_values[0].strip() if x_host_values else None
+        x_proto = x_proto_values[0].strip().casefold() if x_proto_values else None
+        if (x_host and "," in x_host) or (x_proto and "," in x_proto):
+            return None, None, False
+        if forwarded_host and x_host:
+            comparison_scheme = forwarded_proto or x_proto or "http"
+            if _normalized_authority(forwarded_host, comparison_scheme) != _normalized_authority(
+                x_host, comparison_scheme
+            ):
+                return None, None, False
+        if forwarded_proto and x_proto and forwarded_proto != x_proto:
+            return None, None, False
+        host = forwarded_host or x_host
+        proto = forwarded_proto or x_proto
+        if proto is not None and proto not in {"http", "https"}:
+            return None, None, False
+        return host, proto, True
 
     @staticmethod
-    async def _reject(send) -> None:
-        await UploadIngressMiddleware._error(send, 400, "host_not_allowed")
+    async def _reject(send, code: str = "host_not_allowed") -> None:
+        await UploadIngressMiddleware._error(send, 400, code)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
         headers = self._headers(scope)
-        effective_host = headers.get("host", "")
+        host_values = headers.get("host", [])
+        if len(host_values) != 1:
+            await self._reject(send, "invalid_host_header")
+            return
+        effective_host = host_values[0]
         effective_scheme = scope.get("scheme", "http")
         trusted_proxy = self._trusted_proxy(scope)
         if trusted_proxy:
-            forwarded_host, forwarded_proto = self._forwarded_values(headers)
+            forwarded_host, forwarded_proto, valid_forwarding = self._forwarded_values(headers)
+            if not valid_forwarding:
+                await self._reject(send, "invalid_forwarded_headers")
+                return
             effective_host = forwarded_host or effective_host
-            if forwarded_proto in {"http", "https"}:
+            if forwarded_proto:
                 effective_scheme = forwarded_proto
-        hostname = _host_name(effective_host)
+        normalized_authority = _normalized_authority(effective_host, effective_scheme)
+        hostname = _host_name(normalized_authority or "")
         if hostname is None or hostname.casefold() not in self.policy.allowed_hosts:
             await self._reject(send)
             return
         state = scope.setdefault("state", {})
-        state["trusted_host"] = effective_host.casefold()
+        state["trusted_host"] = normalized_authority
         state["trusted_hostname"] = hostname.casefold()
         state["trusted_scheme"] = effective_scheme
         state["trusted_proxy"] = trusted_proxy
@@ -134,11 +233,12 @@ class UploadIngressMiddleware:
             return False, "upload_origin_required"
         parsed = urlsplit(origin)
         origin_hostname = parsed.hostname.casefold() if parsed.hostname else ""
+        origin_authority = _normalized_authority(parsed.netloc, parsed.scheme)
         state = scope.get("state", {})
         allowed = (
             parsed.scheme in {"http", "https"}
             and origin_hostname in self.trust_policy.allowed_hosts
-            and parsed.netloc.casefold() == state.get("trusted_host", "")
+            and origin_authority == state.get("trusted_host", "")
             and parsed.scheme == state.get("trusted_scheme", scope.get("scheme", "http"))
         )
         return allowed, None if allowed else "upload_origin_not_allowed"

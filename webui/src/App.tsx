@@ -239,6 +239,7 @@ function importErrorLabel(t: (key: string) => string, code: string | null | unde
     "stats_failed",
     "web_index_failed",
     "import_job_active",
+    "import_job_start_failed",
     "upload_zip_no_conversation_sources",
     "upload_zip_ambiguous_conversation_sources",
     "upload_origin_not_allowed",
@@ -270,13 +271,13 @@ export default function App() {
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importJob, setImportJob] = useState<ImportJob | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [preflightCleanupWarning, setPreflightCleanupWarning] = useState(false);
   const [uploadingImport, setUploadingImport] = useState(false);
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [showInternal, setShowInternal] = useState(() => new URLSearchParams(window.location.search).get("show_internal") === "true" || (new URLSearchParams(window.location.search).get("show_internal") === null && loadSettings().showInternalDefault));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [storageWarning, setStorageWarning] = useState(false);
-  const [focusIndex, setFocusIndex] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -294,6 +295,14 @@ export default function App() {
   const filtersKey = JSON.stringify(filters);
   const searchContextKey = JSON.stringify({ q: debouncedQuery, sort, path, matchMode, filters, listPageSize: settings.listPageSize });
   const searchContextRef = useRef(searchContextKey);
+  const appliedShareStateRef = useRef({
+    q: urlState.query,
+    sort: urlState.sort || "relevance",
+    path: urlState.path || "current",
+    matchMode: urlState.matchMode,
+    selectedId: urlState.selectedId,
+    filters: { ...urlState.filters },
+  });
   searchContextRef.current = searchContextKey;
   const { t } = useMemo(() => createTranslator(settings.language), [settings.language]);
 
@@ -356,27 +365,10 @@ export default function App() {
         event.preventDefault();
         document.getElementById("global-search")?.focus();
       }
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      const activeElement = document.activeElement instanceof Element ? document.activeElement : null;
-      const sidebarNavigation = Boolean(activeElement?.closest(".sidebar"));
-      if (!interactive && sidebarNavigation && !settingsOpen && !helpOpen) {
-        if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {
-          event.preventDefault();
-          setFocusIndex((value) => Math.min(conversations.length - 1, value + 1));
-        }
-        if (event.key === "ArrowUp" || event.key.toLowerCase() === "k") {
-          event.preventDefault();
-          setFocusIndex((value) => Math.max(0, value - 1));
-        }
-        if (event.key === "Enter" && conversations[focusIndex]) {
-          event.preventDefault();
-          selectConversation(conversations[focusIndex].conversation_id);
-        }
-      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [conversations, focusIndex, settingsOpen, helpOpen]);
+  }, [settingsOpen, helpOpen]);
 
   const loadConversationDetail = useCallback((id: string, local?: ConversationSummary, requestedContextKey = searchContextRef.current) => {
     setSelectedId(id);
@@ -429,7 +421,6 @@ export default function App() {
             return true;
           });
         });
-        if (!append) setFocusIndex(0);
         setTotal(page.total);
         setHasMore(page.has_more);
         setNextOffset(page.next_offset);
@@ -446,11 +437,17 @@ export default function App() {
           } else {
             setSelected((current) => current?.conversation_id === requestedSelectedId ? clearConversationSearchMeta(current) : current);
           }
+          appliedShareStateRef.current = {
+            q: debouncedQuery, sort, path, matchMode, selectedId: requestedSelectedId, filters: { ...filters },
+          };
         } else {
           const first = page.items[0] ?? null;
           selectedIdRef.current = first?.conversation_id ?? null;
           setSelectedId(first?.conversation_id ?? null);
           setSelected(first);
+          appliedShareStateRef.current = {
+            q: debouncedQuery, sort, path, matchMode, selectedId: first?.conversation_id ?? null, filters: { ...filters },
+          };
         }
       })
       .catch((err: Error) => {
@@ -506,18 +503,15 @@ export default function App() {
 
   const selectConversation = (id: string) => {
     const local = conversations.find((item) => item.conversation_id === id);
+    appliedShareStateRef.current = { ...appliedShareStateRef.current, selectedId: id };
     loadConversationDetail(id, local);
   };
 
   const copyCurrentUrl = async () => {
     try {
+      const applied = appliedShareStateRef.current;
       await navigator.clipboard.writeText(canonicalShareUrl({
-        q: query,
-        sort,
-        path,
-        matchMode,
-        selectedId: selectedIdRef.current,
-        filters,
+        ...applied,
         layout: settings.messageLayout,
         showInternal,
       }));
@@ -535,13 +529,17 @@ export default function App() {
     if (!importFile || uploadingImport || (importJob && ["queued", "running"].includes(importJob.status))) return;
     setUploadingImport(true);
     setImportError(null);
+    setPreflightCleanupWarning(false);
     uploadImportZip(importFile)
       .then((job) => {
         setImportJob(job);
         setImportFile(null);
         if (importInputRef.current) importInputRef.current.value = "";
       })
-      .catch((err: unknown) => setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null)))
+      .catch((err: unknown) => {
+        setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null));
+        setPreflightCleanupWarning(err instanceof ApiError && Boolean(err.cleanupWarning));
+      })
       .finally(() => setUploadingImport(false));
   };
 
@@ -566,8 +564,6 @@ export default function App() {
         setFilters={setFilters}
         conversations={conversations}
         selectedId={selectedId}
-        focusIndex={focusIndex}
-        setFocusIndex={setFocusIndex}
         onSelect={selectConversation}
         onLoadMore={loadMore}
         loading={loading}
@@ -610,12 +606,20 @@ export default function App() {
         <div className="top-bar" data-testid="top-toolbar">
           <span>{header}</span>
           <div className="top-actions">
-            <label className="button-like" htmlFor="import-zip-input">{t("importZip")}</label>
+            <button
+              type="button"
+              data-testid="import-zip-button"
+              onClick={() => importInputRef.current?.click()}
+              disabled={uploadingImport || Boolean(importJob && ["queued", "running"].includes(importJob.status))}
+            >
+              {t("importZip")}
+            </button>
             <input
               ref={importInputRef}
               id="import-zip-input"
               data-testid="import-zip-input"
-              className="hidden-file-input"
+              className="visually-hidden-file-input"
+              tabIndex={-1}
               type="file"
               accept=".zip,application/zip"
               disabled={uploadingImport || Boolean(importJob && ["queued", "running"].includes(importJob.status))}
@@ -651,6 +655,7 @@ export default function App() {
             {importError && <span className="error-text">{importError}</span>}
             {importJob?.error_code && <span className="error-text">{importErrorLabel(t, importJob.error_code)}</span>}
             {importJob?.cleanup_warning && <span className="warning-text">{t("importCleanupWarning")}</span>}
+            {preflightCleanupWarning && <span className="warning-text">{t("importCleanupWarning")}</span>}
           </div>
         )}
         <ConversationPane
