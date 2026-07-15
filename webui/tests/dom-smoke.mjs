@@ -66,6 +66,8 @@ function assertStaticFrontendContracts() {
   assert.ok(appSource.includes("has_internal_hits: meta.has_internal_hits"), "selected conversation merge must preserve hidden/internal search metadata after detail load");
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
+  assert.ok(clientSource.includes("getConversationCopyText"), "full conversation copy should use the dedicated server-side text stream");
+  assert.ok(paneSource.includes("getConversationCopyText"), "reader full-copy must not accumulate reader page objects");
   assert.ok(paneSource.includes("countTotal: false"), "reader hit navigation should request fast message-hit pages without exact total counts");
   assert.equal(paneSource.includes("while (items.length < MAX_NAVIGABLE_HIT_MESSAGES)"), false, "reader hit navigation must not serially prefetch ten pages on initial load");
   assert.ok(paneSource.includes("HIT_PREFETCH_THRESHOLD"), "reader hit navigation should lazily append near the loaded boundary");
@@ -1245,8 +1247,16 @@ async function main() {
     await page.locator(".message-scroll").evaluate((node) => { node.scrollTop = 500; });
     await page.waitForFunction(() => document.querySelector(".message-scroll")?.scrollTop > 0);
 
+    let copyReaderPageRequests = 0;
+    const copyRequestListener = (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/api/conversations/dom-long/messages") copyReaderPageRequests += 1;
+    };
+    page.on("request", copyRequestListener);
     await page.getByRole("button", { name: "Copy current path conversation" }).click();
     await page.waitForFunction(() => window.__copiedText?.includes("Synthetic message 379"), undefined, { timeout: 20_000 });
+    page.off("request", copyRequestListener);
+    assert.equal(copyReaderPageRequests, 0, "full conversation copy must not request reader pages");
     assert.equal(await page.evaluate(() => window.__copiedText.includes("Synthetic system context for DOM test")), false, "copy current path conversation should respect hidden internal messages");
     await page.evaluate(() => { window.__copiedText = ""; });
     await page.getByRole("button", { name: "Copy visible" }).click();
@@ -1271,7 +1281,7 @@ async function main() {
       window.__copyRaceRelease = null;
       window.fetch = (input, init) => {
         const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
-        if (url.pathname === "/api/conversations/dom-long/messages" && !url.searchParams.has("q") && url.searchParams.get("offset") === "0") {
+        if (url.pathname === "/api/conversations/dom-long/copy") {
           return new Promise((resolve, reject) => {
             window.__copyRaceRelease = () => window.__nativeFetch(input, { ...init, signal: undefined }).then(resolve, reject);
           });
@@ -1291,19 +1301,14 @@ async function main() {
     await page.goto(`${baseUrl}?conversation=dom-long`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
     await page.evaluate((value) => { window.__copiedText = value; }, copiedBeforeFailure);
-    const failSecondMessagePage = async (route) => {
-      const url = new URL(route.request().url());
-      if (url.pathname === "/api/conversations/dom-long/messages" && url.searchParams.get("offset") === "300") {
-        await route.fulfill({ status: 500, contentType: "application/json", body: '{"detail":"synthetic copy failure"}' });
-        return;
-      }
-      await route.continue();
+    const failCopyStream = async (route) => {
+      await route.fulfill({ status: 500, contentType: "application/json", body: '{"detail":"synthetic copy failure"}' });
     };
-    await page.route("**/api/conversations/dom-long/messages**", failSecondMessagePage);
+    await page.route("**/api/conversations/dom-long/copy**", failCopyStream);
     await page.getByRole("button", { name: "Copy current path conversation" }).click();
     await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Copy conversation failed"), undefined, { timeout: 20_000 });
-    assert.equal(await page.evaluate(() => window.__copiedText || ""), copiedBeforeFailure, "failed full-copy pagination must not overwrite clipboard with a partial conversation");
-    await page.unroute("**/api/conversations/dom-long/messages**", failSecondMessagePage);
+    assert.equal(await page.evaluate(() => window.__copiedText || ""), copiedBeforeFailure, "failed full-copy stream must not overwrite clipboard with a partial conversation");
+    await page.unroute("**/api/conversations/dom-long/copy**", failCopyStream);
 
     await page.getByRole("button", { name: "Load more messages" }).click();
     await page.waitForFunction(() => document.querySelector(".message-page-meta")?.textContent?.includes("of 380 visible messages") && !document.querySelector(".message-page-meta button"), undefined, { timeout: 20_000 });

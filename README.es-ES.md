@@ -190,6 +190,8 @@ python chatgpt_archive.py export --db archive/chatgpt_archive.db --format md --o
 
 El summary de exportación informa recuentos de archivos de cuerpo. `written` cuenta archivos Markdown/TXT cuyos bytes finales cambiaron, y `skipped_unchanged` cuenta archivos Markdown/TXT sin cambios. Los manifest se actualizan cuando hace falta, pero no se incluyen en esos dos recuentos.
 
+Las exportaciones CLI y Web usan por defecto la ruta actual efectiva y solo mensajes visibles. Usa explícitamente `--path all` y/o `--include-internal` para incluir ramas o mensajes internos; el manifest registra ambas opciones. La CLI lee nodos en lotes acotados, mientras que la descarga Web y `Copiar conversación de la ruta actual` usan streams de texto dedicados y acotados en el servidor. El texto canónico completo y el texto legacy/raw recuperable no dependen del presupuesto de respuesta del reader.
+
 Reconstruye los índices opcionales de búsqueda Web:
 
 ```bash
@@ -240,7 +242,7 @@ Todas las rutas comparten la misma regla effective-current para `path=current`: 
 
 La búsqueda global de current path obtiene primero candidatos de conversación independientes del path mediante índices normalizados de mensajes/títulos y predicados seguros de source/date/role; después materializa effective-current solo para esos candidatos. Las consultas solo de exclusión que no se pueden reducir usan un fallback explícito de base completa. La navegación de hits del reader carga una sola página compacta al inicio y añade páginas al acercarse al límite cargado. El SQL de búsqueda y Web-index usa una forma portable que evita flattening, sin exigir `AS MATERIALIZED`, y resuelve cada candidato legacy raw como máximo una vez por etapa lógica.
 
-Las acciones de copiar y exportar del lector siguen el contrato visible del lector. `Copiar conversación de la ruta actual` obtiene todas las páginas de la ruta actual del reader y respeta la opción Show internal messages, pero ignora los filtros de búsqueda actuales. `Copiar visibles` copia solo los mensajes visibles ya cargados. Los enlaces de descarga usan la misma ruta actual y la misma opción Show internal. El acceso raw por mensaje es una vista previa raw ampliada con límite; las respuestas truncadas deben renderizar `raw_text` como texto plano de vista previa y la UI solo muestra esa capped preview.
+Las acciones de copiar y exportar del lector siguen el contrato visible del lector. `Copiar conversación de la ruta actual` usa el stream dedicado de texto completo para la ruta actual del reader y respeta la opción Show internal messages, pero ignora los filtros de búsqueda actuales. No acumula páginas del reader en el navegador. `Copiar visibles` copia solo los mensajes visibles ya cargados. Los enlaces de descarga usan la misma ruta actual y la misma opción Show internal. El acceso raw por mensaje es una vista previa raw ampliada con límite; las respuestas truncadas deben renderizar `raw_text` como texto plano de vista previa y la UI solo muestra esa capped preview.
 
 Cuando el reader salta a un hit con `around_node_id`, usa la misma colección paginada que el reader: visible-only rows si Show internal está desactivado, la node collection completa si Show internal está activado y la effective all-node collection para conversaciones dañadas sin current-path node.
 

@@ -190,6 +190,8 @@ python chatgpt_archive.py export --db archive/chatgpt_archive.db --format md --o
 
 导出 summary 报告的是正文文件计数。`written` 统计最终字节发生变化的 Markdown/TXT 正文文件，`skipped_unchanged` 统计未变化的 Markdown/TXT 正文文件。manifest 会按需更新，但不计入这两个计数。
 
+CLI 与 Web 导出默认使用有效当前路径，并且只包含可见消息。需要包含分支或内部消息时，请显式使用 `--path all` 和/或 `--include-internal`；manifest 会记录这两个选择。CLI 导出会分批、限量读取对话节点；Web 下载与`复制当前路径整段对话`使用专用的有界服务端文本流。因此，完整规范文本以及符合条件的 legacy/raw 恢复文本不会受 reader 响应预算截断。
+
 重建可选 Web 搜索索引：
 
 ```bash
@@ -240,7 +242,7 @@ python chatgpt_archive.py web --port 8787
 
 全局 current-path 搜索会先通过规范化正文/标题索引以及安全的 source/date/role 条件取得不依赖路径的会话候选，再只为这些候选建立 effective-current membership；只有无法缩小的仅排除查询才显式回退到全库。Reader 命中导航初始只取一个紧凑页面，接近已加载边界时才继续追加。搜索与 Web 索引 SQL 使用可移植的防扁平化查询结构，不要求 SQLite 支持 `AS MATERIALIZED`，并保证每个 legacy raw 候选在每个逻辑阶段最多解析一次。
 
-阅读器复制和导出动作遵守可见阅读器契约。`复制当前路径整段对话` 会按当前 reader 路径抓取全部分页，并遵守「显示内部消息」开关，同时忽略当前搜索筛选。`复制当前可见` 只复制已经加载的可见消息。下载链接使用同样的当前路径和「显示内部消息」设置。Raw 消息访问只通过单条消息 endpoint 提供有上限的较大 raw 预览；截断响应必须把 `raw_text` 当作纯文本预览渲染，UI 只显示这个 capped preview。
+阅读器复制和导出动作遵守可见阅读器契约。`复制当前路径整段对话` 使用专用的完整文本流处理当前 reader 路径，遵守「显示内部消息」开关并忽略当前搜索筛选，不会在浏览器中累积 reader 分页。`复制当前可见` 只复制已经加载的可见消息。下载链接使用同样的当前路径和「显示内部消息」设置。Raw 消息访问只通过单条消息 endpoint 提供有上限的较大 raw 预览；截断响应必须把 `raw_text` 当作纯文本预览渲染，UI 只显示这个 capped preview。
 
 reader 使用 `around_node_id` 跳转到命中时，会使用与 reader 相同的分页集合：Show internal 关闭时使用 visible-only rows，Show internal 开启时使用完整 node collection；对没有 current-path node 的损坏 conversation，使用 effective all-node collection。
 

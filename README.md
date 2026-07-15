@@ -190,6 +190,8 @@ python chatgpt_archive.py export --db archive/chatgpt_archive.db --format md --o
 
 The export summary reports body-file counts. `written` counts Markdown/TXT body files whose final bytes changed, and `skipped_unchanged` counts unchanged Markdown/TXT body files. Manifest files are updated as needed but are not included in those two counts.
 
+CLI and Web exports default to the effective current path and visible messages only. Use `--path all` and/or `--include-internal` explicitly when the export should include branches or internal messages; the manifest records both choices. CLI export reads conversation nodes in bounded batches, while Web download and `Copy current path conversation` use dedicated bounded server-side text streams. Complete canonical text and eligible legacy/raw recovered text are therefore exported without depending on the reader response budget.
+
 Rebuild optional Web search indexes:
 
 ```bash
@@ -240,7 +242,7 @@ The default reader layout is `chat`: user messages align right, assistant messag
 
 Global current-path search first derives a path-independent conversation candidate set from normalized text/title indexes and safe source/date/role predicates, then builds effective-current membership only for those candidates. Exclusion-only queries that cannot be narrowed use an explicit full-database fallback. Reader hit navigation fetches one compact page initially and appends more hits only as navigation approaches the loaded boundary. Search and Web-index SQL use a portable non-flattening query shape instead of requiring SQLite's `AS MATERIALIZED` syntax, while resolving each legacy raw candidate at most once per logical stage.
 
-Reader copy and export actions follow the visible reader contract. `Copy current path conversation` fetches every page for the current reader path and respects the Show internal messages toggle, while ignoring the current search filters. `Copy visible` copies only the already loaded visible messages. Download links use the same current path and Show internal setting. Raw message access is a bounded larger raw preview through the per-message endpoint; truncated responses must render `raw_text` as plain preview text and the UI only shows that capped preview.
+Reader copy and export actions follow the visible reader contract. `Copy current path conversation` uses the dedicated complete-text stream for the current reader path and respects the Show internal messages toggle, while ignoring the current search filters. It does not accumulate reader pages in the browser. `Copy visible` copies only the already loaded visible messages. Download links use the same current path and Show internal setting. Raw message access is a bounded larger raw preview through the per-message endpoint; truncated responses must render `raw_text` as plain preview text and the UI only shows that capped preview.
 
 Reader jump-to-hit requests with `around_node_id` use the same pagination collection as the reader: visible-only rows when Show internal is off, the full node collection when Show internal is on, and the effective all-node collection for damaged conversations with no current-path nodes.
 

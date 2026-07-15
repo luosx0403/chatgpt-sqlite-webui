@@ -190,6 +190,8 @@ python chatgpt_archive.py export --db archive/chatgpt_archive.db --format md --o
 
 エクスポート summary は本文ファイルの件数を示します。`written` は最終バイト列が変わった Markdown/TXT 本文ファイル数、`skipped_unchanged` は変更のなかった Markdown/TXT 本文ファイル数です。manifest は必要に応じて更新されますが、この 2 つの件数には含まれません。
 
+CLI と Web のエクスポートは、有効な現在パスと表示メッセージのみを既定にします。分岐や内部メッセージを含める場合は `--path all` と `--include-internal` を明示し、manifest にも両方の選択を記録します。CLI は会話ノードを上限付きバッチで読み、Web ダウンロードと`現在のパスの会話をコピー`は専用の上限付きサーバー側テキストストリームを使います。完全な標準テキストと対象となる legacy/raw 復元テキストは reader 応答予算により切り詰められません。
+
 任意の Web 検索インデックスを再構築します。
 
 ```bash
@@ -240,7 +242,7 @@ python chatgpt_archive.py web --port 8787
 
 global current-path search は、normalized message/title index と安全な source/date/role 条件から path 非依存の conversation candidate を先に求め、その candidate だけに effective-current membership を構築します。絞り込めない exclude-only query のみ明示的な full-database fallback を使います。Reader の hit navigation は初回に compact page を 1 回だけ取得し、読み込み済み境界へ近づいたときに追加します。Search と Web-index SQL は SQLite の `AS MATERIALIZED` を要求せず、portable な non-flattening query shape で各 legacy raw candidate を論理 stage ごとに最大 1 回だけ resolve します。
 
-リーダーのコピーとエクスポートは、表示中のリーダー契約に従います。`現在のパスの会話をコピー` は現在の reader パスの全ページを取得し、Show internal messages の切り替えを尊重し、現在の検索フィルターは無視します。`表示中をコピー` は、すでに読み込まれている表示メッセージだけをコピーします。ダウンロードリンクも同じ現在のパスと Show internal 設定を使います。Raw メッセージアクセスは、メッセージ単位 endpoint による上限付きの大きな raw プレビューです。切り詰められた応答では `raw_text` をプレーンなプレビューテキストとして描画し、UI はその capped preview だけを表示します。
+リーダーのコピーとエクスポートは、表示中のリーダー契約に従います。`現在のパスの会話をコピー` は現在の reader パス専用の完全テキストストリームを使い、Show internal messages の切り替えを尊重し、現在の検索フィルターは無視します。ブラウザーに reader ページを蓄積しません。`表示中をコピー` は、すでに読み込まれている表示メッセージだけをコピーします。ダウンロードリンクも同じ現在のパスと Show internal 設定を使います。Raw メッセージアクセスは、メッセージ単位 endpoint による上限付きの大きな raw プレビューです。切り詰められた応答では `raw_text` をプレーンなプレビューテキストとして描画し、UI はその capped preview だけを表示します。
 
 reader が `around_node_id` でヒットへ移動する場合は、reader と同じページング集合を使います。Show internal がオフなら visible-only rows、Show internal がオンなら完全な node collection、current-path node がない壊れた conversation では effective all-node collection です。
 

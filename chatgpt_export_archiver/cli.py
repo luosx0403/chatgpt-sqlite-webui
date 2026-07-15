@@ -229,6 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
     export_p.add_argument("--out", default="exports")
     export_p.add_argument("--from", dest="from_date", help="Conversation create/update date lower bound YYYY-MM-DD.")
     export_p.add_argument("--to", dest="to_date", help="Conversation create/update date upper bound YYYY-MM-DD.")
+    export_p.add_argument("--path", choices=["current", "all"], default="current", help="Export the effective current path (default) or every mapping node.")
+    export_p.add_argument("--include-internal", action="store_true", help="Include system, developer, tool, technical, and other internal messages. Default exports visible messages only.")
     export_p.add_argument("--force", action="store_true", help="Rewrite files even if content hash is unchanged.")
     export_p.set_defaults(func=cmd_export)
     _add_log_args(export_p)
@@ -910,7 +912,16 @@ def cmd_export(args: argparse.Namespace) -> int:
     try:
         require_current_database_schema(conn)
         formats = ["md", "txt"] if args.format == "all" else [args.format]
-        result = export_conversations(conn, Path(args.out), formats, args.from_date, args.to_date, args.force)
+        result = export_conversations(
+            conn,
+            Path(args.out),
+            formats,
+            args.from_date,
+            args.to_date,
+            args.force,
+            path=args.path,
+            include_internal=args.include_internal,
+        )
     finally:
         conn.close()
     print(f"exported_conversations {result['conversations']}")

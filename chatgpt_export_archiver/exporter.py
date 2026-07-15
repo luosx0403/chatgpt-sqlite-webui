@@ -5,15 +5,18 @@ import json
 import sqlite3
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .current_path import resolve_effective_current_collection
 from .db import export_query, record_export
 from .parser import recover_message_display_text
+from .search import _is_internal_message
 from .utils import epoch_to_date_part, epoch_to_display, finite_float_or_none, parse_date_boundary, safe_filename_part, sha256_bytes, sha256_text, truncate_utf8, write_bytes_if_changed
 
 
 MAX_EXPORT_BASENAME_BYTES = 240
+EXPORT_CONVERSATION_BATCH_SIZE = 200
+EXPORT_NODE_BATCH_SIZE = 200
 
 
 def export_conversations(
@@ -23,7 +26,13 @@ def export_conversations(
     from_date: str | None = None,
     to_date: str | None = None,
     force: bool = False,
+    path: str = "current",
+    include_internal: bool = False,
+    conversation_batch_size: int = EXPORT_CONVERSATION_BATCH_SIZE,
 ) -> dict[str, Any]:
+    if path not in {"current", "all"}:
+        raise ValueError("invalid_export_path")
+    conversation_batch_size = max(1, min(400, int(conversation_batch_size)))
     formats = sorted({str(fmt).lower() for fmt in formats})
     out_dir.mkdir(parents=True, exist_ok=True)
     start_ts = parse_date_boundary(from_date)
@@ -35,36 +44,50 @@ def export_conversations(
     written = 0
     skipped = 0
 
-    for conv in conversations:
-        all_nodes = conn.execute(
-            """
-            SELECT *
-            FROM conversation_nodes
-            WHERE conversation_id = ?
-            """,
-            (conv["conversation_id"],),
-        ).fetchall()
-        nodes = order_current_path(conv, all_nodes)
-        for fmt in formats:
-            rel_path = filenames[(conv["conversation_id"], fmt)]
-            output_path = out_dir / rel_path
-            text = render_markdown(conv, nodes) if fmt == "md" else render_txt(conv, nodes)
-            data = text.encode("utf-8")
-            output_hash = sha256_bytes(data)
-            changed = write_bytes_if_changed(output_path, data, force=force)
-            if changed:
-                written += 1
-            else:
-                skipped += 1
-            record_export(
-                conn,
-                conv["conversation_id"],
-                fmt,
-                output_path,
-                output_hash,
-                {"current_path_only": True, "from": from_date, "to": to_date, "deterministic_export": True},
+    for batch_offset in range(0, len(conversations), conversation_batch_size):
+        conversation_batch = conversations[batch_offset : batch_offset + conversation_batch_size]
+        nodes_by_conversation = _nodes_for_conversation_batch(conn, conversation_batch)
+        for conv in conversation_batch:
+            nodes = prepare_export_nodes(
+                conv,
+                nodes_by_conversation.get(str(conv["conversation_id"]), []),
+                path=path,
+                include_internal=include_internal,
             )
-            manifest_rows.append(manifest_row(conv, fmt, rel_path, output_hash))
+            for fmt in formats:
+                rel_path = filenames[(conv["conversation_id"], fmt)]
+                output_path = out_dir / rel_path
+                text = render_markdown(conv, nodes) if fmt == "md" else render_txt(conv, nodes)
+                data = text.encode("utf-8")
+                output_hash = sha256_bytes(data)
+                changed = write_bytes_if_changed(output_path, data, force=force)
+                if changed:
+                    written += 1
+                else:
+                    skipped += 1
+                record_export(
+                    conn,
+                    conv["conversation_id"],
+                    fmt,
+                    output_path,
+                    output_hash,
+                    {
+                        "current_path_only": path == "current",
+                        "path": path,
+                        "include_internal": include_internal,
+                        "from": from_date,
+                        "to": to_date,
+                        "deterministic_export": True,
+                    },
+                )
+                manifest_rows.append(manifest_row(
+                    conv,
+                    fmt,
+                    rel_path,
+                    output_hash,
+                    path=path,
+                    include_internal=include_internal,
+                ))
     _validate_export_outputs(out_dir, manifest_rows, conversations, formats)
     write_manifest(out_dir, manifest_rows, force=force)
     conn.commit()
@@ -204,6 +227,111 @@ def order_current_path(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> list[sqli
     return [by_id[node_id] for node_id in collection.node_ids]
 
 
+def order_export_path(conv: Mapping[str, Any], nodes: Sequence[Mapping[str, Any]], path: str) -> list[Mapping[str, Any]]:
+    if path == "current":
+        by_id = {str(row["node_id"]): row for row in nodes}
+        collection = resolve_effective_current_collection(conv["current_node"], list(nodes))
+        return [by_id[node_id] for node_id in collection.node_ids]
+    return sorted(
+        nodes,
+        key=lambda row: (
+            row["create_time"] is None,
+            row["create_time"] if row["create_time"] is not None else row["update_time"] if row["update_time"] is not None else 0,
+            row["node_id"],
+        ),
+    )
+
+
+def _resolved_export_node(node: Mapping[str, Any], *, include_internal: bool) -> dict[str, Any] | None:
+    resolved = recover_message_display_text(
+        _optional_row_value(node, "content_text"),
+        _optional_row_value(node, "raw_message_json"),
+    )
+    if not resolved:
+        return None
+    if not include_internal and _is_internal_message(
+        _optional_row_value(node, "role"),
+        _optional_row_value(node, "content_type"),
+        resolved,
+    ):
+        return None
+    output = dict(node)
+    output["content_text"] = resolved
+    output["raw_message_json"] = None
+    return output
+
+
+def prepare_export_nodes(
+    conv: Mapping[str, Any],
+    nodes: Sequence[Mapping[str, Any]],
+    *,
+    path: str,
+    include_internal: bool,
+) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    for node in order_export_path(conv, nodes, path):
+        resolved = _resolved_export_node(node, include_internal=include_internal)
+        if resolved is not None:
+            prepared.append(resolved)
+    return prepared
+
+
+def _nodes_for_conversation_batch(
+    conn: sqlite3.Connection,
+    conversations: Sequence[Mapping[str, Any]],
+) -> dict[str, list[sqlite3.Row]]:
+    ids = [str(conv["conversation_id"]) for conv in conversations]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT * FROM conversation_nodes WHERE conversation_id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    grouped: dict[str, list[sqlite3.Row]] = {conversation_id: [] for conversation_id in ids}
+    for row in rows:
+        grouped[str(row["conversation_id"])].append(row)
+    return grouped
+
+
+def iter_conversation_export_nodes(
+    conn: sqlite3.Connection,
+    conv: Mapping[str, Any],
+    *,
+    path: str,
+    include_internal: bool,
+    batch_size: int = EXPORT_NODE_BATCH_SIZE,
+) -> Iterator[dict[str, Any]]:
+    """Yield complete export rows without accumulating reader page payloads."""
+
+    if path not in {"current", "all"}:
+        raise ValueError("invalid_export_path")
+    batch_size = max(1, min(400, int(batch_size)))
+    skeletons = conn.execute(
+        """SELECT node_id, parent_node_id, children_json, is_on_current_path,
+                  create_time, update_time
+           FROM conversation_nodes
+           WHERE conversation_id = ?""",
+        (conv["conversation_id"],),
+    ).fetchall()
+    ordered_ids = [str(row["node_id"]) for row in order_export_path(conv, skeletons, path)]
+    for offset in range(0, len(ordered_ids), batch_size):
+        ids = ordered_ids[offset : offset + batch_size]
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT * FROM conversation_nodes WHERE conversation_id = ? AND node_id IN ({placeholders})",
+            [conv["conversation_id"], *ids],
+        ).fetchall()
+        by_id = {str(row["node_id"]): row for row in rows}
+        for node_id in ids:
+            node = by_id.get(node_id)
+            if node is None:
+                continue
+            resolved = _resolved_export_node(node, include_internal=include_internal)
+            if resolved is not None:
+                yield resolved
+
+
 def _optional_row_value(row: Any, key: str) -> Any:
     try:
         return row[key]
@@ -211,10 +339,10 @@ def _optional_row_value(row: Any, key: str) -> Any:
         return None
 
 
-def render_markdown(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
+def _markdown_header(conv: Mapping[str, Any]) -> str:
     # No exported_at here by design: default exported files must be byte-stable
     # for identical database contents and CLI parameters.
-    lines = [
+    return "\n".join([
         f"# {conv['title'] or 'untitled'}",
         "",
         f"- conversation_id: `{conv['conversation_id']}`",
@@ -223,24 +351,25 @@ def render_markdown(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
         f"- current_node: `{conv['current_node'] or ''}`",
         f"- source_file: `{conv['source_file'] or ''}`",
         "",
-    ]
-    for node in nodes:
-        content_text = recover_message_display_text(
-            _optional_row_value(node, "content_text"),
-            _optional_row_value(node, "raw_message_json"),
-        )
-        if not content_text:
-            continue
-        role = (node["role"] or "message").title()
-        node_time = node["create_time"] if node["create_time"] is not None else node["update_time"]
-        timestamp = epoch_to_display(node_time)
-        heading = f"## {role}" + (f" {timestamp}" if timestamp else "")
-        lines.extend([heading, "", content_text, ""])
-    return "\n".join(lines).rstrip() + "\n"
+    ])
 
 
-def render_txt(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
-    lines = [
+def _markdown_node(node: Mapping[str, Any]) -> str:
+    content_text = recover_message_display_text(
+        _optional_row_value(node, "content_text"),
+        _optional_row_value(node, "raw_message_json"),
+    )
+    if not content_text:
+        return ""
+    role = (node["role"] or "message").title()
+    node_time = node["create_time"] if node["create_time"] is not None else node["update_time"]
+    timestamp = epoch_to_display(node_time)
+    heading = f"## {role}" + (f" {timestamp}" if timestamp else "")
+    return "\n".join([heading, "", content_text, ""])
+
+
+def _txt_header(conv: Mapping[str, Any]) -> str:
+    return "\n".join([
         conv["title"] or "untitled",
         f"conversation_id: {conv['conversation_id']}",
         f"create_time: {epoch_to_display(conv['create_time'])}",
@@ -249,30 +378,81 @@ def render_txt(conv: sqlite3.Row, nodes: list[sqlite3.Row]) -> str:
         f"source_file: {conv['source_file'] or ''}",
         "=" * 72,
         "",
-    ]
+    ])
+
+
+def _txt_node(node: Mapping[str, Any]) -> str:
+    content_text = recover_message_display_text(
+        _optional_row_value(node, "content_text"),
+        _optional_row_value(node, "raw_message_json"),
+    )
+    if not content_text:
+        return ""
+    role = (node["role"] or "message").upper()
+    node_time = node["create_time"] if node["create_time"] is not None else node["update_time"]
+    timestamp = epoch_to_display(node_time)
+    return "\n".join([f"{role} {timestamp}".strip(), "-" * 72, content_text, ""])
+
+
+def iter_rendered_conversation(
+    conv: Mapping[str, Any],
+    nodes: Iterable[Mapping[str, Any]],
+    fmt: str,
+) -> Iterator[str]:
+    header = _markdown_header(conv) if fmt == "md" else _txt_header(conv)
+    render_node = _markdown_node if fmt == "md" else _txt_node
+    pending = header
+    for node in nodes:
+        fragment = render_node(node)
+        if not fragment:
+            continue
+        yield pending
+        pending = fragment
+    yield pending.rstrip() + "\n"
+
+
+def render_markdown(conv: Mapping[str, Any], nodes: Iterable[Mapping[str, Any]]) -> str:
+    return "".join(iter_rendered_conversation(conv, nodes, "md"))
+
+
+def render_txt(conv: Mapping[str, Any], nodes: Iterable[Mapping[str, Any]]) -> str:
+    return "".join(iter_rendered_conversation(conv, nodes, "txt"))
+
+
+def iter_copy_conversation(nodes: Iterable[Mapping[str, Any]]) -> Iterator[str]:
+    first = True
     for node in nodes:
         content_text = recover_message_display_text(
             _optional_row_value(node, "content_text"),
             _optional_row_value(node, "raw_message_json"),
         )
-        if not content_text:
+        if not content_text or not content_text.strip():
             continue
-        role = (node["role"] or "message").upper()
-        node_time = node["create_time"] if node["create_time"] is not None else node["update_time"]
-        timestamp = epoch_to_display(node_time)
-        lines.extend([f"{role} {timestamp}".strip(), "-" * 72, content_text, ""])
-    return "\n".join(lines).rstrip() + "\n"
+        if not first:
+            yield "\n\n"
+        first = False
+        yield f"{node['role'] or 'message'}:\n{content_text}"
 
 
-def manifest_row(conv: sqlite3.Row, fmt: str, relative_path: Path, output_hash: str) -> dict[str, Any]:
+def manifest_row(
+    conv: Mapping[str, Any],
+    fmt: str,
+    relative_path: Path,
+    output_hash: str,
+    *,
+    path: str = "current",
+    include_internal: bool = False,
+) -> dict[str, Any]:
     return {
         "aggregate_hash": conv["aggregate_hash"],
         "conversation_id": conv["conversation_id"],
         "create_time": finite_float_or_none(conv["create_time"]),
         "current_node": conv["current_node"],
         "format": fmt,
+        "include_internal": include_internal,
         "output_hash": output_hash,
         "output_path": relative_path.as_posix(),
+        "path": path,
         "source_file": conv["source_file"],
         "title": conv["title"],
         "update_time": finite_float_or_none(conv["update_time"]),
@@ -291,8 +471,10 @@ def write_manifest(out_dir: Path, rows: list[dict[str, Any]], force: bool = Fals
         "create_time",
         "current_node",
         "format",
+        "include_internal",
         "output_hash",
         "output_path",
+        "path",
         "source_file",
         "title",
         "update_time",

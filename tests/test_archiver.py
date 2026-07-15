@@ -2604,11 +2604,58 @@ class ArchiverTests(unittest.TestCase):
             csv_header = (out / "manifest.csv").read_text(encoding="utf-8").splitlines()[0]
             self.assertEqual(
                 csv_header,
-                "aggregate_hash,conversation_id,create_time,current_node,format,output_hash,output_path,source_file,title,update_time",
+                "aggregate_hash,conversation_id,create_time,current_node,format,include_internal,output_hash,output_path,path,source_file,title,update_time",
             )
             rows = [json.loads(line) for line in (out / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual([row["output_path"] for row in rows], sorted(row["output_path"] for row in rows))
             self.assertEqual((out / "manifest.jsonl").read_bytes(), (out / "manifest.jsonl").read_text(encoding="utf-8").encode("utf-8"))
+
+    def test_export_batches_twenty_thousand_conversations_without_node_n_plus_one(self):
+        from chatgpt_export_archiver import exporter
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "batch-export.db"
+            conn = connect(db)
+            init_db(conn)
+            count = 20_000
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES (?, 'Synthetic', ?, ?)",
+                ((f"export-{index:05d}", f"node-{index}", f"hash-{index}") for index in range(count)),
+            )
+            conn.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_text, is_on_current_path) VALUES (?, ?, 'user', 'synthetic export body', 1)",
+                ((f"export-{index:05d}", f"node-{index}") for index in range(count)),
+            )
+            conn.commit()
+            statements: list[str] = []
+            conn.set_trace_callback(statements.append)
+            tracemalloc.start()
+            try:
+                with (
+                    mock.patch.object(exporter, "write_bytes_if_changed", return_value=False),
+                    mock.patch.object(exporter, "record_export"),
+                    mock.patch.object(exporter, "write_manifest"),
+                    mock.patch.object(exporter, "_validate_export_outputs"),
+                ):
+                    result = exporter.export_conversations(
+                        conn,
+                        Path(td) / "synthetic-output",
+                        ["txt"],
+                        conversation_batch_size=200,
+                    )
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+                conn.set_trace_callback(None)
+                conn.close()
+            node_selects = [
+                sql for sql in statements
+                if "SELECT * FROM conversation_nodes WHERE conversation_id IN" in sql
+            ]
+            self.assertEqual(result["conversations"], count)
+            self.assertEqual(len(node_selects), count // 200)
+            self.assertFalse(any("WHERE conversation_id = 'export-" in sql for sql in statements))
+            self.assertLess(peak, 160 * 1024 * 1024)
 
     def test_no_chat_content_in_cli_logs_for_import_export_verify(self):
         with tempfile.TemporaryDirectory() as td:

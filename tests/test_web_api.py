@@ -858,6 +858,8 @@ class WebApiTests(unittest.TestCase):
                     self.assertEqual(calls["count"], 34 if include_internal else 33)
 
     def test_long_message_response_has_one_full_text_copy(self):
+        from chatgpt_export_archiver import web_api as web_api_module
+
         td, client, db = self.make_client()
         self.addCleanup(td.cleanup)
         canonical = "c" * 100_000
@@ -900,6 +902,15 @@ class WebApiTests(unittest.TestCase):
         recovered_complete = client.get("/api/conversations/web-1/messages/a1/display?offset=0&limit=65536").json()
         self.assertEqual(recovered_complete["display_text"], recovered[:65_536])
         self.assertTrue(recovered_complete["has_more"])
+        with mock.patch.object(web_api_module, "get_messages", side_effect=AssertionError("export must not use reader pages")):
+            exported = client.get("/api/conversations/web-1/export?format=txt&path=all&include_internal=true")
+            copied = client.get("/api/conversations/web-1/copy?path=all&include_internal=true")
+        self.assertEqual(exported.status_code, 200)
+        self.assertIn(canonical, exported.text)
+        self.assertIn(recovered, exported.text)
+        self.assertEqual(copied.status_code, 200)
+        self.assertIn(canonical, copied.text)
+        self.assertIn(recovered, copied.text)
 
     def test_raw_resolver_decode_counts_scale_once_per_row(self):
         from chatgpt_export_archiver import search as search_module
@@ -1323,7 +1334,7 @@ class WebApiTests(unittest.TestCase):
             self.assertIn("placeholder raw readable text", exported_path.read_text(encoding="utf-8"))
 
     def test_web_export_respects_reader_internal_visibility(self):
-        td, client, _db = self.make_client()
+        td, client, db = self.make_client()
         self.addCleanup(td.cleanup)
         visible = client.get("/api/conversations/web-1/export?format=txt&path=all&include_internal=false")
         self.assertEqual(visible.status_code, 200)
@@ -1339,6 +1350,44 @@ class WebApiTests(unittest.TestCase):
         all_nodes = client.get("/api/conversations/web-1/export?format=txt&path=all&include_internal=false")
         self.assertNotIn("This branch mentions pandas", current.text)
         self.assertIn("This branch mentions pandas", all_nodes.text)
+
+        for path in ("current", "all"):
+            for include_internal in (False, True):
+                for fmt in ("md", "txt"):
+                    with self.subTest(path=path, include_internal=include_internal, format=fmt):
+                        output = Path(td.name) / f"cli-{path}-{include_internal}-{fmt}"
+                        args = [
+                            "--db", str(db), "export", "--out", str(output),
+                            "--format", fmt, "--path", path,
+                        ]
+                        if include_internal:
+                            args.append("--include-internal")
+                        self.assertEqual(main(args), 0)
+                        manifest = [
+                            json.loads(line)
+                            for line in (output / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+                        ]
+                        row = next(item for item in manifest if item["conversation_id"] == "web-1")
+                        self.assertEqual(row["path"], path)
+                        self.assertEqual(row["include_internal"], include_internal)
+                        cli_text = (output / row["output_path"]).read_text(encoding="utf-8")
+                        web = client.get(
+                            f"/api/conversations/web-1/export?format={fmt}&path={path}&include_internal={str(include_internal).lower()}"
+                        )
+                        self.assertEqual(web.status_code, 200)
+                        self.assertEqual(cli_text, web.text)
+
+        default_output = Path(td.name) / "cli-default-visible"
+        self.assertEqual(main(["--db", str(db), "export", "--out", str(default_output), "--format", "txt"]), 0)
+        default_manifest = [json.loads(line) for line in (default_output / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
+        default_row = next(item for item in default_manifest if item["conversation_id"] == "web-1")
+        default_text = (default_output / default_row["output_path"]).read_text(encoding="utf-8")
+        self.assertNotIn("sqlite3.OperationalError should not leak internal payload", default_text)
+
+        copy_visible = client.get("/api/conversations/web-1/copy?path=all&include_internal=false")
+        copy_internal = client.get("/api/conversations/web-1/copy?path=all&include_internal=true")
+        self.assertNotIn("sqlite3.OperationalError should not leak internal payload", copy_visible.text)
+        self.assertIn("sqlite3.OperationalError should not leak internal payload", copy_internal.text)
 
     def test_advanced_exclude_supports_quoted_phrase_and_source_normalization(self):
         td, client, _db = self.make_client()
@@ -3680,6 +3729,9 @@ class WebApiTests(unittest.TestCase):
             ["around_target_found", "around_target_in_effective_collection", "around_target_in_requested_collection", "around_target_visible", "around_target_applied"],
         )
         self.assertIn("effective all collection", schema["messages"]["around_node_id"]["description"])
+        self.assertEqual(schema["export"]["copy_endpoint"], "/api/conversations/{conversation_id}/copy")
+        self.assertIn("default false", schema["export"]["include_internal"])
+        self.assertIn("bounded server-side node batches", schema["export"]["streaming"])
 
     def test_schema_field_lists_match_actual_page_contracts(self):
         td, client, _db = self.make_client()

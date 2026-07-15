@@ -163,6 +163,21 @@ export function exportUrl(id: string, format: "md" | "txt", path: PathMode, incl
   return `/api/conversations/${encodeURIComponent(id)}/export?${query}`;
 }
 
+export async function getConversationCopyText(
+  id: string,
+  path: PathMode,
+  includeInternal = false,
+  signal?: AbortSignal,
+): Promise<string> {
+  const query = params({ path, include_internal: includeInternal });
+  const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/copy?${query}`, {
+    signal,
+    headers: { Accept: "text/plain" },
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.text();
+}
+
 export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal, maxChars = 50000): Promise<RawMessageResponse> {
   return request<RawMessageResponse>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/raw?max_chars=${maxChars}`, signal);
 }

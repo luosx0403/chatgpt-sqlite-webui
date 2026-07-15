@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ConversationSummary, MatchMode, MessageItem, PathMode, SearchFilters, SearchMessageHit } from "../types";
-import { exportUrl, getMessageDisplayChunk, getMessageHits, getMessages } from "../api/client";
+import { exportUrl, getConversationCopyText, getMessageDisplayChunk, getMessageHits, getMessages } from "../api/client";
 import { formatDate } from "../utils/format";
 import { analyzeQuerySyntax } from "../utils/querySyntax";
 import MessageBlock from "./MessageBlock";
@@ -506,20 +506,6 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     }
     return parts.join("\n\n");
   };
-  const fetchMessagesForCopy = async (mode: "visible" | "conversation", signal: AbortSignal) => {
-    if (!conversation) return;
-    if (mode === "visible") return visibleMessages;
-    const allMessages: MessageItem[] = [];
-    let offset = 0;
-    const copyFilters: SearchFilters = { ...effectiveFilters, role: "", title: "", exact: "", exclude: "", after: "", before: "", source: "", scope: "all" };
-    for (;;) {
-      const page = await getMessages({ id: conversation.conversation_id, q: "", path: effectivePath, filters: copyFilters, offset, limit: 300, includeInternal: showInternal, matchMode, signal });
-      allMessages.push(...page.items);
-      if (!page.has_more || page.next_offset === null) break;
-      offset = page.next_offset;
-    }
-    return allMessages.filter((message) => !message.is_empty_mapping_node && (showInternal || !message.is_internal));
-  };
   const runCopy = async (mode: "visible" | "conversation") => {
     if (copyBusy) return;
     copyControllerRef.current?.abort();
@@ -530,9 +516,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     setCopyBusy(mode);
     setCopyStatus(t("preparingCopy"));
     try {
-      const copyItems = await fetchMessagesForCopy(mode, controller.signal) || [];
-      if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
-      const copyValue = await formatMessagesForCopy(copyItems, controller.signal);
+      const copyValue = mode === "conversation"
+        ? await getConversationCopyText(conversation!.conversation_id, effectivePath, showInternal, controller.signal)
+        : await formatMessagesForCopy(visibleMessages, controller.signal);
       if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
       await copyText(copyValue, requestedContextKey, requestId);
     } catch {

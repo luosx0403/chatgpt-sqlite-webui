@@ -13,8 +13,9 @@ from typing import Annotated, Mapping
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, Request, Response, UploadFile
+from starlette.responses import StreamingResponse
 
-from .exporter import render_markdown, render_txt
+from .exporter import iter_conversation_export_nodes, iter_copy_conversation, iter_rendered_conversation
 from .db import (
     DatabaseMigrationError,
     database_schema_error_code,
@@ -630,7 +631,9 @@ def create_api_router(
                 "endpoint": "/api/conversations/{conversation_id}/export",
                 "format": ["md", "txt"],
                 "path": ["current", "all"],
-                "include_internal": "boolean; when true, internal/technical nodes are included in the export",
+                "include_internal": "boolean; default false, matching CLI export and the visible reader; true includes internal/technical nodes",
+                "copy_endpoint": "/api/conversations/{conversation_id}/copy",
+                "streaming": "export and full-conversation copy use complete canonical display text from bounded server-side node batches and never accumulate reader page payloads",
             },
             "search": {
                 "endpoints": ["/api/conversations", "/api/search/messages"],
@@ -1038,27 +1041,33 @@ def create_api_router(
         conv = conn.execute("SELECT * FROM conversations WHERE conversation_id = ?", (conversation_id,)).fetchone()
         if not conv:
             raise HTTPException(status_code=404, detail="conversation_not_found")
-        messages = []
-        offset = 0
-        while True:
-            page = get_messages(conn, conversation_id, path=path, limit=300, offset=offset, include_internal=True)
-            messages.extend(page["items"])
-            offset += page["limit"]
-            if offset >= page["total"]:
-                break
-        visible_messages = [
-            row for row in messages
-            if not row.get("is_empty_mapping_node") and (include_internal or not row.get("is_internal"))
-        ]
-        rows = [_dict_row_to_mapping(_export_message_row(row)) for row in visible_messages]
-        text = render_markdown(conv, rows) if format == "md" else render_txt(conv, rows)
         media_type = "text/markdown; charset=utf-8" if format == "md" else "text/plain; charset=utf-8"
         filename = _download_filename(conversation_id, format)
-        return Response(
-            content=text,
+        nodes = iter_conversation_export_nodes(
+            conn,
+            conv,
+            path=path,
+            include_internal=include_internal,
+        )
+        return StreamingResponse(
+            iter_rendered_conversation(conv, nodes, format),
             media_type=media_type,
             headers={"Content-Disposition": _content_disposition(filename)},
         )
+
+    @router.get("/conversations/{conversation_id}/copy")
+    def conversation_copy(conversation_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)], path: str = "current", include_internal: bool = False, conn=Depends(get_conn)):
+        _validate_common(path=path)
+        conv = conn.execute("SELECT * FROM conversations WHERE conversation_id = ?", (conversation_id,)).fetchone()
+        if not conv:
+            raise HTTPException(status_code=404, detail="conversation_not_found")
+        nodes = iter_conversation_export_nodes(
+            conn,
+            conv,
+            path=path,
+            include_internal=include_internal,
+        )
+        return StreamingResponse(iter_copy_conversation(nodes), media_type="text/plain; charset=utf-8")
 
     @router.get("/search")
     def search(
@@ -1285,21 +1294,6 @@ def _schema_error_detail(
         "foreign_key_violation": bool(schema.get("foreign_key_violation")),
         "foreign_key_violation_sample": schema.get("foreign_key_violation_sample"),
     }
-
-
-def _dict_row_to_mapping(row: dict):
-    class MappingRow(dict):
-        def __getitem__(self, key):
-            return dict.get(self, key)
-
-    return MappingRow(row)
-
-
-def _export_message_row(row: dict) -> dict:
-    output = dict(row)
-    display_text = output.get("display_text") or output.get("render_text") or output.get("content_text") or ""
-    output["content_text"] = display_text
-    return output
 
 
 def _download_filename(conversation_id: str, fmt: str) -> str:
