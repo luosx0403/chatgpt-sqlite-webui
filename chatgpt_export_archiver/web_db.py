@@ -4,10 +4,23 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .db import CORE_SCHEMA_COLUMNS, _drop_table_with_shadows, configure_bulk_write_connection
+from .db import (
+    CORE_SCHEMA_COLUMNS,
+    DatabaseMigrationError,
+    _drop_table_with_shadows,
+    configure_bulk_write_connection,
+    database_schema_status,
+)
 from .parser import recover_message_display_text
+from .schema_contract import (
+    DISPLAY_TEXT_RESOLVER_VERSION,
+    NORMALIZATION_INDEX_FORMAT_VERSION,
+    OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+)
+from .sqlite_errors import is_fts5_capability_unavailable
 from .search import _derived_generation_is_current, invalidate_capability_cache, normalize_search_text, search_fragment_match
 
+WEB_INDEX_FORMAT_VERSION = OPTIONAL_WEB_INDEX_FORMAT_VERSION
 
 REQUIRED_TABLES = {
     "conversations",
@@ -29,6 +42,7 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
@@ -41,6 +55,7 @@ def connect_writable(db_path: Path) -> sqlite3.Connection:
         raise ValueError("database_not_found")
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
@@ -49,30 +64,15 @@ def connect_writable(db_path: Path) -> sqlite3.Connection:
 
 
 def check_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    status = database_schema_status(conn)
     tables = {
         row["name"]
         for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')"
         ).fetchall()
     }
-    missing = sorted(REQUIRED_TABLES - tables)
-    missing_columns: dict[str, list[str]] = {}
-    for table, required_columns in REQUIRED_COLUMNS.items():
-        if table not in tables:
-            continue
-        try:
-            columns = {row["name"] for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
-        except sqlite3.Error:
-            missing_columns[table] = sorted(required_columns)
-            continue
-        missing_for_table = sorted(required_columns - columns)
-        if missing_for_table:
-            missing_columns[table] = missing_for_table
     return {
-        "ok": not missing and not missing_columns,
-        "missing_tables": missing,
-        "missing_columns": missing_columns,
-        "schema_compatible": not missing and not missing_columns,
+        **status,
         "message_fts": "message_fts" in tables,
         "web_message_trigram": "web_message_trigram" in tables,
         "web_title_trigram": "web_title_trigram" in tables,
@@ -90,15 +90,23 @@ def web_index_status(conn: sqlite3.Connection) -> dict[str, Any]:
             metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM web_index_metadata")}
         except sqlite3.Error:
             metadata = {}
-    message_norm_normalized = schema["web_message_norm"] and (
+    format_current = (
+        metadata.get("web_index_format_version") == WEB_INDEX_FORMAT_VERSION
+        and metadata.get("display_text_resolver_version") == DISPLAY_TEXT_RESOLVER_VERSION
+        and metadata.get("normalization_index_format_version") == NORMALIZATION_INDEX_FORMAT_VERSION
+    )
+    message_norm_normalized = format_current and schema["web_message_norm"] and (
         metadata.get("message_norm_text") == "normalized" or metadata.get("message_trigram_text") == "normalized"
     ) and _derived_generation_is_current(conn, "message")
-    title_norm_normalized = schema["web_title_norm"] and (
+    title_norm_normalized = format_current and schema["web_title_norm"] and (
         metadata.get("title_norm_text") == "normalized" or metadata.get("title_trigram_text") == "normalized"
     ) and _derived_generation_is_current(conn, "title")
-    message_trigram_normalized = schema["web_message_trigram"] and metadata.get("message_trigram_text") == "normalized" and _derived_generation_is_current(conn, "message")
-    title_trigram_normalized = schema["web_title_trigram"] and metadata.get("title_trigram_text") == "normalized" and _derived_generation_is_current(conn, "title")
+    message_trigram_normalized = format_current and schema["web_message_trigram"] and metadata.get("message_trigram_text") == "normalized" and _derived_generation_is_current(conn, "message")
+    title_trigram_normalized = format_current and schema["web_title_trigram"] and metadata.get("title_trigram_text") == "normalized" and _derived_generation_is_current(conn, "title")
     return {
+        "web_index_format_current": format_current,
+        "web_index_format_version": metadata.get("web_index_format_version"),
+        "required_web_index_format_version": WEB_INDEX_FORMAT_VERSION,
         "web_normalized_indexed": bool(message_norm_normalized and title_norm_normalized),
         "web_normalized_trigram_indexed": bool(message_trigram_normalized and title_trigram_normalized),
         "web_legacy_trigram_indexed": bool(
@@ -133,8 +141,10 @@ def detect_fts5(conn: sqlite3.Connection) -> bool:
         conn.execute("CREATE VIRTUAL TABLE temp._fts_probe USING fts5(x)")
         conn.execute("DROP TABLE temp._fts_probe")
         return True
-    except sqlite3.Error:
-        return False
+    except sqlite3.OperationalError as exc:
+        if is_fts5_capability_unavailable(exc):
+            return False
+        raise
 
 
 def detect_trigram(conn: sqlite3.Connection) -> bool:
@@ -142,15 +152,21 @@ def detect_trigram(conn: sqlite3.Connection) -> bool:
         conn.execute("CREATE VIRTUAL TABLE temp._tri_probe USING fts5(x, tokenize='trigram')")
         conn.execute("DROP TABLE temp._tri_probe")
         return True
-    except sqlite3.Error:
-        return False
+    except sqlite3.OperationalError as exc:
+        if is_fts5_capability_unavailable(exc):
+            return False
+        raise
 
 
 def create_web_indexes(db_path: Path) -> dict[str, Any]:
     """Build optional Web search indexes without changing archive source tables."""
     conn = connect_writable(db_path)
-    configure_bulk_write_connection(conn)
     try:
+        schema = check_schema(conn)
+        if not schema["ok"]:
+            code = "database_migration_required" if schema["migration_required"] else "database_schema_incompatible"
+            raise DatabaseMigrationError(code, detail=schema)
+        configure_bulk_write_connection(conn)
         trigram_available = detect_trigram(conn)
         drop_failures: list[dict[str, str]] = []
         conn.execute("BEGIN")
@@ -257,6 +273,9 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
         metadata = [
             ("message_norm_text", "normalized"),
             ("title_norm_text", "normalized"),
+            ("web_index_format_version", WEB_INDEX_FORMAT_VERSION),
+            ("display_text_resolver_version", DISPLAY_TEXT_RESOLVER_VERSION),
+            ("normalization_index_format_version", NORMALIZATION_INDEX_FORMAT_VERSION),
         ]
         try:
             generations = {

@@ -16,9 +16,19 @@ from .exporter import render_markdown, render_txt
 from .db import foreign_key_diagnostics
 from .logging_utils import get_logger
 from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
+from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
 from .search import _has_normalized_title_norm, get_conversation, get_messages, list_conversations, normalize_search_text, parse_query, search_conversations, search_messages
 from .utils import finite_float_or_none, safe_filename_part
-from .web_db import check_schema, connect_readonly, detect_fts5, detect_trigram, web_index_status
+from .web_db import (
+    DISPLAY_TEXT_RESOLVER_VERSION,
+    NORMALIZATION_INDEX_FORMAT_VERSION,
+    WEB_INDEX_FORMAT_VERSION,
+    check_schema,
+    connect_readonly,
+    detect_fts5,
+    detect_trigram,
+    web_index_status,
+)
 from .web_jobs import ImportJobManager, ImportJobStartError, cleanup_upload_dir, make_upload_path
 
 LOGGER = get_logger("web_api")
@@ -364,7 +374,11 @@ def create_api_router(
                 "ok": True,
                 "db_ready": False,
                 "database": {"name": "database", "exists": False},
-                "schema_version": 1,
+                "schema_version": API_SCHEMA_VERSION,
+                "api_schema_version": API_SCHEMA_VERSION,
+                "current_database_schema_version": None,
+                "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+                "migration_required": False,
                 "fts5_available": False,
                 "message_fts_available": False,
                 "trigram_available": False,
@@ -378,13 +392,23 @@ def create_api_router(
         try:
             conn = connect_readonly(db_path)
         except ValueError:
-            return {"ok": True, "db_ready": False, "database": {"name": "database", "exists": db_path.exists()}, "schema_version": 1, **access}
+            return {
+                "ok": False,
+                "db_ready": False,
+                "database": {"name": "database", "exists": db_path.exists()},
+                "schema_version": API_SCHEMA_VERSION,
+                "api_schema_version": API_SCHEMA_VERSION,
+                "current_database_schema_version": None,
+                "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+                "migration_required": False,
+                **access,
+            }
         try:
             schema = check_schema(conn)
             web_status = web_index_status(conn)
             fts5 = detect_fts5(conn)
             trigram = detect_trigram(conn)
-            foreign_keys = foreign_key_diagnostics(conn) if schema["ok"] else {
+            foreign_keys = foreign_key_diagnostics(conn) if schema["base_schema_compatible"] else {
                 "foreign_key_violations": 0,
                 "foreign_key_violations_by_table": [],
                 "foreign_key_violation_samples": [],
@@ -393,12 +417,24 @@ def create_api_router(
             conn.close()
         return {
             "ok": schema["ok"] and foreign_keys["foreign_key_violations"] == 0,
-            "db_ready": schema["ok"],
+            "db_ready": schema["ok"] and foreign_keys["foreign_key_violations"] == 0,
             "schema_compatible": schema["schema_compatible"],
             "missing_tables": schema["missing_tables"],
             "missing_columns": schema["missing_columns"],
+            "missing_indexes": schema["missing_indexes"],
+            "invalid_indexes": schema["invalid_indexes"],
+            "missing_triggers": schema["missing_triggers"],
+            "missing_generation_rows": schema["missing_generation_rows"],
+            "missing_foreign_keys": schema["missing_foreign_keys"],
+            "migration_required": schema["migration_required"],
+            "current_database_schema_version": schema["current_database_schema_version"],
+            "required_database_schema_version": schema["required_database_schema_version"],
             "database": {"name": "database", "exists": db_path.exists()},
-            "schema_version": 1,
+            "schema_version": API_SCHEMA_VERSION,
+            "api_schema_version": API_SCHEMA_VERSION,
+            "display_text_resolver_version": DISPLAY_TEXT_RESOLVER_VERSION,
+            "normalization_index_format_version": NORMALIZATION_INDEX_FORMAT_VERSION,
+            "optional_web_index_format_version": WEB_INDEX_FORMAT_VERSION,
             "fts5_available": fts5,
             "message_fts_available": schema["message_fts"],
             "trigram_available": trigram,
@@ -450,7 +486,14 @@ def create_api_router(
     @router.get("/schema")
     def schema_docs():
         return {
-            "version": 2,
+            "version": API_SCHEMA_VERSION,
+            "versions": {
+                "api_schema_version": API_SCHEMA_VERSION,
+                "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+                "optional_web_index_format_version": WEB_INDEX_FORMAT_VERSION,
+                "display_text_resolver_version": DISPLAY_TEXT_RESOLVER_VERSION,
+                "normalization_index_format_version": NORMALIZATION_INDEX_FORMAT_VERSION,
+            },
             "pagination": {
                 "conversation_page": ["items", "total", "limit", "offset", "has_more", "next_offset"],
                 "message_page": ["items", "total", "limit", "offset", "has_more", "next_offset"],
@@ -569,9 +612,14 @@ def create_api_router(
                 "url_precedence": "explicit URL values win over localStorage; missing values may use local settings",
                 "back_forward": "incremental search and selection history restoration is not implemented; routine address-bar updates use replaceState",
             },
-            "database_compatibility": "older databases are checked but are not automatically migrated; re-import the original export into a new database when required columns are missing",
+            "database_compatibility": {
+                "readonly_contract": "health and read endpoints inspect schema but never execute migration DDL",
+                "migration": "run the explicit CLI migrate command after creating and verifying an external backup; import initializes new databases and upgrades migratable databases, while web-index requires a current core schema",
+                "health_fields": ["schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "missing_tables", "missing_columns", "missing_indexes", "invalid_indexes", "missing_triggers", "missing_generation_rows", "missing_foreign_keys"],
+                "errors": ["database_not_ready", "database_migration_required", "database_schema_incompatible"],
+            },
             "stable_error_codes": [
-                "database_not_ready", "database_schema_incompatible", "invalid_job_id", "job_not_found",
+                "database_not_ready", "database_migration_required", "database_schema_incompatible", "invalid_job_id", "job_not_found",
                 "conversation_not_found", "message_not_found", "invalid_export_format",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
@@ -1031,11 +1079,20 @@ def _empty_message_search_page(limit: int, offset: int, *, db_ready: bool) -> di
 
 
 def _schema_error_detail(schema: dict[str, object]) -> dict[str, object]:
+    code = "database_migration_required" if schema.get("migration_required") else "database_schema_incompatible"
     return {
-        "code": "database_schema_incompatible",
+        "code": code,
         "schema_compatible": False,
+        "migration_required": bool(schema.get("migration_required")),
+        "current_database_schema_version": schema.get("current_database_schema_version"),
+        "required_database_schema_version": schema.get("required_database_schema_version"),
         "missing_tables": schema.get("missing_tables", []),
         "missing_columns": schema.get("missing_columns", {}),
+        "missing_indexes": schema.get("missing_indexes", []),
+        "invalid_indexes": schema.get("invalid_indexes", {}),
+        "missing_triggers": schema.get("missing_triggers", []),
+        "missing_generation_rows": schema.get("missing_generation_rows", []),
+        "missing_foreign_keys": schema.get("missing_foreign_keys", {}),
     }
 
 

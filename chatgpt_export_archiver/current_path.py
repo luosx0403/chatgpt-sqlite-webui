@@ -297,7 +297,7 @@ flag_leaf_candidates AS (
     SELECT n.conversation_id, n.node_id, n.parent_node_id,
            row_number() OVER (PARTITION BY n.conversation_id ORDER BY n.node_id) AS leaf_rank
     FROM effective_current_scope scope
-    CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_flag_parent
+    CROSS JOIN conversation_nodes n
     WHERE n.conversation_id = scope.conversation_id
       AND n.is_on_current_path = 1
       AND NOT EXISTS (
@@ -305,7 +305,7 @@ flag_leaf_candidates AS (
       )
       AND NOT EXISTS (
           SELECT 1
-          FROM conversation_nodes child INDEXED BY idx_nodes_conversation_flag_parent
+          FROM conversation_nodes child
           WHERE child.conversation_id = n.conversation_id
             AND child.is_on_current_path = 1
             AND child.parent_node_id = n.node_id
@@ -342,7 +342,7 @@ FROM chosen_chain
 UNION ALL
 SELECT n.conversation_id, n.node_id, n.parent_node_id, NULL, 'fallback_all'
 FROM fallback_conversations f
-CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_path
+CROSS JOIN conversation_nodes n
 WHERE n.conversation_id = f.conversation_id;
 """
 
@@ -493,7 +493,7 @@ def ensure_effective_current_views(
     topology_rows = conn.execute(
         """SELECT n.conversation_id, n.node_id, n.parent_node_id, n.is_on_current_path
            FROM effective_current_scope scope
-           CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_path
+           CROSS JOIN conversation_nodes n
            WHERE n.conversation_id = scope.conversation_id"""
     ).fetchall()
     topology_by_conversation: dict[str, list[sqlite3.Row]] = {}
@@ -557,18 +557,18 @@ def ensure_effective_current_views(
                           MAX(CASE WHEN n.node_id = c.current_node THEN 1 ELSE 0 END) AS current_node_exists
                    FROM effective_current_scope scope
                    CROSS JOIN conversations c
-                   LEFT JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_path
+                   LEFT JOIN conversation_nodes n
                      ON n.conversation_id = c.conversation_id
                    WHERE c.conversation_id = scope.conversation_id
                    GROUP BY scope.conversation_id
                ), raw_leaf_stats AS (
                    SELECT n.conversation_id, COUNT(*) AS raw_flag_leaf_count
                    FROM effective_current_scope scope
-                   CROSS JOIN conversation_nodes n INDEXED BY idx_nodes_conversation_flag_parent
+                   CROSS JOIN conversation_nodes n
                    WHERE n.conversation_id = scope.conversation_id
                      AND n.is_on_current_path = 1
                      AND NOT EXISTS (
-                         SELECT 1 FROM conversation_nodes child INDEXED BY idx_nodes_conversation_flag_parent
+                         SELECT 1 FROM conversation_nodes child
                          WHERE child.conversation_id = n.conversation_id
                            AND child.is_on_current_path = 1
                            AND child.parent_node_id = n.node_id

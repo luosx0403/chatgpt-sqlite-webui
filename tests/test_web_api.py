@@ -4745,5 +4745,201 @@ class WebApiTests(unittest.TestCase):
         self.assertFalse(missing["around_target_found"])
         self.assertFalse(missing["around_target_applied"])
 
+    def test_legacy_health_dependency_gate_migration_and_web_index_contract(self):
+        from chatgpt_export_archiver.db import DatabaseMigrationError, connect, migrate_database
+        from chatgpt_export_archiver.web_db import create_web_indexes, web_index_status
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "legacy.db"
+            fixture = Path(__file__).resolve().parent / "fixtures" / "legacy-fa37b3d.sql"
+            conn = sqlite3.connect(db)
+            conn.executescript(fixture.read_text(encoding="utf-8"))
+            conn.execute("CREATE TABLE web_message_norm(marker TEXT)")
+            conn.execute("INSERT INTO web_message_norm VALUES ('legacy-marker')")
+            conn.commit()
+            conn.close()
+
+            before_tables = None
+            conn = sqlite3.connect(db)
+            before_tables = conn.execute(
+                "SELECT name, type, sql FROM sqlite_master ORDER BY name"
+            ).fetchall()
+            conn.close()
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                create_web_indexes(db)
+            self.assertEqual(caught.exception.code, "database_migration_required")
+            conn = sqlite3.connect(db)
+            self.assertEqual(conn.execute("SELECT marker FROM web_message_norm").fetchone()[0], "legacy-marker")
+            self.assertEqual(before_tables, conn.execute("SELECT name, type, sql FROM sqlite_master ORDER BY name").fetchall())
+            conn.close()
+
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            health = client.get("/api/health")
+            self.assertEqual(health.status_code, 200)
+            degraded = health.json()
+            self.assertFalse(degraded["ok"])
+            self.assertFalse(degraded["db_ready"])
+            self.assertFalse(degraded["schema_compatible"])
+            self.assertTrue(degraded["migration_required"])
+            self.assertEqual(degraded["current_database_schema_version"], 0)
+            self.assertIn("idx_nodes_conversation_flag_parent", degraded["missing_indexes"])
+            for endpoint in (
+                "/api/conversations",
+                "/api/conversations/legacy-synthetic",
+                "/api/conversations/legacy-synthetic/messages",
+                "/api/search/messages?q=synthetic",
+                "/api/search/suggest?q=synthetic",
+            ):
+                with self.subTest(endpoint=endpoint):
+                    response = client.get(endpoint)
+                    self.assertEqual(response.status_code, 409)
+                    self.assertEqual(response.json()["detail"]["code"], "database_migration_required")
+            client.close()
+
+            writer = connect(db)
+            migration = migrate_database(writer)
+            self.assertTrue(migration["changed"])
+            writer.close()
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            ready = client.get("/api/health").json()
+            self.assertTrue(ready["ok"])
+            self.assertTrue(ready["db_ready"])
+            self.assertTrue(ready["schema_compatible"])
+            self.assertFalse(ready["migration_required"])
+            self.assertEqual(client.get("/api/conversations").status_code, 200)
+            self.assertEqual(client.get("/api/conversations/legacy-synthetic").status_code, 200)
+            self.assertEqual(client.get("/api/conversations/legacy-synthetic/messages").status_code, 200)
+            self.assertEqual(client.get("/api/search/messages?q=synthetic").status_code, 200)
+            client.close()
+
+            built = create_web_indexes(db)
+            self.assertEqual(built["indexed_titles"], 1)
+            conn = connect_readonly(db)
+            status = web_index_status(conn)
+            conn.close()
+            self.assertTrue(status["web_normalized_indexed"])
+
+    def test_missing_required_index_is_migration_required_not_operational_error(self):
+        from chatgpt_export_archiver.db import connect, migrate_database
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        client.close()
+        conn = sqlite3.connect(db)
+        conn.execute("DROP INDEX idx_nodes_conversation_flag_parent")
+        conn.commit()
+        conn.close()
+        client = TestClient(create_app(db, static_dir=self.make_build_dir(Path(td.name))))
+        self.addCleanup(client.close)
+        health = client.get("/api/health").json()
+        self.assertFalse(health["db_ready"])
+        self.assertTrue(health["migration_required"])
+        self.assertEqual(health["current_database_schema_version"], health["required_database_schema_version"])
+        response = client.get("/api/conversations")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["code"], "database_migration_required")
+        writer = connect(db)
+        self.assertTrue(migrate_database(writer)["changed"])
+        writer.close()
+        self.assertTrue(client.get("/api/health").json()["db_ready"])
+        self.assertEqual(client.get("/api/conversations").status_code, 200)
+
+    def test_title_only_current_search_materializes_only_page_and_selected_scope(self):
+        from chatgpt_export_archiver import current_path as current_path_module
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.db import connect, init_db
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "titles.db"
+            conn = connect(db)
+            init_db(conn)
+            count = 20_000
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES (?, ?, ?, ?)",
+                ((f"title-{index:05d}", f"Needle {index:05d}", f"node-{index}", f"hash-{index}") for index in range(count)),
+            )
+            conn.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, is_on_current_path) VALUES (?, ?, 0)",
+                ((f"title-{index:05d}", f"node-{index}") for index in range(count)),
+            )
+            conn.commit()
+
+            real_ensure = current_path_module.ensure_effective_current_views
+            scopes: list[tuple[str, ...] | None] = []
+
+            def spy(connection, ids):
+                normalized = None if ids is None else tuple(sorted(str(value) for value in ids))
+                scopes.append(normalized)
+                return real_ensure(connection, ids)
+
+            statements: list[str] = []
+            conn.set_trace_callback(statements.append)
+            with (
+                mock.patch.object(current_path_module, "ensure_effective_current_views", side_effect=spy),
+                mock.patch.object(search_module, "ensure_effective_current_views", side_effect=spy),
+            ):
+                queries = (
+                    search_module.parse_query("title:needle", path_default="current"),
+                    search_module.parse_query("needle", path_default="current", scope="title"),
+                    search_module.parse_query("", path_default="current", title="needle"),
+                    search_module.parse_query("", path_default="current", exact="needle", scope="title"),
+                    search_module.parse_query("needle OR absent", path_default="current", scope="title"),
+                )
+                for parsed in queries:
+                    scopes.clear()
+                    statements.clear()
+                    current = search_module.search_conversations(
+                        conn,
+                        parsed,
+                        limit=20,
+                        selected_id="title-19999",
+                        sort="title",
+                    )
+                    self.assertEqual(current["total"], count)
+                    self.assertEqual(current["selected_item"]["conversation_id"], "title-19999")
+                    self.assertNotIn(None, scopes)
+                    self.assertTrue(scopes)
+                    self.assertLessEqual(max(len(scope or ()) for scope in scopes), 21)
+                    self.assertFalse(any(
+                        "INSERT INTO effective_current_scope SELECT conversation_id FROM conversations" in sql
+                        for sql in statements
+                    ))
+                    parsed_all = search_module.parse_query(
+                        parsed.original,
+                        path_default="all",
+                        title=parsed.required_title,
+                        scope=parsed.scope,
+                    )
+                    all_page = search_module.search_conversations(
+                        conn,
+                        parsed_all,
+                        limit=20,
+                        selected_id="title-19999",
+                        sort="title",
+                    )
+                    self.assertEqual(
+                        [item["conversation_id"] for item in current["items"]],
+                        [item["conversation_id"] for item in all_page["items"]],
+                    )
+            conn.set_trace_callback(None)
+            conn.close()
+
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            self.addCleanup(client.close)
+            scopes.clear()
+            with (
+                mock.patch.object(current_path_module, "ensure_effective_current_views", side_effect=spy),
+                mock.patch.object(search_module, "ensure_effective_current_views", side_effect=spy),
+            ):
+                response = client.get(
+                    "/api/conversations?q=title%3Aneedle&path=current&sort=title&limit=20&selected_id=title-19999"
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["total"], count)
+            self.assertNotIn(None, scopes)
+            self.assertLessEqual(max(len(scope or ()) for scope in scopes), 21)
+
 if __name__ == "__main__":
     unittest.main()

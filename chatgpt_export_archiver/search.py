@@ -16,6 +16,12 @@ from .current_path import (
     resolve_effective_current_collection,
 )
 from .parser import extract_message_content, recover_message_display_text
+from .schema_contract import (
+    DISPLAY_TEXT_RESOLVER_VERSION,
+    NORMALIZATION_INDEX_FORMAT_VERSION,
+    OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+)
+from .sqlite_errors import is_optional_search_capability_missing
 from .utils import compact_json
 
 
@@ -598,7 +604,9 @@ def search_messages(
     try:
         rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, count_total=count_total)
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=True)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
         rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, use_trigram=False, count_total=count_total)
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=False)
     result_ids = [str(row["conversation_id"]) for row in rows]
@@ -632,14 +640,16 @@ def search_conversations(
     _ensure_search_functions(conn)
     if not parsed.has_search_context():
         return list_conversations(conn, limit=limit, offset=offset, sort=sort, after=parsed.after, before=parsed.before, selected_id=selected_id)
-    if parsed.path == "current":
+    if _conversation_search_requires_global_current(parsed):
         ensure_effective_current_views(conn, None)
     limit = _bounded_limit(limit, MAX_API_LIMIT)
     offset = max(0, offset)
     try:
         items, total = _conversation_search_page(conn, parsed, limit, offset, sort)
         diagnostics = _conversation_search_diagnostics(conn, parsed, used_trigram=True)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
         items, total = _conversation_search_page(conn, parsed, limit, offset, sort, use_trigram=False)
         diagnostics = _conversation_search_diagnostics(conn, parsed, used_trigram=False)
     _add_counts_and_path_metadata(conn, items)
@@ -662,6 +672,20 @@ def search_conversations(
 
 def _search_has_positive_body_or_title(parsed: ParsedQuery) -> bool:
     return bool(parsed.terms or parsed.phrases or parsed.required_phrases or parsed.title or parsed.required_title)
+
+
+def _conversation_search_requires_global_current(parsed: ParsedQuery) -> bool:
+    """Return whether candidate filtering itself needs message membership."""
+
+    if parsed.path != "current" or parsed.scope == "title":
+        return False
+    return bool(
+        parsed.terms
+        or parsed.phrases
+        or parsed.required_phrases
+        or parsed.role
+        or parsed.exclude
+    )
 
 
 def _is_title_only_candidate_context(parsed: ParsedQuery) -> bool:
@@ -1644,7 +1668,9 @@ def _filter_conversation_where(parsed: ParsedQuery, *, conversation_id: str | No
 def _conversation_search_item(conn: sqlite3.Connection, parsed: ParsedQuery, conversation_id: str) -> dict[str, Any] | None:
     try:
         return _conversation_search_item_inner(conn, parsed, conversation_id, use_trigram=True)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
         return _conversation_search_item_inner(conn, parsed, conversation_id, use_trigram=False)
 
 
@@ -1806,7 +1832,9 @@ def _conversation_snippets(conn: sqlite3.Connection, parsed: ParsedQuery, conver
     current_path_fallback_to_all = fallback_map.get(conversation_id, False)
     try:
         rows = _substring_message_rows(conn, parsed, conversation_id, 3)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
         rows = _substring_message_rows(conn, parsed, conversation_id, 3, use_trigram=False)
     snippets = []
     for row in rows[:3]:
@@ -1863,7 +1891,9 @@ def _batch_conversation_enrichment(
             """,
             params + ids,
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
         base_sql, params = _message_search_base_select(conn, parsed, None, use_trigram=False)
         rows = conn.execute(
             f"""
@@ -1916,7 +1946,9 @@ def _add_conversation_visibility_metadata(conn: sqlite3.Connection, parsed: Pars
         return
     try:
         flags = _conversation_message_visibility_flags(conn, parsed, item["conversation_id"])
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
         flags = _conversation_message_visibility_flags(conn, parsed, item["conversation_id"], use_trigram=False)
     item.update(flags)
 
@@ -2817,6 +2849,12 @@ def _web_index_metadata_value(conn: sqlite3.Connection, key: str) -> str | None:
 
 
 def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
+    if (
+        _web_index_metadata_value(conn, "web_index_format_version") != OPTIONAL_WEB_INDEX_FORMAT_VERSION
+        or _web_index_metadata_value(conn, "display_text_resolver_version") != DISPLAY_TEXT_RESOLVER_VERSION
+        or _web_index_metadata_value(conn, "normalization_index_format_version") != NORMALIZATION_INDEX_FORMAT_VERSION
+    ):
+        return False
     if not _table_exists(conn, "archive_generations"):
         return False
     expected = _web_index_metadata_value(conn, f"{name}_generation")

@@ -1,0 +1,7 @@
+"""Versioned runtime contracts that must not be conflated with each other."""
+
+API_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 1
+OPTIONAL_WEB_INDEX_FORMAT_VERSION = "2"
+DISPLAY_TEXT_RESOLVER_VERSION = "1"
+NORMALIZATION_INDEX_FORMAT_VERSION = "1"

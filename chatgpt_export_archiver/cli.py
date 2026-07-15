@@ -16,11 +16,13 @@ from .db import (
     connect,
     connect_existing,
     connect_existing_readonly,
+    database_schema_status,
     drop_optional_web_indexes,
     drop_import_rebuildable_indexes,
     finish_import_run,
     get_stats,
     init_db,
+    migrate_database,
     optimize_after_import,
     recreate_import_rebuildable_indexes,
     record_source_entries,
@@ -158,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
     init_p.set_defaults(func=cmd_init)
     _add_log_args(init_p)
 
+    migrate_p = sub.add_parser(
+        "migrate",
+        help="Upgrade an existing database schema after making an external backup.",
+    )
+    migrate_p.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    migrate_p.set_defaults(func=cmd_migrate)
+    _add_log_args(migrate_p)
+
     import_p = sub.add_parser("import", help="Import conversations into SQLite.")
     import_p.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
     import_p.add_argument("--input", help="Export ZIP or extracted directory. Defaults to the only ZIP in cwd.")
@@ -229,6 +239,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     conn.close()
     print("initialized_db true")
     print(f"fts5_available {str(fts).lower()}")
+    return 0
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    db_path = Path(args.db)
+    conn = connect_existing(db_path)
+    try:
+        before = database_schema_status(conn)
+        print("WARNING: create and verify an external database backup before migration.", file=sys.stderr)
+        result = migrate_database(conn)
+    finally:
+        conn.close()
+    print(f"current_database_schema_version {before['current_database_schema_version']}")
+    print(f"required_database_schema_version {before['required_database_schema_version']}")
+    print(f"migration_changed {str(result['changed']).lower()}")
+    print(f"database_schema_version {result['current_database_schema_version']}")
+    print("backup_created false")
     return 0
 
 

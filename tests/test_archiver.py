@@ -3579,5 +3579,202 @@ class ArchiverTests(unittest.TestCase):
                     self.assertEqual(len(data), item["size"])
                     self.assertEqual(hashlib.sha256(data).hexdigest(), item["sha256"])
 
+    def test_real_legacy_fa37_fixture_migrates_without_canonical_data_changes(self):
+        from chatgpt_export_archiver.db import DATABASE_SCHEMA_VERSION, database_schema_status, migrate_database
+
+        root = Path(__file__).resolve().parent
+        fixture = root / "fixtures" / "legacy-fa37b3d.sql"
+        provenance = json.loads((root / "fixtures" / "legacy-fa37b3d.json").read_text(encoding="utf-8"))
+        self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(), provenance["fixture_sha256"])
+        self.assertEqual(provenance["source_commit"], "fa37b3d70ff501b59b168690ea8de69bcadb0c38")
+
+        def canonical_snapshot(conn):
+            counts = {
+                table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+                for table in ("conversations", "conversation_nodes", "import_runs", "source_files", "file_index")
+            }
+            hashes = {}
+            for table, order in (("conversations", "conversation_id"), ("conversation_nodes", "conversation_id, node_id")):
+                rows = [list(row) for row in conn.execute(f'SELECT * FROM "{table}" ORDER BY {order}')]
+                hashes[table] = hashlib.sha256(
+                    json.dumps(rows, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                ).hexdigest()
+            return counts, hashes
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            conn.executescript(fixture.read_text(encoding="utf-8"))
+            conn.execute("PRAGMA foreign_keys = ON")
+            before_counts, before_hashes = canonical_snapshot(conn)
+            before = database_schema_status(conn)
+            self.assertEqual(before["current_database_schema_version"], 0)
+            self.assertTrue(before["migration_required"])
+            self.assertIn("idx_nodes_conversation_flag_parent", before["missing_indexes"])
+            conn.close()
+
+            verify_code, verify_output = run_cli(["--db", str(db), "verify"])
+            self.assertEqual(verify_code, 1)
+            self.assertIn("schema_ok false", verify_output)
+            self.assertNotIn("no such index", verify_output)
+            self.assertEqual(run_cli(["--db", str(db), "stats"])[0], 0)
+            self.assertEqual(run_cli(["--db", str(db), "search", "synthetic"])[0], 0)
+            legacy_exports = Path(td) / "legacy-exports"
+            self.assertEqual(run_cli(["--db", str(db), "export", "--out", str(legacy_exports)])[0], 0)
+
+            conn = connect(db)
+            first = migrate_database(conn)
+            after_counts, after_hashes = canonical_snapshot(conn)
+            second = migrate_database(conn)
+            after = database_schema_status(conn)
+            conn.close()
+
+            self.assertTrue(first["changed"])
+            self.assertFalse(second["changed"])
+            self.assertEqual(after["current_database_schema_version"], DATABASE_SCHEMA_VERSION)
+            self.assertTrue(after["ok"])
+            self.assertEqual(before_counts, after_counts)
+            self.assertEqual(before_hashes, after_hashes)
+            self.assertEqual(before_counts, {
+                "conversations": 1,
+                "conversation_nodes": 3,
+                "import_runs": 1,
+                "source_files": 1,
+                "file_index": 1,
+            })
+            self.assertEqual(run_cli(["--db", str(db), "verify"])[0], 0)
+            self.assertEqual(run_cli(["--db", str(db), "stats"])[0], 0)
+            self.assertEqual(run_cli(["--db", str(db), "search", "synthetic"])[0], 0)
+
+    def test_migration_repairs_drift_and_rolls_back_midway_failure(self):
+        from chatgpt_export_archiver.db import (
+            DATABASE_SCHEMA_VERSION,
+            DatabaseMigrationError,
+            database_schema_status,
+            migrate_database,
+        )
+
+        class FailingConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if "CREATE TRIGGER IF NOT EXISTS archive_message_generation_insert" in sql:
+                    raise sqlite3.OperationalError("synthetic migration statement failure")
+                return super().execute(sql, parameters)
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "drift.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute("DROP TRIGGER archive_message_generation_insert")
+            conn.execute("DROP TRIGGER archive_message_generation_update")
+            conn.execute("DROP TRIGGER archive_message_generation_delete")
+            conn.execute("DROP TRIGGER archive_title_generation_insert")
+            conn.execute("DROP TRIGGER archive_title_generation_update")
+            conn.execute("DROP TRIGGER archive_title_generation_delete")
+            conn.execute("DROP TABLE archive_generations")
+            conn.execute("DROP INDEX idx_nodes_conversation_flag_parent")
+            conn.execute("PRAGMA user_version = 0")
+            conn.commit()
+            conn.close()
+
+            failing = sqlite3.connect(db, factory=FailingConnection)
+            failing.row_factory = sqlite3.Row
+            failing.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(failing)
+            self.assertEqual(caught.exception.code, "database_migration_failed")
+            self.assertFalse(failing.in_transaction)
+            status = database_schema_status(failing)
+            self.assertEqual(status["current_database_schema_version"], 0)
+            self.assertTrue(status["missing_generation_table"])
+            self.assertIn("idx_nodes_conversation_flag_parent", status["missing_indexes"])
+            failing.close()
+
+            repaired = connect(db)
+            result = migrate_database(repaired)
+            self.assertTrue(result["changed"])
+            self.assertEqual(database_schema_status(repaired)["current_database_schema_version"], DATABASE_SCHEMA_VERSION)
+            repaired.close()
+
+    def test_migration_readonly_locked_and_foreign_key_failures_are_stable(self):
+        from chatgpt_export_archiver.db import DatabaseMigrationError, migrate_database
+
+        fixture = Path(__file__).resolve().parent / "fixtures" / "legacy-fa37b3d.sql"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "legacy.db"
+            conn = sqlite3.connect(db)
+            conn.executescript(fixture.read_text(encoding="utf-8"))
+            conn.close()
+
+            readonly = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+            readonly.row_factory = sqlite3.Row
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(readonly)
+            self.assertEqual(caught.exception.code, "database_readonly")
+            readonly.close()
+
+            lock = sqlite3.connect(db)
+            lock.execute("BEGIN EXCLUSIVE")
+            blocked = sqlite3.connect(db)
+            blocked.row_factory = sqlite3.Row
+            blocked.execute("PRAGMA busy_timeout = 1")
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(blocked)
+            self.assertEqual(caught.exception.code, "database_locked")
+            blocked.close()
+            lock.rollback()
+            lock.close()
+
+            damaged = sqlite3.connect(base / "damaged.db")
+            damaged.row_factory = sqlite3.Row
+            init_db(damaged)
+            damaged.execute("PRAGMA foreign_keys = OFF")
+            damaged.execute("INSERT INTO source_files(import_run_id, source_path, file_type) VALUES (999, 'synthetic', 'json')")
+            damaged.execute("DROP INDEX idx_nodes_conversation_flag_parent")
+            damaged.commit()
+            damaged.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(damaged)
+            self.assertEqual(caught.exception.code, "database_foreign_key_violation")
+            damaged.close()
+
+    def test_concurrent_writable_migrations_are_serialized_and_idempotent(self):
+        import threading
+
+        from chatgpt_export_archiver.db import database_schema_status, migrate_database
+
+        fixture = Path(__file__).resolve().parent / "fixtures" / "legacy-fa37b3d.sql"
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.db"
+            seed = sqlite3.connect(db)
+            seed.executescript(fixture.read_text(encoding="utf-8"))
+            seed.close()
+            barrier = threading.Barrier(2)
+            changed: list[bool] = []
+            errors: list[str] = []
+
+            def worker():
+                conn = connect(db)
+                try:
+                    barrier.wait()
+                    changed.append(bool(migrate_database(conn)["changed"]))
+                except Exception as exc:  # pragma: no cover - asserted below
+                    errors.append(type(exc).__name__)
+                finally:
+                    conn.close()
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(changed), [False, True])
+            conn = connect(db)
+            self.assertTrue(database_schema_status(conn)["ok"])
+            conn.close()
+
 if __name__ == "__main__":
     unittest.main()

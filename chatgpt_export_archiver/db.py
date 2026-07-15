@@ -11,10 +11,171 @@ from .current_path import effective_current_metadata, ensure_effective_current_v
 
 from .parser import ParsedConversation, WarningRecord
 from .scanner import InputSource, SourceEntry
+from .schema_contract import DATABASE_SCHEMA_VERSION
+from .sqlite_errors import is_fts5_capability_unavailable, sqlite_runtime_error_code
 from .utils import compact_json, finite_float_or_none, utc_now_iso
 
 SQLITE_VARIABLE_CHUNK = 500
 INSERT_ROW_CHUNK = 5000
+CANONICAL_TABLE_DDL = (
+    """CREATE TABLE IF NOT EXISTS import_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        input_path TEXT NOT NULL,
+        input_kind TEXT NOT NULL,
+        input_sha256 TEXT,
+        input_size INTEGER,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        status TEXT NOT NULL,
+        summary_json TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS source_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_run_id INTEGER NOT NULL,
+        source_path TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        size INTEGER,
+        sha256 TEXT,
+        is_conversation_json INTEGER NOT NULL DEFAULT 0,
+        is_selected_conversation_source INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS import_warnings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_run_id INTEGER NOT NULL,
+        source_file TEXT NOT NULL,
+        array_index INTEGER,
+        warning_type TEXT NOT NULL,
+        keys_json TEXT,
+        raw_json TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS conversations (
+        conversation_id TEXT PRIMARY KEY,
+        exported_id TEXT,
+        title TEXT,
+        create_time REAL,
+        update_time REAL,
+        current_node TEXT,
+        source_file TEXT,
+        source_array_index INTEGER,
+        aggregate_hash TEXT NOT NULL,
+        last_import_run_id INTEGER,
+        is_archived INTEGER,
+        is_starred INTEGER,
+        default_model_slug TEXT,
+        metadata_json TEXT,
+        FOREIGN KEY(last_import_run_id) REFERENCES import_runs(id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS conversation_nodes (
+        conversation_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        parent_node_id TEXT,
+        children_json TEXT,
+        message_id TEXT,
+        role TEXT,
+        author_name TEXT,
+        create_time REAL,
+        update_time REAL,
+        content_type TEXT,
+        content_text TEXT,
+        content_hash TEXT,
+        metadata_json TEXT,
+        is_on_current_path INTEGER NOT NULL DEFAULT 0,
+        raw_message_json TEXT,
+        last_import_run_id INTEGER,
+        PRIMARY KEY(conversation_id, node_id),
+        FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        FOREIGN KEY(last_import_run_id) REFERENCES import_runs(id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS exports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        format TEXT NOT NULL,
+        output_path TEXT NOT NULL,
+        output_hash TEXT NOT NULL,
+        exported_at TEXT NOT NULL,
+        export_options_json TEXT,
+        UNIQUE(conversation_id, format, output_path)
+    )""",
+    """CREATE TABLE IF NOT EXISTS file_index (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        import_run_id INTEGER NOT NULL,
+        source_path TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        extension TEXT,
+        size INTEGER,
+        sha256 TEXT,
+        related_conversation_id TEXT,
+        related_message_id TEXT,
+        FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
+    )""",
+)
+
+GENERATION_TABLE_DDL = """CREATE TABLE IF NOT EXISTS archive_generations (
+    name TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0
+)"""
+
+GENERATION_TRIGGER_DDL = {
+    "archive_title_generation_insert": """CREATE TRIGGER IF NOT EXISTS archive_title_generation_insert
+        AFTER INSERT ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
+        END""",
+    "archive_title_generation_update": """CREATE TRIGGER IF NOT EXISTS archive_title_generation_update
+        AFTER UPDATE OF title ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
+        END""",
+    "archive_title_generation_delete": """CREATE TRIGGER IF NOT EXISTS archive_title_generation_delete
+        AFTER DELETE ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
+        END""",
+    "archive_message_generation_insert": """CREATE TRIGGER IF NOT EXISTS archive_message_generation_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
+        END""",
+    "archive_message_generation_update": """CREATE TRIGGER IF NOT EXISTS archive_message_generation_update
+        AFTER UPDATE OF content_text, raw_message_json ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
+        END""",
+    "archive_message_generation_delete": """CREATE TRIGGER IF NOT EXISTS archive_message_generation_delete
+        AFTER DELETE ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
+        END""",
+}
+
+REQUIRED_INDEX_DDL = {
+    "idx_nodes_conversation_path": """CREATE INDEX IF NOT EXISTS idx_nodes_conversation_path
+        ON conversation_nodes(conversation_id, is_on_current_path)""",
+    "idx_nodes_conversation_flag_parent": """CREATE INDEX IF NOT EXISTS idx_nodes_conversation_flag_parent
+        ON conversation_nodes(conversation_id, is_on_current_path, parent_node_id)""",
+    "idx_conversations_times": """CREATE INDEX IF NOT EXISTS idx_conversations_times
+        ON conversations(create_time, update_time)""",
+    "idx_warnings_run": """CREATE INDEX IF NOT EXISTS idx_warnings_run
+        ON import_warnings(import_run_id, warning_type)""",
+}
+
+REQUIRED_INDEX_COLUMNS = {
+    "idx_nodes_conversation_path": ("conversation_id", "is_on_current_path"),
+    "idx_nodes_conversation_flag_parent": ("conversation_id", "is_on_current_path", "parent_node_id"),
+    "idx_conversations_times": ("create_time", "update_time"),
+    "idx_warnings_run": ("import_run_id", "warning_type"),
+}
+
+REQUIRED_GENERATION_ROWS = ("title", "message")
+
+
+class DatabaseMigrationError(ValueError):
+    """Stable, content-free database schema or migration failure."""
+
+    def __init__(self, code: str, *, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.detail = dict(detail or {})
+
+    def __str__(self) -> str:
+        return self.code
 IMPORT_REBUILDABLE_INDEXES = (
     (
         "idx_nodes_conversation_path",
@@ -101,152 +262,141 @@ def recreate_import_rebuildable_indexes(conn: sqlite3.Connection) -> None:
         conn.execute(sql)
 
 
+def _database_has_user_objects(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """SELECT 1 FROM sqlite_master
+           WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'index', 'trigger')
+           LIMIT 1"""
+    ).fetchone()
+    return row is not None
+
+
+def _database_user_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute("PRAGMA user_version").fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def _migration_sqlite_error_code(exc: sqlite3.Error) -> str:
+    code = sqlite_runtime_error_code(exc)
+    return "database_migration_failed" if code == "database_runtime_failure" else code
+
+
+def _base_schema_compatibility(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+    ).fetchall()
+    found = {str(row[0]) for row in rows}
+    required_tables = set(CORE_SCHEMA_COLUMNS) - {"archive_generations"}
+    missing_tables = sorted(required_tables - found)
+    missing_columns: dict[str, list[str]] = {}
+    for table in sorted(required_tables & found):
+        required_columns = CORE_SCHEMA_COLUMNS[table]
+        columns = {str(row[1]) for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
+        missing = sorted(required_columns - columns)
+        if missing:
+            missing_columns[table] = missing
+    return {
+        "compatible": not missing_tables and not missing_columns,
+        "missing_tables": missing_tables,
+        "missing_columns": missing_columns,
+    }
+
+
+def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False) -> dict[str, Any]:
+    """Initialize or migrate the canonical schema in one protected transaction.
+
+    Read-only callers never invoke this function.  The schema version is
+    raised only after every required table, row, trigger, and index succeeds.
+    """
+
+    try:
+        has_objects = _database_has_user_objects(conn)
+        current_version = _database_user_version(conn)
+    except sqlite3.Error as exc:
+        raise DatabaseMigrationError(
+            _migration_sqlite_error_code(exc),
+            detail={"error_type": type(exc).__name__},
+        ) from exc
+    if current_version > DATABASE_SCHEMA_VERSION:
+        raise DatabaseMigrationError(
+            "database_schema_newer",
+            detail={
+                "current_database_schema_version": current_version,
+                "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+            },
+        )
+    if not has_objects and not allow_initialize:
+        raise DatabaseMigrationError("database_not_ready")
+    try:
+        if has_objects:
+            compatibility = _base_schema_compatibility(conn)
+            if not compatibility["compatible"]:
+                raise DatabaseMigrationError("database_schema_incompatible", detail=compatibility)
+            violation = conn.execute("PRAGMA foreign_key_check").fetchone()
+            if violation is not None:
+                raise DatabaseMigrationError("database_foreign_key_violation")
+        before = database_schema_status(conn)
+    except DatabaseMigrationError:
+        raise
+    except sqlite3.Error as exc:
+        raise DatabaseMigrationError(
+            _migration_sqlite_error_code(exc),
+            detail={"error_type": type(exc).__name__},
+        ) from exc
+    if before["schema_compatible"] and not before["migration_required"]:
+        return {"changed": False, "initialized": False, **before}
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_status = database_schema_status(conn)
+        if locked_status["schema_compatible"] and not locked_status["migration_required"]:
+            conn.commit()
+            return {"changed": False, "initialized": False, **locked_status}
+        if not has_objects:
+            for statement in CANONICAL_TABLE_DDL:
+                conn.execute(statement)
+        generation_infrastructure_changed = bool(
+            before.get("missing_generation_table")
+            or before.get("missing_generation_rows")
+            or before.get("missing_triggers")
+        )
+        if generation_infrastructure_changed and has_objects:
+            failures = drop_optional_web_indexes(conn)
+            if failures:
+                raise DatabaseMigrationError(
+                    "optional_web_index_cleanup_failed",
+                    detail={"failures": failures},
+                )
+        conn.execute(GENERATION_TABLE_DDL)
+        conn.executemany(
+            "INSERT OR IGNORE INTO archive_generations(name, generation) VALUES (?, 0)",
+            ((name,) for name in REQUIRED_GENERATION_ROWS),
+        )
+        for statement in GENERATION_TRIGGER_DDL.values():
+            conn.execute(statement)
+        for statement in REQUIRED_INDEX_DDL.values():
+            conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+        after = database_schema_status(conn)
+        if not after["schema_compatible"] or after["migration_required"]:
+            raise DatabaseMigrationError("database_migration_incomplete", detail=after)
+        conn.commit()
+    except DatabaseMigrationError:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    except sqlite3.Error as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        raise DatabaseMigrationError(
+            _migration_sqlite_error_code(exc),
+            detail={"error_type": type(exc).__name__},
+        ) from exc
+    return {"changed": True, "initialized": not has_objects, **after}
+
+
 def init_db(conn: sqlite3.Connection) -> bool:
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS import_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            input_path TEXT NOT NULL,
-            input_kind TEXT NOT NULL,
-            input_sha256 TEXT,
-            input_size INTEGER,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            status TEXT NOT NULL,
-            summary_json TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS source_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            import_run_id INTEGER NOT NULL,
-            source_path TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            size INTEGER,
-            sha256 TEXT,
-            is_conversation_json INTEGER NOT NULL DEFAULT 0,
-            is_selected_conversation_source INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS import_warnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            import_run_id INTEGER NOT NULL,
-            source_file TEXT NOT NULL,
-            array_index INTEGER,
-            warning_type TEXT NOT NULL,
-            keys_json TEXT,
-            raw_json TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS conversations (
-            conversation_id TEXT PRIMARY KEY,
-            exported_id TEXT,
-            title TEXT,
-            create_time REAL,
-            update_time REAL,
-            current_node TEXT,
-            source_file TEXT,
-            source_array_index INTEGER,
-            aggregate_hash TEXT NOT NULL,
-            last_import_run_id INTEGER,
-            is_archived INTEGER,
-            is_starred INTEGER,
-            default_model_slug TEXT,
-            metadata_json TEXT,
-            FOREIGN KEY(last_import_run_id) REFERENCES import_runs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS conversation_nodes (
-            conversation_id TEXT NOT NULL,
-            node_id TEXT NOT NULL,
-            parent_node_id TEXT,
-            children_json TEXT,
-            message_id TEXT,
-            role TEXT,
-            author_name TEXT,
-            create_time REAL,
-            update_time REAL,
-            content_type TEXT,
-            content_text TEXT,
-            content_hash TEXT,
-            metadata_json TEXT,
-            is_on_current_path INTEGER NOT NULL DEFAULT 0,
-            raw_message_json TEXT,
-            last_import_run_id INTEGER,
-            PRIMARY KEY(conversation_id, node_id),
-            FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-            FOREIGN KEY(last_import_run_id) REFERENCES import_runs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS exports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            format TEXT NOT NULL,
-            output_path TEXT NOT NULL,
-            output_hash TEXT NOT NULL,
-            exported_at TEXT NOT NULL,
-            export_options_json TEXT,
-            UNIQUE(conversation_id, format, output_path)
-        );
-
-        CREATE TABLE IF NOT EXISTS file_index (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            import_run_id INTEGER NOT NULL,
-            source_path TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            extension TEXT,
-            size INTEGER,
-            sha256 TEXT,
-            related_conversation_id TEXT,
-            related_message_id TEXT,
-            FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS archive_generations (
-            name TEXT PRIMARY KEY,
-            generation INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT OR IGNORE INTO archive_generations(name, generation) VALUES ('title', 0);
-        INSERT OR IGNORE INTO archive_generations(name, generation) VALUES ('message', 0);
-
-        CREATE TRIGGER IF NOT EXISTS archive_title_generation_insert
-        AFTER INSERT ON conversations BEGIN
-            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
-        END;
-        CREATE TRIGGER IF NOT EXISTS archive_title_generation_update
-        AFTER UPDATE OF title ON conversations BEGIN
-            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
-        END;
-        CREATE TRIGGER IF NOT EXISTS archive_title_generation_delete
-        AFTER DELETE ON conversations BEGIN
-            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
-        END;
-        CREATE TRIGGER IF NOT EXISTS archive_message_generation_insert
-        AFTER INSERT ON conversation_nodes BEGIN
-            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
-        END;
-        DROP TRIGGER IF EXISTS archive_message_generation_update;
-        CREATE TRIGGER archive_message_generation_update
-        AFTER UPDATE OF content_text, raw_message_json ON conversation_nodes BEGIN
-            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
-        END;
-        CREATE TRIGGER IF NOT EXISTS archive_message_generation_delete
-        AFTER DELETE ON conversation_nodes BEGIN
-            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
-        END;
-
-        CREATE INDEX IF NOT EXISTS idx_nodes_conversation_path
-            ON conversation_nodes(conversation_id, is_on_current_path);
-        CREATE INDEX IF NOT EXISTS idx_nodes_conversation_flag_parent
-            ON conversation_nodes(conversation_id, is_on_current_path, parent_node_id);
-        CREATE INDEX IF NOT EXISTS idx_conversations_times
-            ON conversations(create_time, update_time);
-        CREATE INDEX IF NOT EXISTS idx_warnings_run
-            ON import_warnings(import_run_id, warning_type);
-        """
-    )
+    migrate_database(conn, allow_initialize=True)
     fts_enabled = ensure_fts(conn)
     conn.commit()
     return fts_enabled
@@ -316,8 +466,10 @@ def ensure_fts(conn: sqlite3.Connection) -> bool:
             """
         )
         return True
-    except sqlite3.OperationalError:
-        return False
+    except sqlite3.OperationalError as exc:
+        if is_fts5_capability_unavailable(exc):
+            return False
+        raise
 
 
 def begin_import_run(
@@ -856,8 +1008,8 @@ CORE_SCHEMA_TABLES = frozenset({
     "file_index",
     "conversations",
     "conversation_nodes",
-    "message_fts",
     "exports",
+    "archive_generations",
 })
 
 CORE_SCHEMA_COLUMNS = {
@@ -893,27 +1045,122 @@ CORE_SCHEMA_COLUMNS = {
         "id", "import_run_id", "source_path", "file_type", "extension", "size",
         "sha256", "related_conversation_id", "related_message_id",
     }),
-    "message_fts": frozenset({"conversation_id", "node_id", "role", "content_text"}),
+    "archive_generations": frozenset({"name", "generation"}),
 }
 
 
-def check_core_schema(conn: sqlite3.Connection) -> dict[str, Any]:
-    rows = conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')").fetchall()
-    found = {row["name"] if isinstance(row, sqlite3.Row) else row[0] for row in rows}
-    missing = sorted(CORE_SCHEMA_TABLES - found)
+REQUIRED_FOREIGN_KEYS = {
+    "source_files": frozenset({("import_run_id", "import_runs", "id", "NO ACTION")}),
+    "import_warnings": frozenset({("import_run_id", "import_runs", "id", "NO ACTION")}),
+    "conversations": frozenset({("last_import_run_id", "import_runs", "id", "NO ACTION")}),
+    "conversation_nodes": frozenset({
+        ("conversation_id", "conversations", "conversation_id", "CASCADE"),
+        ("last_import_run_id", "import_runs", "id", "NO ACTION"),
+    }),
+    "file_index": frozenset({("import_run_id", "import_runs", "id", "NO ACTION")}),
+}
+
+
+def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Inspect the read-only runtime schema contract without executing DDL."""
+
+    current_version = _database_user_version(conn)
+    rows = conn.execute(
+        "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view', 'trigger', 'index')"
+    ).fetchall()
+    objects = {str(row[0]): str(row[1]) for row in rows}
+    tables = {name for name, kind in objects.items() if kind in {"table", "view"}}
+    missing_tables = sorted(CORE_SCHEMA_TABLES - tables)
     missing_columns: dict[str, list[str]] = {}
     for table, required_columns in CORE_SCHEMA_COLUMNS.items():
-        if table not in found:
+        if table not in tables:
             continue
         try:
-            columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
+            columns = {str(row[1]) for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
         except sqlite3.Error:
             missing_columns[table] = sorted(required_columns)
             continue
-        missing_for_table = sorted(required_columns - columns)
-        if missing_for_table:
-            missing_columns[table] = missing_for_table
-    return {"schema_ok": not missing and not missing_columns, "missing_tables": missing, "missing_columns": missing_columns}
+        missing = sorted(required_columns - columns)
+        if missing:
+            missing_columns[table] = missing
+
+    missing_indexes: list[str] = []
+    invalid_indexes: dict[str, dict[str, list[str]]] = {}
+    for name, expected in REQUIRED_INDEX_COLUMNS.items():
+        if objects.get(name) != "index":
+            missing_indexes.append(name)
+            continue
+        actual = tuple(str(row[2]) for row in conn.execute(f'PRAGMA index_info("{name}")'))
+        if actual != expected:
+            invalid_indexes[name] = {"expected": list(expected), "actual": list(actual)}
+
+    missing_triggers = sorted(set(GENERATION_TRIGGER_DDL) - {name for name, kind in objects.items() if kind == "trigger"})
+    generation_rows: set[str] = set()
+    if "archive_generations" in tables and "archive_generations" not in missing_columns:
+        try:
+            generation_rows = {str(row[0]) for row in conn.execute("SELECT name FROM archive_generations")}
+        except sqlite3.Error:
+            generation_rows = set()
+    missing_generation_rows = sorted(set(REQUIRED_GENERATION_ROWS) - generation_rows)
+
+    missing_foreign_keys: dict[str, list[dict[str, str]]] = {}
+    for table, required in REQUIRED_FOREIGN_KEYS.items():
+        if table not in tables:
+            continue
+        actual = {
+            (str(row[3]), str(row[2]), str(row[4]), str(row[6]).upper())
+            for row in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+        }
+        missing = required - actual
+        if missing:
+            missing_foreign_keys[table] = [
+                {"column": column, "parent_table": parent, "parent_column": parent_column, "on_delete": on_delete}
+                for column, parent, parent_column, on_delete in sorted(missing)
+            ]
+
+    base_missing_tables = sorted((set(CORE_SCHEMA_COLUMNS) - {"archive_generations"}) - tables)
+    base_missing_columns = {
+        table: columns for table, columns in missing_columns.items() if table != "archive_generations"
+    }
+    base_compatible = not base_missing_tables and not base_missing_columns and not missing_foreign_keys
+    managed_missing = bool(
+        "archive_generations" in missing_tables
+        or missing_generation_rows
+        or missing_triggers
+        or missing_indexes
+        or invalid_indexes
+    )
+    version_migration_required = current_version < DATABASE_SCHEMA_VERSION
+    schema_newer = current_version > DATABASE_SCHEMA_VERSION
+    migration_required = bool(base_compatible and not schema_newer and (version_migration_required or managed_missing))
+    schema_compatible = bool(base_compatible and not schema_newer and not migration_required)
+    return {
+        "ok": schema_compatible,
+        "schema_compatible": schema_compatible,
+        "base_schema_compatible": base_compatible,
+        "migration_required": migration_required,
+        "current_database_schema_version": current_version,
+        "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+        "database_schema_newer": schema_newer,
+        "missing_tables": missing_tables,
+        "missing_columns": missing_columns,
+        "missing_indexes": sorted(missing_indexes),
+        "invalid_indexes": invalid_indexes,
+        "missing_triggers": missing_triggers,
+        "missing_generation_table": "archive_generations" in missing_tables,
+        "missing_generation_rows": missing_generation_rows,
+        "missing_foreign_keys": missing_foreign_keys,
+        "foreign_keys_enabled": bool(conn.execute("PRAGMA foreign_keys").fetchone()[0]),
+        "message_fts_available": "message_fts" in tables,
+    }
+
+
+def check_core_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    status = database_schema_status(conn)
+    return {
+        "schema_ok": status["ok"],
+        **status,
+    }
 
 
 def _run_integrity_check(conn: sqlite3.Connection) -> list[str]:

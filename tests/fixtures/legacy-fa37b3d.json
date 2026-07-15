@@ -1,0 +1,9 @@
+{
+  "source_commit": "fa37b3d70ff501b59b168690ea8de69bcadb0c38",
+  "source_kind": "git_archive_real_legacy_import_normalized_virtual_table_dump",
+  "fixture": "legacy-fa37b3d.sql",
+  "fixture_sha256": "54da0969272f4098fed138a11f8c6028586d0b84aac7090bb105d44382166e7e",
+  "conversation_count": 1,
+  "node_count": 3,
+  "synthetic_only": true
+}
