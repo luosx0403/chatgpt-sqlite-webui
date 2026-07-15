@@ -175,6 +175,35 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(page["has_more"])
         self.assertEqual(page["next_offset"], 1)
 
+    def test_sqlite_runtime_failures_use_safe_structured_http_errors(self):
+        td, original_client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        original_client.close()
+        app = create_app(db)
+        client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(client.close)
+        private = "/private/synthetic/archive.db"
+        for message, code, status in (
+            (f"database disk image is malformed {private}", "database_malformed", 500),
+            (f"database is locked {private}", "database_locked", 503),
+            (f"attempt to write a readonly database {private}", "database_readonly", 503),
+            (f"disk I/O error {private}", "database_io_error", 503),
+            (f"near secret: syntax error {private}", "database_runtime_failure", 500),
+        ):
+            with self.subTest(code=code), mock.patch(
+                "chatgpt_export_archiver.web_api.list_conversations",
+                side_effect=sqlite3.OperationalError(message),
+            ):
+                response = client.get("/api/conversations")
+            self.assertEqual(response.status_code, status)
+            self.assertEqual(
+                response.json(),
+                {"detail": {"code": code, "error_type": "OperationalError"}},
+            )
+            self.assertNotIn(private, response.text)
+            self.assertNotIn("secret", response.text)
+            self.assertIn(code, client.get("/api/schema").json()["stable_error_codes"])
+
     def test_web_starts_without_database_and_serves_empty_contract(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -368,6 +397,11 @@ class WebApiTests(unittest.TestCase):
             "code": "uploaded_file_invalid_zip",
             "cleanup_warning": "temporary_upload_cleanup_failed",
             "cleanup_error_type": "PermissionError",
+            "cleanup_warnings": [{
+                "code": "temporary_upload_cleanup_failed",
+                "error_type": "PermissionError",
+                "path_kind": "upload_directory",
+            }],
         })
         self.assertNotIn(str(base), invalid_zip.text)
 
@@ -677,7 +711,7 @@ class WebApiTests(unittest.TestCase):
         self.assertGreater(exact["total"], 0)
         self.assertEqual(exact["items"], [])
 
-    def test_messages_include_render_text_and_bounded_raw_preview(self):
+    def test_messages_use_single_display_text_and_bounded_raw_preview(self):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
         page = client.get("/api/conversations/web-3/messages?path=current&include_internal=true").json()
@@ -689,7 +723,212 @@ class WebApiTests(unittest.TestCase):
         payload = json.dumps(page)
         self.assertIn("raw_preview", payload)
         self.assertNotIn("raw_message_json", payload)
+        for item in page["items"]:
+            self.assertNotIn("content_text", item)
+            self.assertNotIn("render_text", item)
         self.assertNotIn("private_note", payload)
+
+    def test_reader_reuses_one_raw_decode_per_row_for_around_paths(self):
+        from chatgpt_export_archiver import search as search_module
+
+        td, _client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        raw_rows = []
+        for index in range(30):
+            raw = json.dumps(
+                {
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [f"legacy raw {index}"]},
+                }
+            )
+            raw_rows.append((f"legacy-{index}", f"msg-legacy-{index}", 1_800_000_000 + index, raw))
+        conn = sqlite3.connect(db)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO conversation_nodes(
+                    conversation_id, node_id, parent_node_id, children_json,
+                    message_id, role, create_time, update_time, content_type,
+                    content_text, content_hash, is_on_current_path, raw_message_json
+                ) VALUES('web-1', ?, 'root', '[]', ?, 'user', ?, ?, 'text',
+                         '[non-text content: legacy]', NULL, 0, ?)
+                """,
+                [(node_id, message_id, ts, ts, raw) for node_id, message_id, ts, raw in raw_rows],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        real_loads = search_module.json_loads
+        for include_internal in (True, False):
+            for force_sql in (False, True):
+                with self.subTest(include_internal=include_internal, force_sql=force_sql):
+                    calls = {"count": 0}
+
+                    def counting_loads(value):
+                        calls["count"] += 1
+                        return real_loads(value)
+
+                    conn = connect_readonly(db)
+                    try:
+                        with mock.patch.object(search_module, "json_loads", side_effect=counting_loads), mock.patch.object(
+                            search_module,
+                            "MAX_AROUND_NODE_ROWS",
+                            10 if force_sql else 10_000,
+                        ):
+                            page = search_module.get_messages(
+                                conn,
+                                "web-1",
+                                path="all",
+                                limit=100,
+                                offset=0,
+                                around_node_id="legacy-15",
+                                highlight_query="legacy raw",
+                                include_internal=include_internal,
+                            )
+                    finally:
+                        conn.close()
+                    legacy_items = [item for item in page["items"] if item["node_id"].startswith("legacy-")]
+                    self.assertEqual(len(legacy_items), 30)
+                    expected_calls = 33 if force_sql and not include_internal else 34
+                    self.assertEqual(calls["count"], expected_calls)
+
+    def test_long_message_response_has_one_full_text_copy(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        canonical = "c" * 100_000
+        recovered = "r" * 100_000
+        raw = json.dumps(
+            {"author": {"role": "user"}, "content": {"content_type": "text", "parts": [recovered]}},
+            separators=(",", ":"),
+        )
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "UPDATE conversation_nodes SET content_text = ?, raw_message_json = NULL WHERE conversation_id = 'web-1' AND node_id = 'u1'",
+                (canonical,),
+            )
+            conn.execute(
+                "UPDATE conversation_nodes SET content_text = '[non-text content: legacy]', raw_message_json = ? WHERE conversation_id = 'web-1' AND node_id = 'a1'",
+                (raw,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        response = client.get("/api/conversations/web-1/messages?path=all&include_internal=true&limit=20")
+        page = response.json()
+        by_id = {item["node_id"]: item for item in page["items"]}
+        self.assertEqual(by_id["u1"]["display_text"], canonical)
+        self.assertEqual(by_id["a1"]["display_text"], recovered)
+        self.assertNotIn("content_text", by_id["u1"])
+        self.assertNotIn("render_text", by_id["u1"])
+        self.assertLess(len(response.content), 260_000)
+
+    def test_raw_resolver_decode_counts_scale_once_per_row(self):
+        from chatgpt_export_archiver import search as search_module
+
+        template = {
+            "message_id": "synthetic",
+            "role": "user",
+            "content_type": "text",
+            "content_text": "[non-text content: legacy]",
+        }
+        real_loads = search_module.json_loads
+        for count in (1, 30, 300):
+            rows = []
+            for index in range(count):
+                rows.append({
+                    **template,
+                    "node_id": f"n-{index}",
+                    "raw_message_json": json.dumps({
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": [f"raw body {index}"]},
+                    }),
+                })
+            calls = {"count": 0}
+
+            def counting_loads(value):
+                calls["count"] += 1
+                return real_loads(value)
+
+            with self.subTest(count=count), mock.patch.object(search_module, "json_loads", side_effect=counting_loads):
+                resolved = [search_module._message_display_fields(row) for row in rows]
+            self.assertEqual(calls["count"], count)
+            self.assertEqual(len({item["display_text"] for item in resolved}), count)
+
+    def test_raw_resolver_boundaries_do_not_parse_oversized_values(self):
+        from chatgpt_export_archiver import search as search_module
+
+        prefix = '{"author":{"role":"user"},"content":{"content_type":"text","parts":["'
+        suffix = '"]}}'
+
+        def raw_of_size(size):
+            return prefix + ("x" * (size - len(prefix) - len(suffix))) + suffix
+
+        base = {
+            "node_id": "boundary",
+            "message_id": "synthetic",
+            "role": "user",
+            "content_type": "text",
+            "content_text": "[non-text content: legacy]",
+        }
+        for size, expected_decodes, recovered in (
+            (200_000, 1, True),
+            (200_001, 0, False),
+            (1_000_000, 0, False),
+            (30_000_000, 0, False),
+        ):
+            raw = raw_of_size(size)
+            with self.subTest(size=size), mock.patch.object(search_module, "json_loads", wraps=search_module.json_loads) as loads:
+                fields = search_module._message_display_fields({**base, "raw_message_json": raw})
+            self.assertEqual(loads.call_count, expected_decodes)
+            self.assertEqual(fields["display_text"].startswith("x"), recovered)
+            self.assertLessEqual(len(fields["raw_preview"]), 20_100)
+            self.assertEqual(fields["raw_preview_truncated"], size > 20_000)
+
+    def test_search_and_web_index_sql_resolve_each_candidate_once(self):
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver import web_db as web_db_module
+
+        td, _client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        real_search_resolver = search_module.recover_message_display_text
+        search_calls = {"count": 0}
+
+        def count_search(content_text, raw_message_json):
+            search_calls["count"] += 1
+            return real_search_resolver(content_text, raw_message_json)
+
+        conn = connect_readonly(db)
+        try:
+            with mock.patch.object(search_module, "recover_message_display_text", side_effect=count_search):
+                page = search_module.search_messages(
+                    conn,
+                    search_module.parse_query("python", path_default="all"),
+                    conversation_id="web-1",
+                    limit=20,
+                    count_total=False,
+                )
+        finally:
+            conn.close()
+        self.assertTrue(page["items"])
+        self.assertEqual(search_calls["count"], 5)
+
+        real_index_resolver = web_db_module.recover_message_display_text
+        index_calls = {"count": 0}
+
+        def count_index(content_text, raw_message_json):
+            index_calls["count"] += 1
+            return real_index_resolver(content_text, raw_message_json)
+
+        conn = sqlite3.connect(db)
+        try:
+            node_count = conn.execute("SELECT COUNT(*) FROM conversation_nodes").fetchone()[0]
+        finally:
+            conn.close()
+        with mock.patch.object(web_db_module, "recover_message_display_text", side_effect=count_index):
+            web_db_module.create_web_indexes(db)
+        self.assertEqual(index_calls["count"], node_count)
 
     def test_plain_reader_bounds_large_raw_blob_in_sql(self):
         from chatgpt_export_archiver.search import get_messages
@@ -2896,7 +3135,56 @@ class WebApiTests(unittest.TestCase):
                 manager._run_job(job)
             self.assertEqual(job.status, "succeeded")
             self.assertEqual(job.cleanup_warning, "summary_update_after_commit_failed")
+            self.assertEqual(job.cleanup_warnings, [{
+                "code": "summary_update_after_commit_failed",
+                "error_type": "synthetic",
+                "path_kind": "import_summary",
+            }])
             self.assertTrue(job.canonical_commit_succeeded)
+
+    def test_web_job_accumulates_cleanup_warnings_without_changing_success(self):
+        from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upload = base / "upload.zip"
+            upload.write_bytes(b"synthetic")
+            manager = ImportJobManager(base / "archive.db")
+            job = ImportJob("job", base / "archive.db", upload, "synthetic.zip", upload.stat().st_size)
+            result = {
+                "summary": {"import_run_id": 1},
+                "summary_update_after_commit_failed": "OperationalError",
+                "import_connection_close_failed": "OSError",
+            }
+            cleanup_failure = {
+                "ok": False,
+                "error_type": "PermissionError",
+                "path_still_exists": True,
+                "partial_cleanup": True,
+            }
+            with mock.patch("chatgpt_export_archiver.web_jobs.run_import_pipeline", return_value=result), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.connect"), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.verify_database", return_value={"ok": True}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.get_stats", return_value={"conversations": 1}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.create_web_indexes", return_value={"indexed_messages": 1}), \
+                 mock.patch.object(Path, "unlink", side_effect=PermissionError("private path")), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.cleanup_upload_dir", return_value=cleanup_failure):
+                manager._run_job(job)
+            snapshot = job.snapshot()
+            self.assertEqual(snapshot["status"], "succeeded")
+            self.assertTrue(snapshot["canonical_commit_succeeded"])
+            self.assertEqual(snapshot["cleanup_warning"], "summary_update_after_commit_failed")
+            self.assertEqual(
+                [item["code"] for item in snapshot["cleanup_warnings"]],
+                [
+                    "summary_update_after_commit_failed",
+                    "import_connection_close_failed",
+                    "upload_file_unlink_failed",
+                    "upload_directory_cleanup_failed",
+                ],
+            )
+            self.assertNotIn(str(base), json.dumps(snapshot))
+            self.assertFalse(manager.has_running_job())
 
     def test_web_job_error_is_sanitized(self):
         from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
@@ -3802,6 +4090,11 @@ class WebApiTests(unittest.TestCase):
         with mock.patch("chatgpt_export_archiver.web_api.make_upload_path", side_effect=OSError("synthetic temp failure")):
             response = client.post("/api/import/upload", files={"file": ("synthetic.zip", b"not a real zip", "application/zip")})
         self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.json()["detail"],
+            {"code": "upload_preflight_failed", "error_type": "OSError"},
+        )
+        self.assertNotIn(str(base), response.text)
         self.assertFalse(manager.has_running_job())
 
         good_zip = base / "good.zip"
@@ -3814,6 +4107,44 @@ class WebApiTests(unittest.TestCase):
         self.wait_job(client, second.json()["job_id"])
         self.assertFalse(manager.has_running_job())
         client.close()
+
+    def test_unexpected_upload_preflight_failures_return_safe_json(self):
+        from fastapi import FastAPI
+        from chatgpt_export_archiver import web_api
+        from chatgpt_export_archiver.web_api import create_api_router
+        from chatgpt_export_archiver.web_jobs import ImportJobManager
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        valid = base / "valid.zip"
+        write_zip(valid, [conv("unexpected-upload", "Synthetic", {"root": root([])}, "root", 1)])
+        cases = (
+            ("zip_probe", mock.patch.object(web_api.zipfile, "is_zipfile", side_effect=RuntimeError("private probe detail")), "RuntimeError"),
+            ("zip_validation", mock.patch.object(web_api, "_validate_upload_zip_members", side_effect=PermissionError("private validation detail")), "PermissionError"),
+            ("job_start", mock.patch.object(web_api.ImportJobManager, "start_import", side_effect=ValueError("private start detail")), "ValueError"),
+        )
+        for label, patcher, error_type in cases:
+            with self.subTest(label=label):
+                manager = ImportJobManager(base / f"{label}.db")
+                app = FastAPI()
+                app.include_router(create_api_router(base / f"{label}.db", manager))
+                client = TestClient(app, raise_server_exceptions=False)
+                with patcher:
+                    response = client.post(
+                        "/api/import/upload",
+                        files={"file": ("valid.zip", valid.read_bytes(), "application/zip")},
+                    )
+                self.assertEqual(response.status_code, 500, response.text)
+                self.assertEqual(response.headers["content-type"].split(";", 1)[0], "application/json")
+                self.assertEqual(response.json()["detail"], {
+                    "code": "upload_preflight_failed",
+                    "error_type": error_type,
+                })
+                self.assertNotIn(str(base), response.text)
+                self.assertNotIn("private", response.text)
+                self.assertFalse(manager.has_running_job())
+                client.close()
 
     def test_upload_policy_remote_opt_in_for_all_limits(self):
         from chatgpt_export_archiver.web_api import _get_upload_policy, REMOTE_DEFAULT_MAX_UPLOAD_BYTES, REMOTE_DEFAULT_TOTAL_UNCOMPRESSED
@@ -3952,6 +4283,30 @@ class WebApiTests(unittest.TestCase):
             _validate_upload_zip_members(z, normal_policy)
         except Exception:
             self.fail("legal zip should not raise")
+
+    def test_upload_total_members_counts_directory_entries(self):
+        from chatgpt_export_archiver.web_api import UploadPolicy, _validate_upload_zip_members
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        z = Path(td.name) / "directory-members.zip"
+        with zipfile.ZipFile(z, "w") as archive:
+            for index in range(10):
+                archive.writestr(f"directory-{index}/", b"")
+            archive.writestr("conversations.json", "[]")
+        policy = UploadPolicy(
+            max_upload_bytes=1024 * 1024,
+            max_json_member_bytes=1024 * 1024,
+            max_json_members=3,
+            max_total_uncompressed_bytes=1024 * 1024,
+            max_compression_ratio=100.0,
+            max_total_members=3,
+            remote=False,
+        )
+        with self.assertRaises(Exception) as caught:
+            _validate_upload_zip_members(z, policy)
+        self.assertEqual(caught.exception.status_code, 413)
+        self.assertEqual(caught.exception.detail, "upload_zip_too_many_members")
 
     def test_around_node_id_fallback_avoids_full_row_read(self):
         from chatgpt_export_archiver.search import get_messages, MAX_AROUND_NODE_ROWS, _conversation_rows

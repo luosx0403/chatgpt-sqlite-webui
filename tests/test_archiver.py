@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import io
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -21,7 +22,7 @@ from typing import Any
 from unittest import mock
 
 from chatgpt_export_archiver.cli import build_parser, main
-from chatgpt_export_archiver.db import connect, export_query, init_db, verify_database, drop_optional_web_indexes, _drop_table_with_shadows, _integrity_failure_is_web_index_only, _run_integrity_check, _line_names_web_index_table, _insert_fts_batch, _delete_fts_for_conversation
+from chatgpt_export_archiver.db import connect, export_query, init_db, verify_database, drop_optional_web_indexes, _drop_table_with_shadows, _integrity_failure_is_message_fts_only, _integrity_failure_is_web_index_only, _run_integrity_check, _line_names_web_index_table, _insert_fts_batch, _delete_fts_for_conversation
 from chatgpt_export_archiver.logging_utils import configure_logging, get_logger, parse_log_level
 from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
@@ -824,6 +825,12 @@ class ArchiverTests(unittest.TestCase):
             "webui/node_modules",
             "webui/tsconfig.tsbuildinfo",
             "message_fts",
+            "optional_message_fts_error",
+            "database_malformed",
+            "database_locked",
+            "database_readonly",
+            "database_io_error",
+            "database_runtime_failure",
             "web_message_norm",
             "web_title_norm",
             "web_message_trigram",
@@ -833,6 +840,16 @@ class ArchiverTests(unittest.TestCase):
             "normalized title scan",
             "full scan",
             "remote-safe",
+            "200.0",
+            "1000.0",
+            "PRAGMA user_version",
+            "database_migration_required",
+            "upload_preflight_failed",
+            "invalid_conversation_encoding",
+            "json_integer_too_large",
+            "source_read_failed",
+            "cleanup_warnings",
+            "display_text",
             "/api/schema",
             "current-path node",
             "--input conversations.json",
@@ -2582,6 +2599,8 @@ class ArchiverTests(unittest.TestCase):
             self.assertNotIn(z.name, output)
 
     def test_core_fts_unavailable_is_downgraded_but_other_errors_raise(self):
+        from chatgpt_export_archiver.db import ensure_fts
+
         class FakeConn:
             def __init__(self, message):
                 self.message = message
@@ -2595,8 +2614,68 @@ class ArchiverTests(unittest.TestCase):
         parsed = parse_conversation(conversation("fts-safe"), "conversations.json", 0)
         _insert_fts_batch(FakeConn("no such table: message_fts"), [parsed])
         _delete_fts_for_conversation(FakeConn("no such module: fts5"), "fts-safe")
-        with self.assertRaises(sqlite3.OperationalError):
-            _insert_fts_batch(FakeConn("database disk image is malformed /private/path"), [parsed])
+        self.assertFalse(ensure_fts(FakeConn("no such module: fts5")))
+        for message in (
+            "database disk image is malformed /private/path",
+            "attempt to write a readonly database",
+            "database is locked",
+            "disk I/O error",
+            "near synthetic: syntax error",
+        ):
+            with self.subTest(message=message):
+                with self.assertRaises(sqlite3.OperationalError):
+                    _insert_fts_batch(FakeConn(message), [parsed])
+                with self.assertRaises(sqlite3.OperationalError):
+                    ensure_fts(FakeConn(message))
+
+    def test_optional_message_fts_missing_and_damaged_are_distinct(self):
+        self.assertTrue(_integrity_failure_is_message_fts_only([
+            "malformed inverted index for FTS5 table main.message_fts",
+            "wrong # of entries in index message_fts_idx",
+        ]))
+        self.assertFalse(_integrity_failure_is_message_fts_only([
+            "wrong # of entries in index message_fts_idx",
+            "row missing from index conversations",
+        ]))
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "archive.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute("DROP TABLE IF EXISTS message_fts")
+            missing = verify_database(conn)
+            self.assertTrue(missing["ok"])
+            self.assertFalse(missing["message_fts_available"])
+            self.assertEqual(missing["message_fts_error"], "missing")
+            with mock.patch(
+                "chatgpt_export_archiver.db._run_integrity_check",
+                return_value=["malformed inverted index for FTS5 table main.message_fts"],
+            ):
+                damaged = verify_database(conn)
+            self.assertFalse(damaged["ok"])
+            self.assertTrue(damaged["optional_message_fts_error"])
+            self.assertEqual(damaged["message_fts_error"], "damaged")
+            self.assertIn("--rebuild-fts", damaged["optional_message_fts_recovery_hint"])
+            conn.close()
+
+    def test_cli_sqlite_runtime_errors_are_classified_without_messages(self):
+        private = "/private/synthetic/archive.db"
+        for message, code in (
+            (f"database disk image is malformed {private}", "database_malformed"),
+            (f"database is locked {private}", "database_locked"),
+            (f"attempt to write a readonly database {private}", "database_readonly"),
+            (f"disk I/O error {private}", "database_io_error"),
+            (f"near secret: syntax error {private}", "database_runtime_failure"),
+        ):
+            with self.subTest(code=code), mock.patch(
+                "chatgpt_export_archiver.cli.cmd_search",
+                side_effect=sqlite3.OperationalError(message),
+            ):
+                exit_code, output = run_cli(["--db", "unused.db", "search", "synthetic"])
+            self.assertEqual(exit_code, 2)
+            self.assertIn(code, output)
+            self.assertIn("error_type=OperationalError", output)
+            self.assertNotIn(private, output)
+            self.assertNotIn("secret", output)
 
     def test_web_index_cleanup_drops_shadow_tables(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2956,12 +3035,54 @@ class ArchiverTests(unittest.TestCase):
                     summary = json.loads(run["summary_json"])
                     self.assertEqual(run["status"], "failed")
                     self.assertEqual(summary["failure_code"], "non_finite_json_number")
-                    warnings = conn.execute("SELECT warning_type FROM import_warnings WHERE import_run_id = ?", (summary["import_run_id"],)).fetchall()
+                    warnings = conn.execute(
+                        "SELECT warning_type FROM import_warnings WHERE import_run_id = ?",
+                        (summary["import_run_id"],),
+                    ).fetchall()
                     self.assertEqual([row["warning_type"] for row in warnings], ["non_finite_json_number"])
                     self.assertEqual(summary["warnings"], len(warnings))
-                    self.assertEqual(summary["warnings_by_type"], [{"count": 1, "warning_type": "non_finite_json_number"}])
+                    self.assertEqual(
+                        summary["warnings_by_type"],
+                        [{"count": 1, "warning_type": "non_finite_json_number"}],
+                    )
                 finally:
                     conn.close()
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            payload = conversation("finite-and-invalid")
+            payload["create_time"] = "abc"
+            payload["update_time"] = {"invalid": True}
+            payload["mapping"]["u1"]["message"]["create_time"] = []
+            payload["mapping"]["u1"]["message"]["update_time"] = {"invalid": True}
+            payload["mapping"]["a1"]["message"]["create_time"] = 1e308
+            payload["mapping"]["a1"]["message"]["update_time"] = 5e-324
+            payload["mapping"]["a1"]["message"]["metadata"]["finite"] = 1e308
+            source = base / "finite-invalid.zip"
+            write_zip(source, {"conversations.json": [payload]})
+            db = base / "finite-invalid.db"
+            code, output = run_cli([
+                "--db", str(db), "import", "--input", str(source), "--no-input-sha256",
+            ])
+            self.assertEqual(code, 0, output)
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            try:
+                warnings = conn.execute(
+                    "SELECT warning_type, keys_json, raw_json FROM import_warnings WHERE warning_type = 'invalid_timestamp'"
+                ).fetchall()
+                self.assertEqual(len(warnings), 4)
+                self.assertTrue(all(row["raw_json"] is None for row in warnings))
+                self.assertTrue(all(set(json.loads(row["keys_json"])) == {"field", "value_type"} for row in warnings))
+                node = conn.execute(
+                    "SELECT create_time, update_time, metadata_json, raw_message_json FROM conversation_nodes WHERE node_id = 'a1'"
+                ).fetchone()
+                self.assertEqual(node["create_time"], 1e308)
+                self.assertEqual(node["update_time"], 5e-324)
+                self.assertNotRegex(node["metadata_json"], r"(?:NaN|Infinity)")
+                self.assertNotRegex(node["raw_message_json"], r"(?:NaN|Infinity)")
+            finally:
+                conn.close()
 
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -2997,39 +3118,131 @@ class ArchiverTests(unittest.TestCase):
                 self.assertEqual(code, 2, output)
                 self.assertIn("non_finite_json_number", output)
 
-            payload = conversation("finite-and-invalid")
-            payload["create_time"] = "abc"
-            payload["update_time"] = {"invalid": True}
-            payload["mapping"]["u1"]["message"]["create_time"] = []
-            payload["mapping"]["u1"]["message"]["update_time"] = {"invalid": True}
-            payload["mapping"]["a1"]["message"]["create_time"] = 1e308
-            payload["mapping"]["a1"]["message"]["update_time"] = 5e-324
-            payload["mapping"]["a1"]["message"]["metadata"]["finite"] = 1e308
-            source = base / "finite-invalid.zip"
-            write_zip(source, {"conversations.json": [payload]})
-            db = base / "finite-invalid.db"
-            code, output = run_cli([
-                "--db", str(db), "import", "--input", str(source), "--no-input-sha256",
-            ])
-            self.assertEqual(code, 0, output)
-            conn = sqlite3.connect(db)
-            conn.row_factory = sqlite3.Row
-            try:
-                warnings = conn.execute(
-                    "SELECT warning_type, keys_json, raw_json FROM import_warnings WHERE warning_type = 'invalid_timestamp'"
-                ).fetchall()
-                self.assertEqual(len(warnings), 4)
-                self.assertTrue(all(row["raw_json"] is None for row in warnings))
-                self.assertTrue(all(set(json.loads(row["keys_json"])) == {"field", "value_type"} for row in warnings))
-                node = conn.execute(
-                    "SELECT create_time, update_time, metadata_json, raw_message_json FROM conversation_nodes WHERE node_id = 'a1'"
-                ).fetchone()
-                self.assertEqual(node["create_time"], 1e308)
-                self.assertEqual(node["update_time"], 5e-324)
-                self.assertNotRegex(node["metadata_json"], r"(?:NaN|Infinity)")
-                self.assertNotRegex(node["raw_message_json"], r"(?:NaN|Infinity)")
-            finally:
-                conn.close()
+    def test_json_encoding_and_integer_limits_are_stable_for_all_input_forms(self):
+        fixtures = (
+            ("invalid_conversation_encoding", b"[\xff]"),
+            (
+                "json_integer_too_large",
+                b'[{"id":"bounded-int","mapping":{},"metadata":' + (b"9" * 1001) + b"}]",
+            ),
+        )
+        for expected_code, payload in fixtures:
+            for input_kind in ("json", "directory", "zip"):
+                with self.subTest(expected_code=expected_code, input_kind=input_kind), tempfile.TemporaryDirectory() as td:
+                    base = Path(td)
+                    if input_kind == "json":
+                        source = base / "conversations.json"
+                        source.write_bytes(payload)
+                    elif input_kind == "directory":
+                        source = base / "extracted"
+                        source.mkdir()
+                        (source / "conversations.json").write_bytes(payload)
+                    else:
+                        source = base / "export.zip"
+                        with zipfile.ZipFile(source, "w") as archive:
+                            archive.writestr("conversations.json", payload)
+                    db = base / "archive.db"
+                    code, output = run_cli(
+                        ["--db", str(db), "import", "--input", str(source), "--no-input-sha256"]
+                    )
+                    self.assertEqual(code, 2, output)
+                    self.assertIn(expected_code, output)
+                    self.assertIn("stage=json_decode", output)
+                    conn = sqlite3.connect(db)
+                    try:
+                        status, summary_json = conn.execute(
+                            "SELECT status, summary_json FROM import_runs ORDER BY id DESC LIMIT 1"
+                        ).fetchone()
+                    finally:
+                        conn.close()
+                    summary = json.loads(summary_json)
+                    self.assertEqual(status, "failed")
+                    self.assertEqual(summary["failure_code"], expected_code)
+                    self.assertEqual(summary["failure_stage"], "json_decode")
+
+                    inspect_code, inspect_output = run_cli(["inspect", "--input", str(source)])
+                    self.assertEqual(inspect_code, 0, inspect_output)
+                    self.assertIn(f"error_code {expected_code} stage json_decode", inspect_output)
+
+    def test_json_integer_boundary_values_are_stable_and_sqlite_safe(self):
+        values = {
+            "zero": 0,
+            "negative": -1,
+            "sqlite_max": (1 << 63) - 1,
+            "above_sqlite": 1 << 63,
+            "hundreds": int("8" * 300),
+            "at_limit": int("9" * 1000),
+        }
+        for input_kind in ("json", "directory", "zip"):
+            with self.subTest(input_kind=input_kind), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                payload = conversation(f"integer-boundary-{input_kind}")
+                payload["create_time"] = values["above_sqlite"]
+                payload["update_time"] = values["sqlite_max"]
+                payload["is_archived"] = values["above_sqlite"]
+                payload["is_starred"] = values["negative"]
+                payload["context_scopes"] = {"nested": values}
+                payload["mapping"]["a1"]["message"]["metadata"]["nested"] = values
+                encoded = json.dumps([payload], ensure_ascii=False).encode("utf-8")
+                if input_kind == "json":
+                    source = base / "conversations.json"
+                    source.write_bytes(encoded)
+                elif input_kind == "directory":
+                    source = base / "extracted"
+                    source.mkdir()
+                    (source / "conversations.json").write_bytes(encoded)
+                else:
+                    source = base / "export.zip"
+                    with zipfile.ZipFile(source, "w") as archive:
+                        archive.writestr("conversations.json", encoded)
+                db = base / "archive.db"
+                code, output = run_cli([
+                    "--db", str(db), "import", "--input", str(source), "--no-input-sha256",
+                ])
+                self.assertEqual(code, 0, output)
+                conn = sqlite3.connect(db)
+                try:
+                    row = conn.execute(
+                        "SELECT create_time, update_time, is_archived, is_starred, metadata_json FROM conversations"
+                    ).fetchone()
+                    self.assertTrue(math.isfinite(row[0]))
+                    self.assertTrue(math.isfinite(row[1]))
+                    self.assertEqual(row[2:4], (1, 1))
+                    metadata = json.loads(row[4])
+                    self.assertEqual(metadata["context_scopes"]["nested"], values)
+                    node_metadata = json.loads(conn.execute(
+                        "SELECT metadata_json FROM conversation_nodes WHERE node_id = 'a1'"
+                    ).fetchone()[0])
+                    self.assertEqual(node_metadata["message_metadata"]["nested"], values)
+                finally:
+                    conn.close()
+
+    def test_source_read_errors_are_not_transaction_failures(self):
+        from chatgpt_export_archiver import cli as cli_module
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "conversations.json"
+            source.write_text("[]", encoding="utf-8")
+            db = base / "archive.db"
+            for error, expected_code in (
+                (ValueError("input_source_open_failed"), "input_source_open_failed"),
+                (ValueError("input_source_not_regular_file"), "input_source_not_regular_file"),
+                (OSError("private OS detail"), "source_read_failed"),
+            ):
+                with self.subTest(expected_code=expected_code), mock.patch.object(
+                    cli_module, "load_json_from_source", side_effect=error
+                ):
+                    with self.assertRaises(cli_module.ImportPipelineError) as caught:
+                        cli_module.run_import_pipeline(
+                            db,
+                            str(source),
+                            cwd=base,
+                            no_input_sha256=True,
+                        )
+                    self.assertEqual(caught.exception.code, expected_code)
+                    self.assertEqual(caught.exception.stage, "source_read")
+                    self.assertNotIn("private OS detail", str(caught.exception))
 
     def test_import_preflight_and_transaction_failures_persist_consistent_runs(self):
         cases = []
@@ -3578,6 +3791,30 @@ class ArchiverTests(unittest.TestCase):
                     data = archive.read(item["path"])
                     self.assertEqual(len(data), item["size"])
                     self.assertEqual(hashlib.sha256(data).hexdigest(), item["sha256"])
+
+    def test_release_archive_bytes_are_reproducible(self):
+        from tools import make_release_zip
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            first = base / "a.zip"
+            second = base / "b.zip"
+            payload = {
+                "README.md": b"synthetic\n",
+                "nested/unicode-测试.txt": b"payload\n",
+            }
+            make_release_zip._write_archive(first, payload)
+            time.sleep(2.05)
+            make_release_zip._write_archive(second, payload)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(hashlib.sha256(first.read_bytes()).hexdigest(), hashlib.sha256(second.read_bytes()).hexdigest())
+            for archive_path in (first, second):
+                with zipfile.ZipFile(archive_path) as archive:
+                    self.assertEqual(json.loads(archive.read(make_release_zip.MANIFEST_NAME)), make_release_zip._manifest(payload))
+                    for info in archive.infolist():
+                        self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
+                        self.assertEqual(info.extra, b"")
+                        self.assertEqual(info.comment, b"")
 
     def test_real_legacy_fa37_fixture_migrates_without_canonical_data_changes(self):
         from chatgpt_export_archiver.db import DATABASE_SCHEMA_VERSION, database_schema_status, migrate_database
