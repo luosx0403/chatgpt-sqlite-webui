@@ -238,6 +238,8 @@ python chatgpt_archive.py web --port 8787
 
 すべての経路で同じ `path=current` effective-current 規則を使います。conversation に属する有効な `current_node` とその親 chain が raw flag 全ゼロでも最優先です。次に決定的な利用可能 `is_on_current_path=1` leaf chain を選び、どちらもなければその conversation だけ all に fallback します。raw flag は変更せず、応答は `current_node_exists`、`current_collection_source`、`current_path_fallback_to_all`、`effective_path`、各 node の effective visibility を返します。壊れた親や cycle は有限かつ決定的に診断されます。
 
+global current-path search は、normalized message/title index と安全な source/date/role 条件から path 非依存の conversation candidate を先に求め、その candidate だけに effective-current membership を構築します。絞り込めない exclude-only query のみ明示的な full-database fallback を使います。Reader の hit navigation は初回に compact page を 1 回だけ取得し、読み込み済み境界へ近づいたときに追加します。Search と Web-index SQL は SQLite の `AS MATERIALIZED` を要求せず、portable な non-flattening query shape で各 legacy raw candidate を論理 stage ごとに最大 1 回だけ resolve します。
+
 リーダーのコピーとエクスポートは、表示中のリーダー契約に従います。`現在のパスの会話をコピー` は現在の reader パスの全ページを取得し、Show internal messages の切り替えを尊重し、現在の検索フィルターは無視します。`表示中をコピー` は、すでに読み込まれている表示メッセージだけをコピーします。ダウンロードリンクも同じ現在のパスと Show internal 設定を使います。Raw メッセージアクセスは、メッセージ単位 endpoint による上限付きの大きな raw プレビューです。切り詰められた応答では `raw_text` をプレーンなプレビューテキストとして描画し、UI はその capped preview だけを表示します。
 
 reader が `around_node_id` でヒットへ移動する場合は、reader と同じページング集合を使います。Show internal がオフなら visible-only rows、Show internal がオンなら完全な node collection、current-path node がない壊れた conversation では effective all-node collection です。

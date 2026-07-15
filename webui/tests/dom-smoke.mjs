@@ -67,6 +67,8 @@ function assertStaticFrontendContracts() {
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
   assert.ok(paneSource.includes("countTotal: false"), "reader hit navigation should request fast message-hit pages without exact total counts");
+  assert.equal(paneSource.includes("while (items.length < MAX_NAVIGABLE_HIT_MESSAGES)"), false, "reader hit navigation must not serially prefetch ten pages on initial load");
+  assert.ok(paneSource.includes("HIT_PREFETCH_THRESHOLD"), "reader hit navigation should lazily append near the loaded boundary");
   assert.ok(messageBlockSource.includes("getMessageDisplayChunk"), "truncated reader messages should have an explicit bounded expansion path");
   assert.ok(messageBlockSource.includes("[messageIdentity, showRawDefault]"), "message content state should reset only for data identity/default changes");
   assert.equal(messageBlockSource.includes("[messageIdentity, showRawDefault, layout]"), false, "pure layout changes must preserve message content state");
@@ -1603,8 +1605,19 @@ async function main() {
 
     await page.goto(`${baseUrl}?conversation=dom-hit-sequence`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
+    let initialHitNavigationRequests = 0;
+    const countInitialHitNavigation = (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/api/search/messages" && url.searchParams.get("conversation_id") === "dom-hit-sequence") {
+        initialHitNavigationRequests += 1;
+      }
+    };
+    page.on("request", countInitialHitNavigation);
     await page.locator("#global-search").fill("sequence-target");
-    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 180"), undefined, { timeout: 20_000 });
+    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 100"), undefined, { timeout: 20_000 });
+    await page.waitForTimeout(350);
+    page.off("request", countInitialHitNavigation);
+    assert.equal(initialHitNavigationRequests, 1, "initial reader hit navigation should issue exactly one request");
     const expectedSequence = expectedSequenceHitIds();
     for (let idx = 0; idx <= 155; idx += 1) {
       try {
@@ -1617,6 +1630,9 @@ async function main() {
           pageMeta: document.querySelector(".message-page-meta")?.textContent ?? "",
         }));
         throw new Error(`sequence navigation failed at index=${idx} expected=${expectedSequence[idx]} diagnostic=${JSON.stringify(diagnostic)} cause=${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (idx === 91) {
+        await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("/ 180"), undefined, { timeout: 20_000 });
       }
       if (idx < 155) await page.getByRole("button", { name: "Next hit" }).click();
     }

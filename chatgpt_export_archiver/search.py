@@ -8,7 +8,7 @@ import threading
 import unicodedata
 from array import array
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
@@ -653,7 +653,10 @@ def search_messages(
     if not has_message_text:
         return _page_payload([], 0, limit, offset, extra={"total_exact": True})
     if parsed.path == "current":
-        ensure_effective_current_views(conn, [conversation_id] if conversation_id else None)
+        if conversation_id:
+            ensure_effective_current_views(conn, [conversation_id])
+        else:
+            ensure_effective_current_views(conn, _message_current_candidate_ids(conn, parsed))
     try:
         rows, total = _message_search_page_rows(conn, parsed, conversation_id, limit, offset, order, count_total=count_total)
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=True)
@@ -694,7 +697,7 @@ def search_conversations(
     if not parsed.has_search_context():
         return list_conversations(conn, limit=limit, offset=offset, sort=sort, after=parsed.after, before=parsed.before, selected_id=selected_id)
     if _conversation_search_requires_global_current(parsed):
-        ensure_effective_current_views(conn, None)
+        ensure_effective_current_views(conn, _conversation_current_candidate_ids(conn, parsed))
     limit = _bounded_limit(limit, MAX_API_LIMIT)
     offset = max(0, offset)
     try:
@@ -739,6 +742,85 @@ def _conversation_search_requires_global_current(parsed: ParsedQuery) -> bool:
         or parsed.role
         or parsed.exclude
     )
+
+
+def _path_independent_candidate_query(parsed: ParsedQuery, *, keep_hit_excludes: bool) -> ParsedQuery:
+    """Return a superset query that can run before effective-current exists."""
+
+    return replace(parsed, path="all", exclude=list(parsed.exclude) if keep_hit_excludes else [])
+
+
+def _message_current_candidate_ids(conn: sqlite3.Connection, parsed: ParsedQuery) -> list[str]:
+    """Find global message-search conversation candidates without path membership."""
+
+    candidate = _path_independent_candidate_query(parsed, keep_hit_excludes=True)
+    try:
+        base_sql, params = _message_search_base_select(conn, candidate, None, use_trigram=True)
+        rows = conn.execute(
+            f"SELECT DISTINCT conversation_id FROM ({base_sql}) candidates",
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
+        base_sql, params = _message_search_base_select(conn, candidate, None, use_trigram=False)
+        rows = conn.execute(
+            f"SELECT DISTINCT conversation_id FROM ({base_sql}) candidates",
+            params,
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def _conversation_current_candidate_ids(conn: sqlite3.Connection, parsed: ParsedQuery) -> list[str] | None:
+    """Find a safe path-independent superset for global conversation search.
+
+    Exclusions are intentionally omitted here: an excluded fragment on an
+    off-current branch must not remove a conversation before effective-current
+    membership is known. When exclusion is the only usable predicate, ``None``
+    explicitly selects the documented full-database fallback.
+    """
+
+    candidate = _path_independent_candidate_query(parsed, keep_hit_excludes=False)
+    has_positive = _search_has_positive_body_or_title(candidate)
+    has_safe_filter = bool(candidate.role or candidate.source or candidate.after is not None or candidate.before is not None)
+    if not has_positive and not has_safe_filter:
+        return None
+
+    def select_ids(*, use_trigram: bool) -> list[str]:
+        if not has_positive:
+            where, params = _filter_conversation_where(candidate)
+            rows = conn.execute(
+                f"SELECT c.conversation_id FROM conversations c {where}",
+                params,
+            ).fetchall()
+            return [str(row[0]) for row in rows]
+
+        parts: list[str] = []
+        params: list[Any] = []
+        has_message_match = bool(candidate.terms or candidate.phrases or candidate.required_phrases or candidate.role)
+        if candidate.scope != "title" and has_message_match:
+            sql, sql_params = _message_conversation_select(conn, candidate, use_trigram=use_trigram)
+            parts.append(sql)
+            params.extend(sql_params)
+        if candidate.scope != "message" and not candidate.role:
+            sql, sql_params = _title_conversation_select(conn, candidate, use_trigram=use_trigram)
+            parts.append(sql)
+            params.extend(sql_params)
+        if not parts:
+            return []
+        combined = " UNION ALL ".join(parts)
+        rows = conn.execute(
+            f"SELECT DISTINCT conversation_id FROM ({combined}) candidates",
+            params,
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    try:
+        return select_ids(use_trigram=True)
+    except sqlite3.OperationalError as exc:
+        if not is_optional_search_capability_missing(exc):
+            raise
+        return select_ids(use_trigram=False)
 
 
 def _is_title_only_candidate_context(parsed: ParsedQuery) -> bool:
@@ -1442,7 +1524,7 @@ def _message_search_base_select(
     """ if has_norm else ""
     effective_expression = _current_path_condition("n") if parsed.path == "current" else "0"
     sql = f"""
-        WITH resolved_source AS MATERIALIZED (
+        WITH resolved_source AS (
             SELECT n.*,
                    {_sql_display_text('n')} AS resolved_text,
                    {score_expr} AS candidate_score,
@@ -1456,6 +1538,7 @@ def _message_search_base_select(
             JOIN conversations c ON c.conversation_id = n.conversation_id
             {norm_join}
             WHERE 1 = 1 {where}
+            LIMIT -1 OFFSET 0
         )
         SELECT n.conversation_id, n.node_id, n.role, n.create_time, n.update_time,
                n.content_type, n.resolved_text AS content_text, n.is_on_current_path,
@@ -1937,7 +2020,7 @@ def _message_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, 
     """ if has_norm else ""
     return (
         f"""
-        WITH resolved_source AS MATERIALIZED (
+        WITH resolved_source AS (
             SELECT n.*,
                    {_sql_display_text('n')} AS resolved_text,
                    {score_expr} AS candidate_score,
@@ -1946,6 +2029,7 @@ def _message_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, 
             JOIN conversations c ON c.conversation_id = n.conversation_id
             {norm_join}
             WHERE 1 = 1 {where}
+            LIMIT -1 OFFSET 0
         )
         SELECT n.conversation_id,
                COUNT(*) AS hit_count,
@@ -2354,7 +2438,6 @@ def _conversation_level_exclude_clauses(parsed: ParsedQuery, frag: str) -> tuple
                 FROM conversation_nodes en
                 WHERE en.conversation_id = c.conversation_id
                   {exclude_path_clause}
-                  AND {_sql_display_text('en')} <> ''
                   AND web_search_match({_sql_display_text('en')}, ?, ?) > 0
             )
             """

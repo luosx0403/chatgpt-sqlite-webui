@@ -9,6 +9,8 @@ import type { Settings } from "../settings";
 import { isInteractiveTarget } from "../utils/interaction";
 
 const MAX_NAVIGABLE_HIT_MESSAGES = 1000;
+const HIT_NAVIGATION_PAGE_SIZE = 100;
+const HIT_PREFETCH_THRESHOLD = 10;
 
 interface Props {
   conversation: ConversationSummary | null;
@@ -36,6 +38,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const [loadingMore, setLoadingMore] = useState(false);
   const [hitItems, setHitItems] = useState<SearchMessageHit[]>([]);
   const [hitLimitReached, setHitLimitReached] = useState(false);
+  const [hitHasMore, setHitHasMore] = useState(false);
+  const [hitNextOffset, setHitNextOffset] = useState<number | null>(null);
+  const [hitLoadingMore, setHitLoadingMore] = useState(false);
   const [hitIndex, setHitIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [copyStatus, setCopyStatus] = useState("");
@@ -46,6 +51,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const hitRequestRef = useRef(0);
   const messageControllerRef = useRef<AbortController | null>(null);
   const hitControllerRef = useRef<AbortController | null>(null);
+  const hitAppendInFlightRef = useRef(false);
   const copyControllerRef = useRef<AbortController | null>(null);
   const copyRequestRef = useRef(0);
   const scrollRequestRef = useRef(0);
@@ -115,6 +121,10 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     setHasMore(false);
     setHitItems([]);
     setHitLimitReached(false);
+    setHitHasMore(false);
+    setHitNextOffset(null);
+    setHitLoadingMore(false);
+    hitAppendInFlightRef.current = false;
     setHitIndex(0);
     setCopyBusy(null);
     setCopyStatus("");
@@ -203,6 +213,10 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   useEffect(() => {
     setHitItems([]);
     setHitLimitReached(false);
+    setHitHasMore(false);
+    setHitNextOffset(null);
+    setHitLoadingMore(false);
+    hitAppendInFlightRef.current = false;
     setHitIndex(0);
     const requestId = ++hitRequestRef.current;
     const requestedContextKey = readerDataContextKey;
@@ -212,25 +226,14 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     const controller = new AbortController();
     hitControllerRef.current?.abort();
     hitControllerRef.current = controller;
-    const loadHits = async () => {
-      const items: SearchMessageHit[] = [];
-      let offset = 0;
-      let reachedLimit = false;
-      while (items.length < MAX_NAVIGABLE_HIT_MESSAGES) {
-        const pageLimit = Math.min(100, MAX_NAVIGABLE_HIT_MESSAGES - items.length);
-        const page = await getMessageHits({ q: highlightQuery, conversationId: conversation.conversation_id, path: effectivePath, order: "display", limit: pageLimit, offset, filters: effectiveFilters, matchMode, countTotal: false, signal: controller.signal });
-        items.push(...page.items);
-        if (!page.has_more || page.next_offset === null) break;
-        offset = page.next_offset;
-        if (items.length >= MAX_NAVIGABLE_HIT_MESSAGES) reachedLimit = true;
-      }
-      return { items, reachedLimit };
-    };
+    const loadHits = () => getMessageHits({ q: highlightQuery, conversationId: conversation.conversation_id, path: effectivePath, order: "display", limit: HIT_NAVIGATION_PAGE_SIZE, offset: 0, filters: effectiveFilters, matchMode, countTotal: false, signal: controller.signal });
     loadHits()
-      .then(({ items, reachedLimit }) => {
+      .then((page) => {
         if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
-        setHitItems(items);
-        setHitLimitReached(reachedLimit);
+        setHitItems(page.items);
+        setHitNextOffset(page.next_offset);
+        setHitHasMore(Boolean(page.has_more && page.next_offset !== null));
+        setHitLimitReached(Boolean(page.has_more && page.items.length >= MAX_NAVIGABLE_HIT_MESSAGES));
         setHitIndex(0);
       })
       .catch((err: Error) => {
@@ -308,6 +311,51 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     () => hitItems.filter((hit) => !(hit.is_internal && !showInternal) && !(effectivePath === "current" && !isCurrentFallbackHit(hit))),
     [hitItems, effectivePath, showInternal, isCurrentFallbackHit],
   );
+  const loadMoreHits = useCallback(() => {
+    if (
+      !conversation || !searchActive || !hitHasMore || hitNextOffset === null ||
+      hitAppendInFlightRef.current || hitItems.length >= MAX_NAVIGABLE_HIT_MESSAGES
+    ) return;
+    hitAppendInFlightRef.current = true;
+    setHitLoadingMore(true);
+    const controller = new AbortController();
+    hitControllerRef.current?.abort();
+    hitControllerRef.current = controller;
+    const requestId = ++hitRequestRef.current;
+    const requestedContextKey = readerDataContextKey;
+    const remaining = MAX_NAVIGABLE_HIT_MESSAGES - hitItems.length;
+    getMessageHits({
+      q: highlightQuery,
+      conversationId: conversation.conversation_id,
+      path: effectivePath,
+      order: "display",
+      limit: Math.min(HIT_NAVIGATION_PAGE_SIZE, remaining),
+      offset: hitNextOffset,
+      filters: effectiveFilters,
+      matchMode,
+      countTotal: false,
+      signal: controller.signal,
+    })
+      .then((page) => {
+        if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
+        const loadedCount = Math.min(MAX_NAVIGABLE_HIT_MESSAGES, hitItems.length + page.items.length);
+        setHitItems((current) => [...current, ...page.items].slice(0, MAX_NAVIGABLE_HIT_MESSAGES));
+        setHitNextOffset(page.next_offset);
+        setHitHasMore(Boolean(page.has_more && page.next_offset !== null && loadedCount < MAX_NAVIGABLE_HIT_MESSAGES));
+        setHitLimitReached(Boolean(page.has_more && loadedCount >= MAX_NAVIGABLE_HIT_MESSAGES));
+      })
+      .catch((err: Error) => {
+        if (err.name !== "AbortError" && requestId === hitRequestRef.current && readerDataContextRef.current === requestedContextKey) {
+          setHitHasMore(false);
+        }
+      })
+      .finally(() => {
+        if (requestId === hitRequestRef.current && readerDataContextRef.current === requestedContextKey) {
+          hitAppendInFlightRef.current = false;
+          setHitLoadingMore(false);
+        }
+      });
+  }, [conversation?.conversation_id, effectiveFiltersKey, effectivePath, highlightQuery, hitHasMore, hitItems.length, hitNextOffset, matchMode, readerDataContextKey, searchActive]);
   const titleOnlyContext = Boolean(
     filters.title ||
     (effectiveScope === "title" && (querySyntax.hasBodyText || querySyntax.hasTitleText || filters.exact)),
@@ -499,13 +547,17 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const copyVisible = () => runCopy("visible");
   const jump = useCallback((delta: number) => {
     if (!currentViewHits.length) return;
+    if (delta > 0 && hitHasMore && hitIndex >= Math.max(0, currentViewHits.length - HIT_PREFETCH_THRESHOLD)) {
+      loadMoreHits();
+    }
+    if (delta > 0 && hitHasMore && hitIndex === currentViewHits.length - 1) return;
     const next = (hitIndex + delta + currentViewHits.length) % currentViewHits.length;
     setHitIndex(next);
     const target = currentViewHits[next]?.node_id;
     if (target && !messages.some((message) => message.node_id === target)) {
       loadMessages(0, false, target);
     }
-  }, [currentViewHits, hitIndex, loadMessages, messages]);
+  }, [currentViewHits, hitHasMore, hitIndex, loadMessages, loadMoreHits, messages]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -600,6 +652,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
             </span>
           )}
           {Boolean((totalHitCount || hiddenInternalCount) && !currentViewHits.length && !titleOnlyMatch && !filterOnlyMatch) && <span>{t("hiddenHitsOnlyDescription")}</span>}
+          {hitLoadingMore && <span>{t("loadingMore")}</span>}
           {hitLimitReached && <span>{t("hitNavigationLimited")}</span>}
           {hasBodySearchText && <span>{t("browserFindLimited")}</span>}
           {querySyntax.pathOverride && <span>{t("queryOverridesPath")} {effectivePath === "all" ? t("allNodes") : t("currentPath")}</span>}

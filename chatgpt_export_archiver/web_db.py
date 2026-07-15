@@ -44,7 +44,10 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise ValueError("database_not_found")
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    # TEMP effective-current tables perform DML.  Autocommit prevents that
+    # connection-local work from pinning an old main-database read snapshot
+    # across later requests/tests after another connection commits.
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -240,11 +243,12 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
         )
         conn.execute(
             """
-            WITH resolved AS MATERIALIZED (
+            WITH resolved AS (
                 SELECT conversation_id,
                        node_id,
                        web_norm(web_display_text(content_text, substr(raw_message_json, 1, 200001))) AS content_norm
                 FROM conversation_nodes
+                LIMIT -1 OFFSET 0
             )
             INSERT INTO web_message_norm(conversation_id, node_id, content_norm)
             SELECT conversation_id, node_id, content_norm

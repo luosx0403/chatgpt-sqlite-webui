@@ -238,6 +238,8 @@ python chatgpt_archive.py web --port 8787
 
 所有入口共用同一套 `path=current` effective-current 规则：有效且属于该会话的 `current_node` 及其父链优先，即使所有 raw flag 都为 0；否则选择确定的可用 `is_on_current_path=1` 叶链；只有两者都不存在时，该会话才 fallback 到 all。响应保持 raw flag 原义，并提供 `current_node_exists`、`current_collection_source`、`current_path_fallback_to_all`、`effective_path` 和逐节点 effective visibility。断裂父链和 cycle 会有限、确定地诊断，不会让递归查询挂起。
 
+全局 current-path 搜索会先通过规范化正文/标题索引以及安全的 source/date/role 条件取得不依赖路径的会话候选，再只为这些候选建立 effective-current membership；只有无法缩小的仅排除查询才显式回退到全库。Reader 命中导航初始只取一个紧凑页面，接近已加载边界时才继续追加。搜索与 Web 索引 SQL 使用可移植的防扁平化查询结构，不要求 SQLite 支持 `AS MATERIALIZED`，并保证每个 legacy raw 候选在每个逻辑阶段最多解析一次。
+
 阅读器复制和导出动作遵守可见阅读器契约。`复制当前路径整段对话` 会按当前 reader 路径抓取全部分页，并遵守「显示内部消息」开关，同时忽略当前搜索筛选。`复制当前可见` 只复制已经加载的可见消息。下载链接使用同样的当前路径和「显示内部消息」设置。Raw 消息访问只通过单条消息 endpoint 提供有上限的较大 raw 预览；截断响应必须把 `raw_text` 当作纯文本预览渲染，UI 只显示这个 capped preview。
 
 reader 使用 `around_node_id` 跳转到命中时，会使用与 reader 相同的分页集合：Show internal 关闭时使用 visible-only rows，Show internal 开启时使用完整 node collection；对没有 current-path node 的损坏 conversation，使用 effective all-node collection。

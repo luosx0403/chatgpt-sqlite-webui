@@ -4134,6 +4134,9 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("truncated", schema_json)
         self.assertIn("diagnostics", schema_json)
         self.assertIn("best_effort", schema_json)
+        self.assertIn("path-independent conversation candidates", schema["search"]["current_path_candidates"])
+        self.assertIn("one initial compact page", schema["search"]["hit_navigation"])
+        self.assertIn("without requiring AS MATERIALIZED", schema["search"]["sqlite_query_shape"])
         self.assertNotIn("fts_legacy", schema_json)
         self.assertIn("legacy_fts_present", schema_json)
         fields = set(schema["search"]["diagnostics"]["fields"])
@@ -5645,6 +5648,132 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(response.json()["total"], count)
             self.assertNotIn(None, scopes)
             self.assertLessEqual(max(len(scope or ()) for scope in scopes), 21)
+
+    def test_global_current_search_materializes_only_path_independent_candidates(self):
+        from chatgpt_export_archiver import current_path as current_path_module
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.db import connect, init_db
+        from chatgpt_export_archiver.web_db import create_web_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "candidate-scope.db"
+            writer = connect(db)
+            init_db(writer)
+            count = 20_000
+            rare = {17, 9_999, 19_998}
+            writer.executemany(
+                "INSERT INTO conversations(conversation_id, title, current_node, source_file, aggregate_hash) VALUES (?, 'Synthetic', ?, 'synthetic.json', ?)",
+                ((f"candidate-{index:05d}", f"node-{index}", f"hash-{index}") for index in range(count)),
+            )
+            writer.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_text, is_on_current_path) VALUES (?, ?, 'user', ?, 0)",
+                (
+                    (f"candidate-{index:05d}", f"node-{index}", "rare-candidate-token" if index in rare else "ordinary synthetic text")
+                    for index in range(count)
+                ),
+            )
+            writer.commit()
+            writer.close()
+            create_web_indexes(db)
+
+            conn = connect_readonly(db)
+            real_ensure = current_path_module.ensure_effective_current_views
+            scopes: list[tuple[str, ...] | None] = []
+
+            def spy(connection, ids):
+                normalized = None if ids is None else tuple(sorted(str(value) for value in ids))
+                scopes.append(normalized)
+                return real_ensure(connection, ids)
+
+            statements: list[str] = []
+            conn.set_trace_callback(statements.append)
+            parsed = search_module.parse_query("rare-candidate-token", path_default="current", scope="message")
+            with (
+                mock.patch.object(current_path_module, "ensure_effective_current_views", side_effect=spy),
+                mock.patch.object(search_module, "ensure_effective_current_views", side_effect=spy),
+            ):
+                message_page = search_module.search_messages(conn, parsed, limit=10, count_total=False)
+                self.assertEqual({item["conversation_id"] for item in message_page["items"]}, {f"candidate-{index:05d}" for index in rare})
+                self.assertNotIn(None, scopes)
+                self.assertLessEqual(max(len(scope or ()) for scope in scopes), len(rare))
+                self.assertFalse(any("INSERT INTO effective_current_scope SELECT conversation_id FROM conversations" in sql for sql in statements))
+
+                scopes.clear()
+                statements.clear()
+                conversation_page = search_module.search_conversations(conn, parsed, limit=10)
+                self.assertEqual({item["conversation_id"] for item in conversation_page["items"]}, {f"candidate-{index:05d}" for index in rare})
+                self.assertNotIn(None, scopes)
+                self.assertLessEqual(max(len(scope or ()) for scope in scopes), len(rare))
+                self.assertFalse(any("INSERT INTO effective_current_scope SELECT conversation_id FROM conversations" in sql for sql in statements))
+
+                # A committed graph change from another connection invalidates
+                # both the optional-index generation and the connection-local
+                # effective-current scope before the next search.
+                other = connect(db)
+                try:
+                    other.execute(
+                        "INSERT INTO conversations(conversation_id, title, current_node, source_file, aggregate_hash) VALUES ('candidate-new', 'Synthetic', 'node-new', 'synthetic.json', 'hash-new')"
+                    )
+                    other.execute(
+                        "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_text, is_on_current_path) VALUES ('candidate-new', 'node-new', 'user', 'rare-candidate-token', 0)"
+                    )
+                    other.commit()
+                finally:
+                    other.close()
+                scopes.clear()
+                updated = search_module.search_messages(conn, parsed, limit=10, count_total=False)
+                self.assertIn("candidate-new", {item["conversation_id"] for item in updated["items"]})
+                self.assertNotIn(None, scopes)
+                self.assertLessEqual(max(len(scope or ()) for scope in scopes), len(rare) + 1)
+            conn.set_trace_callback(None)
+            conn.close()
+
+    def test_conversation_exclude_resolves_each_candidate_row_once_without_materialized_hint(self):
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver import web_db as web_db_module
+        from chatgpt_export_archiver.db import init_db
+
+        source = Path(search_module.__file__).read_text(encoding="utf-8") + Path(web_db_module.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("AS MATERIALIZED", source)
+
+        for path in ("all", "current"):
+            for match_mode in ("contains", "word"):
+                with self.subTest(path=path, match_mode=match_mode):
+                    conn = sqlite3.connect(":memory:")
+                    conn.row_factory = sqlite3.Row
+                    init_db(conn)
+                    conn.execute(
+                        "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES ('exclude-once', 'Synthetic', 'n2', 'hash')"
+                    )
+                    raw = json.dumps({"content": {"content_type": "text", "parts": ["legacy safe text"]}})
+                    conn.executemany(
+                        "INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id, role, content_text, raw_message_json, is_on_current_path) VALUES ('exclude-once', ?, ?, 'user', ?, ?, 1)",
+                        (
+                            ("n0", None, "canonical safe zero", None),
+                            ("n1", "n0", "[non-text content: legacy]", raw),
+                            ("n2", "n1", "canonical safe two", None),
+                        ),
+                    )
+                    conn.commit()
+                    real_resolver = search_module.recover_message_display_text
+                    calls = {"count": 0}
+
+                    def count_resolver(content_text, raw_message_json):
+                        calls["count"] += 1
+                        return real_resolver(content_text, raw_message_json)
+
+                    parsed = search_module.parse_query(
+                        "",
+                        exclude="blocked-fragment",
+                        scope="message",
+                        path_default=path,
+                        match_mode=match_mode,
+                    )
+                    with mock.patch.object(search_module, "recover_message_display_text", side_effect=count_resolver):
+                        page = search_module.search_conversations(conn, parsed, limit=10)
+                    self.assertEqual([item["conversation_id"] for item in page["items"]], ["exclude-once"])
+                    self.assertEqual(calls["count"], 3)
+                    conn.close()
 
 if __name__ == "__main__":
     unittest.main()

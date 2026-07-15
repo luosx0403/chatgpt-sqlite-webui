@@ -24,6 +24,8 @@
 - Project logs use Python `logging` levels debug/info/warning/error/none. Logs must not include chat titles, message text, snippets, raw JSON, or parser warning payloads.
 - Ordinary Web list/message APIs must not expose `raw_message_json`, `raw_json`, or full parser warning payloads. They may return normalized message text and bounded `raw_preview` for the selected local browser view. The per-message raw endpoint provides only a bounded/capped larger raw preview; truncated responses must prefer plain `raw_text`, and the UI must present only that capped preview.
 - Search code must parameterize SQL and build FTS `MATCH` expressions through a query builder; never concatenate raw user input into SQL.
+- Global `path=current` search must derive path-independent conversation candidates first and materialize effective-current only for that candidate scope; exclusion-only searches may use the explicit full-database fallback. Reader hit navigation loads one initial page and appends lazily near the loaded boundary.
+- Keep SQLite search/index resolver evaluation to once per candidate row without requiring `AS MATERIALIZED`; use the portable non-flattening query shape and retain resolver-count regressions.
 - Frontend code must render chat text as text nodes, not unsanitized HTML.
 - Web list and message APIs must remain paginated. Do not add endpoints that load every conversation or every node into the browser.
 - Web search must preserve exact substring fallback for Chinese, code symbols, file names, command flags, and quoted phrases even when FTS tokenization fails.

@@ -639,6 +639,9 @@ def create_api_router(
                 "count_total": "boolean; false disables the exact count and returns total_exact=false with a known lower-bound total",
                 "filter_only": "filter-only and exclude-only queries may filter conversation results; message hits and reader highlights require a positive message-text term, and role/source/date filters alone do not create hit navigation",
                 "raw_query_override": "path: and scope: modifiers in q override sidebar path/scope selectors",
+                "current_path_candidates": "global path=current searches derive path-independent conversation candidates first and materialize effective-current only for that scope; exclusion-only queries may require the explicit full-database fallback",
+                "hit_navigation": "the reader requests one initial compact page with count_total=false and appends lazily near the loaded boundary, capped at 1000 navigable hits",
+                "sqlite_query_shape": "portable non-flattening CTEs keep display-text resolution once per candidate stage without requiring AS MATERIALIZED",
                 "diagnostics": {
                     "fields": [
                         "candidate_backend",
