@@ -11,7 +11,7 @@ from .current_path import effective_current_metadata, ensure_effective_current_v
 
 from .parser import ParsedConversation, WarningRecord
 from .scanner import InputSource, SourceEntry
-from .schema_contract import DATABASE_SCHEMA_VERSION
+from .schema_contract import DATABASE_SCHEMA_VERSION, parse_nonnegative_integer
 from .sqlite_errors import (
     is_fts5_capability_unavailable,
     is_optional_search_capability_missing,
@@ -128,7 +128,7 @@ GENERATION_TRIGGER_DDL = {
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
         END""",
     "archive_title_generation_update": """CREATE TRIGGER IF NOT EXISTS archive_title_generation_update
-        AFTER UPDATE OF title ON conversations BEGIN
+        AFTER UPDATE OF conversation_id, title ON conversations BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
         END""",
     "archive_title_generation_delete": """CREATE TRIGGER IF NOT EXISTS archive_title_generation_delete
@@ -140,7 +140,7 @@ GENERATION_TRIGGER_DDL = {
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
         END""",
     "archive_message_generation_update": """CREATE TRIGGER IF NOT EXISTS archive_message_generation_update
-        AFTER UPDATE OF content_text, raw_message_json ON conversation_nodes BEGIN
+        AFTER UPDATE OF conversation_id, node_id, content_text, raw_message_json ON conversation_nodes BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
         END""",
     "archive_message_generation_delete": """CREATE TRIGGER IF NOT EXISTS archive_message_generation_delete
@@ -165,6 +165,126 @@ REQUIRED_INDEX_COLUMNS = {
     "idx_nodes_conversation_flag_parent": ("conversation_id", "is_on_current_path", "parent_node_id"),
     "idx_conversations_times": ("create_time", "update_time"),
     "idx_warnings_run": ("import_run_id", "warning_type"),
+}
+
+# Machine-readable contracts for objects whose exact shape is required by
+# production INSERT/UPSERT, JOIN, search-generation, and migration paths.
+# Only named project-managed indexes/triggers are eligible for automatic
+# replacement; table constraints are deliberately diagnosed as incompatible.
+CANONICAL_TABLE_CONTRACT = {
+    "import_runs": {
+        "primary_key": ("id",),
+        "columns": {
+            "id": ("INTEGER", False, None),
+            "input_path": ("TEXT", True, None),
+            "input_kind": ("TEXT", True, None),
+            "started_at": ("TEXT", True, None),
+            "status": ("TEXT", True, None),
+        },
+    },
+    "source_files": {
+        "primary_key": ("id",),
+        "columns": {
+            "id": ("INTEGER", False, None),
+            "import_run_id": ("INTEGER", True, None),
+            "source_path": ("TEXT", True, None),
+            "file_type": ("TEXT", True, None),
+            "is_conversation_json": ("INTEGER", True, "0"),
+            "is_selected_conversation_source": ("INTEGER", True, "0"),
+        },
+    },
+    "import_warnings": {
+        "primary_key": ("id",),
+        "columns": {
+            "id": ("INTEGER", False, None),
+            "import_run_id": ("INTEGER", True, None),
+            "source_file": ("TEXT", True, None),
+            "warning_type": ("TEXT", True, None),
+            "created_at": ("TEXT", True, None),
+        },
+    },
+    "conversations": {
+        "primary_key": ("conversation_id",),
+        "columns": {
+            "conversation_id": ("TEXT", False, None),
+            "aggregate_hash": ("TEXT", True, None),
+        },
+    },
+    "conversation_nodes": {
+        "primary_key": ("conversation_id", "node_id"),
+        "columns": {
+            "conversation_id": ("TEXT", True, None),
+            "node_id": ("TEXT", True, None),
+            "is_on_current_path": ("INTEGER", True, "0"),
+        },
+    },
+    "exports": {
+        "primary_key": ("id",),
+        "unique": (("conversation_id", "format", "output_path"),),
+        "columns": {
+            "id": ("INTEGER", False, None),
+            "conversation_id": ("TEXT", True, None),
+            "format": ("TEXT", True, None),
+            "output_path": ("TEXT", True, None),
+            "output_hash": ("TEXT", True, None),
+            "exported_at": ("TEXT", True, None),
+        },
+    },
+    "file_index": {
+        "primary_key": ("id",),
+        "columns": {
+            "id": ("INTEGER", False, None),
+            "import_run_id": ("INTEGER", True, None),
+            "source_path": ("TEXT", True, None),
+            "file_type": ("TEXT", True, None),
+        },
+    },
+    "archive_generations": {
+        "primary_key": ("name",),
+        "columns": {
+            "name": ("TEXT", False, None),
+            "generation": ("INTEGER", True, "0"),
+        },
+    },
+}
+
+REQUIRED_INDEX_CONTRACT = {
+    name: {
+        "table": {
+            "idx_nodes_conversation_path": "conversation_nodes",
+            "idx_nodes_conversation_flag_parent": "conversation_nodes",
+            "idx_conversations_times": "conversations",
+            "idx_warnings_run": "import_warnings",
+        }[name],
+        "unique": False,
+        "partial": False,
+        "origin": "c",
+        "keys": tuple((column, "BINARY", False) for column in columns),
+        "where": None,
+    }
+    for name, columns in REQUIRED_INDEX_COLUMNS.items()
+}
+
+GENERATION_TRIGGER_CONTRACT = {
+    "archive_title_generation_insert": ("conversations", "AFTER", "INSERT", (), None, "title"),
+    "archive_title_generation_update": (
+        "conversations", "AFTER", "UPDATE", ("conversation_id", "title"), None, "title"
+    ),
+    "archive_title_generation_delete": ("conversations", "AFTER", "DELETE", (), None, "title"),
+    "archive_message_generation_insert": (
+        "conversation_nodes", "AFTER", "INSERT", (), None, "message"
+    ),
+    "archive_message_generation_update": (
+        "conversation_nodes",
+        "AFTER",
+        "UPDATE",
+        ("conversation_id", "node_id", "content_text", "raw_message_json"),
+        None,
+        "message",
+    ),
+    "archive_message_generation_delete": (
+        "conversation_nodes", "AFTER", "DELETE", (), None, "message"
+    ),
 }
 
 REQUIRED_GENERATION_ROWS = ("title", "message")
@@ -286,23 +406,15 @@ def _migration_sqlite_error_code(exc: sqlite3.Error) -> str:
 
 
 def _base_schema_compatibility(conn: sqlite3.Connection) -> dict[str, Any]:
-    rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
-    ).fetchall()
-    found = {str(row[0]) for row in rows}
-    required_tables = set(CORE_SCHEMA_COLUMNS) - {"archive_generations"}
-    missing_tables = sorted(required_tables - found)
-    missing_columns: dict[str, list[str]] = {}
-    for table in sorted(required_tables & found):
-        required_columns = CORE_SCHEMA_COLUMNS[table]
-        columns = {str(row[1]) for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
-        missing = sorted(required_columns - columns)
-        if missing:
-            missing_columns[table] = missing
+    status = database_schema_status(conn)
     return {
-        "compatible": not missing_tables and not missing_columns,
-        "missing_tables": missing_tables,
-        "missing_columns": missing_columns,
+        "compatible": status["base_schema_compatible"],
+        "missing_tables": status["missing_tables"],
+        "missing_columns": status["missing_columns"],
+        "invalid_tables": status["invalid_tables"],
+        "object_type_mismatches": status["object_type_mismatches"],
+        "missing_foreign_keys": status["missing_foreign_keys"],
+        "invalid_generation_rows": status["invalid_generation_rows"],
     }
 
 
@@ -363,6 +475,7 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             before.get("missing_generation_table")
             or before.get("missing_generation_rows")
             or before.get("missing_triggers")
+            or before.get("invalid_triggers")
         )
         if generation_infrastructure_changed and has_objects:
             failures = drop_optional_web_indexes(conn)
@@ -376,8 +489,12 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             "INSERT OR IGNORE INTO archive_generations(name, generation) VALUES (?, 0)",
             ((name,) for name in REQUIRED_GENERATION_ROWS),
         )
+        for name in locked_status.get("invalid_triggers", {}):
+            conn.execute(f'DROP TRIGGER "{name}"')
         for statement in GENERATION_TRIGGER_DDL.values():
             conn.execute(statement)
+        for name in locked_status.get("invalid_indexes", {}):
+            conn.execute(f'DROP INDEX "{name}"')
         for statement in REQUIRED_INDEX_DDL.values():
             conn.execute(statement)
         conn.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
@@ -1043,15 +1160,153 @@ CORE_SCHEMA_COLUMNS = {
 
 
 REQUIRED_FOREIGN_KEYS = {
-    "source_files": frozenset({("import_run_id", "import_runs", "id", "NO ACTION")}),
-    "import_warnings": frozenset({("import_run_id", "import_runs", "id", "NO ACTION")}),
-    "conversations": frozenset({("last_import_run_id", "import_runs", "id", "NO ACTION")}),
+    "source_files": frozenset({("import_run_id", "import_runs", "id", "NO ACTION", "NO ACTION")}),
+    "import_warnings": frozenset({("import_run_id", "import_runs", "id", "NO ACTION", "NO ACTION")}),
+    "conversations": frozenset({("last_import_run_id", "import_runs", "id", "NO ACTION", "NO ACTION")}),
     "conversation_nodes": frozenset({
-        ("conversation_id", "conversations", "conversation_id", "CASCADE"),
-        ("last_import_run_id", "import_runs", "id", "NO ACTION"),
+        ("conversation_id", "conversations", "conversation_id", "CASCADE", "NO ACTION"),
+        ("last_import_run_id", "import_runs", "id", "NO ACTION", "NO ACTION"),
     }),
-    "file_index": frozenset({("import_run_id", "import_runs", "id", "NO ACTION")}),
+    "file_index": frozenset({("import_run_id", "import_runs", "id", "NO ACTION", "NO ACTION")}),
 }
+
+
+def _normalize_default(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    while len(normalized) >= 2 and normalized[0] == "(" and normalized[-1] == ")":
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
+def _index_keys(conn: sqlite3.Connection, name: str) -> tuple[tuple[str | None, str, bool], ...]:
+    keys: list[tuple[str | None, str, bool]] = []
+    for row in conn.execute(f'PRAGMA index_xinfo("{name}")'):
+        if not bool(row[5]):
+            continue
+        column = None if int(row[1]) < 0 else str(row[2])
+        keys.append((column, str(row[4] or "BINARY").upper(), bool(row[3])))
+    return tuple(keys)
+
+
+def _table_unique_keys(conn: sqlite3.Connection, table: str) -> set[tuple[str, ...]]:
+    unique: set[tuple[str, ...]] = set()
+    for row in conn.execute(f'PRAGMA index_list("{table}")'):
+        if not bool(row[2]) or str(row[3]) != "u" or bool(row[4]):
+            continue
+        keys = _index_keys(conn, str(row[1]))
+        if keys and all(
+            column is not None and collation == "BINARY" and not desc
+            for column, collation, desc in keys
+        ):
+            unique.add(tuple(str(column) for column, _collation, _desc in keys))
+    return unique
+
+
+_TRIGGER_HEADER_RE = re.compile(
+    r"^\s*CREATE\s+TRIGGER(?:\s+IF\s+NOT\s+EXISTS)?\s+"
+    r"(?:[`\"\[]?[^\s`\"\]]+[`\"\]]?)\s+"
+    r"(BEFORE|AFTER|INSTEAD\s+OF)\s+"
+    r"(INSERT|DELETE|UPDATE)(?:\s+OF\s+(.+?))?\s+ON\s+"
+    r"([`\"\[]?[^\s`\"\]]+[`\"\]]?)\s*"
+    r"(?:(WHEN)\s+.+?\s+)?BEGIN\s+(.+)\s+END\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _unquote_identifier(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and (value[0], value[-1]) in {("\"", "\""), ("`", "`"), ("[", "]")}:
+        return value[1:-1]
+    return value
+
+
+def _trigger_definition(sql: str | None) -> dict[str, Any] | None:
+    if not sql:
+        return None
+    match = _TRIGGER_HEADER_RE.match(sql)
+    if match is None:
+        return None
+    timing, event, update_of, table, when_token, body = match.groups()
+    columns = ()
+    if update_of:
+        columns = tuple(_unquote_identifier(value) for value in update_of.split(","))
+    body_compact = re.sub(r"\s+", " ", body.strip()).rstrip(";").strip()
+    body_match = re.fullmatch(
+        r"UPDATE\s+archive_generations\s+SET\s+generation\s*=\s*generation\s*\+\s*1\s+"
+        r"WHERE\s+name\s*=\s*'([^']+)'",
+        body_compact,
+        re.IGNORECASE,
+    )
+    return {
+        "table": _unquote_identifier(table),
+        "timing": re.sub(r"\s+", " ", timing.upper()),
+        "event": event.upper(),
+        "update_of": columns,
+        "when": None if when_token is None else "present",
+        "generation_name": body_match.group(1) if body_match else None,
+        "body_semantics": "increment_by_one" if body_match else "invalid",
+    }
+
+
+def _strict_nonnegative_integer(value: Any, sqlite_type: str) -> bool:
+    return sqlite_type == "integer" and parse_nonnegative_integer(value) is not None
+
+
+def generation_schema_contract_is_current(conn: sqlite3.Connection) -> bool:
+    """Return whether generation counters are maintained by canonical DDL.
+
+    This intentionally checks only the derived-index trust boundary.  Full
+    compatibility remains the responsibility of ``database_schema_status``;
+    search capability probes call this lightweight check once per schema
+    version so they do not multiply unrelated table PRAGMAs.
+    """
+
+    if _database_user_version(conn) != DATABASE_SCHEMA_VERSION:
+        return False
+    table = conn.execute(
+        "SELECT type FROM sqlite_schema WHERE name = 'archive_generations'"
+    ).fetchone()
+    if table is None or str(table[0]) != "table":
+        return False
+    xinfo = list(conn.execute('PRAGMA table_xinfo("archive_generations")'))
+    pk = tuple(
+        str(row[1]) for row in sorted((row for row in xinfo if int(row[5]) > 0), key=lambda row: int(row[5]))
+    )
+    columns = {str(row[1]): row for row in xinfo}
+    generation = columns.get("generation")
+    if (
+        pk != ("name",)
+        or generation is None
+        or str(generation[2]).strip().upper() != "INTEGER"
+        or not bool(generation[3])
+        or _normalize_default(generation[4]) != "0"
+    ):
+        return False
+    rows = conn.execute(
+        "SELECT name, type, sql FROM sqlite_schema WHERE name IN ({})".format(
+            ",".join("?" for _ in GENERATION_TRIGGER_CONTRACT)
+        ),
+        tuple(GENERATION_TRIGGER_CONTRACT),
+    ).fetchall()
+    found = {str(row[0]): (str(row[1]), row[2]) for row in rows}
+    for name, expected_tuple in GENERATION_TRIGGER_CONTRACT.items():
+        item = found.get(name)
+        if item is None or item[0] != "trigger":
+            return False
+        expected = {
+            "table": expected_tuple[0],
+            "timing": expected_tuple[1],
+            "event": expected_tuple[2],
+            "update_of": expected_tuple[3],
+            "when": expected_tuple[4],
+            "generation_name": expected_tuple[5],
+            "body_semantics": "increment_by_one",
+        }
+        if _trigger_definition(item[1]) != expected:
+            return False
+    return True
 
 
 def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -1059,17 +1314,34 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
 
     current_version = _database_user_version(conn)
     rows = conn.execute(
-        "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view', 'trigger', 'index')"
+        "SELECT name, type, tbl_name, sql FROM sqlite_schema "
+        "WHERE type IN ('table', 'view', 'trigger', 'index')"
     ).fetchall()
-    objects = {str(row[0]): str(row[1]) for row in rows}
-    tables = {name for name, kind in objects.items() if kind in {"table", "view"}}
+    objects = {
+        str(row[0]): {"type": str(row[1]), "table": str(row[2]), "sql": row[3]}
+        for row in rows
+    }
+    tables = {name for name, item in objects.items() if item["type"] == "table"}
+    object_type_mismatches: dict[str, dict[str, str]] = {}
+    for name in CORE_SCHEMA_TABLES:
+        item = objects.get(name)
+        if item is not None and item["type"] != "table":
+            object_type_mismatches[name] = {"expected": "table", "actual": str(item["type"])}
+    for name in set(REQUIRED_INDEX_CONTRACT) | set(GENERATION_TRIGGER_CONTRACT):
+        item = objects.get(name)
+        expected_type = "index" if name in REQUIRED_INDEX_CONTRACT else "trigger"
+        if item is not None and item["type"] != expected_type:
+            object_type_mismatches[name] = {"expected": expected_type, "actual": str(item["type"])}
+
     missing_tables = sorted(CORE_SCHEMA_TABLES - tables)
     missing_columns: dict[str, list[str]] = {}
+    invalid_tables: dict[str, dict[str, Any]] = {}
     for table, required_columns in CORE_SCHEMA_COLUMNS.items():
         if table not in tables:
             continue
         try:
-            columns = {str(row[1]) for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
+            xinfo = list(conn.execute(f'PRAGMA table_xinfo("{table}")'))
+            columns = {str(row[1]) for row in xinfo}
         except sqlite3.Error:
             missing_columns[table] = sorted(required_columns)
             continue
@@ -1077,21 +1349,115 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
         if missing:
             missing_columns[table] = missing
 
+        contract = CANONICAL_TABLE_CONTRACT[table]
+        actual_pk = tuple(
+            str(row[1]) for row in sorted((row for row in xinfo if int(row[5]) > 0), key=lambda row: int(row[5]))
+        )
+        expected_pk = tuple(contract.get("primary_key", ()))
+        table_errors: dict[str, Any] = {}
+        if actual_pk != expected_pk:
+            table_errors["primary_key"] = {"expected": list(expected_pk), "actual": list(actual_pk)}
+        by_name = {str(row[1]): row for row in xinfo}
+        invalid_columns: dict[str, dict[str, Any]] = {}
+        for column, (expected_type, expected_not_null, expected_default) in contract.get("columns", {}).items():
+            row = by_name.get(column)
+            if row is None:
+                continue
+            actual = {
+                "type": str(row[2]).strip().upper(),
+                "not_null": bool(row[3]),
+                "default": _normalize_default(row[4]),
+            }
+            expected = {
+                "type": expected_type,
+                "not_null": expected_not_null,
+                "default": expected_default,
+            }
+            if actual != expected:
+                invalid_columns[column] = {"expected": expected, "actual": actual}
+        if invalid_columns:
+            table_errors["columns"] = invalid_columns
+        expected_unique = set(contract.get("unique", ()))
+        missing_unique = sorted(
+            expected_unique - _table_unique_keys(conn, table)
+            if expected_unique
+            else ()
+        )
+        if missing_unique:
+            table_errors["missing_unique"] = [list(value) for value in missing_unique]
+        if table_errors:
+            invalid_tables[table] = table_errors
+
     missing_indexes: list[str] = []
-    invalid_indexes: dict[str, dict[str, list[str]]] = {}
-    for name, expected in REQUIRED_INDEX_COLUMNS.items():
-        if objects.get(name) != "index":
+    invalid_indexes: dict[str, dict[str, Any]] = {}
+    for name, expected in REQUIRED_INDEX_CONTRACT.items():
+        item = objects.get(name)
+        if item is None:
             missing_indexes.append(name)
             continue
-        actual = tuple(str(row[2]) for row in conn.execute(f'PRAGMA index_info("{name}")'))
+        if item["type"] != "index":
+            continue
+        index_row = next(
+            (row for row in conn.execute(f'PRAGMA index_list("{expected["table"]}")') if str(row[1]) == name),
+            None,
+        )
+        actual = {
+            "table": item["table"],
+            "unique": bool(index_row[2]) if index_row is not None else False,
+            "origin": str(index_row[3]) if index_row is not None else "missing",
+            "partial": bool(index_row[4]) if index_row is not None else False,
+            "keys": _index_keys(conn, name),
+            "where": None,
+        }
+        sql = str(item["sql"] or "")
+        where_match = re.search(r"\bWHERE\b(.+)$", sql, re.IGNORECASE | re.DOTALL)
+        if where_match:
+            actual["where"] = re.sub(r"\s+", " ", where_match.group(1).strip()).rstrip(";")
         if actual != expected:
-            invalid_indexes[name] = {"expected": list(expected), "actual": list(actual)}
+            invalid_indexes[name] = {
+                "expected": {**expected, "keys": [list(value) for value in expected["keys"]]},
+                "actual": {**actual, "keys": [list(value) for value in actual["keys"]]},
+            }
 
-    missing_triggers = sorted(set(GENERATION_TRIGGER_DDL) - {name for name, kind in objects.items() if kind == "trigger"})
+    missing_triggers: list[str] = []
+    invalid_triggers: dict[str, dict[str, Any]] = {}
+    for name, expected_tuple in GENERATION_TRIGGER_CONTRACT.items():
+        item = objects.get(name)
+        if item is None:
+            missing_triggers.append(name)
+            continue
+        if item["type"] != "trigger":
+            continue
+        expected = {
+            "table": expected_tuple[0],
+            "timing": expected_tuple[1],
+            "event": expected_tuple[2],
+            "update_of": expected_tuple[3],
+            "when": expected_tuple[4],
+            "generation_name": expected_tuple[5],
+            "body_semantics": "increment_by_one",
+        }
+        actual = _trigger_definition(item["sql"])
+        if actual != expected:
+            invalid_triggers[name] = {
+                "expected": {**expected, "update_of": list(expected["update_of"])},
+                "actual": None if actual is None else {**actual, "update_of": list(actual["update_of"])},
+            }
+
     generation_rows: set[str] = set()
+    invalid_generation_rows: dict[str, dict[str, str]] = {}
     if "archive_generations" in tables and "archive_generations" not in missing_columns:
         try:
-            generation_rows = {str(row[0]) for row in conn.execute("SELECT name FROM archive_generations")}
+            for row in conn.execute(
+                "SELECT name, generation, typeof(generation) FROM archive_generations"
+            ):
+                name = str(row[0])
+                generation_rows.add(name)
+                if name in REQUIRED_GENERATION_ROWS and not _strict_nonnegative_integer(row[1], str(row[2])):
+                    invalid_generation_rows[name] = {
+                        "expected": "nonnegative_integer",
+                        "actual_type": str(row[2]),
+                    }
         except sqlite3.Error:
             generation_rows = set()
     missing_generation_rows = sorted(set(REQUIRED_GENERATION_ROWS) - generation_rows)
@@ -1101,25 +1467,49 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
         if table not in tables:
             continue
         actual = {
-            (str(row[3]), str(row[2]), str(row[4]), str(row[6]).upper())
+            (str(row[3]), str(row[2]), str(row[4]), str(row[6]).upper(), str(row[5]).upper())
             for row in conn.execute(f'PRAGMA foreign_key_list("{table}")')
         }
         missing = required - actual
         if missing:
             missing_foreign_keys[table] = [
-                {"column": column, "parent_table": parent, "parent_column": parent_column, "on_delete": on_delete}
-                for column, parent, parent_column, on_delete in sorted(missing)
+                {
+                    "column": column,
+                    "parent_table": parent,
+                    "parent_column": parent_column,
+                    "on_delete": on_delete,
+                    "on_update": on_update,
+                }
+                for column, parent, parent_column, on_delete, on_update in sorted(missing)
             ]
 
     base_missing_tables = sorted((set(CORE_SCHEMA_COLUMNS) - {"archive_generations"}) - tables)
     base_missing_columns = {
         table: columns for table, columns in missing_columns.items() if table != "archive_generations"
     }
-    base_compatible = not base_missing_tables and not base_missing_columns and not missing_foreign_keys
+    base_object_mismatches = {
+        name: detail
+        for name, detail in object_type_mismatches.items()
+        if name in CORE_SCHEMA_TABLES or name in REQUIRED_INDEX_CONTRACT or name in GENERATION_TRIGGER_CONTRACT
+    }
+    base_invalid_tables = {
+        table: detail for table, detail in invalid_tables.items() if table != "archive_generations"
+    }
+    base_compatible = not (
+        base_missing_tables
+        or base_missing_columns
+        or base_invalid_tables
+        or missing_foreign_keys
+        or base_object_mismatches
+        or invalid_generation_rows
+        or "archive_generations" in missing_columns
+        or ("archive_generations" in tables and "archive_generations" in invalid_tables)
+    )
     managed_missing = bool(
         "archive_generations" in missing_tables
         or missing_generation_rows
         or missing_triggers
+        or invalid_triggers
         or missing_indexes
         or invalid_indexes
     )
@@ -1137,11 +1527,15 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
         "database_schema_newer": schema_newer,
         "missing_tables": missing_tables,
         "missing_columns": missing_columns,
+        "invalid_tables": invalid_tables,
+        "object_type_mismatches": object_type_mismatches,
         "missing_indexes": sorted(missing_indexes),
         "invalid_indexes": invalid_indexes,
-        "missing_triggers": missing_triggers,
+        "missing_triggers": sorted(missing_triggers),
+        "invalid_triggers": invalid_triggers,
         "missing_generation_table": "archive_generations" in missing_tables,
         "missing_generation_rows": missing_generation_rows,
+        "invalid_generation_rows": invalid_generation_rows,
         "missing_foreign_keys": missing_foreign_keys,
         "foreign_keys_enabled": bool(conn.execute("PRAGMA foreign_keys").fetchone()[0]),
         "message_fts_available": "message_fts" in tables,

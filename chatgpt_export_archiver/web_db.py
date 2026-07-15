@@ -57,7 +57,8 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
 def connect_writable(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise ValueError("database_not_found")
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    uri = f"{db_path.resolve().as_uri()}?mode=rw"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")

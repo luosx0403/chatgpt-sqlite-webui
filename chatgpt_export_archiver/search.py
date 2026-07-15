@@ -20,6 +20,7 @@ from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
     OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+    parse_nonnegative_integer,
 )
 from .sqlite_errors import is_optional_search_capability_missing
 from .utils import compact_json
@@ -2937,7 +2938,20 @@ def _connection_capabilities(conn: sqlite3.Connection) -> dict[str, Any]:
             }
         except sqlite3.Error:
             metadata = {}
-    result = {"tables": tables, "metadata": metadata}
+    try:
+        # A matching generation counter is trustworthy only while the managed
+        # trigger/table contract itself is current.  Import lazily to keep the
+        # low-level database module independent from search.
+        from .db import generation_schema_contract_is_current
+
+        generation_schema_current = generation_schema_contract_is_current(conn)
+    except (sqlite3.Error, ValueError):
+        generation_schema_current = False
+    result = {
+        "tables": tables,
+        "metadata": metadata,
+        "generation_schema_current": generation_schema_current,
+    }
     with _CAPABILITY_CACHE_LOCK:
         _CAPABILITY_CACHE[cache_key] = (conn, schema_version, result)
         _CAPABILITY_CACHE.move_to_end(cache_key)
@@ -2968,6 +2982,8 @@ def _web_index_metadata_value(conn: sqlite3.Connection, key: str) -> str | None:
 
 def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
     if (
+        not _connection_capabilities(conn)["generation_schema_current"]
+        or
         _web_index_metadata_value(conn, "web_index_format_version") != OPTIONAL_WEB_INDEX_FORMAT_VERSION
         or _web_index_metadata_value(conn, "display_text_resolver_version") != DISPLAY_TEXT_RESOLVER_VERSION
         or _web_index_metadata_value(conn, "normalization_index_format_version") != NORMALIZATION_INDEX_FORMAT_VERSION
@@ -2976,7 +2992,8 @@ def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
     if not _table_exists(conn, "archive_generations"):
         return False
     expected = _web_index_metadata_value(conn, f"{name}_generation")
-    if expected is None:
+    expected_generation = parse_nonnegative_integer(expected)
+    if expected_generation is None:
         return False
     try:
         row = conn.execute(
@@ -2985,7 +3002,20 @@ def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
         ).fetchone()
     except sqlite3.Error:
         return False
-    return row is not None and str(row[0]) == expected
+    if row is None:
+        return False
+    try:
+        sqlite_type = conn.execute(
+            "SELECT typeof(generation) FROM archive_generations WHERE name = ?",
+            (name,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(
+        sqlite_type is not None
+        and str(sqlite_type[0]) == "integer"
+        and parse_nonnegative_integer(row[0]) == expected_generation
+    )
 
 
 def _has_normalized_message_norm(conn: sqlite3.Connection) -> bool:

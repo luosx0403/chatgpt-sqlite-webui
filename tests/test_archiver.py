@@ -3933,6 +3933,230 @@ class ArchiverTests(unittest.TestCase):
             self.assertEqual(database_schema_status(repaired)["current_database_schema_version"], DATABASE_SCHEMA_VERSION)
             repaired.close()
 
+    def test_schema_contract_detects_and_repairs_every_managed_trigger_shape(self):
+        from chatgpt_export_archiver.db import (
+            GENERATION_TRIGGER_CONTRACT,
+            connect,
+            database_schema_status,
+            init_db,
+            migrate_database,
+        )
+
+        def fresh_db(base: Path, name: str):
+            conn = connect(base / f"{name}.db")
+            init_db(conn)
+            return conn
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            for index, (name, contract) in enumerate(GENERATION_TRIGGER_CONTRACT.items()):
+                with self.subTest(trigger=name, drift="noop"):
+                    conn = fresh_db(base, f"noop-{index}")
+                    conn.execute(f'DROP TRIGGER "{name}"')
+                    conn.execute(
+                        f'CREATE TRIGGER "{name}" {contract[1]} {contract[2]} '
+                        f'ON "{contract[0]}" BEGIN SELECT 1; END'
+                    )
+                    status = database_schema_status(conn)
+                    self.assertTrue(status["migration_required"])
+                    self.assertIn(name, status["invalid_triggers"])
+                    self.assertTrue(migrate_database(conn)["changed"])
+                    self.assertTrue(database_schema_status(conn)["ok"])
+                    self.assertFalse(migrate_database(conn)["changed"])
+                    conn.close()
+
+            variants = {
+                "wrong_target": "AFTER UPDATE OF conversation_id, title ON source_files BEGIN UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title'; END",
+                "wrong_timing": "BEFORE UPDATE OF conversation_id, title ON conversations BEGIN UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title'; END",
+                "wrong_event": "AFTER DELETE ON conversations BEGIN UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title'; END",
+                "wrong_update_of": "AFTER UPDATE OF title ON conversations BEGIN UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title'; END",
+                "wrong_generation": "AFTER UPDATE OF conversation_id, title ON conversations BEGIN UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message'; END",
+                "wrong_body": "AFTER UPDATE OF conversation_id, title ON conversations BEGIN UPDATE archive_generations SET generation = generation + 2 WHERE name = 'title'; END",
+            }
+            trigger_name = "archive_title_generation_update"
+            for index, (label, definition) in enumerate(variants.items()):
+                with self.subTest(trigger=trigger_name, drift=label):
+                    conn = fresh_db(base, f"variant-{index}")
+                    conn.execute(f'DROP TRIGGER "{trigger_name}"')
+                    conn.execute(f'CREATE TRIGGER "{trigger_name}" {definition}')
+                    self.assertIn(trigger_name, database_schema_status(conn)["invalid_triggers"])
+                    self.assertTrue(migrate_database(conn)["changed"])
+                    self.assertTrue(database_schema_status(conn)["ok"])
+                    conn.close()
+
+    def test_schema_contract_detects_and_repairs_managed_index_shape(self):
+        from chatgpt_export_archiver.db import (
+            DatabaseMigrationError,
+            connect,
+            database_schema_status,
+            init_db,
+            migrate_database,
+        )
+
+        variants = {
+            "partial": "CREATE INDEX idx_nodes_conversation_path ON conversation_nodes(conversation_id, is_on_current_path) WHERE is_on_current_path = 1",
+            "wrong_table": "CREATE INDEX idx_nodes_conversation_path ON conversations(create_time, update_time)",
+            "wrong_order": "CREATE INDEX idx_nodes_conversation_path ON conversation_nodes(is_on_current_path, conversation_id)",
+            "unique": "CREATE UNIQUE INDEX idx_nodes_conversation_path ON conversation_nodes(conversation_id, is_on_current_path)",
+            "collation": "CREATE INDEX idx_nodes_conversation_path ON conversation_nodes(conversation_id COLLATE NOCASE, is_on_current_path)",
+            "descending": "CREATE INDEX idx_nodes_conversation_path ON conversation_nodes(conversation_id DESC, is_on_current_path)",
+            "expression": "CREATE INDEX idx_nodes_conversation_path ON conversation_nodes((conversation_id || ''), is_on_current_path)",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            for index, (label, ddl) in enumerate(variants.items()):
+                with self.subTest(drift=label):
+                    conn = connect(base / f"index-{index}.db")
+                    init_db(conn)
+                    conn.execute("DROP INDEX idx_nodes_conversation_path")
+                    conn.execute(ddl)
+                    status = database_schema_status(conn)
+                    self.assertTrue(status["migration_required"])
+                    self.assertIn("idx_nodes_conversation_path", status["invalid_indexes"])
+                    self.assertTrue(migrate_database(conn)["changed"])
+                    self.assertTrue(database_schema_status(conn)["ok"])
+                    conn.close()
+
+            conn = connect(base / "collision.db")
+            init_db(conn)
+            conn.execute("DROP INDEX idx_nodes_conversation_path")
+            conn.execute("CREATE TABLE idx_nodes_conversation_path(marker TEXT)")
+            status = database_schema_status(conn)
+            self.assertFalse(status["base_schema_compatible"])
+            self.assertEqual(status["object_type_mismatches"]["idx_nodes_conversation_path"]["actual"], "table")
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(conn)
+            self.assertEqual(caught.exception.code, "database_schema_incompatible")
+            self.assertIsNotNone(conn.execute("SELECT marker FROM idx_nodes_conversation_path").description)
+            conn.close()
+
+    def test_schema_contract_rejects_unsafe_table_and_generation_drift(self):
+        from chatgpt_export_archiver.db import (
+            DATABASE_SCHEMA_VERSION,
+            DatabaseMigrationError,
+            connect,
+            database_schema_status,
+            init_db,
+            migrate_database,
+        )
+
+        fixture = (Path(__file__).resolve().parent / "fixtures" / "legacy-fa37b3d.sql").read_text(encoding="utf-8")
+        variants = {
+            "missing_exports_unique": fixture.replace(
+                "export_options_json TEXT,\n            UNIQUE(conversation_id, format, output_path)",
+                "export_options_json TEXT",
+            ),
+            "missing_conversation_pk": fixture.replace(
+                "conversation_id TEXT PRIMARY KEY,", "conversation_id TEXT,", 1
+            ),
+            "missing_aggregate_not_null": fixture.replace(
+                "aggregate_hash TEXT NOT NULL,", "aggregate_hash TEXT,", 1
+            ),
+            "wrong_default_and_nullability": fixture.replace(
+                "is_conversation_json INTEGER NOT NULL DEFAULT 0,",
+                "is_conversation_json INTEGER DEFAULT 1,",
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            for index, (label, sql) in enumerate(variants.items()):
+                with self.subTest(drift=label):
+                    db = base / f"table-{index}.db"
+                    conn = sqlite3.connect(db)
+                    conn.row_factory = sqlite3.Row
+                    conn.executescript(sql)
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    status = database_schema_status(conn)
+                    self.assertFalse(status["base_schema_compatible"])
+                    self.assertTrue(status["invalid_tables"])
+                    with self.assertRaises(DatabaseMigrationError) as caught:
+                        migrate_database(conn)
+                    self.assertEqual(caught.exception.code, "database_schema_incompatible")
+                    conn.close()
+
+            for index, value in enumerate((-1, 1.5, "invalid")):
+                with self.subTest(generation=value):
+                    conn = connect(base / f"generation-{index}.db")
+                    init_db(conn)
+                    conn.execute("UPDATE archive_generations SET generation = ? WHERE name = 'title'", (value,))
+                    status = database_schema_status(conn)
+                    self.assertIn("title", status["invalid_generation_rows"])
+                    self.assertFalse(status["base_schema_compatible"])
+                    with self.assertRaises(DatabaseMigrationError) as caught:
+                        migrate_database(conn)
+                    self.assertEqual(caught.exception.code, "database_schema_incompatible")
+                    conn.close()
+
+            conn = connect(base / "missing-row.db")
+            init_db(conn)
+            conn.execute("DELETE FROM archive_generations WHERE name = 'title'")
+            conn.commit()
+            self.assertTrue(database_schema_status(conn)["migration_required"])
+            self.assertTrue(migrate_database(conn)["changed"])
+            self.assertEqual(conn.execute("SELECT generation FROM archive_generations WHERE name = 'title'").fetchone()[0], 0)
+            conn.execute("PRAGMA user_version = 1")
+            conn.commit()
+            self.assertTrue(migrate_database(conn)["changed"])
+            self.assertEqual(database_schema_status(conn)["current_database_schema_version"], DATABASE_SCHEMA_VERSION)
+            self.assertFalse(migrate_database(conn)["changed"])
+            conn.close()
+
+    def test_trigger_drift_invalidates_stale_web_indexes_and_generation_metadata_is_strict(self):
+        from chatgpt_export_archiver.db import connect, database_schema_status, init_db, migrate_database
+        from chatgpt_export_archiver.search import parse_query, search_conversations
+        from chatgpt_export_archiver.web_db import create_web_indexes, web_index_status
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "stale.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES ('c', 'old ghost title', 'h')"
+            )
+            conn.execute(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, content_text) VALUES ('c', 'n', 'old ghost message')"
+            )
+            conn.commit()
+            conn.close()
+            create_web_indexes(db)
+
+            conn = connect(db)
+            self.assertTrue(web_index_status(conn)["web_normalized_indexed"])
+            conn.execute("DROP TRIGGER archive_title_generation_update")
+            conn.execute(
+                "CREATE TRIGGER archive_title_generation_update AFTER UPDATE OF conversation_id, title ON conversations BEGIN SELECT 1; END"
+            )
+            conn.execute("UPDATE conversations SET title = 'new live title' WHERE conversation_id = 'c'")
+            conn.commit()
+            self.assertIn("archive_title_generation_update", database_schema_status(conn)["invalid_triggers"])
+            self.assertFalse(web_index_status(conn)["web_normalized_indexed"])
+            page = search_conversations(conn, parse_query("new live", scope="title"), limit=10)
+            self.assertEqual([item["conversation_id"] for item in page["items"]], ["c"])
+            self.assertEqual(search_conversations(conn, parse_query("old ghost", scope="title"), limit=10)["items"], [])
+
+            conn.commit()
+            self.assertTrue(migrate_database(conn)["changed"])
+            self.assertTrue(database_schema_status(conn)["ok"])
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")}
+            self.assertNotIn("web_title_norm", tables)
+            conn.close()
+
+            create_web_indexes(db)
+            conn = connect(db)
+            current = conn.execute(
+                "SELECT value FROM web_index_metadata WHERE key = 'title_generation'"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE web_index_metadata SET value = ? WHERE key = 'title_generation'",
+                (f"0{current}",),
+            )
+            conn.commit()
+            conn.close()
+            fresh = connect(db)
+            self.assertFalse(web_index_status(fresh)["web_normalized_indexed"])
+            fresh.close()
+
     def test_migration_readonly_locked_and_foreign_key_failures_are_stable(self):
         from chatgpt_export_archiver.db import DatabaseMigrationError, migrate_database
 
