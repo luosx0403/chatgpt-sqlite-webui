@@ -27,6 +27,7 @@ from .web_db import (
     connect_readonly,
     detect_fts5,
     detect_trigram,
+    message_fts_status,
     web_index_status,
 )
 from .web_jobs import ImportJobManager, ImportJobStartError, cleanup_upload_dir, make_upload_path
@@ -381,6 +382,8 @@ def create_api_router(
                 "migration_required": False,
                 "fts5_available": False,
                 "message_fts_available": False,
+                "message_fts_rebuildable": False,
+                "message_fts_error": None,
                 "trigram_available": False,
                 "web_trigram_indexed": False,
                 "web_normalized_indexed": False,
@@ -407,6 +410,7 @@ def create_api_router(
             schema = check_schema(conn)
             web_status = web_index_status(conn)
             fts5 = detect_fts5(conn)
+            fts_status = message_fts_status(conn, fts5_available=fts5)
             trigram = detect_trigram(conn)
             foreign_keys = foreign_key_diagnostics(conn) if schema["base_schema_compatible"] else {
                 "foreign_key_violations": 0,
@@ -436,7 +440,7 @@ def create_api_router(
             "normalization_index_format_version": NORMALIZATION_INDEX_FORMAT_VERSION,
             "optional_web_index_format_version": WEB_INDEX_FORMAT_VERSION,
             "fts5_available": fts5,
-            "message_fts_available": schema["message_fts"],
+            **fts_status,
             "trigram_available": trigram,
             **foreign_keys,
             **access,
@@ -518,6 +522,8 @@ def create_api_router(
                 "filters": ["q", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "match_mode"],
                 "limits": {"conversation_id": MAX_ID_PARAM_LENGTH, "around_node_id": MAX_ID_PARAM_LENGTH, "q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH},
                 "raw": "message pages return raw_preview only; capped raw preview is available per message endpoint",
+                "item_fields": ["node_id", "parent_node_id", "children_json", "message_id", "role", "author_name", "create_time", "update_time", "content_type", "display_text", "has_text", "has_raw", "raw_preview", "raw_preview_truncated", "content_hash", "is_on_current_path", "effective_visible_in_current_view", "is_internal", "is_empty_mapping_node", "highlight_ranges", "highlight_ranges_truncated"],
+                "display_text_contract": "display_text is the single full user-visible resolved body; content_text and render_text are not returned by default",
                 "hidden_counts": {
                     "fields": ["visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"],
                     "contract": "internal_hidden_count is the one canonical non-empty internal-node count; technical_hidden_count is a deprecated exact alias retained for compatibility",
@@ -601,11 +607,11 @@ def create_api_router(
                 "endpoints": ["/api/import/jobs", "/api/import/jobs/{job_id}"],
                 "job_id": "lowercase 32-character hexadecimal UUID; invalid syntax returns invalid_job_id and a valid unknown ID returns job_not_found",
                 "statuses": ["queued", "running", "succeeded", "failed", "postcheck_failed"],
-                "outcomes": ["queued", "import_running", "input_preflight_failed", "source_scan_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
-                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "summary", "verify", "stats", "web_index"],
-                "failure_codes": ["import_job_start_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed"],
-                "cleanup_warnings": ["upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"],
-                "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type"],
+                "outcomes": ["queued", "import_running", "import_job_start_failed", "input_preflight_failed", "source_scan_failed", "source_read_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
+                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index"],
+                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "invalid_conversation_encoding", "json_integer_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed"],
+                "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"]},
+                "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
             },
             "ui_state": {
                 "canonical_copy_url": ["match_mode", "layout", "show_internal", "sort", "path", "scope", "q", "role", "title", "exact", "exclude", "source", "after", "before", "selected conversation"],
@@ -617,20 +623,22 @@ def create_api_router(
                 "migration": "run the explicit CLI migrate command after creating and verifying an external backup; import initializes new databases and upgrades migratable databases, while web-index requires a current core schema",
                 "health_fields": ["schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "missing_tables", "missing_columns", "missing_indexes", "invalid_indexes", "missing_triggers", "missing_generation_rows", "missing_foreign_keys"],
                 "errors": ["database_not_ready", "database_migration_required", "database_schema_incompatible"],
+                "optional_fts_fields": ["message_fts_available", "message_fts_rebuildable", "message_fts_error", "optional_message_fts_error", "optional_message_fts_recovery_hint"],
             },
             "stable_error_codes": [
                 "database_not_ready", "database_migration_required", "database_schema_incompatible", "invalid_job_id", "job_not_found",
+                "database_malformed", "database_locked", "database_readonly", "database_io_error", "database_runtime_failure",
                 "conversation_not_found", "message_not_found", "invalid_export_format",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
-                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required",
+                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_preflight_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required",
                 "upload_invalid_content_length", "upload_multipart_body_too_large", "upload_too_large",
                 "uploaded_file_not_zip", "uploaded_file_invalid_zip", "upload_zip_no_conversation_sources",
                 "upload_zip_ambiguous_conversation_sources", "upload_zip_too_many_members",
                 "upload_zip_too_many_json_members", "upload_zip_member_too_large",
                 "upload_zip_uncompressed_too_large", "upload_zip_compression_ratio_too_high",
-                "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed",
-                "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list",
+                "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read",
+                "invalid_conversation_encoding", "json_integer_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list",
                 "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed",
             ],
             "provenance": {
@@ -688,6 +696,7 @@ def create_api_router(
             raise HTTPException(status_code=409, detail="import_job_active")
         upload_dir: Path | None = None
         transferred = False
+        upload_file_closed = False
         primary_http_error: HTTPException | None = None
         filename = file.filename or "upload.zip"
         try:
@@ -703,7 +712,11 @@ def create_api_router(
                     size += len(chunk)
                     if size > policy.max_upload_bytes:
                         raise HTTPException(status_code=413, detail="upload_too_large")
-                    out.write(chunk)
+                    written = out.write(chunk)
+                    if written != len(chunk):
+                        raise OSError("short upload write")
+            await file.close()
+            upload_file_closed = True
             if not zipfile.is_zipfile(upload_path):
                 raise HTTPException(status_code=400, detail="uploaded_file_invalid_zip")
             _validate_upload_zip_members(upload_path, policy)
@@ -723,9 +736,39 @@ def create_api_router(
         except HTTPException as exc:
             primary_http_error = exc
             raise
+        except Exception as exc:
+            primary_http_error = HTTPException(
+                status_code=500,
+                detail={"code": "upload_preflight_failed", "error_type": type(exc).__name__},
+            )
+            raise primary_http_error from exc
         finally:
             if not transferred:
                 manager.release_pending_upload_slot()
+                if not upload_file_closed:
+                    try:
+                        await file.close()
+                    except Exception as exc:
+                        if primary_http_error is not None:
+                            detail = (
+                                dict(primary_http_error.detail)
+                                if isinstance(primary_http_error.detail, dict)
+                                else {"code": str(primary_http_error.detail)}
+                            )
+                            detail.update(
+                                {
+                                    "cleanup_warning": "upload_file_close_failed",
+                                    "cleanup_error_type": type(exc).__name__,
+                                    "cleanup_warnings": [
+                                        {
+                                            "code": "upload_file_close_failed",
+                                            "error_type": type(exc).__name__,
+                                            "path_kind": "upload_file",
+                                        }
+                                    ],
+                                }
+                            )
+                            primary_http_error.detail = detail
                 if upload_dir is not None:
                     cleanup = cleanup_upload_dir(upload_dir)
                     if not cleanup["ok"]:
@@ -740,6 +783,14 @@ def create_api_router(
                                 {
                                     "cleanup_warning": "temporary_upload_cleanup_failed",
                                     "cleanup_error_type": cleanup["error_type"] or "PathStillExists",
+                                    "cleanup_warnings": [
+                                        *list(detail.get("cleanup_warnings", [])),
+                                        {
+                                            "code": "temporary_upload_cleanup_failed",
+                                            "error_type": cleanup["error_type"] or "PathStillExists",
+                                            "path_kind": "upload_directory",
+                                        },
+                                    ],
                                 }
                             )
                             primary_http_error.detail = detail
@@ -1000,7 +1051,7 @@ def _validate_upload_zip_members(path: Path, policy: UploadPolicy) -> None:
         with zipfile.ZipFile(path) as zf:
             all_infos = zf.infolist()
             file_infos = [info for info in all_infos if not info.is_dir()]
-            total_members = len(file_infos)
+            total_members = len(all_infos)
             source_infos = [info for info in file_infos if not is_metadata_path(info.filename)]
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=400, detail="uploaded_file_invalid_zip") from exc

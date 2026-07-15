@@ -38,6 +38,7 @@ from .logging_utils import configure_logging, get_logger
 from .parser import WarningRecord, conversation_id_from_value, parse_conversation, validate_conversation_element
 from .scanner import (
     InputSource,
+    JsonIntegerTooLargeError,
     NonFiniteJsonNumberError,
     is_legacy_conversations_source,
     is_shard_conversation_source,
@@ -46,6 +47,7 @@ from .scanner import (
     resolve_input,
     select_conversation_sources,
 )
+from .sqlite_errors import sqlite_runtime_error_code
 from .utils import compact_json, epoch_to_display, sha256_file, sha256_text
 from .web_db import create_web_indexes
 
@@ -106,7 +108,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         return args.func(args)
-    except (ValueError, sqlite3.Error, OSError, json.JSONDecodeError) as exc:
+    except sqlite3.Error as exc:
+        print(f"ERROR: {sqlite_runtime_error_code(exc)} error_type={type(exc).__name__}", file=sys.stderr)
+        return 2
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -259,6 +264,27 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _classify_source_load_error(exc: BaseException) -> tuple[str, str]:
+    """Map parser/read failures to stable public codes without OS details."""
+
+    if isinstance(exc, JsonIntegerTooLargeError):
+        return "json_integer_too_large", "json_decode"
+    if isinstance(exc, NonFiniteJsonNumberError):
+        return "non_finite_json_number", "json_decode"
+    if isinstance(exc, UnicodeDecodeError):
+        return "invalid_conversation_encoding", "json_decode"
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_conversation_json", "json_decode"
+    raw_code = str(exc).split(" ", 1)[0] if isinstance(exc, ValueError) else ""
+    if raw_code == "input_source_open_failed":
+        return raw_code, "source_read"
+    if raw_code == "input_source_not_regular_file":
+        return raw_code, "source_read"
+    if raw_code in {"input_symlink_not_allowed", "input_source_outside_root", "source_not_found"}:
+        return "source_changed_during_read", "source_read"
+    return "source_read_failed", "source_read"
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     source = resolve_input(args.input, Path.cwd())
     entries = list_source_entries(source)
@@ -284,9 +310,13 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     for entry in selected:
         try:
             data = load_json_from_source(source, entry.source_path)
-        except (json.JSONDecodeError, NonFiniteJsonNumberError):
+        except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, UnicodeDecodeError, OSError, ValueError) as exc:
             top_level_bad += 1
-            print(f"source {Path(entry.source_path).name} top_level invalid_json valid 0 invalid 0")
+            code, stage = _classify_source_load_error(exc)
+            print(
+                f"source {Path(entry.source_path).name} top_level invalid_json "
+                f"valid 0 invalid 0 error_code {code} stage {stage}"
+            )
             continue
         if not isinstance(data, list):
             top_level_bad += 1
@@ -540,30 +570,12 @@ def run_import_pipeline(
         for source_index, entry in enumerate(selected):
             try:
                 data = load_json_from_source(source, entry.source_path)
-            except json.JSONDecodeError as exc:
-                summary["failure_code"] = "invalid_conversation_json"
+            except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, UnicodeDecodeError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                code, stage = _classify_source_load_error(exc)
+                summary["failure_code"] = code
                 raise ImportPipelineError(
-                    "invalid_conversation_json",
-                    stage="json_decode",
-                    source_identifier=f"selected_source_{source_index}",
-                    run_id=run_id,
-                ) from exc
-            except NonFiniteJsonNumberError as exc:
-                summary["failure_code"] = "non_finite_json_number"
-                raise ImportPipelineError(
-                    "non_finite_json_number",
-                    stage="json_decode",
-                    source_identifier=f"selected_source_{source_index}",
-                    run_id=run_id,
-                ) from exc
-            except ValueError as exc:
-                raw_code = str(exc).split(" ", 1)[0]
-                if raw_code not in {"input_symlink_not_allowed", "input_source_outside_root"}:
-                    raise
-                summary["failure_code"] = raw_code
-                raise ImportPipelineError(
-                    raw_code,
-                    stage="source_scan",
+                    code,
+                    stage=stage,
                     source_identifier=f"selected_source_{source_index}",
                     run_id=run_id,
                 ) from exc
@@ -900,6 +912,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if result.get("optional_web_index_error"):
         print(f"optional_web_index_error {str(result['optional_web_index_error']).lower()}")
         print(f"optional_web_index_recovery_hint {result['optional_web_index_recovery_hint']}")
+    print(f"message_fts_available {str(bool(result.get('message_fts_available'))).lower()}")
+    print(f"message_fts_rebuildable {str(bool(result.get('message_fts_rebuildable'))).lower()}")
+    if result.get("message_fts_error"):
+        print(f"message_fts_error {result['message_fts_error']}")
+    if result.get("optional_message_fts_error"):
+        print("optional_message_fts_error true")
+        print(f"optional_message_fts_recovery_hint {result['optional_message_fts_recovery_hint']}")
     for item in result["latest_warnings_by_type"]:
         print(f"latest_warning_type {item['warning_type']} count {item['count']}")
     for item in result["warnings_by_type"]:

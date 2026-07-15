@@ -14,10 +14,15 @@ from .utils import classify_file
 
 
 SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
+MAX_JSON_INTEGER_DIGITS = 1000
 
 
 class NonFiniteJsonNumberError(ValueError):
     """Raised when a JSON source contains non-standard NaN/Infinity tokens."""
+
+
+class JsonIntegerTooLargeError(ValueError):
+    """Raised when a JSON integer exceeds the project-stable digit budget."""
 
 
 def _reject_non_finite_json_number(value: str) -> None:
@@ -29,6 +34,13 @@ def _parse_finite_json_float(value: str) -> float:
     if not math.isfinite(number):
         _reject_non_finite_json_number(value)
     return number
+
+
+def _parse_bounded_json_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise JsonIntegerTooLargeError("json_integer_too_large")
+    return int(value, 10)
 
 
 @dataclass(frozen=True)
@@ -227,6 +239,7 @@ def load_json_from_source(input_source: InputSource, source_path: str) -> Any:
     load_options = {
         "parse_constant": _reject_non_finite_json_number,
         "parse_float": _parse_finite_json_float,
+        "parse_int": _parse_bounded_json_int,
     }
     if input_source.kind == "zip":
         with zipfile.ZipFile(input_source.path) as zf:

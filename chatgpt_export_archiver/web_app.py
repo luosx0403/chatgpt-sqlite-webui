@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import sqlite3
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -12,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .web_api import WebTrustPolicy, create_api_router
 from .web_jobs import ImportJobManager
+from .sqlite_errors import sqlite_runtime_error_code
 
 
 class _UploadBodyTooLarge(Exception):
@@ -346,6 +348,16 @@ def create_app(
         redoc_url=None,
         default_response_class=FiniteJSONResponse,
     )
+
+    @app.exception_handler(sqlite3.Error)
+    async def sqlite_error_response(_request, exc: sqlite3.Error):
+        code = sqlite_runtime_error_code(exc)
+        status = 503 if code in {"database_locked", "database_readonly", "database_io_error"} else 500
+        return FiniteJSONResponse(
+            status_code=status,
+            content={"detail": {"code": code, "error_type": type(exc).__name__}},
+        )
+
     app.include_router(create_api_router(db_path, manager, upload_policy=upload_policy, trust_policy=trust_policy))
     from .web_api import upload_body_limit
 
@@ -413,7 +425,7 @@ def create_app(
               const esc=s=>String(s??'').replace(/[&<>"'`]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
               const date=v=>v!==null&&v!==undefined?new Date(v*1000).toLocaleString():'';
               async function loadList(){const p=new URLSearchParams({q:q.value,sort:sort.value,path:pathSel.value,limit:'50'}); const r=await fetch('/api/conversations?'+p); const data=await r.json(); list.innerHTML=data.items.map(x=>`<button class="item ${x.conversation_id===selected?'selected':''}" data-id="${esc(x.conversation_id)}"><span class="title">${esc(x.title||'untitled')}</span><div class="meta">${date(x.update_time??x.create_time)}${x.hit_count?' · '+x.hit_count+' hits':''}</div><div class="snippet">${esc((x.snippets&&x.snippets[0]&&x.snippets[0].snippet)||'')}</div></button>`).join('');}
-              async function openConv(id){selected=id; const d=await (await fetch('/api/conversations/'+encodeURIComponent(id))).json(); heading.textContent=d.title||'untitled'; info.textContent=`Created ${date(d.create_time)} · Updated ${date(d.update_time)} · ${d.current_path_nodes??0}/${d.node_count??0} raw current flags; effective path ${d.effective_path||pathSel.value}`;               actions.innerHTML=`<a href="/api/conversations/${encodeURIComponent(id)}/export?format=md&path=${pathSel.value}&include_internal=false">Download visible MD</a><a href="/api/conversations/${encodeURIComponent(id)}/export?format=txt&path=${pathSel.value}&include_internal=false">Download visible TXT</a>`; const p=new URLSearchParams({q:q.value,path:pathSel.value,limit:'300',include_internal:'false'}); const page=await (await fetch('/api/conversations/'+encodeURIComponent(id)+'/messages?'+p)).json(); messages.innerHTML=page.items.map(m=>`<article class="msg ${esc(m.role||'message')}"><div class="role">${esc(m.role||'message')} · ${date(m.create_time??m.update_time)}</div><pre>${esc(m.content_text||'[empty]')}</pre></article>`).join(''); await loadList();}
+              async function openConv(id){selected=id; const d=await (await fetch('/api/conversations/'+encodeURIComponent(id))).json(); heading.textContent=d.title||'untitled'; info.textContent=`Created ${date(d.create_time)} · Updated ${date(d.update_time)} · ${d.current_path_nodes??0}/${d.node_count??0} raw current flags; effective path ${d.effective_path||pathSel.value}`;               actions.innerHTML=`<a href="/api/conversations/${encodeURIComponent(id)}/export?format=md&path=${pathSel.value}&include_internal=false">Download visible MD</a><a href="/api/conversations/${encodeURIComponent(id)}/export?format=txt&path=${pathSel.value}&include_internal=false">Download visible TXT</a>`; const p=new URLSearchParams({q:q.value,path:pathSel.value,limit:'300',include_internal:'false'}); const page=await (await fetch('/api/conversations/'+encodeURIComponent(id)+'/messages?'+p)).json(); messages.innerHTML=page.items.map(m=>`<article class="msg ${esc(m.role||'message')}"><div class="role">${esc(m.role||'message')} · ${date(m.create_time??m.update_time)}</div><pre>${esc(m.display_text||'[empty]')}</pre></article>`).join(''); await loadList();}
               list.addEventListener('click',e=>{const b=e.target.closest('button[data-id]'); if(b) openConv(b.dataset.id);});
               q.addEventListener('input',()=>{clearTimeout(timer); timer=setTimeout(loadList,220)}); sort.addEventListener('change',loadList); pathSel.addEventListener('change',()=>selected?openConv(selected):loadList());
               window.addEventListener('keydown',e=>{const t=e.target; const typing=t&&(['INPUT','TEXTAREA','SELECT'].includes(t.tagName)||t.isContentEditable); if((!typing&&e.key==='/')||((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k')){e.preventDefault();q.focus();}});

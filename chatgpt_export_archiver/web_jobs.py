@@ -63,6 +63,7 @@ class ImportJob:
     outcome: str = "queued"
     canonical_commit_succeeded: bool = False
     cleanup_warning: str | None = None
+    cleanup_warnings: list[dict[str, str]] = field(default_factory=list)
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=1000))
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -88,6 +89,7 @@ class ImportJob:
                 "error_code": self.error_code,
                 "error_type": self.error_type,
                 "cleanup_warning": self.cleanup_warning,
+                "cleanup_warnings": [dict(item) for item in self.cleanup_warnings],
                 "log_tail": list(self.logs)[-100:],
             }
 
@@ -99,6 +101,23 @@ class ImportJobStartError(RuntimeError):
         super().__init__("import_job_start_failed")
         self.code = "import_job_start_failed"
         self.error_type = error_type
+
+
+def _add_cleanup_warning(
+    job: ImportJob,
+    code: str,
+    *,
+    error_type: str = "UnknownError",
+    path_kind: str = "import_job",
+) -> None:
+    """Append every distinct warning while preserving the deprecated scalar alias."""
+
+    with job._lock:
+        item = {"code": code, "error_type": error_type, "path_kind": path_kind}
+        if item not in job.cleanup_warnings:
+            job.cleanup_warnings.append(item)
+        if job.cleanup_warning is None:
+            job.cleanup_warning = code
 
 
 class ImportJobManager:
@@ -248,16 +267,13 @@ class ImportJobManager:
                 job.canonical_commit_succeeded = True
                 job.outcome = "canonical_commit_succeeded"
             if result.get("summary_update_after_commit_failed"):
-                with job._lock:
-                    job.cleanup_warning = "summary_update_after_commit_failed"
+                _add_cleanup_warning(job, "summary_update_after_commit_failed", error_type=str(result["summary_update_after_commit_failed"]), path_kind="import_summary")
                 self._log(job, "warning", f"summary_update_after_commit_failed {result['summary_update_after_commit_failed']}")
             if result.get("import_connection_close_failed"):
-                with job._lock:
-                    job.cleanup_warning = job.cleanup_warning or "import_connection_close_failed"
+                _add_cleanup_warning(job, "import_connection_close_failed", error_type=str(result["import_connection_close_failed"]), path_kind="database_connection")
                 self._log(job, "warning", f"import_connection_close_failed {result['import_connection_close_failed']}")
             if result.get("summary_update_after_close_failed"):
-                with job._lock:
-                    job.cleanup_warning = job.cleanup_warning or "summary_update_after_close_failed"
+                _add_cleanup_warning(job, "summary_update_after_close_failed", error_type=str(result["summary_update_after_close_failed"]), path_kind="import_summary")
                 self._log(job, "warning", f"summary_update_after_close_failed {result['summary_update_after_close_failed']}")
             self._set_stage(job, "verify")
             try:
@@ -331,6 +347,7 @@ class ImportJobManager:
             outcome_by_stage = {
                 "input_preflight": "input_preflight_failed",
                 "source_scan": "source_scan_failed",
+                "source_read": "source_read_failed",
                 "json_decode": "json_decode_failed",
                 "top_level_contract": "top_level_contract_failed",
                 "transaction": "import_transaction_failed",
@@ -366,20 +383,21 @@ class ImportJobManager:
                 pass
             except OSError as exc:
                 unlink_error = type(exc).__name__
-                with job._lock:
-                    job.cleanup_warning = "upload_file_unlink_failed"
+                _add_cleanup_warning(job, "upload_file_unlink_failed", error_type=unlink_error, path_kind="upload_file")
                 try:
                     self._log(job, "warning", f"upload_file_unlink_failed error_type={unlink_error}")
                 except Exception:
                     pass
             cleanup = cleanup_upload_dir(job.upload_path.parent)
             if not cleanup["ok"]:
-                with job._lock:
-                    job.cleanup_warning = (
-                        "upload_directory_cleanup_failed"
-                        if cleanup["error_type"]
-                        else "upload_directory_cleanup_incomplete"
-                    )
+                _add_cleanup_warning(
+                    job,
+                    "upload_directory_cleanup_failed"
+                    if cleanup["error_type"]
+                    else "upload_directory_cleanup_incomplete",
+                    error_type=cleanup["error_type"] or "PathStillExists",
+                    path_kind="upload_directory",
+                )
                 try:
                     self._log(
                         job,
