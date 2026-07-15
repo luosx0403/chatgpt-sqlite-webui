@@ -470,6 +470,8 @@ Health y `verify` distinguen entre `message_fts` opcional ausente y dañado. El 
 
 ## Contratos de seguridad y respuesta
 
+La entrada de carga acepta un solo valor para `Origin`, `Content-Length` y `Sec-Fetch-Site`. Origin debe ser un único origen HTTP(S) sin credenciales, ruta, consulta, fragmento, controles ni cadenas separadas por comas; Content-Length debe ser un entero decimal ASCII no negativo en forma canónica. Los encabezados duplicados o mal formados se rechazan antes de analizar multipart, y una configuración de ratio inválida o no finita vuelve al valor seguro y finito del perfil.
+
 El Web loopback solo acepta `localhost`, `127.0.0.1`, `::1`, el host loopback explícito y hosts configurados. Un bind no loopback exige el hostname/IP LAN real en `CHATGPT_ARCHIVE_ALLOWED_HOSTS`; se rechaza `*`. `CHATGPT_ARCHIVE_TRUSTED_PROXIES` usa un modelo estricto de un solo proxy edge: se ignoran forwarded headers de pares no confiables y el edge directo confiable debe sobrescribir los valores del cliente. Se rechazan Host/Forwarded repetidos, cadenas con comas, sintaxis inválida y conflictos entre `Forwarded` y `X-Forwarded-Host/Proto`. Todas las solicitudes validan Host y las escrituras remotas requieren un `Origin` de mismo origen.
 
 Los fallos incluyen una etapa source-read y códigos estables `upload_preflight_failed`, `input_source_open_failed`, `input_source_not_regular_file`, `source_read_failed`, `source_changed_during_read`, `invalid_conversation_encoding` y `json_integer_too_large`. La limpieza usa `cleanup_warnings` estructurado; `cleanup_warning` conserva solo el primer elemento por compatibilidad.

@@ -256,6 +256,9 @@ function importErrorLabel(t: (key: string) => string, code: string | null | unde
     "upload_zip_ambiguous_conversation_sources",
     "upload_origin_not_allowed",
     "upload_origin_required",
+    "upload_duplicate_origin_header",
+    "upload_duplicate_content_length",
+    "upload_duplicate_sec_fetch_site",
   ]);
   if (code && direct.has(code)) return t(`importError_${code}`);
   if (code === "upload_content_length_required") return t("importError_upload_content_length_required");

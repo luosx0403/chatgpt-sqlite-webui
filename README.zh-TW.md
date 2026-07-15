@@ -470,6 +470,8 @@ Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回
 
 ## 安全與回應契約
 
+上傳入口對 `Origin`、`Content-Length` 與 `Sec-Fetch-Site` 各只接受一個值。Origin 必須是沒有使用者資訊、路徑、查詢、片段、控制字元或逗號鏈的單一 HTTP(S) origin；Content-Length 必須是規範的非負 ASCII 十進位整數。重複或格式錯誤的安全標頭會在 multipart 解析前拒絕；無效或非有限的壓縮比設定會回退到有限的安全 profile 預設值。
+
 Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bind host 與明確設定的 host。非 loopback bind 還必須透過 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定實際瀏覽器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）採嚴格單 edge 模型：未受信直連的 forwarded header 會被忽略，受信直連 proxy 必須覆寫 client 值；重複 Host/Forwarded、逗號 proxy chain、非法語法及 `Forwarded` 與 `X-Forwarded-Host/Proto` 衝突會被拒絕。靜態 UI、GET API 與全部請求都驗證 Host。遠端寫入必須有同源 `Origin`；只有可信 loopback profile 相容無 Origin 用戶端。上傳永遠拒絕 `Sec-Fetch-Site: cross-site`。
 
 匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。

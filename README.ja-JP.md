@@ -470,6 +470,8 @@ Health と `verify` は任意の `message_fts` の欠落と破損を区別しま
 
 ## セキュリティとレスポンス契約
 
+アップロード入口は `Origin`、`Content-Length`、`Sec-Fetch-Site` をそれぞれ 1 値だけ受け付けます。Origin は userinfo、path、query、fragment、制御文字、カンマチェーンを含まない単一の HTTP(S) origin、Content-Length は正規形の非負 ASCII 10 進整数でなければなりません。重複または不正な安全ヘッダーは multipart 解析前に拒否し、無効または非有限の圧縮率設定は有限な安全 profile 既定値へ戻します。
+
 Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では実際の browser hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS` で指定し、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES` は厳格な単一 edge proxy モデルです。未信頼 peer の forwarded header は無視し、信頼済み direct edge は client 値を上書きする必要があります。重複 Host/Forwarded、カンマ区切り chain、不正構文、`Forwarded` と `X-Forwarded-Host/Proto` の競合は拒否されます。全リクエストで Host を検証し、remote write は same-origin `Origin` が必要です。
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。

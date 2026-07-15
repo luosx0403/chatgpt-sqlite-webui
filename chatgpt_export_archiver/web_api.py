@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import re
 import sqlite3
@@ -162,6 +163,9 @@ def _positive_float_from_env(name: str, default: float, environ: Mapping[str, st
     try:
         value = float(raw.strip())
     except (TypeError, ValueError):
+        LOGGER.warning("invalid_upload_config env=%s", name)
+        return default
+    if not math.isfinite(value) or value <= 0:
         LOGGER.warning("invalid_upload_config env=%s", name)
         return default
     return max(1.0, value)
@@ -679,6 +683,8 @@ def create_api_router(
                     "trusted_proxies": list(trust.trusted_proxies),
                     "missing_origin_write_allowed": trust.allow_missing_origin_for_writes,
                     "origin": "writes require a trusted Host and a same-origin Origin in remote mode; loopback permits non-browser clients without Origin",
+                    "single_value_headers": ["Origin", "Content-Length", "Sec-Fetch-Site"],
+                    "content_length": "canonical nonnegative ASCII decimal with at most 20 digits; duplicates and alternate numeric syntax are rejected before multipart parsing",
                     "forwarded_headers": "strict edge-proxy model: ignored from untrusted peers; a trusted direct edge must overwrite client values and provide at most one Forwarded element or one X-Forwarded-Host/Proto value; duplicates, chains, malformed syntax, and conflicts are rejected",
                 },
                 "limits_note": "ZIP size checks run before import; JSON parsing, SQLite writes, and web-index rebuild still consume memory, disk, and CPU proportional to decoded conversation JSON size.",
@@ -720,7 +726,7 @@ def create_api_router(
                 "conversation_not_found", "message_not_found", "invalid_export_format",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
-                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_preflight_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required",
+                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_preflight_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required", "upload_duplicate_origin_header", "upload_duplicate_content_length", "upload_duplicate_sec_fetch_site",
                 "upload_invalid_content_length", "upload_multipart_body_too_large", "upload_too_large",
                 "uploaded_file_not_zip", "uploaded_file_invalid_zip", "upload_zip_no_conversation_sources",
                 "upload_zip_ambiguous_conversation_sources", "upload_zip_too_many_members",

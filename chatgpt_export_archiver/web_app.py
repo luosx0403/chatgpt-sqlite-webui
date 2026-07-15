@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import re
 import sqlite3
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -222,19 +223,39 @@ class UploadIngressMiddleware:
         self.trust_policy = trust_policy
 
     @staticmethod
-    def _headers(scope) -> dict[str, str]:
-        return {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope.get("headers", [])}
+    def _headers(scope) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for key, value in scope.get("headers", []):
+            result.setdefault(key.decode("latin-1").lower(), []).append(value.decode("latin-1"))
+        return result
 
-    def _origin_allowed(self, headers: dict[str, str], scope) -> tuple[bool, str | None]:
-        if headers.get("sec-fetch-site", "").casefold() == "cross-site":
+    def _origin_allowed(self, headers: dict[str, list[str]], scope) -> tuple[bool, str | None]:
+        sec_fetch_site = headers.get("sec-fetch-site", [])
+        if sec_fetch_site and sec_fetch_site[0].casefold() == "cross-site":
             return False, "upload_origin_not_allowed"
-        origin = headers.get("origin")
-        if not origin:
+        origin_values = headers.get("origin", [])
+        if not origin_values:
             if self.trust_policy.allow_missing_origin_for_writes:
                 return True, None
             return False, "upload_origin_required"
-        parsed = urlsplit(origin)
-        origin_hostname = parsed.hostname.casefold() if parsed.hostname else ""
+        origin = origin_values[0]
+        if (
+            origin != origin.strip()
+            or not origin
+            or "," in origin
+            or any(ord(char) < 32 or ord(char) == 127 for char in origin)
+        ):
+            return False, "upload_origin_not_allowed"
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            return False, "upload_origin_not_allowed"
+        if parsed.path or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None:
+            return False, "upload_origin_not_allowed"
+        try:
+            origin_hostname = parsed.hostname.casefold() if parsed.hostname else ""
+        except ValueError:
+            return False, "upload_origin_not_allowed"
         origin_authority = _normalized_authority(parsed.netloc, parsed.scheme)
         state = scope.get("state", {})
         allowed = (
@@ -262,23 +283,29 @@ class UploadIngressMiddleware:
             await self.app(scope, receive, send)
             return
         headers = self._headers(scope)
+        duplicate_codes = {
+            "origin": "upload_duplicate_origin_header",
+            "content-length": "upload_duplicate_content_length",
+            "sec-fetch-site": "upload_duplicate_sec_fetch_site",
+        }
+        for name, code in duplicate_codes.items():
+            if len(headers.get(name, [])) > 1:
+                await self._error(send, 400, code)
+                return
         origin_allowed, origin_error = self._origin_allowed(headers, scope)
         if not origin_allowed:
             await self._error(send, 403, origin_error or "upload_origin_not_allowed")
             return
-        raw_length = headers.get("content-length")
+        length_values = headers.get("content-length", [])
+        raw_length = length_values[0] if length_values else None
         if raw_length is None and self.trust_policy.remote:
             await self._error(send, 411, "upload_content_length_required")
             return
         if raw_length is not None:
-            try:
-                content_length = int(raw_length)
-            except ValueError:
+            if len(raw_length) > 20 or re.fullmatch(r"0|[1-9][0-9]*", raw_length, flags=re.ASCII) is None:
                 await self._error(send, 400, "upload_invalid_content_length")
                 return
-            if content_length < 0:
-                await self._error(send, 400, "upload_invalid_content_length")
-                return
+            content_length = int(raw_length)
             if content_length > self.body_limit:
                 await self._error(send, 413, "upload_multipart_body_too_large")
                 return

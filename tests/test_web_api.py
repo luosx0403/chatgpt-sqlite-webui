@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import asyncio
 import json
+import math
 import os
 import re
 import sqlite3
@@ -4177,10 +4178,19 @@ class WebApiTests(unittest.TestCase):
             "remote_profile",
         ):
             self.assertIn(field, effective)
+        self.assertTrue(math.isfinite(effective["max_compression_ratio"]))
+        host_origin_policy = schema["upload"]["host_origin_policy"]
+        self.assertEqual(
+            host_origin_policy["single_value_headers"],
+            ["Origin", "Content-Length", "Sec-Fetch-Site"],
+        )
+        self.assertIn("canonical nonnegative ASCII decimal", host_origin_policy["content_length"])
         for code in (
             "database_not_ready", "conversation_not_found", "message_not_found",
             "invalid_query", "invalid_sort", "invalid_message_order",
             "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed",
+            "upload_duplicate_origin_header", "upload_duplicate_content_length",
+            "upload_duplicate_sec_fetch_site",
         ):
             self.assertIn(code, schema["stable_error_codes"])
 
@@ -4298,6 +4308,50 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response[0]["status"], 200)
         self.assertFalse(manager.has_running_job())
 
+        def response_code(response):
+            return json.loads(response[-1]["body"])["code"]
+
+        for name, headers, expected in (
+            ("origin", [(b"origin", b"http://testserver"), (b"origin", b"https://evil.invalid")], "upload_duplicate_origin_header"),
+            ("length", [(b"content-length", b"4"), (b"content-length", b"5")], "upload_duplicate_content_length"),
+            ("fetch", [(b"sec-fetch-site", b"same-origin"), (b"sec-fetch-site", b"cross-site")], "upload_duplicate_sec_fetch_site"),
+        ):
+            with self.subTest(duplicate=name):
+                response = asyncio.run(invoke(headers=headers, chunks=[b"safe"]))
+                self.assertEqual(response[0]["status"], 400)
+                self.assertEqual(response_code(response), expected)
+
+        for origin in (
+            b"http://testserver/path",
+            b"http://testserver?query",
+            b"http://testserver#fragment",
+            b"http://user@testserver",
+            b"null",
+            b"http://testserver,http://evil.invalid",
+            b"http://testserver\x01",
+        ):
+            with self.subTest(origin=origin):
+                response = asyncio.run(invoke(
+                    headers=[(b"origin", origin), (b"content-length", b"4")],
+                    chunks=[b"safe"],
+                    remote=True,
+                ))
+                self.assertEqual(response[0]["status"], 403)
+                self.assertEqual(response_code(response), "upload_origin_not_allowed")
+
+        for raw_length in (b"+1", b"-0", b" 1", b"1 ", b"01", "١".encode("utf-8"), b"1,2", b"9" * 21):
+            with self.subTest(content_length=raw_length):
+                response = asyncio.run(invoke(headers=[(b"content-length", raw_length)], chunks=[b"safe"]))
+                self.assertEqual(response[0]["status"], 400)
+                self.assertEqual(response_code(response), "upload_invalid_content_length")
+
+        response = asyncio.run(invoke(
+            headers=[(b"origin", b"http://testserver"), (b"content-length", b"4"), (b"sec-fetch-site", b"same-origin")],
+            chunks=[b"safe"],
+            remote=True,
+        ))
+        self.assertEqual(response[0]["status"], 200)
+
         async def cancelled_app(scope, receive, send):
             await receive()
             raise asyncio.CancelledError
@@ -4328,6 +4382,46 @@ class WebApiTests(unittest.TestCase):
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(invoke_cancelled())
         self.assertFalse(manager.has_running_job(), "client cancellation must release the pre-parser writer slot")
+
+    def test_upload_compression_ratio_config_rejects_nonfinite_and_nonpositive_values(self):
+        from chatgpt_export_archiver.web_api import (
+            DEFAULT_MAX_UPLOAD_COMPRESSION_RATIO,
+            REMOTE_DEFAULT_COMPRESSION_RATIO,
+            _get_upload_policy,
+        )
+
+        env_name = "CHATGPT_ARCHIVE_MAX_UPLOAD_COMPRESSION_RATIO"
+        for raw in ("NaN", "Infinity", "-Infinity", "0", "-0", "-1", "invalid"):
+            with self.subTest(raw=raw):
+                local = _get_upload_policy({env_name: raw}, host="127.0.0.1")
+                remote = _get_upload_policy({env_name: raw, "CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS": "true"}, host="0.0.0.0")
+                self.assertEqual(local.max_compression_ratio, DEFAULT_MAX_UPLOAD_COMPRESSION_RATIO)
+                self.assertEqual(remote.max_compression_ratio, REMOTE_DEFAULT_COMPRESSION_RATIO)
+                self.assertTrue(math.isfinite(local.max_compression_ratio))
+                self.assertTrue(math.isfinite(remote.max_compression_ratio))
+
+    def test_connect_writable_mode_rw_never_creates_a_missing_database(self):
+        from chatgpt_export_archiver.web_db import connect_writable
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            missing = base / "missing.db"
+            with self.assertRaises(ValueError):
+                connect_writable(missing)
+            self.assertFalse(missing.exists())
+            with mock.patch.object(Path, "exists", return_value=True):
+                with self.assertRaises(sqlite3.OperationalError):
+                    connect_writable(missing)
+            self.assertFalse(missing.exists(), "mode=rw must not create a database after an exists/open race")
+            with self.assertRaises(sqlite3.OperationalError):
+                connect_writable(base)
+            normal = base / "normal.db"
+            sqlite3.connect(normal).close()
+            conn = connect_writable(normal)
+            try:
+                self.assertEqual(conn.execute("PRAGMA query_only").fetchone()[0], 0)
+            finally:
+                conn.close()
 
     def test_upload_slot_released_when_make_upload_path_fails(self):
         from fastapi import FastAPI

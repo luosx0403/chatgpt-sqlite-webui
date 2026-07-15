@@ -77,4 +77,5 @@
 - Conversation JSON is streamed one top-level array element at a time for standalone, directory, and ZIP inputs. Accept at most one leading UTF-8 BOM; reject repeated/interior BOMs, UTF-16/32, mixed, or invalid encoding consistently.
 - Canonical conversation, mapping-node, message, current, parent, and child IDs are limited to 512 characters across import and Web APIs. Skip an element with a content-free warning when any graph ID is over the limit; never truncate IDs.
 - ZIP member read failures keep distinct safe `source_read` codes for encrypted, missing, changed, CRC-failed, and other read failures.
+- Upload ingress treats `Origin`, `Content-Length`, and `Sec-Fetch-Site` as single-value security headers. Reject duplicates, non-origin URL components, and non-canonical content lengths before multipart parsing.
 - Release ZIP member metadata and ordering are deterministic. Identical payloads must produce byte-identical outer ZIPs while preserving authoritative required-file, internal manifest, hash, delivery, temporary-file, and atomic-replace checks.
