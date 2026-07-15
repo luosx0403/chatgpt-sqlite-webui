@@ -709,7 +709,7 @@ async function main() {
     run([
       ...pythonCommand(),
       "-c",
-      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.commit(); conn.close()",
+      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = CASE WHEN node_id = 'branch' THEN 1 ELSE 0 END WHERE conversation_id = 'dom-branch-override'\"); conn.commit(); conn.close()",
       db,
     ]);
     run([...pythonCommand(), "chatgpt_archive.py", "web-index", "--db", db]);
@@ -1470,7 +1470,8 @@ async function main() {
     await page.waitForFunction(() => document.querySelector(".reader-header h1")?.textContent?.includes("DOM Branch Override Conversation"), undefined, { timeout: 20_000 });
 	    await page.waitForFunction(() => document.querySelector(".search-visibility-notes")?.textContent?.includes("Query overrides path"), undefined, { timeout: 20_000 });
 	    await page.waitForFunction(() => document.querySelector(".message-scroll")?.textContent?.includes("branchoverride-token"), undefined, { timeout: 20_000 });
-	    assert.ok(await page.locator(".message", { hasText: "branchoverride-token" }).locator(".branch-pill").count() >= 1, "normal path=all branch message should keep branch badge");
+	    assert.ok(await page.locator(".message", { hasText: "branchoverride-token" }).locator(".branch-pill").count() >= 1, "effective off-current branch keeps its badge even when the raw flag is stray true");
+    assert.equal(await page.locator(".message", { hasText: "branchoverride-token" }).getAttribute("data-raw-current-path"), "true", "debug provenance keeps the original raw current-path flag");
     assert.equal(await page.getByLabel("Message path").inputValue(), "all", "reader path dropdown should show effective query path override");
     assert.equal(await page.getByLabel("Message path").isDisabled(), true, "reader path dropdown should be disabled while raw query overrides it");
     assert.equal(await page.getByLabel("Search path").isDisabled(), true, "sidebar path dropdown should be disabled while raw query overrides it");

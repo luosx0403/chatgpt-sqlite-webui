@@ -15,7 +15,7 @@ from .current_path import (
     ensure_effective_current_views,
     resolve_effective_current_collection,
 )
-from .parser import extract_message_content, recover_message_display_text
+from .parser import RAW_MESSAGE_NOT_PARSED, extract_message_content, recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
@@ -156,7 +156,7 @@ def _is_word_char(char: str) -> bool:
 
 def _ensure_search_functions(conn: sqlite3.Connection) -> None:
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
-    conn.create_function("web_display_text", 2, recover_message_display_text, deterministic=True)
+    conn.create_function("web_display_text", 2, recover_message_display_text)
 
 
 def _sql_display_text(alias: str = "n") -> str:
@@ -754,10 +754,15 @@ def get_messages(
         parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
         conversation_excluded = _conversation_has_excluded_in_scope(conn, parsed, conversation_id)
         total = len(ordered)
-        visibility_counts = _message_visibility_counts(ordered)
+        resolved_fields = _resolved_fields_by_node(ordered)
+        visibility_counts = _message_visibility_counts(ordered, resolved_fields)
         current_path_fallback_to_all = _current_path_fallback_to_all_from_counts(conversation) if path == "current" else False
         if not include_internal:
-            ordered = [row for row in ordered if _message_display_fields(row)["is_empty_mapping_node"] is False and _message_display_fields(row)["is_internal"] is False]
+            ordered = [
+                row for row in ordered
+                if not resolved_fields[str(row["node_id"])]["is_empty_mapping_node"]
+                and not resolved_fields[str(row["node_id"])]["is_internal"]
+            ]
             total = len(ordered)
         target_visible = any(str(row["node_id"]) == around_node_id for row in ordered)
         index = next((idx for idx, row in enumerate(ordered) if row["node_id"] == around_node_id), None)
@@ -767,15 +772,16 @@ def get_messages(
             offset = 0
         window = ordered[offset : offset + limit]
         return _page_payload(
-            [
-                _message_payload(
-                    row,
-                    _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path, str(row["node_id"]) in effective_ids) else [],
-                    current_path_fallback_to_all=current_path_fallback_to_all,
-                    effective_visible_in_current_view=str(row["node_id"]) in effective_ids,
-                )
-                for row in window
-            ],
+            _message_page_items(
+                window,
+                parsed,
+                conversation,
+                path,
+                effective_ids,
+                conversation_excluded,
+                current_path_fallback_to_all,
+                resolved_fields,
+            ),
             total,
             limit,
             offset,
@@ -796,15 +802,15 @@ def get_messages(
     parsed = highlight_parsed or parse_query(highlight_query or "", match_mode=match_mode)
     conversation_excluded = _conversation_has_excluded_in_scope(conn, parsed, conversation_id)
     return _page_payload(
-        [
-            _message_payload(
-                row,
-                _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path, str(row["node_id"]) in effective_ids) else [],
-                current_path_fallback_to_all=current_path_fallback_to_all,
-                effective_visible_in_current_view=str(row["node_id"]) in effective_ids,
-            )
-            for row in rows
-        ],
+        _message_page_items(
+            rows,
+            parsed,
+            conversation,
+            path,
+            effective_ids,
+            conversation_excluded,
+            current_path_fallback_to_all,
+        ),
         total,
         limit,
         offset,
@@ -824,7 +830,6 @@ def _message_select_columns(alias: str = "") -> str:
     columns.extend(
         [
             f"substr({prefix}raw_message_json, 1, 200001) AS raw_message_json",
-            f"length({prefix}raw_message_json) AS raw_message_size",
         ]
     )
     return ", ".join(columns)
@@ -897,15 +902,15 @@ def _get_messages_around_node_sql(
         applied=index is not None,
     )
     return _page_payload(
-        [
-            _message_payload(
-                row,
-                _highlight_terms(parsed) if not conversation_excluded and _message_row_matches_highlight(row, conversation, parsed, path, str(row["node_id"]) in effective_ids) else [],
-                current_path_fallback_to_all=current_path_fallback_to_all,
-                effective_visible_in_current_view=str(row["node_id"]) in effective_ids,
-            )
-            for row in rows
-        ],
+        _message_page_items(
+            rows,
+            parsed,
+            conversation,
+            path,
+            effective_ids,
+            conversation_excluded,
+            current_path_fallback_to_all,
+        ),
         total,
         limit,
         offset,
@@ -988,13 +993,20 @@ def _message_visibility_counts_for_path(conn: sqlite3.Connection, conversation_i
     }
 
 
-def _message_visibility_counts(rows: list[sqlite3.Row]) -> dict[str, int]:
+def _message_visibility_counts(
+    rows: list[sqlite3.Row],
+    resolved_fields: Mapping[str, dict[str, Any]] | None = None,
+) -> dict[str, int]:
     empty_hidden = 0
     internal_hidden = 0
     technical_hidden = 0
     visible = 0
     for row in rows:
-        fields = _message_display_fields(row)
+        fields = (
+            resolved_fields[str(row["node_id"])]
+            if resolved_fields is not None
+            else _message_display_fields(row)
+        )
 
         if fields["is_empty_mapping_node"]:
             empty_hidden += 1
@@ -1264,27 +1276,43 @@ def _message_search_base_select(
     source_sql, source_params, score_expr, reason = _message_match_source(conn, parsed, use_trigram=use_trigram)
     where, params = _node_filters(parsed, conversation_id)
     has_norm = _has_normalized_message_norm(conn)
-    text_clause, text_params = _message_text_filter(parsed, has_norm)
-    where += text_clause
-    params.extend(text_params)
+    text_clause, text_params = _message_text_filter(
+        parsed,
+        has_norm,
+        display_column="n.resolved_text",
+        normalized_column="n.resolved_norm",
+    )
     norm_join = """
         LEFT JOIN web_message_norm mn
           ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
     """ if has_norm else ""
     effective_expression = _current_path_condition("n") if parsed.path == "current" else "0"
-    display_text = _sql_display_text("n")
     sql = f"""
+        WITH resolved_source AS MATERIALIZED (
+            SELECT n.*,
+                   {_sql_display_text('n')} AS resolved_text,
+                   {score_expr} AS candidate_score,
+                   {"mn.content_norm" if has_norm else "NULL"} AS resolved_norm,
+                   c.title AS conversation_title,
+                   c.create_time AS conversation_create_time,
+                   c.update_time AS conversation_update_time,
+                   c.current_node AS conversation_current_node,
+                   c.source_file AS conversation_source_file
+            FROM {source_sql}
+            JOIN conversations c ON c.conversation_id = n.conversation_id
+            {norm_join}
+            WHERE 1 = 1 {where}
+        )
         SELECT n.conversation_id, n.node_id, n.role, n.create_time, n.update_time,
-               n.content_type, {display_text} AS content_text, n.is_on_current_path,
+               n.content_type, n.resolved_text AS content_text, n.is_on_current_path,
                CASE WHEN {effective_expression} THEN 1 ELSE 0 END AS effective_visible_in_current_view,
-               c.title, c.create_time AS conversation_create_time, c.update_time AS conversation_update_time,
-               c.current_node, c.source_file, {score_expr} AS bm25_score, ? AS match_reason
-        FROM {source_sql}
-        JOIN conversations c ON c.conversation_id = n.conversation_id
-        {norm_join}
-        WHERE {display_text} <> '' {where}
+               n.conversation_title AS title, n.conversation_create_time, n.conversation_update_time,
+               n.conversation_current_node AS current_node, n.conversation_source_file AS source_file,
+               n.candidate_score AS bm25_score, ? AS match_reason
+        FROM resolved_source n
+        WHERE n.resolved_text <> '' {text_clause}
     """
-    return sql, [reason] + source_params + params
+    return sql, source_params + params + [reason] + text_params
 
 
 def _message_match_source(conn: sqlite3.Connection, parsed: ParsedQuery, *, use_trigram: bool) -> tuple[str, list[Any], str, str]:
@@ -1743,28 +1771,39 @@ def _message_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, 
     source_sql, source_params, score_expr, _reason = _message_match_source(conn, parsed, use_trigram=use_trigram)
     where, params = _node_filters(parsed, conversation_id)
     has_norm = _has_normalized_message_norm(conn)
-    text_clause, text_params = _message_text_filter(parsed, has_norm)
-    where += text_clause
-    params.extend(text_params)
+    text_clause, text_params = _message_text_filter(
+        parsed,
+        has_norm,
+        display_column="n.resolved_text",
+        normalized_column="n.resolved_norm",
+    )
     norm_join = """
         LEFT JOIN web_message_norm mn
           ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
     """ if has_norm else ""
     return (
         f"""
+        WITH resolved_source AS MATERIALIZED (
+            SELECT n.*,
+                   {_sql_display_text('n')} AS resolved_text,
+                   {score_expr} AS candidate_score,
+                   {"mn.content_norm" if has_norm else "NULL"} AS resolved_norm
+            FROM {source_sql}
+            JOIN conversations c ON c.conversation_id = n.conversation_id
+            {norm_join}
+            WHERE 1 = 1 {where}
+        )
         SELECT n.conversation_id,
                COUNT(*) AS hit_count,
                COUNT(*) * 10.0
-                   + MAX(CASE WHEN {score_expr} IS NULL THEN 0.0 ELSE 25.0 - min(25.0, abs({score_expr})) END) AS score,
+                   + MAX(CASE WHEN n.candidate_score IS NULL THEN 0.0 ELSE 25.0 - min(25.0, abs(n.candidate_score)) END) AS score,
                1 AS message_match,
                0 AS title_match
-        FROM {source_sql}
-        JOIN conversations c ON c.conversation_id = n.conversation_id
-        {norm_join}
-        WHERE {_sql_display_text('n')} <> '' {where}
+        FROM resolved_source n
+        WHERE n.resolved_text <> '' {text_clause}
         GROUP BY n.conversation_id
         """,
-        source_params + params,
+        source_params + params + text_params,
     )
 
 
@@ -2012,7 +2051,14 @@ def _conversation_search_order(sort: str) -> str:
     return "score DESC, COALESCE(update_time, create_time, 0) DESC, conversation_id"
 
 
-def _message_text_filter(parsed: ParsedQuery, has_norm: bool) -> tuple[str, list[Any]]:
+def _message_text_filter(
+    parsed: ParsedQuery,
+    has_norm: bool,
+    *,
+    display_column: str = "",
+    normalized_column: str = "mn.content_norm",
+) -> tuple[str, list[Any]]:
+    display_expression = display_column or _sql_display_text("n")
     params: list[Any] = []
     fragments = parsed.phrases + parsed.terms
     positive_clauses = []
@@ -2023,48 +2069,50 @@ def _message_text_filter(parsed: ParsedQuery, has_norm: bool) -> tuple[str, list
             continue
         norm = normalize_search_text(frag)
         if parsed.match_mode == "word":
-            column = "mn.content_norm" if has_norm else _sql_display_text("n")
+            column = normalized_column if has_norm else display_expression
             positive_clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([norm if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            positive_clauses.append("instr(mn.content_norm, ?) > 0")
+            positive_clauses.append(f"instr({normalized_column}, ?) > 0")
             params.append(norm)
         else:
-            positive_clauses.append(f"web_search_match({_sql_display_text('n')}, ?, ?) > 0")
+            positive_clauses.append(f"web_search_match({display_expression}, ?, ?) > 0")
             params.extend([frag, parsed.match_mode])
     for frag in parsed.required_phrases:
         if not frag:
             continue
         norm = normalize_search_text(frag)
         if parsed.match_mode == "word":
-            column = "mn.content_norm" if has_norm else _sql_display_text("n")
+            column = normalized_column if has_norm else display_expression
             required_clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([norm if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            required_clauses.append("instr(mn.content_norm, ?) > 0")
+            required_clauses.append(f"instr({normalized_column}, ?) > 0")
             params.append(norm)
         else:
-            required_clauses.append(f"web_search_match({_sql_display_text('n')}, ?, ?) > 0")
+            required_clauses.append(f"web_search_match({display_expression}, ?, ?) > 0")
             params.extend([frag, parsed.match_mode])
     for frag in parsed.exclude:
         norm = normalize_search_text(frag)
         if parsed.match_mode == "word":
-            column = "mn.content_norm" if has_norm else _sql_display_text("n")
+            column = normalized_column if has_norm else display_expression
             exclude_clauses.append(f"web_search_match({column}, ?, ?) = 0")
             params.extend([norm if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            exclude_clauses.append("instr(mn.content_norm, ?) = 0")
+            exclude_clauses.append(f"instr({normalized_column}, ?) = 0")
             params.append(norm)
         else:
-            exclude_clauses.append(f"web_search_match({_sql_display_text('n')}, ?, ?) = 0")
+            exclude_clauses.append(f"web_search_match({display_expression}, ?, ?) = 0")
             params.extend([frag, parsed.match_mode])
     clauses = []
     if positive_clauses:
         clauses.append("(" + (" OR ".join(positive_clauses) if parsed.or_mode else " AND ".join(positive_clauses)) + ")")
     clauses.extend(required_clauses)
     clauses.extend(exclude_clauses)
-    display_text = _sql_display_text("n")
-    clauses.append(f"NOT (trim({display_text}) LIKE '[non-text content:%' OR trim({display_text}) LIKE '[non-text part:%')")
+    clauses.append(
+        f"NOT (trim({display_expression}) LIKE '[non-text content:%' "
+        f"OR trim({display_expression}) LIKE '[non-text part:%')"
+    )
     return (" AND " + " AND ".join(clauses) if clauses else ""), params
 
 
@@ -2396,7 +2444,7 @@ def _message_search_payload(
         "create_time": row["create_time"],
         "update_time": row["update_time"],
         "content_type": row["content_type"],
-        "content_text": text,
+        "display_text": text,
         "snippet": make_snippet(text, _highlight_terms(parsed), parsed.match_mode),
         "is_on_current_path": bool(row["is_on_current_path"]),
         "current_path_fallback_to_all": current_path_fallback_to_all,
@@ -2412,14 +2460,63 @@ def _message_search_payload(
     }
 
 
+def _resolved_fields_by_node(rows: Sequence[sqlite3.Row]) -> dict[str, dict[str, Any]]:
+    return {str(row["node_id"]): _message_display_fields(row) for row in rows}
+
+
+def _message_page_items(
+    rows: Sequence[sqlite3.Row],
+    parsed: ParsedQuery,
+    conversation: Mapping[str, Any] | None,
+    path: str,
+    effective_ids: set[str],
+    conversation_excluded: bool,
+    current_path_fallback_to_all: bool,
+    resolved_fields: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    resolved = resolved_fields or _resolved_fields_by_node(rows)
+    highlight_terms_for_query = _highlight_terms(parsed)
+    has_positive_text = bool(parsed.terms or parsed.phrases or parsed.required_phrases)
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        node_id = str(row["node_id"])
+        fields = resolved[node_id]
+        effective_visible = node_id in effective_ids
+        terms = []
+        if (
+            has_positive_text
+            and not conversation_excluded
+            and _message_row_matches_highlight(
+                row,
+                conversation,
+                parsed,
+                path,
+                effective_visible,
+                display_text=fields["display_text"],
+            )
+        ):
+            terms = highlight_terms_for_query
+        items.append(
+            _message_payload(
+                row,
+                terms,
+                current_path_fallback_to_all=current_path_fallback_to_all,
+                effective_visible_in_current_view=effective_visible,
+                fields=fields,
+            )
+        )
+    return items
+
+
 def _message_payload(
     row: sqlite3.Row,
     terms: list[str],
     *,
     current_path_fallback_to_all: bool = False,
     effective_visible_in_current_view: bool | None = None,
+    fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    fields = _message_display_fields(row)
+    fields = fields or _message_display_fields(row)
     message_highlights = highlight_ranges(fields["display_text"], terms)
     return {
         "node_id": row["node_id"],
@@ -2431,9 +2528,7 @@ def _message_payload(
         "create_time": row["create_time"],
         "update_time": row["update_time"],
         "content_type": row["content_type"],
-        "content_text": fields["content_text"],
         "display_text": fields["display_text"],
-        "render_text": fields["display_text"],
         "has_text": bool(fields["display_text"]),
         "has_raw": bool(fields["raw_preview"]),
         "raw_preview": fields["raw_preview"],
@@ -2455,12 +2550,24 @@ def _message_payload(
 
 def _message_display_fields(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     text = row["content_text"] or ""
-    raw_preview = _raw_preview(row["raw_message_json"])
-    display_text = recover_message_display_text(text, row["raw_message_json"])
+    raw_message_json = row["raw_message_json"] or ""
+    parsed_message: Any = RAW_MESSAGE_NOT_PARSED
+    parsed_ok = False
+    if raw_message_json and len(raw_message_json) <= 200_000:
+        try:
+            parsed_message = json_loads(raw_message_json)
+            parsed_ok = True
+        except (TypeError, ValueError):
+            parsed_message = None
+    raw_preview = _raw_preview(raw_message_json, parsed_message=parsed_message, parsed_ok=parsed_ok)
+    display_text = recover_message_display_text(
+        text,
+        raw_message_json,
+        parsed_message=parsed_message if parsed_message is not RAW_MESSAGE_NOT_PARSED else None,
+    )
     is_empty_mapping_node = not row["message_id"] and not display_text and not raw_preview
     is_technical = _is_internal_message(row["role"], row["content_type"], display_text)
-    keys = row.keys()
-    raw_size = row["raw_message_size"] if "raw_message_size" in keys else len(row["raw_message_json"] or "")
+    raw_size = len(raw_message_json)
     return {
         "content_text": text,
         "display_text": display_text,
@@ -2478,6 +2585,8 @@ def _message_row_matches_highlight(
     parsed: ParsedQuery,
     path: str,
     effective_visible_in_current_view: bool,
+    *,
+    display_text: str | None = None,
 ) -> bool:
     if not (parsed.terms or parsed.phrases or parsed.required_phrases):
         return False
@@ -2505,7 +2614,7 @@ def _message_row_matches_highlight(
         for title_filter in (parsed.title, parsed.required_title):
             if title_filter and not _fragment_matches(conversation.get("title") or "", title_filter, parsed.match_mode):
                 return False
-    text = recover_message_display_text(row["content_text"], row["raw_message_json"])
+    text = display_text if display_text is not None else recover_message_display_text(row["content_text"], row["raw_message_json"])
     if not text or _is_placeholder_text(text):
         return False
     for excluded in parsed.exclude:
@@ -2526,14 +2635,23 @@ def _text_from_raw_message(raw_message_json: str) -> str:
     return recover_message_display_text("", raw_message_json)
 
 
-def _raw_preview(raw_message_json: str | None, limit: int = 20000) -> str:
+def _raw_preview(
+    raw_message_json: str | None,
+    limit: int = 20000,
+    *,
+    parsed_message: Any = RAW_MESSAGE_NOT_PARSED,
+    parsed_ok: bool = False,
+) -> str:
     if not raw_message_json:
         return ""
-    try:
-        value = json_loads(raw_message_json)
-        return compact_json(_sanitize_raw_preview(value), limit)
-    except ValueError:
-        return raw_message_json[:limit]
+    if parsed_ok:
+        return compact_json(_sanitize_raw_preview(parsed_message), limit)
+    if parsed_message is RAW_MESSAGE_NOT_PARSED and len(raw_message_json) <= 200_000:
+        try:
+            return compact_json(_sanitize_raw_preview(json_loads(raw_message_json)), limit)
+        except ValueError:
+            pass
+    return raw_message_json[:limit]
 
 
 def json_loads(value: str) -> Any:

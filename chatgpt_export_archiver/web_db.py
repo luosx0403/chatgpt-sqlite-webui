@@ -17,7 +17,11 @@ from .schema_contract import (
     NORMALIZATION_INDEX_FORMAT_VERSION,
     OPTIONAL_WEB_INDEX_FORMAT_VERSION,
 )
-from .sqlite_errors import is_fts5_capability_unavailable
+from .sqlite_errors import (
+    is_fts5_capability_unavailable,
+    is_optional_message_fts_damaged,
+    is_optional_search_capability_missing,
+)
 from .search import _derived_generation_is_current, invalidate_capability_cache, normalize_search_text, search_fragment_match
 
 WEB_INDEX_FORMAT_VERSION = OPTIONAL_WEB_INDEX_FORMAT_VERSION
@@ -46,7 +50,7 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
-    conn.create_function("web_display_text", 2, recover_message_display_text, deterministic=True)
+    conn.create_function("web_display_text", 2, recover_message_display_text)
     return conn
 
 
@@ -59,7 +63,7 @@ def connect_writable(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
-    conn.create_function("web_display_text", 2, recover_message_display_text, deterministic=True)
+    conn.create_function("web_display_text", 2, recover_message_display_text)
     return conn
 
 
@@ -147,6 +151,38 @@ def detect_fts5(conn: sqlite3.Connection) -> bool:
         raise
 
 
+def message_fts_status(conn: sqlite3.Connection, *, fts5_available: bool) -> dict[str, Any]:
+    """Return a bounded capability probe that distinguishes missing and damaged FTS."""
+
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_fts'"
+    ).fetchone() is not None
+    if not present:
+        return {
+            "message_fts_available": False,
+            "message_fts_rebuildable": fts5_available,
+            "message_fts_error": "missing" if fts5_available else "capability_unavailable",
+        }
+    try:
+        conn.execute(
+            "SELECT rowid FROM message_fts WHERE message_fts MATCH ? LIMIT 1",
+            ("__chatgpt_archive_health_probe__",),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if is_optional_message_fts_damaged(exc) or is_optional_search_capability_missing(exc):
+            return {
+                "message_fts_available": False,
+                "message_fts_rebuildable": fts5_available,
+                "message_fts_error": "damaged",
+            }
+        raise
+    return {
+        "message_fts_available": True,
+        "message_fts_rebuildable": fts5_available,
+        "message_fts_error": None,
+    }
+
+
 def detect_trigram(conn: sqlite3.Connection) -> bool:
     try:
         conn.execute("CREATE VIRTUAL TABLE temp._tri_probe USING fts5(x, tokenize='trigram')")
@@ -175,6 +211,53 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
         conn.execute("DROP TABLE IF EXISTS web_message_norm")
         conn.execute("DROP TABLE IF EXISTS web_title_norm")
         conn.execute("DROP TABLE IF EXISTS web_index_metadata")
+        conn.execute(
+            """
+            CREATE TABLE web_message_norm(
+                conversation_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                content_norm TEXT NOT NULL,
+                PRIMARY KEY(conversation_id, node_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE web_title_norm(
+                conversation_id TEXT PRIMARY KEY,
+                title_norm TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE web_index_metadata(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            WITH resolved AS MATERIALIZED (
+                SELECT conversation_id,
+                       node_id,
+                       web_norm(web_display_text(content_text, substr(raw_message_json, 1, 200001))) AS content_norm
+                FROM conversation_nodes
+            )
+            INSERT INTO web_message_norm(conversation_id, node_id, content_norm)
+            SELECT conversation_id, node_id, content_norm
+            FROM resolved
+            WHERE content_norm <> ''
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO web_title_norm(conversation_id, title_norm)
+            SELECT conversation_id, web_norm(COALESCE(title, ''))
+            FROM conversations
+            """
+        )
         if trigram_available:
             conn.execute(
                 """
@@ -217,59 +300,20 @@ def create_web_indexes(db_path: Path) -> dict[str, Any]:
             conn.execute(
                 """
                 INSERT INTO web_message_trigram(rowid, content_text)
-                SELECT rowid, web_norm(web_display_text(content_text, substr(raw_message_json, 1, 200001)))
-                FROM conversation_nodes
-                WHERE web_display_text(content_text, substr(raw_message_json, 1, 200001)) <> ''
+                SELECT n.rowid, mn.content_norm
+                FROM web_message_norm mn
+                JOIN conversation_nodes n
+                  ON n.conversation_id = mn.conversation_id AND n.node_id = mn.node_id
                 """
             )
             conn.execute(
                 """
                 INSERT INTO web_title_trigram(rowid, title)
-                SELECT rowid, web_norm(COALESCE(title, ''))
-                FROM conversations
+                SELECT c.rowid, tn.title_norm
+                FROM web_title_norm tn
+                JOIN conversations c ON c.conversation_id = tn.conversation_id
                 """
             )
-        conn.execute(
-            """
-            CREATE TABLE web_message_norm(
-                conversation_id TEXT NOT NULL,
-                node_id TEXT NOT NULL,
-                content_norm TEXT NOT NULL,
-                PRIMARY KEY(conversation_id, node_id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE web_title_norm(
-                conversation_id TEXT PRIMARY KEY,
-                title_norm TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE web_index_metadata(
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO web_message_norm(conversation_id, node_id, content_norm)
-            SELECT conversation_id, node_id, web_norm(web_display_text(content_text, substr(raw_message_json, 1, 200001)))
-            FROM conversation_nodes
-            WHERE web_display_text(content_text, substr(raw_message_json, 1, 200001)) <> ''
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO web_title_norm(conversation_id, title_norm)
-            SELECT conversation_id, web_norm(COALESCE(title, ''))
-            FROM conversations
-            """
-        )
         metadata = [
             ("message_norm_text", "normalized"),
             ("title_norm_text", "normalized"),

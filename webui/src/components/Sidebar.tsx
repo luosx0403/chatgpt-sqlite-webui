@@ -144,7 +144,7 @@ export default function Sidebar(props: Props) {
       <div className="conversation-list" ref={listRef} onScroll={handleScroll} aria-label={props.t("conversations")}>
         {props.conversations.map((item) => {
           const pathFallback = Boolean(item.current_path_fallback_to_all);
-          const hasSnippetBranch = item.snippets?.some((snippet) => snippet.is_on_current_path === false && !snippet.effective_visible_in_current_view && !snippet.current_path_fallback_to_all) ?? false;
+          const hasSnippetBranch = item.snippets?.some((snippet) => !snippet.effective_visible_in_current_view && !snippet.current_path_fallback_to_all) ?? false;
           const badges = [
             (item.has_title_hits || item.title_match || item.reasons?.includes("title match")) ? props.t("titleHitBadge") : "",
             (item.has_internal_hits || item.snippets?.some((snippet) => snippet.is_internal)) ? props.t("internalHitBadge") : "",

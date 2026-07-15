@@ -12,7 +12,11 @@ from .current_path import effective_current_metadata, ensure_effective_current_v
 from .parser import ParsedConversation, WarningRecord
 from .scanner import InputSource, SourceEntry
 from .schema_contract import DATABASE_SCHEMA_VERSION
-from .sqlite_errors import is_fts5_capability_unavailable, sqlite_runtime_error_code
+from .sqlite_errors import (
+    is_fts5_capability_unavailable,
+    is_optional_search_capability_missing,
+    sqlite_runtime_error_code,
+)
 from .utils import compact_json, finite_float_or_none, utc_now_iso
 
 SQLITE_VARIABLE_CHUNK = 500
@@ -758,10 +762,7 @@ def rebuild_message_fts(conn: sqlite3.Connection, *, optimize: bool = False) -> 
         """
     )
     if optimize:
-        try:
-            conn.execute("INSERT INTO message_fts(message_fts) VALUES('optimize')")
-        except sqlite3.OperationalError:
-            pass
+        conn.execute("INSERT INTO message_fts(message_fts) VALUES('optimize')")
     return True
 
 
@@ -939,15 +940,7 @@ def _insert_fts(conn: sqlite3.Connection, conv: ParsedConversation) -> None:
 
 
 def _is_acceptable_fts_operational_error(exc: sqlite3.OperationalError) -> bool:
-    message = str(exc).casefold()
-    return any(
-        marker in message
-        for marker in (
-            "no such table: message_fts",
-            "no such module: fts5",
-            "no such module: fts",
-        )
-    )
+    return is_optional_search_capability_missing(exc)
 
 
 def record_export(
@@ -1194,6 +1187,31 @@ def _integrity_failure_is_web_index_only(lines: list[str]) -> bool:
     return True
 
 
+def _integrity_failure_is_message_fts_only(lines: list[str]) -> bool:
+    """Return True when all integrity failures name only rebuildable message_fts objects."""
+
+    if not lines:
+        return False
+    allowed = {"message_fts", *(f"message_fts{suffix}" for suffix in _WEB_INDEX_SHADOW_SUFFIXES)}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped == "ok":
+            continue
+        names = {
+            match.group(1)
+            for match in re.finditer(
+                r"\b(?:table|index(?!\s+for\b))\s+(?:main\.)?([A-Za-z_][A-Za-z0-9_]*)\b",
+                stripped,
+            )
+        }
+        for name in allowed:
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", stripped):
+                names.add(name)
+        if not names or not names.issubset(allowed):
+            return False
+    return True
+
+
 def _line_names_web_index_table(line: str) -> bool:
     """Check whether *line* refers exclusively to whitelisted web-index objects."""
     allowed = set(_WEB_INDEX_BASE_NAMES)
@@ -1214,6 +1232,7 @@ def _line_names_web_index_table(line: str) -> bool:
 
 def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
     schema = check_core_schema(conn)
+    message_fts_available = bool(schema.get("message_fts_available"))
     integrity_lines = _run_integrity_check(conn)
     if len(integrity_lines) == 1 and integrity_lines[0] == "ok":
         integrity = "ok"
@@ -1241,6 +1260,11 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             "integrity_check": integrity,
             "optional_web_index_error": False,
             "optional_web_index_recovery_hint": "",
+            "message_fts_available": message_fts_available,
+            "message_fts_error": None if message_fts_available else "missing",
+            "message_fts_rebuildable": True,
+            "optional_message_fts_error": False,
+            "optional_message_fts_recovery_hint": "",
             "warnings_by_type": [],
             "latest_warnings_by_type": [],
             "ok": False,
@@ -1317,10 +1341,15 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
     effective_diagnostics = _effective_current_diagnostics(conn)
     optional_web_index_error = False
     optional_web_index_recovery_hint = ""
+    optional_message_fts_error = False
+    optional_message_fts_recovery_hint = ""
     if integrity != "ok":
         optional_web_index_error = _integrity_failure_is_web_index_only(integrity_lines)
         if optional_web_index_error:
             optional_web_index_recovery_hint = "run `web-index` to rebuild optional web search indexes"
+        optional_message_fts_error = _integrity_failure_is_message_fts_only(integrity_lines)
+        if optional_message_fts_error:
+            optional_message_fts_recovery_hint = "re-import with `--rebuild-fts` to rebuild optional message_fts"
     return {
         "schema_ok": True,
         "missing_tables": [],
@@ -1339,6 +1368,11 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         "integrity_check": integrity,
         "optional_web_index_error": optional_web_index_error,
         "optional_web_index_recovery_hint": optional_web_index_recovery_hint,
+        "message_fts_available": message_fts_available and not optional_message_fts_error,
+        "message_fts_error": "damaged" if optional_message_fts_error else (None if message_fts_available else "missing"),
+        "message_fts_rebuildable": True,
+        "optional_message_fts_error": optional_message_fts_error,
+        "optional_message_fts_recovery_hint": optional_message_fts_recovery_hint,
         "warnings_by_type": warning_counts,
         "latest_warnings_by_type": latest_warning_counts,
         "ok": missing_current == 0 and broken_parent == 0 and zero_node == 0 and cycle_nodes == 0 and foreign_keys["foreign_key_violations"] == 0 and non_finite_timestamps == 0 and integrity == "ok",

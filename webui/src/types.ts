@@ -71,9 +71,7 @@ export interface MessageItem {
   create_time: number | null;
   update_time: number | null;
   content_type: string | null;
-  content_text: string;
   display_text: string;
-  render_text: string;
   has_text: boolean;
   has_raw: boolean;
   raw_preview: string;
@@ -100,7 +98,7 @@ export interface SearchMessageHit {
   create_time: number | null;
   update_time: number | null;
   content_type: string | null;
-  content_text: string;
+  display_text: string;
   snippet: string;
   is_on_current_path: boolean;
   current_path_fallback_to_all?: boolean;
@@ -209,11 +207,19 @@ export interface Health {
   db_ready?: boolean;
   database: { name: string; exists: boolean };
   schema_version: number;
+  api_schema_version?: number;
+  current_database_schema_version?: number | null;
+  required_database_schema_version?: number;
+  migration_required?: boolean;
   schema_compatible?: boolean;
   missing_tables?: string[];
   missing_columns?: Record<string, string[]>;
   fts5_available?: boolean;
   message_fts_available?: boolean;
+  message_fts_rebuildable?: boolean;
+  message_fts_error?: string | null;
+  optional_message_fts_error?: boolean;
+  optional_message_fts_recovery_hint?: string;
   trigram_available?: boolean;
   web_trigram_indexed?: boolean;
   web_normalized_indexed?: boolean;
@@ -234,7 +240,7 @@ export interface ImportJob {
   job_id: string;
   status: "queued" | "running" | "succeeded" | "failed" | "postcheck_failed";
   stage: string;
-  outcome: "queued" | "import_running" | "import_job_start_failed" | "input_preflight_failed" | "source_scan_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "succeeded";
+  outcome: "queued" | "import_running" | "import_job_start_failed" | "input_preflight_failed" | "source_scan_failed" | "source_read_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "succeeded";
   canonical_commit_succeeded: boolean;
   filename: string;
   size: number;
@@ -250,6 +256,7 @@ export interface ImportJob {
   error_code: string | null;
   error_type: string | null;
   cleanup_warning: string | null;
+  cleanup_warnings: Array<{ code: string; error_type: string; path_kind: string }>;
   log_tail: string[];
 }
 
@@ -292,7 +299,7 @@ export interface ApiSchemaResponse {
     job_id: string;
     fields: string[];
     failure_codes: string[];
-    cleanup_warnings: string[];
+    cleanup_warnings: { item_fields: string[]; codes: string[] };
     preflight_cleanup_error: string[];
     [key: string]: unknown;
   };

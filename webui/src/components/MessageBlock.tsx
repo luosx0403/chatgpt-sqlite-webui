@@ -81,7 +81,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   const rawControllerRef = useRef<AbortController | null>(null);
   const rawRequestIdRef = useRef(0);
   const role = roleLabel(message.role, t);
-  const text = message.display_text || message.render_text || message.content_text || "";
+  const text = message.display_text || "";
   const placeholder = `[non-text content: ${message.content_type || "empty"}]`;
   const timestamp = formatDate(message.create_time ?? message.update_time);
   const shouldUseChat = layout === "chat";
@@ -89,7 +89,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   const side = isTechnicalPayload ? "system" : chatSide(message);
   const shouldCollapseDetails = shouldUseChat && isTechnicalPayload;
   const articleClass = `message ${roleClass(message.role)} ${message.is_internal ? "message-internal" : ""} ${active ? "message-active" : ""}`;
-  const showBranchBadge = !message.is_on_current_path && !message.effective_visible_in_current_view && !message.current_path_fallback_to_all && !currentPathFallbackToAll;
+  const showBranchBadge = !message.effective_visible_in_current_view && !message.current_path_fallback_to_all && !currentPathFallbackToAll;
   const messageIdentity = `${conversationId}:${message.node_id}:${message.message_id || ""}:${message.content_hash || ""}`;
   const messageIdentityRef = useRef(messageIdentity);
   messageIdentityRef.current = messageIdentity;
@@ -247,7 +247,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   if (shouldCollapseDetails) {
     return (
       <div className={`message-row message-row-chat message-row-${side}`}>
-        <details className={`${articleClass} message-disclosure`} data-node-id={message.node_id} open={detailsOpen} onToggle={(event) => { setDetailsOpen(event.currentTarget.open); notifySizeMayChange(); }}>
+        <details className={`${articleClass} message-disclosure`} data-node-id={message.node_id} data-raw-current-path={String(message.is_on_current_path)} open={detailsOpen} onToggle={(event) => { setDetailsOpen(event.currentTarget.open); notifySizeMayChange(); }}>
           <summary className="message-summary">
             <span className="role-pill">{role}</span>
             <span>{timestamp}</span>
@@ -263,7 +263,7 @@ export default function MessageBlock({ message, conversationId, active, layout, 
   }
 
   const article = (
-    <article className={articleClass} data-node-id={message.node_id}>
+    <article className={articleClass} data-node-id={message.node_id} data-raw-current-path={String(message.is_on_current_path)}>
       {header}
       {body}
     </article>

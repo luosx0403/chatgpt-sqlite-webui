@@ -297,7 +297,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const hiddenInternalHits = useMemo(() => hitItems.filter((hit) => hit.is_internal && !showInternal), [hitItems, showInternal]);
   const isCurrentFallbackHit = useCallback((hit: SearchMessageHit) => Boolean(hit.effective_visible_in_current_view || hit.current_path_fallback_to_all || currentPathFallbackToAll || conversation?.current_path_fallback_to_all), [conversation?.current_path_fallback_to_all, currentPathFallbackToAll]);
   const currentViewHits = useMemo(
-    () => hitItems.filter((hit) => !(hit.is_internal && !showInternal) && !(effectivePath === "current" && !hit.is_on_current_path && !isCurrentFallbackHit(hit))),
+    () => hitItems.filter((hit) => !(hit.is_internal && !showInternal) && !(effectivePath === "current" && !isCurrentFallbackHit(hit))),
     [hitItems, effectivePath, showInternal, isCurrentFallbackHit],
   );
   const titleOnlyContext = Boolean(
@@ -429,7 +429,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
       return false;
     }
   };
-  const messageText = (m: MessageItem) => m.display_text || m.render_text || m.content_text || "";
+  const messageText = (m: MessageItem) => m.display_text || "";
   const copyableMessages = (items: MessageItem[]) => items.filter((m) => !m.is_empty_mapping_node && messageText(m).trim());
   const formatMessagesForCopy = (items: MessageItem[]) => copyableMessages(items).map((m) => `${m.role || "message"}:\n${messageText(m)}`).join("\n\n");
   const fetchMessagesForCopy = async (mode: "visible" | "conversation", signal: AbortSignal) => {

@@ -8,6 +8,9 @@ from typing import Any
 from .utils import canonical_json, compact_json, sha256_text
 
 
+RAW_MESSAGE_NOT_PARSED = object()
+
+
 @dataclass
 class WarningRecord:
     source_file: str
@@ -343,6 +346,7 @@ def recover_message_display_text(
     raw_message_json: str | None,
     *,
     max_raw_chars: int = 200_000,
+    parsed_message: Any = RAW_MESSAGE_NOT_PARSED,
 ) -> str:
     """Resolve legacy placeholder text without parsing unbounded raw payloads."""
 
@@ -353,10 +357,13 @@ def recover_message_display_text(
         return canonical
     if not raw_message_json or len(raw_message_json) > max_raw_chars:
         return canonical
-    try:
-        message = json.loads(raw_message_json)
-    except (TypeError, json.JSONDecodeError):
-        return canonical
+    if parsed_message is RAW_MESSAGE_NOT_PARSED:
+        try:
+            message = json.loads(raw_message_json)
+        except (TypeError, json.JSONDecodeError):
+            return canonical
+    else:
+        message = parsed_message
     if not isinstance(message, dict):
         return canonical
     _content_type, recovered, _notes = extract_message_content(message)
