@@ -69,6 +69,11 @@ function assertStaticFrontendContracts() {
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
   assert.ok(clientSource.includes("getConversationCopyText"), "full conversation copy should use the dedicated server-side text stream");
+  assert.ok(clientSource.includes("response.body.getReader()"), "full conversation copy should consume a ReadableStream instead of response.text()");
+  assert.equal(clientSource.includes("return response.text()"), false, "full conversation copy must not allocate an unbounded response string");
+  assert.ok(clientSource.includes("MAX_BROWSER_COPY_BYTES"), "browser copy must enforce a byte budget");
+  assert.ok(clientSource.includes("MAX_BROWSER_COPY_CHARS"), "browser copy must enforce a character budget");
+  assert.ok(clientSource.includes("reader.cancel()"), "over-limit or failed stream copy should cancel the response reader");
   assert.ok(clientSource.includes("structured.cleanup_warnings"), "ApiError should parse every structured cleanup warning");
   assert.ok(appSource.includes("cleanupWarningLabel"), "cleanup warning codes and path kinds should render as localized safe text");
   assert.ok(paneSource.includes("getConversationCopyText"), "reader full-copy must not accumulate reader page objects");
@@ -76,6 +81,14 @@ function assertStaticFrontendContracts() {
   assert.equal(paneSource.includes("while (items.length < MAX_NAVIGABLE_HIT_MESSAGES)"), false, "reader hit navigation must not serially prefetch ten pages on initial load");
   assert.ok(paneSource.includes("HIT_PREFETCH_THRESHOLD"), "reader hit navigation should lazily append near the loaded boundary");
   assert.ok(messageBlockSource.includes("getMessageDisplayChunk"), "truncated reader messages should have an explicit bounded expansion path");
+  assert.ok(messageBlockSource.includes("chunk.resolver_input_truncated || !chunk.total_chars_exact"), "single-message expansion/copy must detect incomplete raw recovery on every chunk");
+  assert.ok(paneSource.includes("chunk.resolver_input_truncated || !chunk.total_chars_exact"), "Copy visible must detect incomplete raw recovery on every chunk");
+  assert.ok(paneSource.includes("new IncompleteDisplayRecoveryError()"), "Copy visible must reject incomplete recovered text before clipboard mutation");
+  assert.ok(i18nSource.includes("displayRecoveryIncomplete"), "incomplete raw recovery should have an accessible localized warning");
+  assert.ok(messageBlockSource.includes("JSON.stringify([conversationId, message.node_id"), "message state keys should use collision-free tuple serialization");
+  assert.ok(messageBlockSource.includes('hasOwnProperty.call(savedState, "displayNextOffset")'), "terminal next_offset=null must survive remount");
+  assert.ok(paneSource.includes("new CopyLimitError()"), "visible/full copy accumulation must stop at the browser copy budget");
+  assert.ok(paneSource.indexOf("assertBrowserCopyLimit(text)") < paneSource.indexOf("navigator.clipboard.writeText(text)"), "copy limits must be checked before clipboard mutation");
   assert.ok(messageBlockSource.includes("[messageIdentity, showRawDefault]"), "message content state should reset only for data identity/default changes");
   assert.equal(messageBlockSource.includes("[messageIdentity, showRawDefault, layout]"), false, "pure layout changes must preserve message content state");
   assert.ok(paneSource.includes("readerDataContextKey"), "reader requests should use a data-only context key");
@@ -684,7 +697,7 @@ async function main() {
     });
     await noDbPage.getByTestId("import-zip-input").setInputFiles(uploadZip);
     await noDbPage.getByTestId("import-start-button").click();
-    await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("could not be completed"), undefined, { timeout: 20_000 });
+    await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("could not be prepared safely"), undefined, { timeout: 20_000 });
     assert.equal((await noDbPage.getByTestId("import-panel").textContent())?.includes("synthetic upload failure"), false, "upload API details must not leak into localized UI");
     const preflightWarnings = await noDbPage.getByTestId("preflight-cleanup-warnings").textContent();
     assert.ok(preflightWarnings?.includes("temporary uploaded file"), "preflight cleanup should show its localized file warning");
@@ -693,16 +706,23 @@ async function main() {
     assert.equal(preflightWarnings?.includes("PermissionError"), false, "cleanup UI must not expose OS error class details");
     assert.ok((await noDbPage.getByTestId("import-panel").textContent())?.includes("Selected ZIP"), "failed upload should keep selected file for retry");
     assert.equal(await noDbPage.getByTestId("import-start-button").count(), 1, "failed upload should keep retry button");
+    await noDbPage.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="import-start-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    }, undefined, { timeout: 20_000 });
     let activeJobPolls = 0;
     let maxActiveJobPolls = 0;
     let delayedFirstJobPoll = true;
+    let allowTerminalJobPoll = false;
     await noDbPage.route("**/api/import/jobs/*", async (route) => {
       activeJobPolls += 1;
       maxActiveJobPolls = Math.max(maxActiveJobPolls, activeJobPolls);
       try {
-        if (delayedFirstJobPoll) {
-          delayedFirstJobPoll = false;
-          await new Promise((resolve) => setTimeout(resolve, 1_600));
+        if (delayedFirstJobPoll || !allowTerminalJobPoll) {
+          if (delayedFirstJobPoll) {
+            delayedFirstJobPoll = false;
+            await new Promise((resolve) => setTimeout(resolve, 1_600));
+          }
           const jobId = new URL(route.request().url()).pathname.split("/").pop();
           await route.fulfill({
             status: 200,
@@ -749,8 +769,14 @@ async function main() {
       }
     });
     await noDbPage.getByTestId("import-start-button").click();
-    await noDbPage.getByTestId("web-index-progress").waitFor({ state: "visible", timeout: 20_000 });
+    try {
+      await noDbPage.getByTestId("web-index-progress").waitFor({ state: "visible", timeout: 20_000 });
+    } catch (error) {
+      const panelText = await noDbPage.getByTestId("import-panel").textContent().catch(() => "");
+      throw new Error(`web-index progress did not render; active=${activeJobPolls} max=${maxActiveJobPolls} panel=${JSON.stringify(panelText)} cause=${error instanceof Error ? error.message : String(error)}`);
+    }
     assert.ok((await noDbPage.getByTestId("web-index-progress").textContent())?.includes("Normalizing messages · 100/250"), "Web index progress should use a localized stage label and bounded counts");
+    allowTerminalJobPoll = true;
     await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-status"]')?.textContent?.includes("succeeded"), undefined, { timeout: 60_000 });
     await noDbPage.waitForTimeout(1_500);
     assert.equal(maxActiveJobPolls, 1, "import job polling must be serial even when one response exceeds the polling interval");
@@ -1160,8 +1186,8 @@ async function main() {
       window.__readerRace = {};
       window.fetch = (input, init) => {
         const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
-        const isDelayedDetail = url.pathname === "/api/conversations/dom-long";
-        const isDelayedMessages = url.pathname === "/api/conversations/dom-long/messages";
+        const isDelayedDetail = url.pathname === "/api/by-id/conversation" && url.searchParams.get("conversation_id") === "dom-long";
+        const isDelayedMessages = url.pathname === "/api/by-id/messages" && url.searchParams.get("conversation_id") === "dom-long";
         if (isDelayedDetail || isDelayedMessages) {
           const key = isDelayedDetail ? "detail" : "messages";
           return new Promise((resolve, reject) => {
@@ -1187,7 +1213,7 @@ async function main() {
       await waitForCount(page, ".message", 1);
       await page.waitForFunction(() => document.querySelector(".message-page-meta")?.textContent?.includes("of 380 visible messages"), undefined, { timeout: 20_000 });
     } catch (error) {
-      const apiMessages = await (await fetch(new URL("/api/conversations/dom-long/messages?limit=5", baseUrl))).json();
+      const apiMessages = await (await fetch(new URL("/api/by-id/messages?conversation_id=dom-long&limit=5", baseUrl))).json();
       const readerText = await page.locator(".reader").textContent({ timeout: 1000 }).catch(() => "");
       throw new Error(`long conversation messages did not render; api_count=${apiMessages.items?.length ?? 0} total=${apiMessages.total ?? "unknown"} reader=${JSON.stringify((readerText || "").slice(0, 160))} diagnostics=${browserDiagnostics.join(" | ")}`);
     }
@@ -1197,7 +1223,10 @@ async function main() {
 
     await page.goto(`${baseUrl}?conversation=dom-long-body`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
-    const displayRequestsBeforeExpand = await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/messages/long-body/display?")).length);
+    const displayRequestsBeforeExpand = await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => {
+      const url = new URL(entry.name);
+      return url.pathname === "/api/by-id/display" && url.searchParams.get("node_id") === "long-body";
+    }).length);
     await page.getByRole("button", { name: "Load full message body" }).click();
     await page.getByRole("button", { name: "Load more message body" }).click();
     await page.waitForFunction(() => document.querySelector('[data-node-id="long-body"] .message-text')?.textContent?.includes("DOM-LONG-BODY-END"), undefined, { timeout: 20_000 });
@@ -1207,8 +1236,47 @@ async function main() {
     await page.locator(".message-scroll").evaluate((node) => { node.scrollTop = 0; });
     await page.locator('[data-node-id="long-body"] .message-text').waitFor({ state: "visible", timeout: 20_000 });
     assert.ok((await page.locator('[data-node-id="long-body"] .message-text').textContent())?.includes("DOM-LONG-BODY-END"), "layout changes must preserve expanded long message text");
-    const displayRequestsAfterLayout = await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/messages/long-body/display?")).length);
+    const displayRequestsAfterLayout = await page.evaluate(() => performance.getEntriesByType("resource").filter((entry) => {
+      const url = new URL(entry.name);
+      return url.pathname === "/api/by-id/display" && url.searchParams.get("node_id") === "long-body";
+    }).length);
     assert.equal(displayRequestsAfterLayout - displayRequestsBeforeExpand, 2, "long-body expansion should be chunked and layout must not refetch it");
+
+    const incompleteDisplayRoute = async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("node_id") !== "long-body") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversation_id: "dom-long-body",
+          node_id: "long-body",
+          display_text: "bounded placeholder only",
+          offset: 0,
+          returned_chars: 24,
+          total_chars: 24,
+          total_chars_exact: false,
+          has_more: false,
+          next_offset: null,
+          next_cursor: null,
+          content_revision: "synthetic-incomplete",
+          max_chunk_chars: 65536,
+          resolver_input_truncated: true,
+          source: "canonical_placeholder",
+        }),
+      });
+    };
+    await page.route("**/api/by-id/display?**", incompleteDisplayRoute);
+    await page.goto(`${baseUrl}?conversation=dom-long-body`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    await page.evaluate(() => { window.__copiedText = "incomplete-copy-sentinel"; });
+    await page.locator('[data-node-id="long-body"]').getByRole("button", { name: "Copy", exact: true }).click();
+    await page.getByText("The stored raw payload exceeded the safe recovery limit", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+    assert.equal(await page.evaluate(() => window.__copiedText), "incomplete-copy-sentinel", "single-message copy must not write an incomplete recovered body to the clipboard");
+    await page.unroute("**/api/by-id/display?**", incompleteDisplayRoute);
 
     await page.goto(`${baseUrl}?conversation=dom-long&layout=classic`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
@@ -1275,7 +1343,7 @@ async function main() {
     let visualDataRequests = 0;
     const visualRequestListener = (request) => {
       const url = new URL(request.url());
-      if (url.pathname === "/api/conversations/dom-long/messages" || url.pathname === "/api/search/messages") visualDataRequests += 1;
+      if ((url.pathname === "/api/by-id/messages" && url.searchParams.get("conversation_id") === "dom-long") || url.pathname === "/api/search/messages") visualDataRequests += 1;
     };
     page.on("request", visualRequestListener);
     const firstMessageBeforeVisualChanges = await page.locator(".message").first().textContent();
@@ -1306,7 +1374,7 @@ async function main() {
     let copyReaderPageRequests = 0;
     const copyRequestListener = (request) => {
       const url = new URL(request.url());
-      if (url.pathname === "/api/conversations/dom-long/messages") copyReaderPageRequests += 1;
+      if (url.pathname === "/api/by-id/messages" && url.searchParams.get("conversation_id") === "dom-long") copyReaderPageRequests += 1;
     };
     page.on("request", copyRequestListener);
     await page.getByRole("button", { name: "Copy current path conversation" }).click();
@@ -1337,7 +1405,7 @@ async function main() {
       window.__copyRaceRelease = null;
       window.fetch = (input, init) => {
         const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
-        if (url.pathname === "/api/conversations/dom-long/copy") {
+        if (url.pathname === "/api/by-id/copy" && url.searchParams.get("conversation_id") === "dom-long") {
           return new Promise((resolve, reject) => {
             window.__copyRaceRelease = () => window.__nativeFetch(input, { ...init, signal: undefined }).then(resolve, reject);
           });
@@ -1360,11 +1428,11 @@ async function main() {
     const failCopyStream = async (route) => {
       await route.fulfill({ status: 500, contentType: "application/json", body: '{"detail":"synthetic copy failure"}' });
     };
-    await page.route("**/api/conversations/dom-long/copy**", failCopyStream);
+    await page.route("**/api/by-id/copy?**", failCopyStream);
     await page.getByRole("button", { name: "Copy current path conversation" }).click();
     await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Copy conversation failed"), undefined, { timeout: 20_000 });
     assert.equal(await page.evaluate(() => window.__copiedText || ""), copiedBeforeFailure, "failed full-copy stream must not overwrite clipboard with a partial conversation");
-    await page.unroute("**/api/conversations/dom-long/copy**", failCopyStream);
+    await page.unroute("**/api/by-id/copy?**", failCopyStream);
 
     await page.getByRole("button", { name: "Load more messages" }).click();
     await page.waitForFunction(() => document.querySelector(".message-page-meta")?.textContent?.includes("of 380 visible messages") && !document.querySelector(".message-page-meta button"), undefined, { timeout: 20_000 });
@@ -1375,7 +1443,7 @@ async function main() {
     await page.locator(".raw-message").first().waitFor({ state: "visible", timeout: 10_000 });
     await assertStableMessageViewport(page, "raw preview expansion");
     const cappedRawText = 'plain raw_text preview with "quotes" and \\ backslash';
-    await page.route("**/api/conversations/*/messages/*/raw?*", async (route) => {
+    await page.route("**/api/by-id/raw?*", async (route) => {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1393,7 +1461,7 @@ async function main() {
     assert.equal((await page.locator(".raw-full").first().textContent())?.includes('\\"'), false, "truncated raw_text should not be JSON string escaped");
     assert.ok((await page.locator(".raw-error").first().textContent())?.includes("truncated"), "truncated capped raw preview should show a localized note");
     await assertStableMessageViewport(page, "async larger raw preview expansion");
-    await page.route("**/api/conversations/*/messages/*/raw?*", async (route) => {
+    await page.route("**/api/by-id/raw?*", async (route) => {
       await route.fulfill({ status: 500, contentType: "application/json", body: '{"detail":"synthetic raw failure"}' });
     }, { times: 1 });
     await page.getByRole("button", { name: "Close larger raw preview" }).first().click();
@@ -1402,7 +1470,7 @@ async function main() {
     await page.getByRole("button", { name: "Open larger raw preview" }).first().click();
     await page.locator(".raw-error").first().waitFor({ state: "visible", timeout: 20_000 });
     await assertStableMessageViewport(page, "larger raw preview error state");
-    await page.unroute("**/api/conversations/*/messages/*/raw?*");
+    await page.unroute("**/api/by-id/raw?*");
     await page.getByRole("button", { name: "Open larger raw preview" }).first().click();
     await page.locator(".raw-full").first().waitFor({ state: "visible", timeout: 20_000 });
     assert.equal(await page.locator(".raw-error").count(), 0, "full raw retry should clear the visible error state");

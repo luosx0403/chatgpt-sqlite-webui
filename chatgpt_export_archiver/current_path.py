@@ -6,6 +6,14 @@ from typing import Any, Iterable, Mapping, Sequence, TypeVar
 
 
 RowT = TypeVar("RowT", bound=Mapping[str, Any])
+MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION = 100_000
+MAX_EFFECTIVE_CURRENT_GRAPH_BYTES_PER_CONVERSATION = 128 * 1024 * 1024
+
+
+class EffectiveCurrentResourceLimitError(ValueError):
+    def __init__(self, code: str = "effective_current_node_limit_exceeded"):
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -421,6 +429,37 @@ def ensure_effective_current_views(
             "INSERT INTO effective_current_scope(conversation_id) VALUES (?)",
             ((value,) for value in ids),
         )
+
+    oversized = conn.execute(
+        """WITH scope_stats AS (
+               SELECT scope.conversation_id,
+                      (SELECT COUNT(*)
+                       FROM conversation_nodes n INDEXED BY idx_nodes_conversation_path
+                       WHERE n.conversation_id = scope.conversation_id) AS node_count,
+                      (SELECT COALESCE(SUM(
+                           COALESCE(length(CAST(n.node_id AS BLOB)), 0) +
+                           COALESCE(length(CAST(n.parent_node_id AS BLOB)), 0)
+                       ), 0)
+                       FROM conversation_nodes n INDEXED BY idx_nodes_conversation_path
+                       WHERE n.conversation_id = scope.conversation_id) AS graph_bytes
+               FROM effective_current_scope scope
+           )
+           SELECT conversation_id, node_count, graph_bytes
+           FROM scope_stats
+           WHERE node_count > ? OR graph_bytes > ?
+           LIMIT 1""",
+        (
+            MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION,
+            MAX_EFFECTIVE_CURRENT_GRAPH_BYTES_PER_CONVERSATION,
+        ),
+    ).fetchone()
+    if oversized is not None:
+        code = (
+            "effective_current_node_limit_exceeded"
+            if int(oversized[1]) > MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION
+            else "effective_current_input_limit_exceeded"
+        )
+        raise EffectiveCurrentResourceLimitError(code)
 
     membership = conn.execute(_SCOPED_EFFECTIVE_CURRENT_SQL).fetchall()
     grouped: dict[str, list[tuple[str, str | None, str | None, str]]] = {}

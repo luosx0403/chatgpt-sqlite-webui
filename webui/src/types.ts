@@ -18,10 +18,14 @@ export interface SearchFilters {
 export interface ConversationSummary {
   conversation_id: string;
   title: string | null;
+  title_truncated?: boolean;
+  title_length?: number;
   create_time: number | null;
   update_time: number | null;
   current_node: string | null;
   source_file: string | null;
+  source_file_truncated?: boolean;
+  source_file_length?: number;
   node_count?: number;
   current_path_nodes?: number;
   current_path_fallback_to_all?: boolean;
@@ -67,10 +71,16 @@ export interface MessageItem {
   parent_node_id: string | null;
   message_id: string | null;
   role: string | null;
+  role_truncated?: boolean;
+  role_length?: number;
   author_name: string | null;
+  author_name_truncated?: boolean;
+  author_name_length?: number;
   create_time: number | null;
   update_time: number | null;
   content_type: string | null;
+  content_type_truncated?: boolean;
+  content_type_length?: number;
   display_text: string;
   display_text_truncated?: boolean;
   display_text_total_chars?: number;
@@ -189,6 +199,8 @@ export interface DisplayTextChunk {
   total_chars_exact: boolean;
   has_more: boolean;
   next_offset: number | null;
+  next_cursor: string | null;
+  content_revision: string | null;
   max_chunk_chars: number;
   resolver_input_truncated: boolean;
   source: "canonical" | "raw_fallback" | "canonical_placeholder" | UnknownApiEnum;
@@ -325,6 +337,8 @@ export interface RawMessageResponse {
   raw_message: unknown;
   raw_text?: string;
   raw_size: number;
+  raw_size_exact: boolean;
+  raw_size_bytes: number;
   truncated: boolean;
 }
 

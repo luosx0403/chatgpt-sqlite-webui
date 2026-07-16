@@ -40,6 +40,7 @@ from .logging_utils import configure_logging, get_logger
 from .parser import WarningRecord, conversation_id_from_value, parse_conversation, validate_conversation_element
 from .scanner import (
     ConversationJsonTopLevelError,
+    ConversationJsonElementTooLargeError,
     EncryptedZipMemberError,
     InputSource,
     InvalidConversationEncodingError,
@@ -49,6 +50,7 @@ from .scanner import (
     ZipMemberCrcError,
     ZipMemberNotFoundError,
     ZipMemberReadError,
+    delete_input_identity_is_current,
     is_legacy_conversations_source,
     is_shard_conversation_source,
     iter_json_array_from_source,
@@ -310,6 +312,8 @@ def _classify_source_load_error(exc: BaseException) -> tuple[str, str]:
 
     if isinstance(exc, JsonIntegerTooLargeError):
         return "json_integer_too_large", "json_decode"
+    if isinstance(exc, ConversationJsonElementTooLargeError):
+        return "conversation_json_element_too_large", "json_decode"
     if isinstance(exc, NonFiniteJsonNumberError):
         return "non_finite_json_number", "json_decode"
     if isinstance(exc, (UnicodeDecodeError, InvalidConversationEncodingError)):
@@ -527,6 +531,7 @@ def run_import_pipeline(
         "summary": summary,
         "delete_input_on_success": bool(delete_input_on_success),
         "deleted_input": None,
+        "delete_input_changed": None,
         "delete_input_failed": None,
         "delete_input_error_type": None,
         "summary_update_after_commit_failed": None,
@@ -801,26 +806,37 @@ def run_import_pipeline(
     if not import_succeeded:
         raise RuntimeError("import did not complete")
     if delete_input_on_success:
-        try:
-            delete_target = source.delete_target or source.path
-            delete_target.unlink()
-        except OSError as exc:
-            error_type = type(exc).__name__
-            result["delete_input_failed"] = True
-            result["delete_input_error_type"] = error_type
-            summary["delete_input_failed"] = True
-            summary["delete_input_error_type"] = error_type
+        if not delete_input_identity_is_current(source):
+            result["delete_input_changed"] = True
+            summary["delete_input_changed"] = True
             summary["warnings"] += 1
             _record_post_import_warning(
                 db_path,
                 run_id,
-                WarningRecord("input", None, "delete_input_failed", compact_json({"error_type": error_type}), None),
+                WarningRecord("input", None, "delete_input_changed", None, None),
                 summary,
             )
         else:
-            result["deleted_input"] = True
-            summary["deleted_input"] = True
-            _update_post_import_summary(db_path, run_id, summary)
+            try:
+                delete_target = source.delete_target or source.path
+                delete_target.unlink()
+            except OSError as exc:
+                error_type = type(exc).__name__
+                result["delete_input_failed"] = True
+                result["delete_input_error_type"] = error_type
+                summary["delete_input_failed"] = True
+                summary["delete_input_error_type"] = error_type
+                summary["warnings"] += 1
+                _record_post_import_warning(
+                    db_path,
+                    run_id,
+                    WarningRecord("input", None, "delete_input_failed", compact_json({"error_type": error_type}), None),
+                    summary,
+                )
+            else:
+                result["deleted_input"] = True
+                summary["deleted_input"] = True
+                _update_post_import_summary(db_path, run_id, summary)
     LOGGER.info(
         "import_finished run_id=%s valid=%s inserted=%s updated=%s unchanged=%s seconds=%s",
         run_id,

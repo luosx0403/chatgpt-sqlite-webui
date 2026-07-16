@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import json
+import base64
+import codecs
 import os
 import sqlite3
 import threading
@@ -17,7 +19,7 @@ from .current_path import (
     ensure_effective_current_views,
     resolve_effective_current_collection,
 )
-from .parser import RAW_MESSAGE_NOT_PARSED, extract_message_content, recover_message_display_text
+from .parser import RAW_MESSAGE_NOT_PARSED, extract_message_content, normalize_display_text, recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
@@ -36,6 +38,65 @@ HIGHLIGHT_TERM_LIMIT = 10
 HIGHLIGHT_RANGE_LIMIT = 50
 HIGHLIGHT_MESSAGE_SCAN_CHARS = 100_000
 READER_MIN_TEXT_HYDRATION_CHARS = 4096
+MAX_API_TITLE_CHARS = 4096
+MAX_API_SOURCE_CHARS = 4096
+MAX_API_ROLE_CHARS = 256
+MAX_API_AUTHOR_CHARS = 4096
+MAX_API_CONTENT_TYPE_CHARS = 256
+MAX_DISPLAY_CURSOR_LENGTH = 1024
+MAX_LEGACY_DISPLAY_OFFSET = 1_048_576
+MAX_SQLITE_CURSOR_OFFSET = 9_223_372_036_854_775_807
+
+
+class DisplayCursorError(ValueError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _encode_display_cursor(rowid: int, revision: str, byte_offset: int, char_offset: int) -> str:
+    payload = json.dumps([rowid, revision, byte_offset, char_offset], separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_display_cursor(value: str) -> tuple[int, str, int, int]:
+    if not value or len(value) > MAX_DISPLAY_CURSOR_LENGTH:
+        raise DisplayCursorError("invalid_display_cursor")
+    try:
+        raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+        payload = json.loads(raw)
+        rowid, revision, byte_offset, char_offset = payload
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise DisplayCursorError("invalid_display_cursor") from exc
+    if (
+        isinstance(rowid, bool) or not isinstance(rowid, int) or rowid < 1
+        or not isinstance(revision, str) or len(revision) > 256
+        or isinstance(byte_offset, bool) or not isinstance(byte_offset, int)
+        or byte_offset < 0 or byte_offset > MAX_SQLITE_CURSOR_OFFSET
+        or isinstance(char_offset, bool) or not isinstance(char_offset, int)
+        or char_offset < 0 or char_offset > MAX_SQLITE_CURSOR_OFFSET
+    ):
+        raise DisplayCursorError("invalid_display_cursor")
+    return rowid, revision, byte_offset, char_offset
+
+
+def _read_utf8_blob_chunk(blob: sqlite3.Blob, byte_offset: int, char_limit: int) -> tuple[str, int, bool, bool]:
+    blob.seek(byte_offset)
+    data = blob.read(min(len(blob) - byte_offset, char_limit * 4 + 4))
+    try:
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        decoded = decoder.decode(data, final=byte_offset + len(data) >= len(blob))
+        invalid_utf8 = False
+    except UnicodeDecodeError:
+        decoded = data.decode("utf-8", errors="replace")
+        invalid_utf8 = True
+    chunk = normalize_display_text(decoded[:char_limit])
+    if invalid_utf8:
+        consumed = len(data)
+    else:
+        consumed = len(decoded[:char_limit].encode("utf-8"))
+    next_byte = byte_offset + consumed
+    return chunk, next_byte, next_byte < len(blob), invalid_utf8
 
 
 @dataclass(frozen=True)
@@ -147,7 +208,7 @@ class ParsedQuery:
 
 def normalize_search_text(value: str | None) -> str:
     """Normalize query/content for human search without changing stored archive text."""
-    text = unicodedata.normalize("NFKC", value or "")
+    text = unicodedata.normalize("NFKC", normalize_display_text(value))
     text = text.translate(NORMALIZE_TRANSLATION).casefold()
     return re.sub(r"\s+", " ", text).strip()
 
@@ -924,39 +985,88 @@ def get_message_display_chunk(
     *,
     offset: int,
     limit: int,
+    cursor: str | None = None,
 ) -> dict[str, Any] | None:
     """Return a bounded display-text chunk without exposing raw JSON."""
 
     budget = reader_budget()
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), budget.display_chunk_chars))
+    if not cursor and offset > MAX_LEGACY_DISPLAY_OFFSET:
+        raise DisplayCursorError("display_cursor_required")
     row = conn.execute(
         """
-        SELECT length(COALESCE(content_text, '')) AS content_total,
-               substr(COALESCE(content_text, ''), ?, ?) AS content_chunk,
-               substr(COALESCE(content_text, ''), 1, 64) AS content_prefix,
-               length(COALESCE(raw_message_json, '')) AS raw_total,
-               substr(COALESCE(raw_message_json, ''), 1, 200001) AS raw_bounded
-        FROM conversation_nodes
-        WHERE conversation_id = ? AND node_id = ?
+        SELECT n.rowid AS storage_rowid,
+               COALESCE(g.generation, 0) AS message_generation
+        FROM conversation_nodes n
+        LEFT JOIN archive_generations g ON g.name = 'message'
+        WHERE n.conversation_id = ? AND n.node_id = ?
         """,
-        (offset + 1, limit + 1, conversation_id, node_id),
+        (conversation_id, node_id),
     ).fetchone()
     if row is None:
         return None
-    content_total = int(row["content_total"] or 0)
-    content_prefix = str(row["content_prefix"] or "")
-    raw_total = int(row["raw_total"] or 0)
-    raw_bounded = str(row["raw_bounded"] or "")
-    resolver_input_truncated = raw_total > 200_000
-    if content_total and not _is_placeholder_text(content_prefix):
-        value = str(row["content_chunk"] or "")
-        chunk = value[:limit]
-        total_chars = content_total
-        total_exact = True
+    storage_rowid = int(row["storage_rowid"])
+    revision = f"generation:{int(row['message_generation'] or 0)}"
+    prefix_bytes = b""
+    if cursor:
+        cursor_rowid, cursor_revision, byte_offset, char_offset = _decode_display_cursor(cursor)
+        if cursor_rowid != storage_rowid or cursor_revision != revision or char_offset != offset:
+            raise DisplayCursorError("display_cursor_stale")
+        prefix_bytes = b"cursor"
+        content_prefix = ""
+    else:
+        try:
+            with conn.blobopen("conversation_nodes", "content_text", storage_rowid, readonly=True) as prefix_blob:
+                prefix_bytes = prefix_blob.read(min(len(prefix_blob), 256))
+        except sqlite3.OperationalError:
+            is_null = conn.execute(
+                "SELECT content_text IS NULL FROM conversation_nodes WHERE rowid = ?",
+                (storage_rowid,),
+            ).fetchone()
+            if not is_null or not bool(is_null[0]):
+                raise
+        content_prefix = normalize_display_text(prefix_bytes.decode("utf-8", errors="replace"))
+    resolver_input_truncated = False
+    next_cursor = None
+    canonical_has_more = False
+    if prefix_bytes and not _is_placeholder_text(content_prefix):
+        if not cursor:
+            byte_offset = 0
+            char_offset = 0
+            if offset:
+                # Compatibility path for old clients. It is NUL-safe but scans
+                # the requested prefix once; sequential clients use cursor.
+                with conn.blobopen("conversation_nodes", "content_text", storage_rowid, readonly=True) as prefix_blob:
+                    _discard, byte_offset, _more, invalid = _read_utf8_blob_chunk(prefix_blob, 0, offset)
+                    if invalid:
+                        byte_offset = min(len(prefix_blob), offset)
+                char_offset = offset
+        with conn.blobopen("conversation_nodes", "content_text", storage_rowid, readonly=True) as blob:
+            if byte_offset > len(blob):
+                raise DisplayCursorError("invalid_display_cursor")
+            chunk, next_byte, has_more, invalid_utf8 = _read_utf8_blob_chunk(blob, byte_offset, limit)
+        canonical_has_more = has_more
+        total_chars = offset + len(chunk)
+        total_exact = not has_more
+        if has_more and not invalid_utf8:
+            next_cursor = _encode_display_cursor(storage_rowid, revision, next_byte, total_chars)
         source = "canonical"
     else:
-        canonical = str(row["content_chunk"] or "") if offset == 0 else content_prefix
+        raw_row = conn.execute(
+            """
+            SELECT length(CAST(COALESCE(raw_message_json, '') AS BLOB)) AS raw_bytes,
+                   substr(CAST(COALESCE(raw_message_json, '') AS BLOB), 1, 800004) AS raw_bounded_bytes
+            FROM conversation_nodes
+            WHERE rowid = ?
+            """,
+            (storage_rowid,),
+        ).fetchone()
+        raw_bytes = int(raw_row["raw_bytes"] or 0)
+        raw_bounded_bytes = bytes(raw_row["raw_bounded_bytes"] or b"")
+        raw_bounded = normalize_display_text(raw_bounded_bytes.decode("utf-8", errors="replace"))
+        resolver_input_truncated = raw_bytes > len(raw_bounded_bytes) or len(raw_bounded) > 200_000
+        canonical = content_prefix
         recovered = recover_message_display_text(
             canonical,
             raw_bounded[:200_000] if not resolver_input_truncated else "",
@@ -973,8 +1083,10 @@ def get_message_display_chunk(
         "returned_chars": len(chunk),
         "total_chars": total_chars,
         "total_chars_exact": total_exact,
-        "has_more": offset + len(chunk) < total_chars,
-        "next_offset": offset + len(chunk) if offset + len(chunk) < total_chars else None,
+        "has_more": canonical_has_more if source == "canonical" else offset + len(chunk) < total_chars,
+        "next_offset": total_chars if canonical_has_more else (offset + len(chunk) if offset + len(chunk) < total_chars else None),
+        "next_cursor": next_cursor,
+        "content_revision": revision,
         "max_chunk_chars": budget.display_chunk_chars,
         "resolver_input_truncated": resolver_input_truncated,
         "source": source,
@@ -1528,7 +1640,7 @@ def _message_search_base_select(
             SELECT n.*,
                    {_sql_display_text('n')} AS resolved_text,
                    {score_expr} AS candidate_score,
-                   {"mn.content_norm" if has_norm else "NULL"} AS resolved_norm,
+                   {f"COALESCE(mn.content_norm, web_norm({_sql_display_text('n')}))" if has_norm else "NULL"} AS resolved_norm,
                    c.title AS conversation_title,
                    c.create_time AS conversation_create_time,
                    c.update_time AS conversation_update_time,
@@ -1566,6 +1678,9 @@ def _message_match_source(conn: sqlite3.Connection, parsed: ParsedQuery, *, use_
                     SELECT conversation_id, node_id, rank AS fts_rank
                     FROM web_message_trigram
                     WHERE web_message_trigram MATCH ?
+                    UNION ALL
+                    SELECT conversation_id, node_id, NULL AS fts_rank
+                    FROM web_index_oversized WHERE kind = 'message'
                 ) mk
                 JOIN conversation_nodes n
                   ON n.conversation_id = mk.conversation_id AND n.node_id = mk.node_id
@@ -1580,6 +1695,9 @@ def _message_match_source(conn: sqlite3.Connection, parsed: ParsedQuery, *, use_
                 SELECT rowid AS node_rowid, rank AS fts_rank
                 FROM web_message_trigram
                 WHERE web_message_trigram MATCH ?
+                UNION ALL
+                SELECT source_rowid AS node_rowid, NULL AS fts_rank
+                FROM web_index_oversized WHERE kind = 'message'
             ) mk
             JOIN conversation_nodes n ON n.rowid = mk.node_rowid
             """,
@@ -1682,11 +1800,11 @@ def _title_rows(conn: sqlite3.Connection, parsed: ParsedQuery, limit: int | None
         if not frag and parsed.has_non_time_filters():
             continue
         if parsed.match_mode == "word":
-            column = "tn.title_norm" if has_norm else "COALESCE(c.title, '')"
+            column = "COALESCE(tn.title_norm, web_norm(COALESCE(c.title, '')))" if has_norm else "COALESCE(c.title, '')"
             positive_clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([normalize_search_text(frag) if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            positive_clauses.append("instr(tn.title_norm, ?) > 0")
+            positive_clauses.append("instr(COALESCE(tn.title_norm, web_norm(COALESCE(c.title, ''))), ?) > 0")
             params.append(normalize_search_text(frag))
         else:
             positive_clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) > 0")
@@ -1698,11 +1816,11 @@ def _title_rows(conn: sqlite3.Connection, parsed: ParsedQuery, limit: int | None
         if not frag:
             continue
         if parsed.match_mode == "word":
-            column = "tn.title_norm" if has_norm else "COALESCE(c.title, '')"
+            column = "COALESCE(tn.title_norm, web_norm(COALESCE(c.title, '')))" if has_norm else "COALESCE(c.title, '')"
             filter_clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([normalize_search_text(frag) if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            filter_clauses.append("instr(tn.title_norm, ?) > 0")
+            filter_clauses.append("instr(COALESCE(tn.title_norm, web_norm(COALESCE(c.title, ''))), ?) > 0")
             params.append(normalize_search_text(frag))
         else:
             filter_clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) > 0")
@@ -1713,11 +1831,11 @@ def _title_rows(conn: sqlite3.Connection, parsed: ParsedQuery, limit: int | None
         params.extend(trigram_params)
     for frag in parsed.exclude:
         if parsed.match_mode == "word":
-            column = "tn.title_norm" if has_norm else "COALESCE(c.title, '')"
+            column = "COALESCE(tn.title_norm, web_norm(COALESCE(c.title, '')))" if has_norm else "COALESCE(c.title, '')"
             filter_clauses.append(f"web_search_match({column}, ?, ?) = 0")
             params.extend([normalize_search_text(frag) if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            filter_clauses.append("instr(tn.title_norm, ?) = 0")
+            filter_clauses.append("instr(COALESCE(tn.title_norm, web_norm(COALESCE(c.title, ''))), ?) = 0")
             params.append(normalize_search_text(frag))
         else:
             filter_clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) = 0")
@@ -2024,7 +2142,7 @@ def _message_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, 
             SELECT n.*,
                    {_sql_display_text('n')} AS resolved_text,
                    {score_expr} AS candidate_score,
-                   {"mn.content_norm" if has_norm else "NULL"} AS resolved_norm
+                   {f"COALESCE(mn.content_norm, web_norm({_sql_display_text('n')}))" if has_norm else "NULL"} AS resolved_norm
             FROM {source_sql}
             JOIN conversations c ON c.conversation_id = n.conversation_id
             {norm_join}
@@ -2068,6 +2186,9 @@ def _title_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, *,
                     SELECT conversation_id, rank AS title_rank
                     FROM web_title_trigram
                     WHERE web_title_trigram MATCH ?
+                    UNION ALL
+                    SELECT conversation_id, NULL AS title_rank
+                    FROM web_index_oversized WHERE kind = 'title'
                 ) tk
                 JOIN conversations c ON c.conversation_id = tk.conversation_id
             """
@@ -2077,6 +2198,9 @@ def _title_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, *,
                     SELECT rowid AS conversation_rowid, rank AS title_rank
                     FROM web_title_trigram
                     WHERE web_title_trigram MATCH ?
+                    UNION ALL
+                    SELECT source_rowid AS conversation_rowid, NULL AS title_rank
+                    FROM web_index_oversized WHERE kind = 'title'
                 ) tk
                 JOIN conversations c ON c.rowid = tk.conversation_rowid
             """
@@ -2365,11 +2489,11 @@ def _title_filter_clauses(parsed: ParsedQuery, has_norm: bool) -> tuple[list[str
         if not frag and parsed.has_non_time_filters():
             continue
         if parsed.match_mode == "word":
-            column = "tn.title_norm" if has_norm else "COALESCE(c.title, '')"
+            column = "COALESCE(tn.title_norm, web_norm(COALESCE(c.title, '')))" if has_norm else "COALESCE(c.title, '')"
             positive_clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([normalize_search_text(frag) if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            positive_clauses.append("instr(tn.title_norm, ?) > 0")
+            positive_clauses.append("instr(COALESCE(tn.title_norm, web_norm(COALESCE(c.title, ''))), ?) > 0")
             params.append(normalize_search_text(frag))
         else:
             positive_clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) > 0")
@@ -2380,11 +2504,11 @@ def _title_filter_clauses(parsed: ParsedQuery, has_norm: bool) -> tuple[list[str
         if not frag:
             continue
         if parsed.match_mode == "word":
-            column = "tn.title_norm" if has_norm else "COALESCE(c.title, '')"
+            column = "COALESCE(tn.title_norm, web_norm(COALESCE(c.title, '')))" if has_norm else "COALESCE(c.title, '')"
             clauses.append(f"web_search_match({column}, ?, ?) > 0")
             params.extend([normalize_search_text(frag) if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            clauses.append("instr(tn.title_norm, ?) > 0")
+            clauses.append("instr(COALESCE(tn.title_norm, web_norm(COALESCE(c.title, ''))), ?) > 0")
             params.append(normalize_search_text(frag))
         else:
             clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) > 0")
@@ -2394,11 +2518,11 @@ def _title_filter_clauses(parsed: ParsedQuery, has_norm: bool) -> tuple[list[str
         params.append(parsed.source)
     for frag in parsed.exclude:
         if parsed.match_mode == "word":
-            column = "tn.title_norm" if has_norm else "COALESCE(c.title, '')"
+            column = "COALESCE(tn.title_norm, web_norm(COALESCE(c.title, '')))" if has_norm else "COALESCE(c.title, '')"
             clauses.append(f"web_search_match({column}, ?, ?) = 0")
             params.extend([normalize_search_text(frag) if has_norm else frag, parsed.match_mode])
         elif has_norm:
-            clauses.append("instr(tn.title_norm, ?) = 0")
+            clauses.append("instr(COALESCE(tn.title_norm, web_norm(COALESCE(c.title, ''))), ?) = 0")
             params.append(normalize_search_text(frag))
         else:
             clauses.append("web_search_match(COALESCE(c.title, ''), ?, ?) = 0")
@@ -2674,24 +2798,36 @@ def _message_search_payload(
             reasons.add("message match")
     if bm25_score is not None:
         score += max(0.0, 25.0 - min(25.0, abs(float(bm25_score))))
+    role, role_truncated, role_length = _bounded_api_scalar(row["role"], MAX_API_ROLE_CHARS)
+    content_type, content_type_truncated, content_type_length = _bounded_api_scalar(row["content_type"], MAX_API_CONTENT_TYPE_CHARS)
+    title, title_truncated, title_length = _bounded_api_scalar(row["title"], MAX_API_TITLE_CHARS)
+    source_file, source_truncated, source_length = _bounded_api_scalar(row["source_file"], MAX_API_SOURCE_CHARS)
     return {
         "conversation_id": row["conversation_id"],
         "node_id": row["node_id"],
-        "role": row["role"],
+        "role": role,
+        "role_truncated": role_truncated,
+        "role_length": role_length,
         "create_time": row["create_time"],
         "update_time": row["update_time"],
-        "content_type": row["content_type"],
+        "content_type": content_type,
+        "content_type_truncated": content_type_truncated,
+        "content_type_length": content_type_length,
         "display_text": text,
         "snippet": make_snippet(text, _highlight_terms(parsed), parsed.match_mode),
         "is_on_current_path": bool(row["is_on_current_path"]),
         "current_path_fallback_to_all": current_path_fallback_to_all,
         "effective_visible_in_current_view": effective_visible,
         "is_internal": _is_internal_message(row["role"], row["content_type"], text),
-        "title": row["title"],
+        "title": title,
+        "title_truncated": title_truncated,
+        "title_length": title_length,
         "conversation_create_time": row["conversation_create_time"],
         "conversation_update_time": row["conversation_update_time"],
         "current_node": row["current_node"],
-        "source_file": row["source_file"],
+        "source_file": source_file,
+        "source_file_truncated": source_truncated,
+        "source_file_length": source_length,
         "reasons": sorted(reasons),
         "score": score,
     }
@@ -2808,15 +2944,24 @@ def _message_payload(
     if message_highlights is None:
         message_highlights, highlight_meta = _highlight_ranges_with_meta(fields["display_text"], terms)
     highlight_meta = highlight_meta or {}
+    role, role_truncated, role_length = _bounded_api_scalar(row["role"], MAX_API_ROLE_CHARS)
+    author_name, author_truncated, author_length = _bounded_api_scalar(row["author_name"], MAX_API_AUTHOR_CHARS)
+    content_type, content_type_truncated, content_type_length = _bounded_api_scalar(row["content_type"], MAX_API_CONTENT_TYPE_CHARS)
     return {
         "node_id": row["node_id"],
         "parent_node_id": row["parent_node_id"],
         "message_id": row["message_id"],
-        "role": row["role"],
-        "author_name": row["author_name"],
+        "role": role,
+        "role_truncated": role_truncated,
+        "role_length": role_length,
+        "author_name": author_name,
+        "author_name_truncated": author_truncated,
+        "author_name_length": author_length,
         "create_time": row["create_time"],
         "update_time": row["update_time"],
-        "content_type": row["content_type"],
+        "content_type": content_type,
+        "content_type_truncated": content_type_truncated,
+        "content_type_length": content_type_length,
         "display_text": fields["display_text"],
         "display_text_truncated": bool(fields.get("display_text_truncated")),
         "display_text_total_chars": fields.get("display_text_total_chars", len(fields["display_text"])),
@@ -3007,16 +3152,35 @@ def _sanitize_raw_preview(value: Any) -> Any:
     return value
 
 
+def _bounded_api_scalar(value: Any, limit: int) -> tuple[str | None, bool, int]:
+    if value is None:
+        return None, False, 0
+    text = normalize_display_text(str(value))
+    return text[:limit], len(text) > limit, len(text)
+
+
+def _conversation_scalar_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+    title, title_truncated, title_length = _bounded_api_scalar(row["title"], MAX_API_TITLE_CHARS)
+    source_file, source_truncated, source_length = _bounded_api_scalar(row["source_file"], MAX_API_SOURCE_CHARS)
+    return {
+        "title": title,
+        "title_truncated": title_truncated,
+        "title_length": title_length,
+        "source_file": source_file,
+        "source_file_truncated": source_truncated,
+        "source_file_length": source_length,
+    }
+
+
 def _conversation_summary(row: sqlite3.Row) -> dict[str, Any]:
     node_count = int(row["node_count"] or 0)
     current_path_nodes = int(row["current_path_nodes"] or 0)
     return {
         "conversation_id": row["conversation_id"],
-        "title": row["title"],
+        **_conversation_scalar_fields(row),
         "create_time": row["create_time"],
         "update_time": row["update_time"],
         "current_node": row["current_node"],
-        "source_file": row["source_file"],
         "node_count": node_count,
         "current_path_nodes": current_path_nodes,
         "current_path_fallback_to_all": node_count > 0 and current_path_nodes == 0,
@@ -3035,11 +3199,10 @@ def _conversation_summary_with_counts(row: sqlite3.Row, counts: dict[str, int]) 
     current_path_nodes = int(counts.get("current_path_nodes", 0))
     return {
         "conversation_id": row["conversation_id"],
-        "title": row["title"],
+        **_conversation_scalar_fields(row),
         "create_time": row["create_time"],
         "update_time": row["update_time"],
         "current_node": row["current_node"],
-        "source_file": row["source_file"],
         "node_count": node_count,
         "current_path_nodes": current_path_nodes,
         "current_path_fallback_to_all": bool(counts.get("current_path_fallback_to_all", node_count > 0 and current_path_nodes == 0)),
@@ -3371,6 +3534,8 @@ def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
         _web_index_metadata_value(conn, "web_index_format_version") != OPTIONAL_WEB_INDEX_FORMAT_VERSION
         or _web_index_metadata_value(conn, "display_text_resolver_version") != DISPLAY_TEXT_RESOLVER_VERSION
         or _web_index_metadata_value(conn, "normalization_index_format_version") != NORMALIZATION_INDEX_FORMAT_VERSION
+        or _web_index_metadata_value(conn, "oversized_fallback") != "required"
+        or not _table_exists(conn, "web_index_oversized")
     ):
         return False
     if not _table_exists(conn, "archive_generations"):

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { HighlightRange, MessageItem } from "../types";
 import { formatDate, roleLabel } from "../utils/format";
-import { getMessageDisplayChunk, getRawMessage } from "../api/client";
+import { CopyLimitError, IncompleteDisplayRecoveryError, MAX_BROWSER_COPY_BYTES, MAX_BROWSER_COPY_CHARS, getMessageDisplayChunk, getRawMessage } from "../api/client";
 import type { MessageLayout } from "../settings";
 
 interface Props {
@@ -24,6 +24,8 @@ interface PreservedMessageState {
   fullRawTruncated: boolean;
   expandedText: string | null;
   displayNextOffset: number | null;
+  displayNextCursor: string | null;
+  displayRecoveryIncomplete: boolean;
 }
 
 const preservedMessageStates = new Map<string, PreservedMessageState>();
@@ -36,7 +38,8 @@ function preserveMessageState(key: string, state: PreservedMessageState, showRaw
     !state.detailsOpen &&
     !state.fullRaw &&
     !state.fullRawTruncated &&
-    state.expandedText === null
+    state.expandedText === null &&
+    !state.displayRecoveryIncomplete
   ) {
     preservedMessageStates.delete(key);
     return;
@@ -106,8 +109,8 @@ function looksLikeTechnicalPayload(message: MessageItem, text: string): boolean 
 }
 
 export default function MessageBlock({ message, conversationId, stateContextKey, active, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
-  const messageIdentity = `${conversationId}:${message.node_id}:${message.message_id || ""}:${message.content_hash || ""}`;
-  const preservedStateKey = `${stateContextKey}:${messageIdentity}:${showRawDefault ? "raw" : "plain"}`;
+  const messageIdentity = JSON.stringify([conversationId, message.node_id, message.message_id || "", message.content_hash || ""]);
+  const preservedStateKey = JSON.stringify([stateContextKey, messageIdentity, showRawDefault ? "raw" : "plain"]);
   const savedState = preservedMessageStates.get(preservedStateKey);
   const [showRaw, setShowRaw] = useState(() => savedState?.showRaw ?? showRawDefault);
   const [detailsOpen, setDetailsOpen] = useState(() => savedState?.detailsOpen ?? false);
@@ -116,7 +119,15 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
   const [fullRawLoading, setFullRawLoading] = useState(false);
   const [fullRawError, setFullRawError] = useState("");
   const [expandedText, setExpandedText] = useState<string | null>(() => savedState?.expandedText ?? null);
-  const [displayNextOffset, setDisplayNextOffset] = useState<number | null>(() => savedState?.displayNextOffset ?? 0);
+  const [displayNextOffset, setDisplayNextOffset] = useState<number | null>(() =>
+    savedState && Object.prototype.hasOwnProperty.call(savedState, "displayNextOffset")
+      ? savedState.displayNextOffset
+      : 0,
+  );
+  const [displayNextCursor, setDisplayNextCursor] = useState<string | null>(() => savedState?.displayNextCursor ?? null);
+  const [displayRecoveryIncomplete, setDisplayRecoveryIncomplete] = useState(
+    () => savedState?.displayRecoveryIncomplete ?? message.display_text_total_chars_exact === false,
+  );
   const [displayLoading, setDisplayLoading] = useState(false);
   const [displayError, setDisplayError] = useState("");
   const FULL_RAW_MAX_CHARS = 50000;
@@ -139,11 +150,16 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
   const shouldCollapseDetails = shouldUseChat && isTechnicalPayload;
   const articleClass = `message ${roleClass(message.role)} ${message.is_internal ? "message-internal" : ""} ${active ? "message-active" : ""}`;
   const showBranchBadge = !message.effective_visible_in_current_view && !message.current_path_fallback_to_all && !currentPathFallbackToAll;
-  const preservedStateRef = useRef<PreservedMessageState>({ showRaw, detailsOpen, fullRaw, fullRawTruncated, expandedText, displayNextOffset });
-  preservedStateRef.current = { showRaw, detailsOpen, fullRaw, fullRawTruncated, expandedText, displayNextOffset };
+  const preservedStateRef = useRef<PreservedMessageState>({ showRaw, detailsOpen, fullRaw, fullRawTruncated, expandedText, displayNextOffset, displayNextCursor, displayRecoveryIncomplete });
+  preservedStateRef.current = { showRaw, detailsOpen, fullRaw, fullRawTruncated, expandedText, displayNextOffset, displayNextCursor, displayRecoveryIncomplete };
   const messageIdentityRef = useRef(messageIdentity);
   messageIdentityRef.current = messageIdentity;
   const copy = async () => {
+    if (message.display_text_total_chars_exact === false || displayRecoveryIncomplete) {
+      setDisplayRecoveryIncomplete(true);
+      setDisplayError(t("displayRecoveryIncomplete"));
+      return;
+    }
     if (!message.display_text_truncated && expandedText === null) {
       await onCopy(text || message.raw_preview || "");
       return;
@@ -157,16 +173,28 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     setDisplayError("");
     try {
       let offset = 0;
+      let cursor: string | null = null;
       let complete = "";
+      let completeBytes = 0;
       while (true) {
-        const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal);
+        const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal, cursor);
         if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
+        if (chunk.resolver_input_truncated || !chunk.total_chars_exact) {
+          setDisplayRecoveryIncomplete(true);
+          throw new IncompleteDisplayRecoveryError();
+        }
+        completeBytes += new TextEncoder().encode(chunk.display_text).byteLength;
+        if (complete.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || completeBytes > MAX_BROWSER_COPY_BYTES) {
+          throw new CopyLimitError();
+        }
         complete += chunk.display_text;
         if (!chunk.has_more || chunk.next_offset === null) break;
         offset = chunk.next_offset;
+        cursor = chunk.next_cursor;
       }
       setExpandedText(complete);
       setDisplayNextOffset(null);
+      setDisplayNextCursor(null);
       await onCopy(complete || message.raw_preview || "");
     } catch (error) {
       if (
@@ -174,7 +202,13 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
         requestId === displayRequestIdRef.current &&
         requestIdentity === messageIdentityRef.current &&
         !(error instanceof Error && error.name === "AbortError")
-      ) setDisplayError(t("displayTextFailed"));
+      ) setDisplayError(
+        error instanceof CopyLimitError
+          ? t("copyTooLarge")
+          : error instanceof IncompleteDisplayRecoveryError
+            ? t("displayRecoveryIncomplete")
+            : t("displayTextFailed"),
+      );
     } finally {
       if (requestId === displayRequestIdRef.current && requestIdentity === messageIdentityRef.current) {
         displayControllerRef.current = null;
@@ -224,6 +258,8 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     displayControllerRef.current = null;
     setExpandedText(null);
     setDisplayNextOffset(0);
+    setDisplayNextCursor(null);
+    setDisplayRecoveryIncomplete(message.display_text_total_chars_exact === false);
     setDisplayLoading(false);
     setDisplayError("");
     notifySizeMayChange();
@@ -307,10 +343,13 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     setDisplayLoading(true);
     setDisplayError("");
     try {
-      const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal);
+      const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal, displayNextCursor);
       if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
+      const incomplete = chunk.resolver_input_truncated || !chunk.total_chars_exact;
+      if (incomplete) setDisplayRecoveryIncomplete(true);
       setExpandedText((current) => offset === 0 ? chunk.display_text : `${current ?? ""}${chunk.display_text}`);
       setDisplayNextOffset(chunk.next_offset);
+      setDisplayNextCursor(chunk.next_cursor);
       if (!chunk.has_more) window.requestAnimationFrame(() => bodyRef.current?.focus());
     } catch (error) {
       if (
@@ -366,7 +405,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
       </pre>
       {message.highlight_ranges_truncated && <p className="hint">{t("highlightRangesTruncated")}</p>}
       {active && message.highlight_truncated && message.highlight_ranges.length === 0 && <p className="hint">{t("activeHighlightUnavailable")}</p>}
-      {(message.display_text_truncated || expandedText !== null) && (
+      {(message.display_text_truncated || expandedText !== null || displayRecoveryIncomplete) && (
         <div className="hint">
           {message.display_text_truncated && expandedText === null && <span>{t("displayTextTruncated")} </span>}
           {(expandedText === null || displayNextOffset !== null) && (
@@ -374,7 +413,10 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
               {displayLoading ? t("displayTextLoading") : expandedText === null ? t("loadDisplayText") : t("loadMoreDisplayText")}
             </button>
           )}
-          {displayError && <span className="error-text">{displayError}</span>}
+          {displayError && <span className="error-text" role="status">{displayError}</span>}
+          {displayRecoveryIncomplete && !displayError && (
+            <span className="error-text" role="status">{t("displayRecoveryIncomplete")}</span>
+          )}
         </div>
       )}
       {showRaw && (

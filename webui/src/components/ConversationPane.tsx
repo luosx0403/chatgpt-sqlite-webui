@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ConversationSummary, MatchMode, MessageItem, PathMode, SearchFilters, SearchMessageHit } from "../types";
-import { exportUrl, getConversationCopyText, getMessageDisplayChunk, getMessageHits, getMessages } from "../api/client";
+import { CopyLimitError, IncompleteDisplayRecoveryError, MAX_BROWSER_COPY_BYTES, MAX_BROWSER_COPY_CHARS, assertBrowserCopyLimit, exportUrl, getConversationCopyText, getMessageDisplayChunk, getMessageHits, getMessages } from "../api/client";
 import { formatDate } from "../utils/format";
 import { analyzeQuerySyntax } from "../utils/querySyntax";
 import MessageBlock from "./MessageBlock";
@@ -189,24 +189,24 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     const counts = new Map<string, number>();
     const keys = new Map<MessageItem, string>();
     messages.forEach((message, index) => {
-      const base = [
+      const base = JSON.stringify([
         conversation?.conversation_id || "conversation",
         message.node_id || "missing-node",
         message.message_id || "missing-message",
         message.content_hash || "missing-hash",
-      ].join(":");
+      ]);
       const occurrence = counts.get(base) || 0;
       counts.set(base, occurrence + 1);
-      keys.set(message, `${base}:${occurrence}`);
+      keys.set(message, JSON.stringify([base, occurrence]));
     });
     return keys;
   }, [conversation?.conversation_id, messages]);
   const messageKey = useCallback((message: MessageItem | undefined, index: number) => {
-    if (!message) return `${conversation?.conversation_id || "conversation"}:missing:${index}`;
-    return messageKeys.get(message) || `${conversation?.conversation_id || "conversation"}:${message.node_id || message.message_id || index}:${index}`;
+    if (!message) return JSON.stringify([conversation?.conversation_id || "conversation", "missing", index]);
+    return messageKeys.get(message) || JSON.stringify([conversation?.conversation_id || "conversation", message.node_id || message.message_id || index, index]);
   }, [conversation?.conversation_id, messageKeys]);
   const visibleMessageKeys = useMemo(
-    () => visibleMessages.map((message, index) => messageKey(message, index)).join("|"),
+    () => JSON.stringify(visibleMessages.map((message, index) => messageKey(message, index))),
     [messageKey, visibleMessages],
   );
 
@@ -472,6 +472,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
 
   const copyText = async (text: string, expectedContextKey?: string, requestId?: number): Promise<boolean> => {
     try {
+      assertBrowserCopyLimit(text);
       if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(text);
       if (expectedContextKey && (readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current)) return false;
@@ -487,22 +488,39 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   };
   const messageText = (m: MessageItem) => m.display_text || "";
   const completeMessageText = async (message: MessageItem, signal: AbortSignal): Promise<string> => {
+    if (message.display_text_total_chars_exact === false) throw new IncompleteDisplayRecoveryError();
     if (!message.display_text_truncated) return messageText(message);
     let offset = 0;
+    let cursor: string | null = null;
     let complete = "";
+    let completeBytes = 0;
     for (;;) {
-      const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 65536, signal);
+      const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 65536, signal, cursor);
+      if (chunk.resolver_input_truncated || !chunk.total_chars_exact) throw new IncompleteDisplayRecoveryError();
+      completeBytes += new TextEncoder().encode(chunk.display_text).byteLength;
+      if (complete.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || completeBytes > MAX_BROWSER_COPY_BYTES) {
+        throw new CopyLimitError();
+      }
       complete += chunk.display_text;
       if (!chunk.has_more || chunk.next_offset === null) return complete;
       offset = chunk.next_offset;
+      cursor = chunk.next_cursor;
     }
   };
   const formatMessagesForCopy = async (items: MessageItem[], signal: AbortSignal): Promise<string> => {
     const parts: string[] = [];
+    let chars = 0;
+    let bytes = 0;
     for (const message of items) {
       if (message.is_empty_mapping_node) continue;
       const complete = await completeMessageText(message, signal);
-      if (complete.trim()) parts.push(`${message.role || "message"}:\n${complete}`);
+      if (complete.trim()) {
+        const part = `${message.role || "message"}:\n${complete}`;
+        chars += part.length + (parts.length ? 2 : 0);
+        bytes += new TextEncoder().encode(part).byteLength + (parts.length ? 2 : 0);
+        if (chars > MAX_BROWSER_COPY_CHARS || bytes > MAX_BROWSER_COPY_BYTES) throw new CopyLimitError();
+        parts.push(part);
+      }
     }
     return parts.join("\n\n");
   };
@@ -521,9 +539,17 @@ export default function ConversationPane({ conversation, query, filters, matchMo
         : await formatMessagesForCopy(visibleMessages, controller.signal);
       if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
       await copyText(copyValue, requestedContextKey, requestId);
-    } catch {
+    } catch (error) {
       if (controller.signal.aborted || readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
-      setCopyStatus(mode === "conversation" ? t("copyConversationFailed") : t("copyFailed"));
+      setCopyStatus(
+        error instanceof CopyLimitError
+          ? t("copyTooLarge")
+          : error instanceof IncompleteDisplayRecoveryError
+            ? t("copyIncomplete")
+            : mode === "conversation"
+              ? t("copyConversationFailed")
+              : t("copyFailed"),
+      );
       window.setTimeout(() => setCopyStatus(""), 1800);
     } finally {
       if (readerDataContextRef.current === requestedContextKey && requestId === copyRequestRef.current) setCopyBusy(null);

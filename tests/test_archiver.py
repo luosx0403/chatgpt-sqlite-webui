@@ -2810,7 +2810,7 @@ class ArchiverTests(unittest.TestCase):
             tracemalloc.start()
             try:
                 with (
-                    mock.patch.object(exporter, "write_bytes_if_changed", return_value=False),
+                    mock.patch.object(exporter, "write_chunks_if_changed", return_value=(False, "synthetic-hash", 0)),
                     mock.patch.object(exporter, "record_export"),
                     mock.patch.object(exporter, "write_manifest"),
                     mock.patch.object(exporter, "_validate_export_outputs"),
@@ -3948,9 +3948,8 @@ class ArchiverTests(unittest.TestCase):
                 ["--db", str(db), "export", "--out", str(export_dir)],
             ):
                 command_code, command_output = run_cli(command)
-                self.assertEqual(command_code, 2)
-                self.assertIn("database_foreign_key_violation", command_output)
-            self.assertFalse(export_dir.exists())
+                self.assertEqual(command_code, 0)
+                self.assertNotIn("database_foreign_key_violation", command_output)
 
     def test_parent_cycle_nodes_and_components_have_explicit_units(self):
         from chatgpt_export_archiver.db import parent_cycle_diagnostics
@@ -4773,6 +4772,91 @@ class ArchiverTests(unittest.TestCase):
             self.assertFalse(web_index_status(fresh)["web_normalized_indexed"])
             fresh.close()
 
+    def test_round6_migration_lock_race_repairs_title_and_message_drift_and_invalidates_indexes(self):
+        import threading
+        from chatgpt_export_archiver.db import connect, database_schema_status, init_db, migrate_database
+        from chatgpt_export_archiver.search import parse_query, search_conversations, search_messages
+        from chatgpt_export_archiver.web_db import create_web_indexes, web_index_status
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "migration-race.db"
+            setup = connect(db)
+            init_db(setup)
+            setup.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES ('c', 'old title ghost', 'n', 'h')"
+            )
+            setup.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       content_hash, is_on_current_path
+                   ) VALUES ('c', 'n', 'assistant', 'text', 'old message ghost', 'h', 1)"""
+            )
+            setup.commit()
+            setup.close()
+            create_web_indexes(db)
+
+            writer = connect(db)
+            writer.execute("BEGIN IMMEDIATE")
+            migration_started = threading.Event()
+            outcome: list[Any] = []
+
+            def migrate_worker():
+                conn = connect(db)
+                conn.set_trace_callback(
+                    lambda sql: migration_started.set() if sql.strip().upper() == "BEGIN IMMEDIATE" else None
+                )
+                try:
+                    outcome.append(migrate_database(conn))
+                except BaseException as exc:
+                    outcome.append(exc)
+                finally:
+                    conn.close()
+
+            thread = threading.Thread(target=migrate_worker, daemon=True)
+            thread.start()
+            self.assertTrue(migration_started.wait(5))
+            for trigger in ("archive_title_generation_update", "archive_message_generation_update"):
+                writer.execute(f"DROP TRIGGER {trigger}")
+            writer.execute(
+                "CREATE TRIGGER archive_title_generation_update AFTER UPDATE OF title ON conversations BEGIN SELECT 1; END"
+            )
+            writer.execute(
+                "CREATE TRIGGER archive_message_generation_update AFTER UPDATE OF content_text ON conversation_nodes BEGIN SELECT 1; END"
+            )
+            writer.execute("UPDATE conversations SET title='new title live' WHERE conversation_id='c'")
+            writer.execute(
+                "UPDATE conversation_nodes SET content_text='new message live', content_hash='new' WHERE conversation_id='c' AND node_id='n'"
+            )
+            writer.commit()
+            writer.close()
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], dict)
+            self.assertTrue(outcome[0]["changed"])
+
+            check = connect(db)
+            self.assertTrue(database_schema_status(check)["ok"])
+            self.assertFalse(web_index_status(check)["web_normalized_indexed"])
+            optional_tables = {
+                row[0] for row in check.execute(
+                    "SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'web_%'"
+                )
+            }
+            self.assertNotIn("web_title_norm", optional_tables)
+            self.assertNotIn("web_message_norm", optional_tables)
+            title_page = search_conversations(check, parse_query("new title", scope="title"), limit=10)
+            self.assertEqual([item["conversation_id"] for item in title_page["items"]], ["c"])
+            self.assertEqual(search_conversations(
+                check, parse_query("old title", scope="title"), limit=10
+            )["items"], [])
+            message_page = search_messages(check, parse_query("new message"), conversation_id="c")
+            self.assertEqual([item["node_id"] for item in message_page["items"]], ["n"])
+            self.assertEqual(search_messages(
+                check, parse_query("old message"), conversation_id="c"
+            )["items"], [])
+            check.close()
+
     def test_readonly_cli_schema_newer_gate_precedes_queries_and_export_output(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -4877,6 +4961,198 @@ class ArchiverTests(unittest.TestCase):
             conn = connect(db)
             self.assertTrue(database_schema_status(conn)["ok"])
             conn.close()
+
+    def test_round6_migration_reads_future_version_only_after_write_lock(self):
+        import threading
+
+        from chatgpt_export_archiver.db import DatabaseMigrationError, migrate_database
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "race.db"
+            seed = connect(db)
+            init_db(seed)
+            seed.close()
+            writer = sqlite3.connect(db)
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("PRAGMA user_version = 99")
+            begin_seen = threading.Event()
+            outcome: list[str] = []
+
+            def worker():
+                conn = connect(db)
+                conn.set_trace_callback(
+                    lambda sql: begin_seen.set() if sql.strip().upper() == "BEGIN IMMEDIATE" else None
+                )
+                try:
+                    migrate_database(conn)
+                except DatabaseMigrationError as exc:
+                    outcome.append(exc.code)
+                finally:
+                    conn.close()
+
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(begin_seen.wait(5))
+            writer.commit()
+            writer.close()
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(outcome, ["database_schema_newer"])
+            check = sqlite3.connect(db)
+            self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 99)
+            check.close()
+
+    def test_round6_legacy_null_identity_is_rejected_and_valid_rows_migrate(self):
+        from chatgpt_export_archiver.db import DatabaseMigrationError, DATABASE_SCHEMA_VERSION, migrate_database
+
+        fixture = Path(__file__).resolve().parent / "fixtures" / "legacy-fa37b3d.sql"
+        with tempfile.TemporaryDirectory() as td:
+            valid_db = Path(td) / "valid.db"
+            valid = sqlite3.connect(valid_db)
+            valid.row_factory = sqlite3.Row
+            valid.executescript(fixture.read_text(encoding="utf-8"))
+            before_hash = valid.execute(
+                "SELECT aggregate_hash FROM conversations ORDER BY conversation_id"
+            ).fetchall()
+            self.assertTrue(migrate_database(valid)["changed"])
+            self.assertEqual(valid.execute("PRAGMA user_version").fetchone()[0], DATABASE_SCHEMA_VERSION)
+            self.assertEqual(before_hash, valid.execute(
+                "SELECT aggregate_hash FROM conversations ORDER BY conversation_id"
+            ).fetchall())
+            with self.assertRaises(sqlite3.IntegrityError):
+                valid.execute("INSERT INTO conversations(conversation_id, aggregate_hash) VALUES(NULL, 'x')")
+            valid.close()
+
+            damaged = sqlite3.connect(Path(td) / "null.db")
+            damaged.row_factory = sqlite3.Row
+            damaged.executescript(fixture.read_text(encoding="utf-8"))
+            damaged.execute("INSERT INTO conversations(conversation_id, aggregate_hash) VALUES(NULL, 'x')")
+            damaged.commit()
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(damaged)
+            self.assertEqual(caught.exception.code, "database_schema_incompatible")
+            self.assertEqual(damaged.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertEqual(damaged.execute(
+                "SELECT COUNT(*) FROM conversations WHERE conversation_id IS NULL"
+            ).fetchone()[0], 1)
+            damaged.close()
+
+    def test_round6_delete_input_replacement_is_preserved(self):
+        from chatgpt_export_archiver.cli import run_import_pipeline
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "source.zip"
+            moved = base / "moved.zip"
+            replacement_payload = [conversation("replacement")]
+            write_zip(source, {"conversations.json": [conversation("original")]})
+            replaced = False
+
+            def progress(stage, _summary):
+                nonlocal replaced
+                if stage == "import_index_rebuild_complete" and not replaced:
+                    source.rename(moved)
+                    write_zip(source, {"conversations.json": replacement_payload})
+                    replaced = True
+
+            result = run_import_pipeline(
+                base / "archive.db", str(source), cwd=base,
+                no_input_sha256=True, delete_input_on_success=True,
+                progress_callback=progress,
+            )
+            self.assertTrue(replaced)
+            self.assertTrue(source.exists())
+            self.assertTrue(moved.exists())
+            self.assertIsNone(result["deleted_input"])
+            self.assertTrue(result["delete_input_changed"])
+            conn = sqlite3.connect(base / "archive.db")
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM import_warnings WHERE warning_type='delete_input_changed'"
+            ).fetchone()[0], 1)
+            conn.close()
+
+    def test_round6_streamed_export_compare_and_failure_preserve_old_output(self):
+        from chatgpt_export_archiver.utils import write_chunks_if_changed
+
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "synthetic.txt"
+            output.write_bytes(b"stable-output")
+            original_mtime = output.stat().st_mtime_ns
+            changed, digest, size = write_chunks_if_changed(
+                output, ["stable", b"-output"], max_bytes=1024
+            )
+            self.assertFalse(changed)
+            self.assertEqual(size, len(b"stable-output"))
+            self.assertEqual(digest, hashlib.sha256(b"stable-output").hexdigest())
+            self.assertEqual(output.stat().st_mtime_ns, original_mtime)
+
+            def failing_chunks():
+                yield b"replacement-prefix"
+                raise RuntimeError("synthetic failure")
+
+            with self.assertRaises(RuntimeError):
+                write_chunks_if_changed(output, failing_chunks(), max_bytes=1024)
+            self.assertEqual(output.read_bytes(), b"stable-output")
+            with self.assertRaisesRegex(ValueError, "export_output_byte_limit_exceeded"):
+                write_chunks_if_changed(output, [b"too-large"], max_bytes=3)
+            self.assertEqual(output.read_bytes(), b"stable-output")
+            self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp")), [])
+
+    def test_round6_unicode_scalar_and_timestamp_overflow_are_classified(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "conversations.json"
+            valid = conversation(
+                "unicode",
+                title="literal\ufeff isolated \ud800",
+                current_node="node",
+                mapping={"node": message_node("node", None, "assistant", "left\ufeffright \ud800", 1)},
+                create_time=10 ** 400,
+            )
+            invalid_id = conversation(
+                "bad-id",
+                current_node="bad\ud800",
+                mapping={"bad\ud800": message_node("bad\ud800", None, "assistant", "hidden", 1)},
+            )
+            source.write_text(json.dumps([valid, invalid_id]), encoding="utf-8")
+            db = base / "archive.db"
+            result = run_cli(["--db", str(db), "import", "--input", str(source), "--no-input-sha256"])
+            self.assertEqual(result[0], 0, result[1])
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT title, create_time FROM conversations WHERE conversation_id='unicode'"
+            ).fetchone()
+            self.assertEqual(row["title"], "literal\ufeff isolated \ufffd")
+            self.assertIsNone(row["create_time"])
+            self.assertEqual(conn.execute(
+                "SELECT content_text FROM conversation_nodes WHERE conversation_id='unicode' AND node_id='node'"
+            ).fetchone()[0], "left\ufeffright \ufffd")
+            warning_types = {
+                row[0] for row in conn.execute("SELECT warning_type FROM import_warnings")
+            }
+            self.assertIn("unicode_text_normalized", warning_types)
+            self.assertIn("invalid_timestamp", warning_types)
+            self.assertIn("canonical_id_invalid_unicode", warning_types)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM conversations WHERE conversation_id='bad-id'"
+            ).fetchone()[0], 0)
+            conn.close()
+
+    def test_round6_json_framer_rejects_invalid_long_tail_and_single_element_budget(self):
+        import chatgpt_export_archiver.scanner as scanner
+
+        with mock.patch.object(scanner, "MAX_JSON_ELEMENT_CHARS", 128):
+            with self.assertRaises(scanner.ConversationJsonElementTooLargeError):
+                list(scanner._iter_json_array(iter(["[{\"padding\":\"" + "x" * 256 + "\"}]"])))
+            with self.assertRaises(scanner.ConversationJsonElementTooLargeError):
+                list(scanner._iter_json_array(iter(["[!" + " " * 256 + "]"])))
+        with self.assertRaises(scanner.InvalidConversationEncodingError):
+            list(scanner._iter_json_array(iter(["[{\"x\":1}\ufeff]"])))
+        self.assertEqual(
+            list(scanner._iter_json_array(iter(["[{\"literal\":\"a\ufeffb\",\"escaped\":\"a\\ufeffb\"}]"]))),
+            [{"literal": "a\ufeffb", "escaped": "a\ufeffb"}],
+        )
 
 if __name__ == "__main__":
     unittest.main()

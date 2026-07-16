@@ -171,6 +171,8 @@ const en = {
   preparingCopy: "Preparing copy...",
   copyFailed: "Copy failed",
   copyConversationFailed: "Copy conversation failed. Try again.",
+  copyTooLarge: "Too much text to copy safely. Use Download instead.",
+  copyIncomplete: "Copy was stopped because the complete message could not be recovered. Open the raw preview or use Download.",
   requestFailed: "The local archive request failed. Try again.",
   currentPathFallbackAll: "This archive has no usable current path. The reader is showing all nodes as a safe fallback.",
   settingsStorageWarning: "Settings are applied for this session, but this browser did not allow them to be saved.",
@@ -272,6 +274,7 @@ const en = {
   loadMoreDisplayText: "Load more message body",
   displayTextLoading: "Loading message body...",
   displayTextFailed: "The complete message body could not be loaded.",
+  displayRecoveryIncomplete: "The stored raw payload exceeded the safe recovery limit, so this is not the complete message. Open the raw preview or use Download.",
   activeHighlightUnavailable: "The active hit is outside the returned or scanned preview; load more text to locate it.",
 } as const;
 
@@ -449,6 +452,8 @@ const zhHans: Dict = {
   preparingCopy: "正在准备复制...",
   copyFailed: "复制失败",
   copyConversationFailed: "复制整段对话失败，请重试。",
+  copyTooLarge: "内容过大，无法安全复制；请改用下载。",
+  copyIncomplete: "无法恢复完整消息，复制已停止；请打开 raw 预览或改用下载。",
   requestFailed: "本地归档请求失败，请重试。",
   currentPathFallbackAll: "此归档没有可用的当前路径，阅读器正以安全回退方式显示全部节点。",
   settingsStorageWarning: "设置已在本次会话中生效，但浏览器不允许持久保存。",
@@ -550,6 +555,7 @@ const zhHans: Dict = {
   loadMoreDisplayText: "继续加载消息正文",
   displayTextLoading: "正在加载消息正文…",
   displayTextFailed: "无法加载完整消息正文。",
+  displayRecoveryIncomplete: "存储的 raw 内容超过安全恢复上限，当前并非完整消息；请打开 raw 预览或改用下载。",
   activeHighlightUnavailable: "当前命中位于已返回或已扫描预览之外；请加载更多正文以定位。",
 };
 
@@ -724,6 +730,8 @@ const zhHant: Dict = {
   preparingCopy: "正在準備複製...",
   copyFailed: "複製失敗",
   copyConversationFailed: "複製整段對話失敗，請重試。",
+  copyTooLarge: "內容過大，無法安全複製；請改用下載。",
+  copyIncomplete: "無法復原完整訊息，複製已停止；請開啟 raw 預覽或改用下載。",
   requestFailed: "本機封存請求失敗，請重試。",
   currentPathFallbackAll: "此封存沒有可用的目前路徑，閱讀器正以安全回退方式顯示全部節點。",
   settingsStorageWarning: "設定已在本次工作階段中生效，但瀏覽器不允許永久儲存。",
@@ -825,6 +833,7 @@ const zhHant: Dict = {
   loadMoreDisplayText: "繼續載入訊息正文",
   displayTextLoading: "正在載入訊息正文…",
   displayTextFailed: "無法載入完整訊息正文。",
+  displayRecoveryIncomplete: "儲存的 raw 內容超過安全復原上限，目前並非完整訊息；請開啟 raw 預覽或改用下載。",
   activeHighlightUnavailable: "目前命中位於已回傳或已掃描預覽之外；請載入更多正文以定位。",
 };
 
@@ -858,6 +867,9 @@ const ja: Dict = {
   preparingCopy: "コピー準備中...",
   copyFailed: "コピーに失敗しました",
   copyConversationFailed: "現在のパスの会話をコピーできませんでした。",
+  copyTooLarge: "安全にコピーできる上限を超えました。ダウンロードを使用してください。",
+  copyIncomplete: "完全なメッセージを復元できないため、コピーを中止しました。raw プレビューを開くかダウンロードしてください。",
+  displayRecoveryIncomplete: "保存された raw payload が安全な復元上限を超えたため、完全なメッセージではありません。raw プレビューを開くかダウンロードしてください。",
   requestFailed: "ローカルアーカイブへのリクエストに失敗しました。再試行してください。",
   currentPathFallbackAll: "使用可能な現在のパスがないため、安全な代替として全ノードを表示しています。",
   settingsStorageWarning: "設定はこのセッションに適用されましたが、ブラウザーに保存できませんでした。",
@@ -944,6 +956,9 @@ const es: Dict = {
   preparingCopy: "Preparando copia...",
   copyFailed: "Error al copiar",
   copyConversationFailed: "No se pudo copiar la conversación de la ruta actual.",
+  copyTooLarge: "Hay demasiado texto para copiar con seguridad. Usa Descargar.",
+  copyIncomplete: "Se detuvo la copia porque no se pudo recuperar el mensaje completo. Abre la vista raw o usa Descargar.",
+  displayRecoveryIncomplete: "El contenido raw almacenado supera el límite de recuperación segura, por lo que el mensaje no está completo. Abre la vista raw o usa Descargar.",
   requestFailed: "Falló la solicitud al archivo local. Inténtalo de nuevo.",
   currentPathFallbackAll: "Este archivo no tiene una ruta actual utilizable; se muestran todos los nodos como alternativa segura.",
   settingsStorageWarning: "Los ajustes se aplicaron a esta sesión, pero el navegador no permitió guardarlos.",

@@ -15,7 +15,18 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, Request, Response, UploadFile
 from starlette.responses import StreamingResponse
 
-from .exporter import iter_conversation_export_nodes, iter_copy_conversation, iter_rendered_conversation
+from .exporter import (
+    ExportResourceLimitError,
+    MAX_EXPORT_CONVERSATION_INPUT_BYTES,
+    MAX_EXPORT_NODE_INPUT_BYTES,
+    MAX_EXPORT_NODES_PER_CONVERSATION,
+    MAX_EXPORT_OUTPUT_BYTES,
+    check_conversation_export_budget,
+    iter_conversation_export_nodes,
+    iter_copy_conversation,
+    iter_rendered_conversation,
+)
+from .current_path import MAX_EFFECTIVE_CURRENT_GRAPH_BYTES_PER_CONVERSATION, MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION
 from .db import (
     DatabaseMigrationError,
     database_schema_error_code,
@@ -24,15 +35,19 @@ from .db import (
 )
 from .logging_utils import get_logger
 from .identifiers import MAX_CANONICAL_ID_LENGTH
+from .parser import normalize_display_text
 from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
 from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
 from .sqlite_errors import sqlite_runtime_error_code
-from .search import _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_messages
-from .utils import finite_float_or_none, safe_filename_part
+from .search import DisplayCursorError, _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_messages
+from .utils import finite_float_or_none, safe_filename_part, utc_now_iso
 from .web_db import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
     WEB_INDEX_BUILD_STAGES,
+    WEB_INDEX_MAX_DERIVED_BYTES,
+    WEB_INDEX_MAX_INPUT_BYTES,
+    WEB_INDEX_MAX_NORMALIZED_BYTES,
     WEB_INDEX_FORMAT_VERSION,
     check_schema,
     connect_readonly,
@@ -53,6 +68,8 @@ ALLOWED_MESSAGE_ORDERS = {"relevance", "display"}
 ALLOWED_MATCH_MODES = {"contains", "word"}
 MAX_DATE_PARAM_LENGTH = 64
 MAX_ID_PARAM_LENGTH = MAX_CANONICAL_ID_LENGTH
+MAX_LEGACY_ID_PARAM_LENGTH = 16 * 1024
+MAX_SQLITE_OFFSET = (1 << 63) - 1
 JOB_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 
 DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024
@@ -344,13 +361,13 @@ def create_api_router(
     trust = trust_policy or _get_web_trust_policy(host="127.0.0.1")
 
     def get_conn():
-        if not db_path.exists():
-            raise HTTPException(status_code=409, detail="database_not_ready")
         try:
             conn = connect_readonly(db_path)
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail="database_not_ready") from exc
+            code = str(exc) if str(exc).startswith("database_") else "database_not_ready"
+            raise HTTPException(status_code=409, detail=code) from exc
         try:
+            conn.execute("BEGIN")
             try:
                 require_current_database_schema(conn)
             except DatabaseMigrationError as exc:
@@ -359,19 +376,25 @@ def create_api_router(
                     detail=_schema_error_detail(exc.detail, code=exc.code),
                 ) from exc
             yield conn
+            if conn.in_transaction:
+                conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
     def get_optional_conn():
-        if not db_path.exists():
-            yield None
-            return
         try:
             conn = connect_readonly(db_path)
-        except ValueError:
-            yield None
-            return
+        except ValueError as exc:
+            if str(exc) in {"database_not_found", "database_not_ready"}:
+                yield None
+                return
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         try:
+            conn.execute("BEGIN")
             try:
                 require_current_database_schema(conn)
             except DatabaseMigrationError as exc:
@@ -380,17 +403,29 @@ def create_api_router(
                     detail=_schema_error_detail(exc.detail, code=exc.code),
                 ) from exc
             yield conn
+            if conn.in_transaction:
+                conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
     @router.get("/health")
-    def health():
+    def health(deep: bool = False):
         access = {
             "access_profile": "remote_opt_in" if policy.remote else "loopback_local",
             "remote_access": policy.remote,
             "allowed_hosts": list(trust.allowed_hosts),
             "trusted_proxies": list(trust.trusted_proxies),
             "write_origin_required": not trust.allow_missing_origin_for_writes,
+        }
+        incomplete_integrity = {
+            "integrity_mode": "deep" if deep else "quick",
+            "foreign_key_check_last_completed_at": None,
+            "foreign_key_check_generation": None,
+            "result_stale": True,
         }
         if not db_path.exists():
             return {
@@ -420,6 +455,7 @@ def create_api_router(
                 "foreign_key_violation_sample_limit": 20,
                 "foreign_key_violations_by_table": [],
                 "foreign_key_violation_samples": [],
+                **incomplete_integrity,
                 **access,
             }
         try:
@@ -428,7 +464,7 @@ def create_api_router(
             error_code = (
                 sqlite_runtime_error_code(exc)
                 if isinstance(exc, sqlite3.Error)
-                else "database_not_ready"
+                else (str(exc) if str(exc).startswith("database_") else "database_not_ready")
             )
             return {
                 "ok": False,
@@ -448,16 +484,18 @@ def create_api_router(
                 "foreign_key_violation_sample_limit": 20,
                 "foreign_key_violations_by_table": [],
                 "foreign_key_violation_samples": [],
+                **incomplete_integrity,
                 **access,
             }
         try:
+            conn.execute("BEGIN")
             try:
                 schema = check_schema(conn)
                 web_status = web_index_status(conn)
                 fts5 = detect_fts5(conn)
                 fts_status = message_fts_status(conn, fts5_available=fts5)
                 trigram = detect_trigram(conn)
-                foreign_keys = foreign_key_diagnostics(conn) if schema["base_schema_compatible"] else {
+                foreign_keys = foreign_key_diagnostics(conn) if deep and schema["base_schema_compatible"] else {
                     "foreign_key_violations": 0,
                     "foreign_key_violations_exact": False,
                     "foreign_key_check_complete": False,
@@ -465,6 +503,8 @@ def create_api_router(
                     "foreign_key_violations_by_table": [],
                     "foreign_key_violation_samples": [],
                 }
+                foreign_key_generation = int(conn.execute("PRAGMA data_version").fetchone()[0])
+                foreign_key_checked_at = utc_now_iso() if foreign_keys["foreign_key_check_complete"] else None
                 conversation_count = (
                     int(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
                     if schema["schema_compatible"] and foreign_keys["foreign_key_violations"] == 0
@@ -484,9 +524,12 @@ def create_api_router(
                     "required_database_schema_version": DATABASE_SCHEMA_VERSION,
                     "migration_required": False,
                     "schema_compatible": False,
+                    **incomplete_integrity,
                     **access,
                 }
         finally:
+            if conn.in_transaction:
+                conn.rollback()
             conn.close()
         schema_error = database_schema_error_code(schema)
         if foreign_keys["foreign_key_violations"]:
@@ -527,6 +570,10 @@ def create_api_router(
             "fts5_available": fts5,
             **fts_status,
             "trigram_available": trigram,
+            "integrity_mode": "deep" if deep else "quick",
+            "foreign_key_check_last_completed_at": foreign_key_checked_at,
+            "foreign_key_check_generation": foreign_key_generation if deep else None,
+            "result_stale": not bool(foreign_keys["foreign_key_check_complete"]),
             **foreign_keys,
             **access,
             **web_status,
@@ -538,9 +585,12 @@ def create_api_router(
             return _empty_stats(db_ready=False)
         try:
             conn = connect_readonly(db_path)
-        except ValueError:
-            return _empty_stats(db_ready=False)
+        except ValueError as exc:
+            if str(exc) in {"database_not_found", "database_not_ready"}:
+                return _empty_stats(db_ready=False)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         try:
+            conn.execute("BEGIN")
             try:
                 require_current_database_schema(conn)
             except DatabaseMigrationError as exc:
@@ -563,6 +613,8 @@ def create_api_router(
             ).fetchone()
             warnings = conn.execute("SELECT COUNT(*) AS c FROM import_warnings").fetchone()["c"]
         finally:
+            if conn.in_transaction:
+                conn.rollback()
             conn.close()
         return {
             "db_ready": True,
@@ -594,11 +646,18 @@ def create_api_router(
                 "message_search_page": ["items", "total", "total_exact", "limit", "offset", "has_more", "next_offset"],
                 "total_exact": "true means total is an exact count; false means total is only the known lower bound from the current page probe",
             },
+            "id_addressing": {
+                "primary": "query-based by-id endpoints; URLSearchParams encoding is reversible and unambiguous for slash, percent, question mark, hash, colon, and Unicode IDs",
+                "legacy_id_max_chars": MAX_LEGACY_ID_PARAM_LENGTH,
+                "new_import_id_max_chars": MAX_CANONICAL_ID_LENGTH,
+                "endpoints": ["/api/by-id/conversation", "/api/by-id/messages", "/api/by-id/raw", "/api/by-id/display", "/api/by-id/copy", "/api/by-id/export"],
+                "legacy_path_routes": "retained only for route-safe IDs up to the new-import limit",
+            },
             "conversations": {
                 "endpoint": "/api/conversations",
-                "detail_endpoint": "/api/conversations/{conversation_id}",
+                "detail_endpoint": "/api/by-id/conversation?conversation_id=...",
                 "filters": ["q", "sort", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "path", "match_mode"],
-                "limits": {"q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH, "selected_id": MAX_ID_PARAM_LENGTH},
+                "limits": {"q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH, "selected_id": MAX_LEGACY_ID_PARAM_LENGTH},
                 "path": ["current", "all"],
                 "match_mode": ["contains", "word"],
                 "date": "after/before use UTC calendar days as YYYY-MM-DD; before is exclusive (next-day 00:00:00 UTC)",
@@ -607,11 +666,11 @@ def create_api_router(
                 "diagnostics": "best-effort search diagnostics; see search.diagnostics",
             },
             "messages": {
-                "endpoint": "/api/conversations/{conversation_id}/messages",
+                "endpoint": "/api/by-id/messages?conversation_id=...",
                 "path": ["current", "all"],
                 "include_internal": "boolean; default false for reader pages so pagination is over visible messages, true includes root/internal/technical nodes",
                 "filters": ["q", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "match_mode"],
-                "limits": {"conversation_id": MAX_ID_PARAM_LENGTH, "around_node_id": MAX_ID_PARAM_LENGTH, "q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH},
+                "limits": {"conversation_id": MAX_LEGACY_ID_PARAM_LENGTH, "around_node_id": MAX_LEGACY_ID_PARAM_LENGTH, "q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH, "offset": MAX_SQLITE_OFFSET},
                 "raw": "message pages return raw_preview only; capped raw preview is available per message endpoint",
                 "item_fields": ["node_id", "parent_node_id", "message_id", "role", "author_name", "create_time", "update_time", "content_type", "display_text", "display_text_truncated", "display_text_total_chars", "display_text_total_chars_exact", "display_text_returned_chars", "has_text", "has_raw", "raw_preview", "raw_preview_truncated", "content_hash", "is_on_current_path", "effective_visible_in_current_view", "is_internal", "is_empty_mapping_node", "highlight_ranges", "highlight_ranges_truncated", "highlight_scanned_chars", "highlight_range_limit_reached"],
                 "display_text_contract": "display_text is the bounded reader preview of the resolved user-visible body; use the display chunk endpoint for explicit expansion and copy",
@@ -626,7 +685,8 @@ def create_api_router(
                     "env": dict(_READER_BUDGET_ENV),
                 },
                 "page_budget_fields": ["page_text_budget_exhausted", "page_preview_budget_exhausted", "page_highlight_budget_exhausted", "response_budget_estimated", "response_budget_limit", "response_budget_estimate_exhausted"],
-                "display_endpoint": "/api/conversations/{conversation_id}/messages/{node_id}/display?offset=0&limit=65536",
+                "display_endpoint": "/api/by-id/display?conversation_id=...&node_id=...&offset=0&limit=65536",
+                "display_cursor": "next_cursor is a revision-bound opaque sequential cursor; stale revisions return display_cursor_stale (409); numeric offset is a compatibility scan capped at 1048576 characters and larger values return display_cursor_required (409)",
                 "hidden_counts": {
                     "fields": ["visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"],
                     "contract": "internal_hidden_count is the one canonical non-empty internal-node count; technical_hidden_count is a deprecated exact alias retained for compatibility",
@@ -640,27 +700,36 @@ def create_api_router(
                 },
             },
             "raw": {
-                "endpoint": "/api/conversations/{conversation_id}/messages/{node_id}/raw",
+                "endpoint": "/api/by-id/raw?conversation_id=...&node_id=...",
                 "max_chars": "1-200000, default 50000; when raw_size exceeds max_chars, returns truncated raw_text; max_chars=0 is rejected",
-                "response": ["raw_message", "raw_text", "raw_size", "truncated"],
+                "response": ["raw_message", "raw_text", "raw_size", "raw_size_exact", "raw_size_bytes", "truncated"],
                 "truncated": "when true, use raw_text as plain preview; raw_message is a compat field in truncated mode",
             },
             "export": {
-                "endpoint": "/api/conversations/{conversation_id}/export",
+                "endpoint": "/api/by-id/export?conversation_id=...",
                 "format": ["md", "txt"],
                 "path": ["current", "all"],
                 "include_internal": "boolean; default false, matching CLI export and the visible reader; true includes internal/technical nodes",
-                "copy_endpoint": "/api/conversations/{conversation_id}/copy",
+                "copy_endpoint": "/api/by-id/copy?conversation_id=...",
                 "streaming": "export and full-conversation copy use complete canonical display text from bounded server-side node batches and never accumulate reader page payloads",
+                "resource_limits": {
+                    "max_nodes_per_conversation": MAX_EXPORT_NODES_PER_CONVERSATION,
+                    "max_node_input_bytes": MAX_EXPORT_NODE_INPUT_BYTES,
+                    "max_conversation_input_bytes": MAX_EXPORT_CONVERSATION_INPUT_BYTES,
+                    "max_output_bytes": MAX_EXPORT_OUTPUT_BYTES,
+                    "effective_current_max_nodes_per_conversation": MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION,
+                    "effective_current_max_graph_bytes_per_conversation": MAX_EFFECTIVE_CURRENT_GRAPH_BYTES_PER_CONVERSATION,
+                    "browser_copy": "16 MiB UTF-8 and 8 Mi characters; over-limit copy is aborted before clipboard write and the UI directs users to Download",
+                },
             },
             "web_index_build": {
                 "command": "python chatgpt_archive.py web-index --db <archive.db>",
                 "stages": list(WEB_INDEX_BUILD_STAGES),
                 "progress": ["build_stage", "processed", "total", "complete", "batch_size"],
-                "bounded": "canonical messages and titles plus optional trigram rows are processed with rowid keyset batches; each message display-text candidate is resolved once",
-                "publication": "one SQLite transaction keeps the previous current optional index visible until a short commit/swap; failure or cancellation rolls back all replacement objects and metadata",
-                "cancellation": "the production builder accepts a cancellation check and also installs a SQLite VM progress handler; CLI interruption rolls back the transaction",
-                "locking": "the single atomic build transaction holds one writer slot and may use SQLite temporary disk for the duration of a large rebuild",
+                "bounded": {"row_keyset": True, "max_input_bytes": WEB_INDEX_MAX_INPUT_BYTES, "max_normalized_bytes": WEB_INDEX_MAX_NORMALIZED_BYTES, "max_derived_bytes": WEB_INDEX_MAX_DERIVED_BYTES, "oversized_recall": "web_index_oversized rows are unioned into candidates and verified against canonical text"},
+                "publication": "one SQLite transaction keeps the previous current optional index visible until commit; failure or internal cancellation rolls back all replacement objects and metadata",
+                "cancellation": "no Web build job or Web cancel endpoint is exposed; only the internal/CLI builder callback and SQLite progress handler can request rollback",
+                "locking": "the atomic build holds BEGIN IMMEDIATE for scan, normalization, trigram construction, metadata validation, and commit; other writers may wait or time out while readers retain the old index",
             },
             "search": {
                 "endpoints": ["/api/conversations", "/api/search/messages"],
@@ -720,7 +789,7 @@ def create_api_router(
                     "content_length": "canonical nonnegative ASCII decimal with at most 20 digits; duplicates and alternate numeric syntax are rejected before multipart parsing",
                     "forwarded_headers": "strict edge-proxy model: ignored from untrusted peers; a trusted direct edge must overwrite client values and provide at most one Forwarded element or one X-Forwarded-Host/Proto value; duplicates, chains, malformed syntax, and conflicts are rejected",
                 },
-                "limits_note": "ZIP size checks run before import; JSON parsing, SQLite writes, and web-index rebuild still consume memory, disk, and CPU proportional to decoded conversation JSON size.",
+                "limits_note": "ZIP size checks run before import; JSON parsing and SQLite writes still consume memory, disk, and CPU proportional to decoded conversation JSON size; one top-level JSON element is capped at 128 Mi characters.",
             },
             "jobs": {
                 "endpoints": ["/api/import/jobs", "/api/import/jobs/{job_id}"],
@@ -734,8 +803,8 @@ def create_api_router(
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
             },
             "import_contract": {
-                "top_level": "conversation JSON must be one array and is decoded one element at a time in a single import transaction",
-                "encoding": "UTF-8 only; exactly one leading UTF-8 BOM is accepted, while repeated, interior, UTF-16/32, mixed, and invalid encodings are rejected",
+                "top_level": "conversation JSON must be one array; a single-pass incremental framer scans each element once, then decodes it once; one element is capped at 128 Mi characters",
+                "encoding": "UTF-8 only; exactly one file-leading UTF-8 BOM is removed; repeated or JSON-outside-string U+FEFF, UTF-16/32, mixed, and invalid encodings are rejected, while U+FEFF inside a JSON string is preserved",
                 "canonical_id_max_chars": MAX_CANONICAL_ID_LENGTH,
                 "id_fields": ["conversation_id", "exported_conversation_id", "mapping_node_key", "node_id", "message_id", "current_node", "parent", "children"],
                 "overlong_id": "the conversation element is skipped with canonical_id_too_long; IDs are never truncated",
@@ -749,8 +818,8 @@ def create_api_router(
             "database_compatibility": {
                 "readonly_contract": "health and read endpoints inspect schema but never execute migration DDL",
                 "migration": "run the explicit CLI migrate command after creating and verifying an external backup; import initializes new databases and upgrades migratable databases, while web-index requires a current core schema",
-                "health_fields": ["readiness", "database_error_code", "schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "missing_tables", "missing_columns", "invalid_tables", "object_type_mismatches", "missing_indexes", "invalid_indexes", "missing_triggers", "invalid_triggers", "missing_generation_rows", "invalid_generation_rows", "missing_foreign_keys", "foreign_key_violations", "foreign_key_violations_exact", "foreign_key_check_complete", "foreign_key_violation_sample_limit", "foreign_key_violation_samples"],
-                "foreign_key_check": "health and verify stream a complete database-wide PRAGMA foreign_key_check, retain only a bounded sample, and report an exact total; CPU and SQLite VM work remain proportional to database size",
+                "health_fields": ["integrity_mode", "readiness", "database_error_code", "schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "foreign_key_violations", "foreign_key_violations_exact", "foreign_key_check_complete", "foreign_key_check_last_completed_at", "foreign_key_check_generation", "result_stale"],
+                "foreign_key_check": "GET /api/health is a bounded quick schema gate and does not run PRAGMA foreign_key_check; GET /api/health?deep=true and CLI verify stream the complete check and retain bounded samples",
                 "effective_current_verify_counters": {
                     "unit": "conversation count",
                     "selected_chain": ["selected_chain_cycles", "missing_parent_in_selected_chain", "cross_conversation_parent_in_selected_chain", "partial_selected_chain"],
@@ -764,7 +833,8 @@ def create_api_router(
             "stable_error_codes": [
                 "database_not_ready", "database_migration_required", "database_schema_newer", "database_schema_incompatible", "database_foreign_key_violation", "invalid_job_id", "job_not_found",
                 "database_malformed", "database_locked", "database_readonly", "database_io_error", "database_runtime_failure",
-                "conversation_not_found", "message_not_found", "invalid_export_format",
+                "conversation_not_found", "message_not_found", "invalid_export_format", "invalid_display_cursor", "display_cursor_stale", "display_cursor_required",
+                "export_node_count_limit_exceeded", "export_node_input_limit_exceeded", "export_input_byte_limit_exceeded", "export_header_input_limit_exceeded", "export_output_byte_limit_exceeded", "effective_current_node_limit_exceeded", "effective_current_input_limit_exceeded",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
                 "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_preflight_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required", "upload_duplicate_origin_header", "upload_duplicate_content_length", "upload_duplicate_sec_fetch_site",
@@ -774,7 +844,7 @@ def create_api_router(
                 "upload_zip_too_many_json_members", "upload_zip_member_too_large",
                 "upload_zip_uncompressed_too_large", "upload_zip_compression_ratio_too_high",
                 "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read",
-                "invalid_conversation_encoding", "json_integer_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list",
+                "invalid_conversation_encoding", "json_integer_too_large", "conversation_json_element_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_invalid_unicode", "delete_input_changed",
                 "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed",
             ],
             "provenance": {
@@ -788,7 +858,7 @@ def create_api_router(
     def conversations(
         q: Annotated[str, Query(max_length=500)] = "",
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=MAX_SQLITE_OFFSET)] = 0,
         sort: str = "newest",
         after: Annotated[str | None, Query(max_length=MAX_DATE_PARAM_LENGTH)] = None,
         before: Annotated[str | None, Query(max_length=MAX_DATE_PARAM_LENGTH)] = None,
@@ -800,7 +870,7 @@ def create_api_router(
         source: Annotated[str | None, Query(max_length=200)] = None,
         path: str = "current",
         match_mode: str = "contains",
-        selected_id: Annotated[str | None, Query(max_length=MAX_ID_PARAM_LENGTH)] = None,
+        selected_id: Annotated[str | None, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)] = None,
         conn=Depends(get_optional_conn),
     ):
         _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
@@ -973,7 +1043,7 @@ def create_api_router(
         before: Annotated[str | None, Query(max_length=MAX_DATE_PARAM_LENGTH)] = None,
         source: Annotated[str | None, Query(max_length=200)] = None,
         limit: Annotated[int, Query(ge=1, le=300)] = 300,
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=MAX_SQLITE_OFFSET)] = 0,
         around_node_id: Annotated[str | None, Query(max_length=MAX_ID_PARAM_LENGTH)] = None,
         include_internal: bool = False,
         conn=Depends(get_conn),
@@ -1013,17 +1083,17 @@ def create_api_router(
     def conversation_message_display(
         conversation_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)],
         node_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)],
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=MAX_SQLITE_OFFSET)] = 0,
         limit: Annotated[int, Query(ge=1, le=1_048_576)] = 65_536,
+        cursor: Annotated[str | None, Query(max_length=1024)] = None,
         conn=Depends(get_conn),
     ):
-        item = get_message_display_chunk(
-            conn,
-            conversation_id,
-            node_id,
-            offset=offset,
-            limit=limit,
-        )
+        try:
+            item = get_message_display_chunk(
+                conn, conversation_id, node_id, offset=offset, limit=limit, cursor=cursor,
+            )
+        except DisplayCursorError as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from exc
         if item is None:
             raise HTTPException(status_code=404, detail="message_not_found")
         return item
@@ -1035,38 +1105,48 @@ def create_api_router(
         max_chars: int = Query(default=50000, ge=1, le=200000, alias="max_chars"),
         conn=Depends(get_conn),
     ):
-        size_row = conn.execute(
-            "SELECT COALESCE(length(raw_message_json), 0) AS raw_size FROM conversation_nodes WHERE conversation_id = ? AND node_id = ?",
-            (conversation_id, node_id),
+        max_bytes = max_chars * 4 + 4
+        row = conn.execute(
+            """SELECT COALESCE(length(CAST(raw_message_json AS BLOB)), 0) AS raw_size_bytes,
+                      substr(CAST(COALESCE(raw_message_json, '') AS BLOB), 1, ?) AS raw_prefix
+               FROM conversation_nodes WHERE conversation_id = ? AND node_id = ?""",
+            (max_bytes, conversation_id, node_id),
         ).fetchone()
-        if size_row is None:
+        if row is None:
             raise HTTPException(status_code=404, detail="message_not_found")
-        raw_size = int(size_row["raw_size"] or 0)
-        if raw_size == 0:
-            return {"conversation_id": conversation_id, "node_id": node_id, "raw_message": None, "raw_size": 0, "truncated": False}
-        if max_chars > 0 and raw_size > max_chars:
-            truncated_row = conn.execute(
-                "SELECT substr(raw_message_json, 1, ?) AS raw_preview FROM conversation_nodes WHERE conversation_id = ? AND node_id = ?",
-                (max_chars, conversation_id, node_id),
-            ).fetchone()
-            raw_preview = truncated_row["raw_preview"] or ""
+        raw_size_bytes = int(row["raw_size_bytes"] or 0)
+        if raw_size_bytes == 0:
+            return {
+                "conversation_id": conversation_id, "node_id": node_id,
+                "raw_message": None, "raw_size": 0, "raw_size_exact": True,
+                "raw_size_bytes": 0, "truncated": False,
+            }
+        prefix_value = row["raw_prefix"]
+        prefix_bytes = bytes(prefix_value) if prefix_value is not None else b""
+        decoded = normalize_display_text(prefix_bytes.decode("utf-8", errors="replace"))
+        truncated = raw_size_bytes > len(prefix_bytes) or len(decoded) > max_chars
+        raw_text = decoded[:max_chars]
+        if truncated:
             return {
                 "conversation_id": conversation_id,
                 "node_id": node_id,
-                "raw_message": raw_preview,
-                "raw_text": raw_preview,
-                "raw_size": raw_size,
+                "raw_message": raw_text,
+                "raw_text": raw_text,
+                "raw_size": raw_size_bytes,
+                "raw_size_exact": False,
+                "raw_size_bytes": raw_size_bytes,
                 "truncated": True,
             }
-        row = conn.execute(
-            "SELECT raw_message_json FROM conversation_nodes WHERE conversation_id = ? AND node_id = ?",
-            (conversation_id, node_id),
-        ).fetchone()
         try:
-            raw = json.loads(row["raw_message_json"] or "null")
+            raw = _safe_json_scalars(json.loads(raw_text or "null"))
         except json.JSONDecodeError:
-            raw = row["raw_message_json"]
-        return {"conversation_id": conversation_id, "node_id": node_id, "raw_message": raw, "raw_size": raw_size, "truncated": False}
+            raw = raw_text
+        return {
+            "conversation_id": conversation_id, "node_id": node_id,
+            "raw_message": raw, "raw_text": raw_text,
+            "raw_size": len(raw_text), "raw_size_exact": True,
+            "raw_size_bytes": raw_size_bytes, "truncated": False,
+        }
 
     @router.get("/conversations/{conversation_id}/export")
     def conversation_export(conversation_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)], format: str = "md", path: str = "current", include_internal: bool = False, conn=Depends(get_conn)):
@@ -1076,6 +1156,10 @@ def create_api_router(
         conv = conn.execute("SELECT * FROM conversations WHERE conversation_id = ?", (conversation_id,)).fetchone()
         if not conv:
             raise HTTPException(status_code=404, detail="conversation_not_found")
+        try:
+            check_conversation_export_budget(conn, conversation_id)
+        except ExportResourceLimitError as exc:
+            raise HTTPException(status_code=413, detail=exc.code) from None
         media_type = "text/markdown; charset=utf-8" if format == "md" else "text/plain; charset=utf-8"
         filename = _download_filename(conversation_id, format)
         nodes = iter_conversation_export_nodes(
@@ -1096,6 +1180,10 @@ def create_api_router(
         conv = conn.execute("SELECT * FROM conversations WHERE conversation_id = ?", (conversation_id,)).fetchone()
         if not conv:
             raise HTTPException(status_code=404, detail="conversation_not_found")
+        try:
+            check_conversation_export_budget(conn, conversation_id)
+        except ExportResourceLimitError as exc:
+            raise HTTPException(status_code=413, detail=exc.code) from None
         nodes = iter_conversation_export_nodes(
             conn,
             conv,
@@ -1104,11 +1192,85 @@ def create_api_router(
         )
         return StreamingResponse(iter_copy_conversation(nodes), media_type="text/plain; charset=utf-8")
 
+    # Query-based by-id routes are the primary unambiguous addressing contract.
+    # Legacy path routes above remain for route-safe clients.
+    @router.get("/by-id/conversation")
+    def conversation_detail_by_id(
+        conversation_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        conn=Depends(get_conn),
+    ):
+        return conversation_detail(conversation_id, conn)
+
+    @router.get("/by-id/messages")
+    def conversation_messages_by_id(
+        conversation_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        path: str = "current",
+        q: Annotated[str, Query(max_length=500)] = "",
+        match_mode: str = "contains",
+        role: str | None = None,
+        title: Annotated[str | None, Query(max_length=200)] = None,
+        scope: str = "all",
+        exact: Annotated[str | None, Query(max_length=300)] = None,
+        exclude: Annotated[str | None, Query(max_length=200)] = None,
+        after: Annotated[str | None, Query(max_length=MAX_DATE_PARAM_LENGTH)] = None,
+        before: Annotated[str | None, Query(max_length=MAX_DATE_PARAM_LENGTH)] = None,
+        source: Annotated[str | None, Query(max_length=200)] = None,
+        limit: Annotated[int, Query(ge=1, le=300)] = 300,
+        offset: Annotated[int, Query(ge=0, le=MAX_SQLITE_OFFSET)] = 0,
+        around_node_id: Annotated[str | None, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)] = None,
+        include_internal: bool = False,
+        conn=Depends(get_conn),
+    ):
+        return conversation_messages(
+            conversation_id, path, q, match_mode, role, title, scope, exact,
+            exclude, after, before, source, limit, offset, around_node_id,
+            include_internal, conn,
+        )
+
+    @router.get("/by-id/display")
+    def conversation_message_display_by_id(
+        conversation_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        node_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        offset: Annotated[int, Query(ge=0, le=MAX_SQLITE_OFFSET)] = 0,
+        limit: Annotated[int, Query(ge=1, le=1_048_576)] = 65_536,
+        cursor: Annotated[str | None, Query(max_length=1024)] = None,
+        conn=Depends(get_conn),
+    ):
+        return conversation_message_display(conversation_id, node_id, offset, limit, cursor, conn)
+
+    @router.get("/by-id/raw")
+    def conversation_message_raw_by_id(
+        conversation_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        node_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        max_chars: int = Query(default=50000, ge=1, le=200000, alias="max_chars"),
+        conn=Depends(get_conn),
+    ):
+        return conversation_message_raw(conversation_id, node_id, max_chars, conn)
+
+    @router.get("/by-id/export")
+    def conversation_export_by_id(
+        conversation_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        format: str = "md",
+        path: str = "current",
+        include_internal: bool = False,
+        conn=Depends(get_conn),
+    ):
+        return conversation_export(conversation_id, format, path, include_internal, conn)
+
+    @router.get("/by-id/copy")
+    def conversation_copy_by_id(
+        conversation_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        path: str = "current",
+        include_internal: bool = False,
+        conn=Depends(get_conn),
+    ):
+        return conversation_copy(conversation_id, path, include_internal, conn)
+
     @router.get("/search")
     def search(
         q: Annotated[str, Query(max_length=500)] = "",
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=MAX_SQLITE_OFFSET)] = 0,
         sort: str = "relevance",
         path: str = "current",
         role: str | None = None,
@@ -1120,7 +1282,7 @@ def create_api_router(
         before: Annotated[str | None, Query(max_length=MAX_DATE_PARAM_LENGTH)] = None,
         source: Annotated[str | None, Query(max_length=200)] = None,
         match_mode: str = "contains",
-        selected_id: Annotated[str | None, Query(max_length=MAX_ID_PARAM_LENGTH)] = None,
+        selected_id: Annotated[str | None, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)] = None,
         conn=Depends(get_optional_conn),
     ):
         _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
@@ -1133,9 +1295,9 @@ def create_api_router(
     @router.get("/search/messages")
     def search_message_endpoint(
         q: Annotated[str, Query(max_length=500)] = "",
-        conversation_id: Annotated[str | None, Query(max_length=MAX_ID_PARAM_LENGTH)] = None,
+        conversation_id: Annotated[str | None, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)] = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=MAX_SQLITE_OFFSET)] = 0,
         path: str = "current",
         order: str = "relevance",
         role: str | None = None,
@@ -1167,7 +1329,9 @@ def create_api_router(
         if _has_normalized_title_norm(conn) and normalized:
             rows = conn.execute(
                 """
-                SELECT c.conversation_id, c.title
+                SELECT c.conversation_id,
+                       substr(CAST(COALESCE(c.title, '') AS BLOB), 1, 16388) AS title_prefix,
+                       length(CAST(COALESCE(c.title, '') AS BLOB)) AS title_bytes
                 FROM web_title_norm tn
                 JOIN conversations c ON c.conversation_id = tn.conversation_id
                 WHERE instr(tn.title_norm, ?) > 0
@@ -1180,7 +1344,9 @@ def create_api_router(
             conn.create_function("web_normalize", 1, normalize_search_text, deterministic=True)
             rows = conn.execute(
                 """
-                SELECT conversation_id, title
+                SELECT conversation_id,
+                       substr(CAST(COALESCE(title, '') AS BLOB), 1, 16388) AS title_prefix,
+                       length(CAST(COALESCE(title, '') AS BLOB)) AS title_bytes
                 FROM conversations
                 WHERE ? = '' OR instr(web_normalize(COALESCE(title, '')), ?) > 0
                 ORDER BY COALESCE(update_time, create_time, 0) DESC
@@ -1188,7 +1354,19 @@ def create_api_router(
                 """,
                 (normalized, normalized, limit),
             ).fetchall()
-        return {"items": [dict(row) for row in rows]}
+        items = []
+        for row in rows:
+            prefix = bytes(row["title_prefix"] or b"").decode("utf-8", errors="replace")
+            title = normalize_display_text(prefix)[:4096]
+            title_bytes = int(row["title_bytes"] or 0)
+            items.append({
+                "conversation_id": row["conversation_id"],
+                "title": title,
+                "title_truncated": title_bytes > len(bytes(row["title_prefix"] or b"")) or len(prefix) > 4096,
+                "title_length": len(prefix) if title_bytes <= len(bytes(row["title_prefix"] or b"")) else None,
+                "title_bytes": title_bytes,
+            })
+        return {"items": items}
 
     return router
 
@@ -1275,6 +1453,18 @@ def _empty_page(limit: int, offset: int, *, selected_id: str | None, db_ready: b
         "next_offset": None,
         "selected_in_results": False if selected_id else None,
     }
+
+
+def _safe_json_scalars(value):
+    """Make a bounded raw preview safe for the API JSON encoder."""
+
+    if isinstance(value, str):
+        return normalize_display_text(value)
+    if isinstance(value, list):
+        return [_safe_json_scalars(item) for item in value]
+    if isinstance(value, dict):
+        return {normalize_display_text(str(key)): _safe_json_scalars(item) for key, item in value.items()}
+    return value
 
 
 def _empty_message_search_page(limit: int, offset: int, *, db_ready: bool) -> dict[str, object]:

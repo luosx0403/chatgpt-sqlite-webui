@@ -13,6 +13,7 @@ OPTIONAL_SEARCH_OBJECTS = frozenset({
     "web_message_norm",
     "web_title_norm",
     "web_index_metadata",
+    "web_index_oversized",
 })
 MESSAGE_FTS_OBJECTS = frozenset({
     "message_fts",
@@ -67,6 +68,15 @@ def is_optional_web_index_damaged(exc: sqlite3.Error) -> bool:
 
 
 def sqlite_runtime_error_code(exc: sqlite3.Error) -> str:
+    primary = int(getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF
+    if primary in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
+        return "database_malformed"
+    if primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return "database_locked"
+    if primary == sqlite3.SQLITE_READONLY:
+        return "database_readonly"
+    if primary == sqlite3.SQLITE_IOERR:
+        return "database_io_error"
     message = sqlite_error_message(exc)
     if "malformed" in message or "not a database" in message:
         return "database_malformed"
@@ -77,3 +87,12 @@ def sqlite_runtime_error_code(exc: sqlite3.Error) -> str:
     if "disk i/o" in message or "i/o error" in message:
         return "database_io_error"
     return "database_runtime_failure"
+
+
+def sqlite_open_error_code(exc: sqlite3.Error, *, path_exists: bool | None) -> str:
+    """Classify a mode=ro/mode=rw open failure without exposing its path."""
+
+    primary = int(getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF
+    if primary == sqlite3.SQLITE_CANTOPEN:
+        return "database_not_found" if path_exists is False else "database_io_error"
+    return sqlite_runtime_error_code(exc)

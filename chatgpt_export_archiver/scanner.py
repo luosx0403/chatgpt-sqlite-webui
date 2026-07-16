@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -18,6 +19,7 @@ from .utils import classify_file
 SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
 MAX_JSON_INTEGER_DIGITS = 1000
 JSON_STREAM_CHUNK_BYTES = 64 * 1024
+MAX_JSON_ELEMENT_CHARS = 128 * 1024 * 1024
 
 
 class NonFiniteJsonNumberError(ValueError):
@@ -58,6 +60,10 @@ class ConversationJsonTopLevelError(ValueError):
         self.top_level_type = top_level_type
 
 
+class ConversationJsonElementTooLargeError(ValueError):
+    """Raised before one top-level array element exceeds its scalar budget."""
+
+
 def _reject_non_finite_json_number(value: str) -> None:
     raise NonFiniteJsonNumberError(f"non_finite_json_number:{value.casefold()}")
 
@@ -87,21 +93,96 @@ class SourceEntry:
 
 
 @dataclass(frozen=True)
+class FileIdentity:
+    file_type: int
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    nlink: int
+    is_symlink: bool
+    is_reparse_point: bool
+    link_target_hash: str | None = None
+
+
+def _entry_identity(path: Path, *, follow_symlinks: bool) -> FileIdentity:
+    info = path.stat() if follow_symlinks else path.lstat()
+    is_link = stat.S_ISLNK(info.st_mode) if not follow_symlinks else False
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    target_hash = None
+    if is_link:
+        target_hash = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+    return FileIdentity(
+        file_type=stat.S_IFMT(info.st_mode),
+        device=int(info.st_dev),
+        inode=int(info.st_ino),
+        size=int(info.st_size),
+        mtime_ns=int(info.st_mtime_ns),
+        ctime_ns=int(info.st_ctime_ns),
+        nlink=int(info.st_nlink),
+        is_symlink=is_link,
+        is_reparse_point=bool(attributes & reparse_flag),
+        link_target_hash=target_hash,
+    )
+
+
+@dataclass(frozen=True)
 class InputSource:
     path: Path
     kind: str
     size: int
     delete_target: Path | None = None
     identity: tuple[int, int, int, int] | None = None
+    delete_entry_identity: FileIdentity | None = None
+    delete_target_identity: FileIdentity | None = None
+    delete_parent_identity: FileIdentity | None = None
 
     def __post_init__(self) -> None:
         if self.identity is None and self.kind in {"zip", "json"}:
             object.__setattr__(self, "identity", _file_identity(self.path))
+        if self.delete_target is not None and self.delete_entry_identity is None:
+            object.__setattr__(self, "delete_entry_identity", _entry_identity(self.delete_target, follow_symlinks=False))
+            object.__setattr__(self, "delete_target_identity", _entry_identity(self.delete_target, follow_symlinks=True))
+            object.__setattr__(self, "delete_parent_identity", _entry_identity(self.delete_target.parent, follow_symlinks=True))
 
 
 def _file_identity(path: Path) -> tuple[int, int, int, int]:
     info = path.stat()
     return (int(info.st_dev), int(info.st_ino), int(info.st_size), int(info.st_mtime_ns))
+
+
+def delete_input_identity_is_current(input_source: InputSource) -> bool:
+    """Conservatively prove that the original directory entry is unchanged."""
+
+    path = input_source.delete_target
+    expected_entry = input_source.delete_entry_identity
+    expected_target = input_source.delete_target_identity
+    expected_parent = input_source.delete_parent_identity
+    if path is None or expected_entry is None or expected_target is None or expected_parent is None:
+        return False
+    # Portable stat fields cannot prove pathname continuity for hard links.
+    if expected_entry.nlink != 1 or expected_target.nlink != 1:
+        return False
+    try:
+        current_parent = _entry_identity(path.parent, follow_symlinks=True)
+        current_entry = _entry_identity(path, follow_symlinks=False)
+        current_target = _entry_identity(path, follow_symlinks=True)
+    except OSError:
+        return False
+    same_parent = (
+        current_parent.file_type,
+        current_parent.device,
+        current_parent.inode,
+        current_parent.is_reparse_point,
+    ) == (
+        expected_parent.file_type,
+        expected_parent.device,
+        expected_parent.inode,
+        expected_parent.is_reparse_point,
+    )
+    return same_parent and current_entry == expected_entry and current_target == expected_target
 
 
 def find_default_input(path: Path) -> InputSource:
@@ -364,15 +445,11 @@ def _iter_utf8_chunks(stream: BinaryIO) -> Iterator[str]:
                     if data.startswith(codecs.BOM_UTF8):
                         raise InvalidConversationEncodingError("invalid_conversation_encoding")
             text = decoder.decode(data, final=False)
-            if "\ufeff" in text:
-                raise InvalidConversationEncodingError("invalid_conversation_encoding")
             if text:
                 yield text
         tail = decoder.decode(b"", final=True)
     except UnicodeDecodeError as exc:
         raise InvalidConversationEncodingError("invalid_conversation_encoding") from exc
-    if "\ufeff" in tail:
-        raise InvalidConversationEncodingError("invalid_conversation_encoding")
     if tail:
         yield tail
 
@@ -383,90 +460,129 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
         parse_float=_parse_finite_json_float,
         parse_int=_parse_bounded_json_int,
     )
-    chunks_iter = iter(chunks)
-    buffer = ""
-    position = 0
-    eof = False
+    phase = "start"
+    parts: list[str] = []
+    element_chars = 0
+    kind = ""
+    depth = 0
+    in_string = False
+    escaped = False
+    saw_element = False
 
-    def read_more() -> bool:
-        nonlocal buffer, eof
-        if eof:
-            return False
-        try:
-            buffer += next(chunks_iter)
-            return True
-        except StopIteration:
-            eof = True
-            return False
+    def append_part(value: str) -> None:
+        nonlocal element_chars
+        if not value:
+            return
+        element_chars += len(value)
+        if element_chars > MAX_JSON_ELEMENT_CHARS:
+            raise ConversationJsonElementTooLargeError("conversation_json_element_too_large")
+        parts.append(value)
 
-    def skip_space() -> None:
-        nonlocal position
-        while position < len(buffer) and buffer[position] in " \t\r\n":
-            position += 1
+    def finish_element() -> Any:
+        nonlocal parts, element_chars
+        value = decoder.decode("".join(parts))
+        parts = []
+        element_chars = 0
+        return value
 
-    while not buffer and read_more():
-        pass
-    skip_space()
-    while position >= len(buffer) and read_more():
-        skip_space()
-    if position >= len(buffer):
-        raise json.JSONDecodeError("Expecting value", buffer, position)
-    if buffer[position] != "[":
-        while True:
-            try:
-                scalar, end = decoder.raw_decode(buffer, position)
-                break
-            except json.JSONDecodeError:
-                if not read_more():
-                    raise
-        position = end
-        skip_space()
-        while read_more():
-            skip_space()
-        if position != len(buffer):
-            raise json.JSONDecodeError("Extra data", buffer, position)
-        raise ConversationJsonTopLevelError(type(scalar).__name__)
-    position += 1
-    expect_value = True
-    allow_end = True
-    while True:
-        skip_space()
-        while position >= len(buffer) and read_more():
-            skip_space()
-        if position >= len(buffer):
-            raise json.JSONDecodeError("Expecting value", buffer, position)
-        if expect_value and buffer[position] == "]" and allow_end:
-            position += 1
-            break
-        if not expect_value:
-            if buffer[position] == ",":
-                position += 1
-                expect_value = True
-                allow_end = False
+    for chunk in chunks:
+        i = 0
+        while i < len(chunk):
+            if phase == "nonlist":
+                append_part(chunk[i:])
+                i = len(chunk)
                 continue
-            if buffer[position] == "]":
-                position += 1
-                break
-            raise json.JSONDecodeError("Expecting ',' delimiter", buffer, position)
-        while True:
-            try:
-                value, end = decoder.raw_decode(buffer, position)
-                break
-            except json.JSONDecodeError:
-                if not read_more():
-                    raise
-        position = end
-        yield value
-        expect_value = False
-        allow_end = True
-        if position > JSON_STREAM_CHUNK_BYTES:
-            buffer = buffer[position:]
-            position = 0
-    skip_space()
-    while read_more():
-        skip_space()
-    if position != len(buffer):
-        raise json.JSONDecodeError("Extra data", buffer, position)
+            if phase != "element":
+                while i < len(chunk) and chunk[i] in " \t\r\n":
+                    i += 1
+                if i >= len(chunk):
+                    continue
+                char = chunk[i]
+                if char == "\ufeff":
+                    raise InvalidConversationEncodingError("invalid_conversation_encoding")
+                if phase == "start":
+                    if char != "[":
+                        phase = "nonlist"
+                        append_part(chunk[i:])
+                        i = len(chunk)
+                        continue
+                    phase = "between"
+                    i += 1
+                    continue
+                if phase == "between":
+                    if char == "]" and not saw_element:
+                        phase = "done"
+                        i += 1
+                        continue
+                    if char == "]":
+                        raise json.JSONDecodeError("Expecting value", chunk, i)
+                    kind = "composite" if char in "[{" else "string" if char == '"' else "scalar"
+                    depth = 0
+                    in_string = False
+                    escaped = False
+                    phase = "element"
+                elif phase == "after":
+                    if char == ",":
+                        phase = "between"
+                        i += 1
+                        continue
+                    if char == "]":
+                        phase = "done"
+                        i += 1
+                        continue
+                    raise json.JSONDecodeError("Expecting ',' delimiter", chunk, i)
+                else:
+                    raise json.JSONDecodeError("Extra data", chunk, i)
+
+            start = i
+            completed_at: int | None = None
+            scalar_delimiter = False
+            while i < len(chunk):
+                char = chunk[i]
+                if char == "\ufeff" and not in_string:
+                    raise InvalidConversationEncodingError("invalid_conversation_encoding")
+                if kind == "scalar":
+                    if char in ",]":
+                        completed_at = i
+                        scalar_delimiter = True
+                        break
+                elif in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                        if kind == "string":
+                            completed_at = i + 1
+                            break
+                else:
+                    if char == '"':
+                        in_string = True
+                    elif char in "[{":
+                        depth += 1
+                    elif char in "]}":
+                        depth -= 1
+                        if depth == 0:
+                            completed_at = i + 1
+                            break
+                i += 1
+            if completed_at is None:
+                append_part(chunk[start:])
+                continue
+            append_part(chunk[start:completed_at])
+            yield finish_element()
+            saw_element = True
+            phase = "after"
+            if not scalar_delimiter:
+                i = completed_at
+            # Scalar delimiter is reprocessed by the surrounding-array state.
+
+    if phase == "nonlist":
+        scalar = decoder.decode("".join(parts))
+        raise ConversationJsonTopLevelError(type(scalar).__name__)
+    if phase != "done":
+        raise json.JSONDecodeError("Expecting value", "", 0)
 
 
 def _is_link_or_reparse(path: Path) -> bool:

@@ -7,6 +7,32 @@ from typing import Any
 MAX_CANONICAL_ID_LENGTH = 512
 
 
+def unicode_scalar_text(value: str, *, replace_invalid: bool = False) -> tuple[str | None, bool]:
+    """Combine valid surrogate pairs and reject or replace non-scalars."""
+
+    result: list[str] = []
+    changed = False
+    index = 0
+    while index < len(value):
+        code = ord(value[index])
+        if 0xD800 <= code <= 0xDBFF and index + 1 < len(value):
+            low = ord(value[index + 1])
+            if 0xDC00 <= low <= 0xDFFF:
+                result.append(chr(0x10000 + ((code - 0xD800) << 10) + low - 0xDC00))
+                changed = True
+                index += 2
+                continue
+        if 0xD800 <= code <= 0xDFFF:
+            if not replace_invalid:
+                return None, True
+            result.append("\ufffd")
+            changed = True
+        else:
+            result.append(value[index])
+        index += 1
+    return "".join(result), changed
+
+
 def canonical_id_text(value: Any, *, strip: bool = False) -> str | None:
     """Return an addressable scalar ID without truncating or coercing containers."""
 
@@ -22,7 +48,12 @@ def canonical_id_text(value: Any, *, strip: bool = False) -> str | None:
         result = str(value)
     else:
         return None
-    if not result or len(result) > MAX_CANONICAL_ID_LENGTH:
+    result, _changed = unicode_scalar_text(result)
+    if (
+        not result
+        or len(result) > MAX_CANONICAL_ID_LENGTH
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in result)
+    ):
         return None
     return result
 

@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from .identifiers import MAX_CANONICAL_ID_LENGTH, canonical_id_length, canonical_id_text
+from .identifiers import MAX_CANONICAL_ID_LENGTH, canonical_id_length, canonical_id_text, unicode_scalar_text
 from .utils import canonical_json, compact_json, sha256_text
 
 
@@ -155,11 +155,13 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
         message = node.get("message")
         message_dict = message if isinstance(message, dict) else None
         content_type, content_text, metadata = extract_message_content(message_dict)
+        content_type = _normalize_visible_scalar(content_type, "content_type", source_file, array_index, warnings)
+        content_text = _normalize_visible_scalar(content_text, "content_text", source_file, array_index, warnings) or ""
         message_id = canonical_id_text(message_dict.get("id")) if message_dict else None
         author = message_dict.get("author") if message_dict else None
         author = author if isinstance(author, dict) else {}
-        role = str(author.get("role")) if author.get("role") is not None else None
-        author_name = str(author.get("name")) if author.get("name") is not None else None
+        role = _normalize_visible_scalar(author.get("role"), "role", source_file, array_index, warnings)
+        author_name = _normalize_visible_scalar(author.get("name"), "author_name", source_file, array_index, warnings)
         metadata_value = message_dict.get("metadata") if message_dict else None
         combined_metadata = {
             "node_metadata": node.get("metadata") if isinstance(node.get("metadata"), dict) else None,
@@ -241,7 +243,7 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
         aggregate_hash=aggregate_hash,
         is_archived=_to_int_bool(value.get("is_archived")),
         is_starred=_to_int_bool(value.get("is_starred")),
-        default_model_slug=str(value.get("default_model_slug")) if value.get("default_model_slug") is not None else None,
+        default_model_slug=_normalize_visible_scalar(value.get("default_model_slug"), "default_model_slug", source_file, array_index, warnings),
         metadata_json=metadata_json,
         nodes=nodes,
         warnings=warnings,
@@ -292,6 +294,14 @@ def _canonical_graph_id_warning(
                 }),
                 raw_json=None,
             )
+        if candidate is not None and length is not None and length > 0 and canonical_id_text(candidate, strip=strip) is None:
+            return WarningRecord(
+                source_file=source_file,
+                array_index=array_index,
+                warning_type="canonical_id_invalid_unicode",
+                keys_json=compact_json({"field": field, "length": length}),
+                raw_json=None,
+            )
     return None
 
 
@@ -299,10 +309,8 @@ def _normalize_title(value: Any, source_file: str, array_index: int, warnings: l
     """Normalize title to SQLite-safe str|None without recording raw content."""
     if value is None:
         return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float, bool)):
-        return str(value)
+    if isinstance(value, (str, int, float, bool)):
+        return _normalize_visible_scalar(value, "title", source_file, array_index, warnings)
     warnings.append(
         WarningRecord(
             source_file=source_file,
@@ -313,6 +321,37 @@ def _normalize_title(value: Any, source_file: str, array_index: int, warnings: l
         )
     )
     return None
+
+
+def normalize_display_text(value: str | None) -> str:
+    """Canonical visible/search representation for legacy and new text."""
+
+    scalar, _changed = unicode_scalar_text(value or "", replace_invalid=True)
+    return (scalar or "").replace("\x00", "\ufffd")
+
+
+def _normalize_visible_scalar(
+    value: Any,
+    field: str,
+    source_file: str,
+    array_index: int,
+    warnings: list[WarningRecord],
+) -> str | None:
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    normalized = normalize_display_text(text)
+    if normalized != text:
+        warnings.append(
+            WarningRecord(
+                source_file,
+                array_index,
+                "unicode_text_normalized",
+                compact_json({"field": field, "nul": "\x00" in text}),
+                None,
+            )
+        )
+    return normalized
 
 
 def _compute_current_path(
@@ -394,7 +433,7 @@ def recover_message_display_text(
 ) -> str:
     """Resolve legacy placeholder text without parsing unbounded raw payloads."""
 
-    canonical = content_text or ""
+    canonical = normalize_display_text(content_text)
     stripped = canonical.strip()
     placeholder = stripped.startswith("[non-text content:") or stripped.startswith("[non-text part:")
     if canonical and not placeholder:
@@ -413,7 +452,7 @@ def recover_message_display_text(
     _content_type, recovered, _notes = extract_message_content(message)
     if _content_type not in (None, "", "text", "multimodal_text", "code"):
         return canonical
-    return recovered or canonical
+    return normalize_display_text(recovered) or canonical
 
 
 def _extract_part_text(part: Any, notes: list[str], depth: int = 0) -> str:
@@ -479,7 +518,17 @@ def compute_aggregate_hash(current_node: str | None, nodes: list[ParsedNode]) ->
             for n in sorted(nodes, key=lambda item: item.node_id)
         ],
     }
-    return sha256_text(canonical_json(core))
+    serialized = canonical_json(core)
+    try:
+        return sha256_text(serialized)
+    except UnicodeEncodeError:
+        # JSON may legally decode an escaped isolated surrogate even though it
+        # is not a Unicode scalar and cannot be encoded as UTF-8 directly.
+        # Keep ordinary historical hashes unchanged; use deterministic ASCII
+        # JSON escaping only for this legacy/invalid-scalar edge case.
+        return sha256_text(
+            json.dumps(core, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        )
 
 
 def _to_float(
@@ -494,7 +543,7 @@ def _to_float(
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         if warnings is not None:
             warnings.append(
                 WarningRecord(

@@ -168,8 +168,13 @@ class WebApiTests(unittest.TestCase):
         self.addCleanup(td.cleanup)
         health = client.get("/api/health").json()
         self.assertTrue(health["ok"])
-        self.assertTrue(health["foreign_key_check_complete"])
-        self.assertTrue(health["foreign_key_violations_exact"])
+        self.assertEqual(health["integrity_mode"], "quick")
+        self.assertFalse(health["foreign_key_check_complete"])
+        self.assertFalse(health["foreign_key_violations_exact"])
+        deep = client.get("/api/health?deep=true").json()
+        self.assertEqual(deep["integrity_mode"], "deep")
+        self.assertTrue(deep["foreign_key_check_complete"])
+        self.assertTrue(deep["foreign_key_violations_exact"])
         self.assertEqual(health["foreign_key_violation_sample_limit"], 20)
         self.assertEqual(health["database"]["name"], "database")
         self.assertNotIn(db.name, json.dumps(health))
@@ -317,7 +322,7 @@ class WebApiTests(unittest.TestCase):
             conn.close()
             damaged_client = TestClient(create_app(damaged, static_dir=build))
             self.addCleanup(damaged_client.close)
-            health = damaged_client.get("/api/health").json()
+            health = damaged_client.get("/api/health?deep=true").json()
             self.assertEqual(health["readiness"], "foreign_key_violation")
             self.assertEqual(health["database_error_code"], "database_foreign_key_violation")
             self.assertGreater(health["foreign_key_violations"], 0)
@@ -326,13 +331,7 @@ class WebApiTests(unittest.TestCase):
             sample = health["foreign_key_violation_samples"][0]
             self.assertEqual(set(sample), {"table", "rowid", "parent_table", "constraint_index"})
             response = damaged_client.get("/api/stats")
-            self.assertEqual(response.status_code, 409)
-            detail = response.json()["detail"]
-            self.assertEqual(detail["code"], "database_foreign_key_violation")
-            self.assertEqual(
-                set(detail["foreign_key_violation_sample"]),
-                {"table", "rowid", "parent_table", "constraint_index"},
-            )
+            self.assertEqual(response.status_code, 200)
 
             malformed = base / "malformed.db"
             malformed.write_bytes(b"synthetic-not-a-sqlite-database")
@@ -2384,13 +2383,13 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(client.get("/api/search?q=React&before=not-a-date").status_code, 400)
         self.assertEqual(client.get("/api/conversations?limit=1000").status_code, 422)
         too_long_date = "2" * 65
-        too_long_id = "x" * 513
+        too_long_id = "x" * (16 * 1024 + 1)
         self.assertEqual(client.get(f"/api/conversations?after={too_long_date}").status_code, 422)
         self.assertEqual(client.get(f"/api/conversations?selected_id={too_long_id}").status_code, 422)
         self.assertEqual(client.get(f"/api/search?selected_id={too_long_id}").status_code, 422)
         self.assertEqual(client.get(f"/api/search/messages?conversation_id={too_long_id}").status_code, 422)
-        self.assertEqual(client.get(f"/api/conversations/web-1/messages?around_node_id={too_long_id}").status_code, 422)
-        self.assertEqual(client.get(f"/api/conversations/{too_long_id}").status_code, 422)
+        self.assertEqual(client.get(f"/api/by-id/messages?conversation_id=web-1&around_node_id={too_long_id}").status_code, 422)
+        self.assertEqual(client.get(f"/api/by-id/conversation?conversation_id={too_long_id}").status_code, 422)
 
     def test_selected_membership_and_empty_results_contract(self):
         td, client, _db = self.make_client()
@@ -3700,7 +3699,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(client.get(f"/api/search/suggest?q={quote(long_suggest)}").status_code, 422)
         long_id = "x" * 513
         self.assertEqual(client.get(f"/api/conversations/{quote(long_id)}").status_code, 422)
-        self.assertEqual(client.get(f"/api/conversations?selected_id={quote(long_id)}").status_code, 422)
+        self.assertEqual(client.get(f"/api/conversations?selected_id={quote(long_id)}").status_code, 200)
 
     def test_imported_maximum_ids_are_addressable_across_reader_raw_display_export_and_selected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3763,16 +3762,17 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("selected_item", json.dumps(schema))
         self.assertIn("count_total", json.dumps(schema))
         self.assertIn("technical_hidden_count", json.dumps(schema))
-        self.assertEqual(schema["messages"]["limits"]["around_node_id"], 512)
-        self.assertEqual(schema["conversations"]["limits"]["selected_id"], 512)
+        self.assertEqual(schema["messages"]["limits"]["around_node_id"], 16 * 1024)
+        self.assertEqual(schema["conversations"]["limits"]["selected_id"], 16 * 1024)
+        self.assertEqual(schema["id_addressing"]["new_import_id_max_chars"], 512)
         self.assertIn("visible-only reader pagination collection", schema["messages"]["around_node_id"]["description"])
         self.assertEqual(
             schema["messages"]["around_node_id"]["response"],
             ["around_target_found", "around_target_in_effective_collection", "around_target_in_requested_collection", "around_target_visible", "around_target_applied"],
         )
         self.assertIn("effective all collection", schema["messages"]["around_node_id"]["description"])
-        self.assertEqual(schema["conversations"]["detail_endpoint"], "/api/conversations/{conversation_id}")
-        self.assertEqual(schema["export"]["copy_endpoint"], "/api/conversations/{conversation_id}/copy")
+        self.assertEqual(schema["conversations"]["detail_endpoint"], "/api/by-id/conversation?conversation_id=...")
+        self.assertEqual(schema["export"]["copy_endpoint"], "/api/by-id/copy?conversation_id=...")
         self.assertIn("default false", schema["export"]["include_internal"])
         self.assertIn("bounded server-side node batches", schema["export"]["streaming"])
         self.assertEqual(
@@ -4529,10 +4529,10 @@ class WebApiTests(unittest.TestCase):
                 connect_writable(missing)
             self.assertFalse(missing.exists())
             with mock.patch.object(Path, "exists", return_value=True):
-                with self.assertRaises(sqlite3.OperationalError):
+                with self.assertRaises(ValueError):
                     connect_writable(missing)
             self.assertFalse(missing.exists(), "mode=rw must not create a database after an exists/open race")
-            with self.assertRaises(sqlite3.OperationalError):
+            with self.assertRaises(ValueError):
                 connect_writable(base)
             normal = base / "normal.db"
             sqlite3.connect(normal).close()
@@ -5890,6 +5890,354 @@ class WebApiTests(unittest.TestCase):
                     self.assertEqual([item["conversation_id"] for item in page["items"]], ["exclude-once"])
                     self.assertEqual(calls["count"], 3)
                     conn.close()
+
+    def test_round6_by_id_routes_address_slash_and_legacy_ids(self):
+        from chatgpt_export_archiver.db import init_db
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.db"
+            conversation_id = "conversation/with?hash#colon:" + "x" * 600
+            node_id = "node/with?hash#colon:" + "y" * 600
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES (?, 'Synthetic', ?, 'h')",
+                (conversation_id, node_id),
+            )
+            raw = json.dumps({"content": {"content_type": "text", "parts": ["synthetic body"]}})
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       content_hash, raw_message_json, is_on_current_path
+                   ) VALUES (?, ?, 'assistant', 'text', 'synthetic body', 'r1', ?, 1)""",
+                (conversation_id, node_id, raw),
+            )
+            conn.commit()
+            conn.close()
+            client = TestClient(create_app(db))
+            self.addCleanup(client.close)
+            detail = client.get("/api/by-id/conversation", params={"conversation_id": conversation_id})
+            self.assertEqual(detail.status_code, 200)
+            messages = client.get(
+                "/api/by-id/messages",
+                params={"conversation_id": conversation_id, "around_node_id": node_id},
+            )
+            self.assertEqual(messages.status_code, 200)
+            self.assertEqual(messages.json()["items"][0]["node_id"], node_id)
+            for endpoint in ("raw", "display"):
+                response = client.get(
+                    f"/api/by-id/{endpoint}",
+                    params={"conversation_id": conversation_id, "node_id": node_id},
+                )
+                self.assertEqual(response.status_code, 200)
+            self.assertEqual(client.get(
+                "/api/by-id/copy", params={"conversation_id": conversation_id}
+            ).status_code, 200)
+            self.assertEqual(client.get(
+                "/api/by-id/export", params={"conversation_id": conversation_id, "format": "txt"}
+            ).status_code, 200)
+
+    def test_round6_nul_display_and_index_recall_are_consistent(self):
+        from chatgpt_export_archiver.db import init_db
+        from chatgpt_export_archiver.search import get_message_display_chunk, parse_query, search_messages
+        from chatgpt_export_archiver.web_db import create_web_indexes, connect_readonly
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "nul.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES ('c', ?, 'n', 'h')",
+                ("abc\x00def needle",),
+            )
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       content_hash, is_on_current_path
+                   ) VALUES ('c', 'n', 'assistant', 'text', ?, 'r1', 1)""",
+                ("abc\x00def needle",),
+            )
+            conn.commit()
+            first = get_message_display_chunk(conn, "c", "n", offset=0, limit=4)
+            self.assertEqual(first["display_text"], "abc\ufffd")
+            before = search_messages(conn, parse_query("needle"), conversation_id="c")
+            self.assertEqual([item["node_id"] for item in before["items"]], ["n"])
+            conn.close()
+            create_web_indexes(db)
+            reader = connect_readonly(db)
+            after = search_messages(reader, parse_query("needle"), conversation_id="c")
+            self.assertEqual([item["node_id"] for item in after["items"]], ["n"])
+            reader.close()
+
+    def test_round6_oversized_web_index_row_uses_recall_fallback(self):
+        from chatgpt_export_archiver.db import init_db
+        from chatgpt_export_archiver.search import parse_query, search_messages
+        from chatgpt_export_archiver.web_db import create_web_indexes, connect_readonly
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "oversized.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            text = "a" * (2 * 1024 * 1024 + 32) + " synthetic-oversized-needle"
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES ('c', 'Synthetic', 'n', 'h')"
+            )
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       content_hash, is_on_current_path
+                   ) VALUES ('c', 'n', 'assistant', 'text', ?, 'r1', 1)""",
+                (text,),
+            )
+            conn.commit()
+            conn.close()
+            result = create_web_indexes(db)
+            self.assertEqual(result["oversized_messages"], 1)
+            reader = connect_readonly(db)
+            self.assertEqual(reader.execute(
+                "SELECT COUNT(*) FROM web_index_oversized WHERE kind='message'"
+            ).fetchone()[0], 1)
+            page = search_messages(
+                reader, parse_query("synthetic-oversized-needle"), conversation_id="c"
+            )
+            self.assertEqual([item["node_id"] for item in page["items"]], ["n"])
+            reader.close()
+
+    def test_round6_sqlite_integer_boundary_is_rejected_before_bind(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        self.assertEqual(
+            client.get("/api/conversations", params={"offset": 1 << 63}).status_code,
+            422,
+        )
+
+    def test_round6_display_cursor_is_sequential_and_legacy_revision_bound(self):
+        from chatgpt_export_archiver.db import init_db
+        from chatgpt_export_archiver.search import DisplayCursorError, get_message_display_chunk
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "cursor.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            text = ("ab\x00中🙂" * 180_000) + "tail"
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES ('c', 'Synthetic', 'n', 'h')"
+            )
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       content_hash, is_on_current_path
+                   ) VALUES ('c', 'n', 'assistant', 'text', ?, NULL, 1)""",
+                (text,),
+            )
+            conn.commit()
+            offset = 0
+            cursor = None
+            parts: list[str] = []
+            statement_counts: list[int] = []
+            while True:
+                statements: list[str] = []
+                conn.set_trace_callback(statements.append)
+                chunk = get_message_display_chunk(
+                    conn, "c", "n", offset=offset, limit=65_536, cursor=cursor
+                )
+                conn.set_trace_callback(None)
+                self.assertIsNotNone(chunk)
+                statement_counts.append(sum(
+                    1 for sql in statements if sql.lstrip().upper().startswith("SELECT")
+                ))
+                parts.append(chunk["display_text"])
+                if not chunk["has_more"]:
+                    self.assertIsNone(chunk["next_cursor"])
+                    break
+                self.assertTrue(chunk["next_cursor"])
+                cursor = chunk["next_cursor"]
+                offset = chunk["next_offset"]
+            self.assertEqual("".join(parts), text.replace("\x00", "\ufffd"))
+            self.assertTrue(all(count == statement_counts[0] for count in statement_counts))
+
+            first = get_message_display_chunk(conn, "c", "n", offset=0, limit=65_536)
+            self.assertTrue(first["next_cursor"])
+            conn.execute(
+                "UPDATE conversation_nodes SET content_text = ? WHERE conversation_id='c' AND node_id='n'",
+                ("z" * len(text),),
+            )
+            conn.commit()
+            with self.assertRaises(DisplayCursorError) as caught:
+                get_message_display_chunk(
+                    conn, "c", "n", offset=first["next_offset"], limit=65_536,
+                    cursor=first["next_cursor"],
+                )
+            self.assertEqual(caught.exception.code, "display_cursor_stale")
+            with self.assertRaises(DisplayCursorError) as required:
+                get_message_display_chunk(
+                    conn, "c", "n", offset=1_048_577, limit=65_536,
+                )
+            self.assertEqual(required.exception.code, "display_cursor_required")
+            import base64
+            invalid_payload = json.dumps([
+                conn.execute(
+                    "SELECT rowid FROM conversation_nodes WHERE conversation_id='c' AND node_id='n'"
+                ).fetchone()[0],
+                first["content_revision"],
+                2**100,
+                first["next_offset"],
+            ], separators=(",", ":")).encode("utf-8")
+            invalid_cursor = base64.urlsafe_b64encode(invalid_payload).rstrip(b"=").decode("ascii")
+            with self.assertRaises(DisplayCursorError) as invalid:
+                get_message_display_chunk(
+                    conn, "c", "n", offset=first["next_offset"], limit=65_536,
+                    cursor=invalid_cursor,
+                )
+            self.assertEqual(invalid.exception.code, "invalid_display_cursor")
+            conn.close()
+
+    def test_round6_effective_current_and_export_node_budgets_reject_before_materialization(self):
+        from chatgpt_export_archiver.current_path import MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conversation_id = "resource-budget"
+        count = MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION + 1
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) VALUES (?, 'Synthetic', ?, 'h')",
+            (conversation_id, f"n-{count - 1}"),
+        )
+        conn.executemany(
+            """INSERT INTO conversation_nodes(
+                   conversation_id, node_id, role, content_type, content_text,
+                   content_hash, is_on_current_path
+               ) VALUES (?, ?, 'assistant', 'text', 'x', 'h', 0)""",
+            ((conversation_id, f"n-{index}") for index in range(count)),
+        )
+        conn.commit()
+        conn.close()
+        reader = client.get("/api/by-id/messages", params={"conversation_id": conversation_id})
+        self.assertEqual(reader.status_code, 413)
+        self.assertEqual(reader.json()["detail"], "effective_current_node_limit_exceeded")
+        export = client.get("/api/by-id/export", params={"conversation_id": conversation_id})
+        self.assertEqual(export.status_code, 413)
+        self.assertEqual(export.json()["detail"], "export_node_count_limit_exceeded")
+
+    def test_round6_reader_and_streaming_export_hold_one_read_snapshot(self):
+        import threading
+        import chatgpt_export_archiver.search as search_module
+        import chatgpt_export_archiver.web_api as web_api_module
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        writer = sqlite3.connect(db, timeout=5)
+        old_title = writer.execute(
+            "SELECT title FROM conversations WHERE conversation_id='web-1'"
+        ).fetchone()[0]
+        entered = threading.Event()
+        release = threading.Event()
+        original_ensure = search_module.ensure_effective_current_views
+
+        def paused_ensure(conn, ids):
+            result = original_ensure(conn, ids)
+            if ids == ["web-1"] and not entered.is_set():
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return result
+
+        detail_result: list[Any] = []
+        with mock.patch.object(search_module, "ensure_effective_current_views", side_effect=paused_ensure):
+            thread = threading.Thread(
+                target=lambda: detail_result.append(client.get(
+                    "/api/by-id/conversation", params={"conversation_id": "web-1"}
+                )),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(entered.wait(5))
+            writer.execute("UPDATE conversations SET title='new committed title' WHERE conversation_id='web-1'")
+            writer.commit()
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(detail_result[0].status_code, 200)
+        self.assertEqual(detail_result[0].json()["title"], old_title)
+
+        old_body = writer.execute(
+            "SELECT content_text FROM conversation_nodes WHERE conversation_id='web-1' AND node_id='a1'"
+        ).fetchone()[0]
+        entered.clear()
+        release.clear()
+        original_iter = web_api_module.iter_conversation_export_nodes
+
+        def paused_iter(conn, conv, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return original_iter(conn, conv, **kwargs)
+
+        export_result: list[Any] = []
+        with mock.patch.object(web_api_module, "iter_conversation_export_nodes", side_effect=paused_iter):
+            thread = threading.Thread(
+                target=lambda: export_result.append(client.get(
+                    "/api/by-id/export",
+                    params={"conversation_id": "web-1", "format": "txt", "path": "current"},
+                )),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(entered.wait(5))
+            writer.execute(
+                "UPDATE conversation_nodes SET content_text='new committed body', content_hash='new-revision' "
+                "WHERE conversation_id='web-1' AND node_id='a1'"
+            )
+            writer.commit()
+            release.set()
+            thread.join(5)
+        writer.close()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(export_result[0].status_code, 200)
+        self.assertIn(old_body, export_result[0].text)
+        self.assertNotIn("new committed body", export_result[0].text)
+
+    def test_round6_ordinary_reads_never_run_database_wide_foreign_key_check(self):
+        import chatgpt_export_archiver.web_api as web_api_module
+
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        original_connect = web_api_module.connect_readonly
+        statements: list[str] = []
+
+        def traced_connect(path):
+            conn = original_connect(path)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with mock.patch.object(web_api_module, "connect_readonly", side_effect=traced_connect):
+            responses = [
+                client.get("/api/health"),
+                client.get("/api/stats"),
+                client.get("/api/conversations?limit=2"),
+                client.get("/api/by-id/conversation", params={"conversation_id": "web-1"}),
+                client.get("/api/by-id/messages", params={"conversation_id": "web-1", "limit": 2}),
+                client.get("/api/search/messages", params={"q": "SQLite", "limit": 2}),
+                client.get("/api/search/suggest", params={"q": "python"}),
+                client.get("/api/by-id/raw", params={"conversation_id": "web-1", "node_id": "a1"}),
+                client.get("/api/by-id/export", params={"conversation_id": "web-1", "format": "txt"}),
+            ]
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertFalse(any("FOREIGN_KEY_CHECK" in sql.upper() for sql in statements))
+
+        deep_statements: list[str] = []
+
+        def deep_connect(path):
+            conn = original_connect(path)
+            conn.set_trace_callback(deep_statements.append)
+            return conn
+
+        with mock.patch.object(web_api_module, "connect_readonly", side_effect=deep_connect):
+            self.assertEqual(client.get("/api/health?deep=true").status_code, 200)
+        self.assertTrue(any("FOREIGN_KEY_CHECK" in sql.upper() for sql in deep_statements))
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,12 +22,17 @@ from .sqlite_errors import (
     is_fts5_capability_unavailable,
     is_optional_message_fts_damaged,
     is_optional_search_capability_missing,
+    sqlite_open_error_code,
 )
 from .search import _derived_generation_is_current, invalidate_capability_cache, normalize_search_text, search_fragment_match
 
 WEB_INDEX_FORMAT_VERSION = OPTIONAL_WEB_INDEX_FORMAT_VERSION
 WEB_INDEX_BATCH_SIZE = 200
 WEB_INDEX_PROGRESS_VM_STEPS = 10_000
+WEB_INDEX_MAX_INPUT_BYTES = 4 * 1024 * 1024
+WEB_INDEX_MAX_NORMALIZED_BYTES = 2 * 1024 * 1024
+WEB_INDEX_MAX_DERIVED_BYTES = 8 * 1024 * 1024
+WEB_INDEX_BATCH_INPUT_BYTES = 16 * 1024 * 1024
 WEB_INDEX_BUILD_STAGES = (
     "scan_normalize_messages",
     "normalize_titles",
@@ -68,13 +73,15 @@ REQUIRED_COLUMNS = {
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
     """Open a per-request SQLite connection for Web API reads."""
-    if not db_path.exists():
-        raise ValueError("database_not_found")
-    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    absolute = db_path.expanduser().absolute()
+    uri = f"{absolute.as_uri()}?mode=ro"
     # TEMP effective-current tables perform DML.  Autocommit prevents that
     # connection-local work from pinning an old main-database read snapshot
     # across later requests/tests after another connection commits.
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
+    try:
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise ValueError(sqlite_open_error_code(exc, path_exists=absolute.exists())) from exc
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -85,10 +92,12 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
 
 
 def connect_writable(db_path: Path) -> sqlite3.Connection:
-    if not db_path.exists():
-        raise ValueError("database_not_found")
-    uri = f"{db_path.resolve().as_uri()}?mode=rw"
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    absolute = db_path.expanduser().absolute()
+    uri = f"{absolute.as_uri()}?mode=rw"
+    try:
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    except sqlite3.Error as exc:
+        raise ValueError(sqlite_open_error_code(exc, path_exists=absolute.exists())) from exc
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -114,6 +123,7 @@ def check_schema(conn: sqlite3.Connection) -> dict[str, Any]:
         "web_message_norm": "web_message_norm" in tables,
         "web_title_norm": "web_title_norm" in tables,
         "web_index_metadata": "web_index_metadata" in tables,
+        "web_index_oversized": "web_index_oversized" in tables,
     }
 
 
@@ -128,7 +138,8 @@ def web_index_status(conn: sqlite3.Connection) -> dict[str, Any]:
         if {"key", "value"}.issubset(columns):
             metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM web_index_metadata")}
     format_current = (
-        metadata.get("web_index_format_version") == WEB_INDEX_FORMAT_VERSION
+        schema["web_index_oversized"]
+        and metadata.get("web_index_format_version") == WEB_INDEX_FORMAT_VERSION
         and metadata.get("display_text_resolver_version") == DISPLAY_TEXT_RESOLVER_VERSION
         and metadata.get("normalization_index_format_version") == NORMALIZATION_INDEX_FORMAT_VERSION
     )
@@ -304,6 +315,7 @@ def create_web_indexes(
         conn.execute("DROP TABLE IF EXISTS web_message_norm")
         conn.execute("DROP TABLE IF EXISTS web_title_norm")
         conn.execute("DROP TABLE IF EXISTS web_index_metadata")
+        conn.execute("DROP TABLE IF EXISTS web_index_oversized")
         conn.execute(
             """CREATE TABLE web_message_norm(
                    conversation_id TEXT NOT NULL,
@@ -314,14 +326,25 @@ def create_web_indexes(
         )
         conn.execute(
             """CREATE TABLE web_title_norm(
-                   conversation_id TEXT PRIMARY KEY,
+                   conversation_id TEXT NOT NULL PRIMARY KEY,
                    title_norm TEXT NOT NULL
                )"""
         )
         conn.execute(
             """CREATE TABLE web_index_metadata(
-                   key TEXT PRIMARY KEY,
+                   key TEXT NOT NULL PRIMARY KEY,
                    value TEXT NOT NULL
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE web_index_oversized(
+                   kind TEXT NOT NULL,
+                   source_rowid INTEGER NOT NULL,
+                   conversation_id TEXT NOT NULL,
+                   node_id TEXT,
+                   input_bytes INTEGER NOT NULL,
+                   reason TEXT NOT NULL,
+                   PRIMARY KEY(kind, source_rowid)
                )"""
         )
 
@@ -329,23 +352,55 @@ def create_web_indexes(
         last_rowid = 0
         message_processed = 0
         indexed_messages = 0
+        oversized_messages = 0
+        row_limit = min(batch_size, max(1, WEB_INDEX_BATCH_INPUT_BYTES // WEB_INDEX_MAX_INPUT_BYTES))
         while True:
             rows = conn.execute(
-                """SELECT rowid, conversation_id, node_id, content_text,
-                          substr(raw_message_json, 1, 200001) AS raw_message_json
+                """SELECT rowid, conversation_id, node_id,
+                          length(CAST(COALESCE(content_text, '') AS BLOB)) AS content_bytes,
+                          length(CAST(COALESCE(raw_message_json, '') AS BLOB)) AS raw_bytes,
+                          CASE WHEN length(CAST(COALESCE(content_text, '') AS BLOB)) <= ?
+                                    AND length(CAST(COALESCE(raw_message_json, '') AS BLOB)) <= ?
+                               THEN content_text END AS content_text,
+                          CASE WHEN length(CAST(COALESCE(content_text, '') AS BLOB)) <= ?
+                                    AND length(CAST(COALESCE(raw_message_json, '') AS BLOB)) <= ?
+                               THEN substr(raw_message_json, 1, 200001) END AS raw_message_json
                    FROM conversation_nodes
                    WHERE rowid > ?
                    ORDER BY rowid
                    LIMIT ?""",
-                (last_rowid, batch_size),
+                (
+                    WEB_INDEX_MAX_INPUT_BYTES, WEB_INDEX_MAX_INPUT_BYTES,
+                    WEB_INDEX_MAX_INPUT_BYTES, WEB_INDEX_MAX_INPUT_BYTES,
+                    last_rowid, row_limit,
+                ),
             ).fetchall()
             if not rows:
                 break
             normalized_rows: list[tuple[str, str, str]] = []
             for row in rows:
+                input_bytes = max(int(row["content_bytes"] or 0), int(row["raw_bytes"] or 0))
+                if input_bytes > WEB_INDEX_MAX_INPUT_BYTES:
+                    conn.execute(
+                        "INSERT INTO web_index_oversized VALUES ('message', ?, ?, ?, ?, 'input_bytes')",
+                        (row["rowid"], row["conversation_id"], row["node_id"], input_bytes),
+                    )
+                    oversized_messages += 1
+                    continue
                 display_text = recover_message_display_text(row["content_text"], row["raw_message_json"])
                 content_norm = normalize_search_text(display_text)
                 if content_norm:
+                    normalized_bytes = len(content_norm.encode("utf-8"))
+                    if (
+                        normalized_bytes > WEB_INDEX_MAX_NORMALIZED_BYTES
+                        or normalized_bytes * 4 > WEB_INDEX_MAX_DERIVED_BYTES
+                    ):
+                        conn.execute(
+                            "INSERT INTO web_index_oversized VALUES ('message', ?, ?, ?, ?, 'derived_bytes')",
+                            (row["rowid"], row["conversation_id"], row["node_id"], input_bytes),
+                        )
+                        oversized_messages += 1
+                        continue
                     normalized_rows.append((row["conversation_id"], row["node_id"], content_norm))
             if normalized_rows:
                 conn.executemany(
@@ -360,25 +415,46 @@ def create_web_indexes(
         report("normalize_titles", 0, title_total)
         last_rowid = 0
         title_processed = 0
+        oversized_titles = 0
         while True:
             rows = conn.execute(
-                """SELECT rowid, conversation_id, title
+                """SELECT rowid, conversation_id,
+                          length(CAST(COALESCE(title, '') AS BLOB)) AS title_bytes,
+                          CASE WHEN length(CAST(COALESCE(title, '') AS BLOB)) <= ? THEN title END AS title
                    FROM conversations
                    WHERE rowid > ?
                    ORDER BY rowid
                    LIMIT ?""",
-                (last_rowid, batch_size),
+                (WEB_INDEX_MAX_INPUT_BYTES, last_rowid, row_limit),
             ).fetchall()
             if not rows:
                 break
-            conn.executemany(
-                "INSERT INTO web_title_norm(conversation_id, title_norm) VALUES (?, ?)",
-                [(row["conversation_id"], normalize_search_text(row["title"] or "")) for row in rows],
-            )
+            title_rows: list[tuple[str, str]] = []
+            for row in rows:
+                input_bytes = int(row["title_bytes"] or 0)
+                title_norm = normalize_search_text(row["title"] or "") if input_bytes <= WEB_INDEX_MAX_INPUT_BYTES else ""
+                normalized_bytes = len(title_norm.encode("utf-8"))
+                if (
+                    input_bytes > WEB_INDEX_MAX_INPUT_BYTES
+                    or normalized_bytes > WEB_INDEX_MAX_NORMALIZED_BYTES
+                    or normalized_bytes * 4 > WEB_INDEX_MAX_DERIVED_BYTES
+                ):
+                    conn.execute(
+                        "INSERT INTO web_index_oversized VALUES ('title', ?, ?, NULL, ?, 'byte_budget')",
+                        (row["rowid"], row["conversation_id"], input_bytes),
+                    )
+                    oversized_titles += 1
+                else:
+                    title_rows.append((row["conversation_id"], title_norm))
+            if title_rows:
+                conn.executemany(
+                    "INSERT INTO web_title_norm(conversation_id, title_norm) VALUES (?, ?)",
+                    title_rows,
+                )
             last_rowid = int(rows[-1]["rowid"])
             title_processed += len(rows)
             report("normalize_titles", title_processed, title_total)
-        indexed_titles = title_processed
+        indexed_titles = title_processed - oversized_titles
 
         if trigram_available:
             conn.execute(
@@ -452,6 +528,10 @@ def create_web_indexes(
             ("web_index_format_version", WEB_INDEX_FORMAT_VERSION),
             ("display_text_resolver_version", DISPLAY_TEXT_RESOLVER_VERSION),
             ("normalization_index_format_version", NORMALIZATION_INDEX_FORMAT_VERSION),
+            ("oversized_fallback", "required"),
+            ("max_input_bytes", str(WEB_INDEX_MAX_INPUT_BYTES)),
+            ("max_normalized_bytes", str(WEB_INDEX_MAX_NORMALIZED_BYTES)),
+            ("max_derived_bytes", str(WEB_INDEX_MAX_DERIVED_BYTES)),
             ("message_generation", generations["message"]),
             ("title_generation", generations["title"]),
         ]
@@ -491,6 +571,11 @@ def create_web_indexes(
             "trigram_available": trigram_available,
             "indexed_messages": indexed_messages,
             "indexed_titles": indexed_titles,
+            "oversized_messages": oversized_messages,
+            "oversized_titles": oversized_titles,
+            "max_input_bytes": WEB_INDEX_MAX_INPUT_BYTES,
+            "max_normalized_bytes": WEB_INDEX_MAX_NORMALIZED_BYTES,
+            "max_derived_bytes": WEB_INDEX_MAX_DERIVED_BYTES,
             "batch_size": batch_size,
             "atomic_publish": True,
             "progress_stages": list(WEB_INDEX_BUILD_STAGES),

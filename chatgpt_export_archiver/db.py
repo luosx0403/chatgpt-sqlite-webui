@@ -16,6 +16,7 @@ from .sqlite_errors import (
     is_fts5_capability_unavailable,
     is_optional_search_capability_missing,
     sqlite_runtime_error_code,
+    sqlite_open_error_code,
 )
 from .utils import compact_json, finite_float_or_none, utc_now_iso
 
@@ -56,7 +57,7 @@ CANONICAL_TABLE_DDL = (
         FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
     )""",
     """CREATE TABLE IF NOT EXISTS conversations (
-        conversation_id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL PRIMARY KEY,
         exported_id TEXT,
         title TEXT,
         create_time REAL,
@@ -118,7 +119,7 @@ CANONICAL_TABLE_DDL = (
 )
 
 GENERATION_TABLE_DDL = """CREATE TABLE IF NOT EXISTS archive_generations (
-    name TEXT PRIMARY KEY,
+    name TEXT NOT NULL PRIMARY KEY,
     generation INTEGER NOT NULL DEFAULT 0
 )"""
 
@@ -206,7 +207,7 @@ CANONICAL_TABLE_CONTRACT = {
     "conversations": {
         "primary_key": ("conversation_id",),
         "columns": {
-            "conversation_id": ("TEXT", False, None),
+            "conversation_id": ("TEXT", True, None),
             "aggregate_hash": ("TEXT", True, None),
         },
     },
@@ -242,7 +243,7 @@ CANONICAL_TABLE_CONTRACT = {
     "archive_generations": {
         "primary_key": ("name",),
         "columns": {
-            "name": ("TEXT", False, None),
+            "name": ("TEXT", True, None),
             "generation": ("INTEGER", True, "0"),
         },
     },
@@ -315,27 +316,17 @@ def database_schema_error_code(status: dict[str, Any]) -> str | None:
 
 
 def require_current_database_schema(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Gate production reads without performing migration or other main DDL."""
+    """Cheap production-read gate without migration, DDL, or full-table checks.
+
+    Database-wide foreign-key verification is deliberately reserved for
+    ``verify`` and the deep health endpoint.  Running it in every request
+    makes an indexed lookup proportional to the entire archive.
+    """
 
     status = database_schema_status(conn)
     code = database_schema_error_code(status)
     if code is not None:
         raise DatabaseMigrationError(code, detail=status)
-    violation = conn.execute("PRAGMA foreign_key_check").fetchone()
-    if violation is not None:
-        raise DatabaseMigrationError(
-            "database_foreign_key_violation",
-            detail={
-                **status,
-                "foreign_key_violation": True,
-                "foreign_key_violation_sample": {
-                    "table": str(violation[0]),
-                    "rowid": violation[1],
-                    "parent_table": str(violation[2]),
-                    "constraint_index": int(violation[3]),
-                },
-            },
-        )
     return status
 IMPORT_REBUILDABLE_INDEXES = (
     (
@@ -365,10 +356,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def connect_existing_readonly(db_path: Path) -> sqlite3.Connection:
-    if not db_path.exists():
-        raise ValueError("database_not_found")
-    uri = f"{db_path.resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    absolute = db_path.expanduser().absolute()
+    uri = f"{absolute.as_uri()}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        raise ValueError(sqlite_open_error_code(exc, path_exists=absolute.exists())) from exc
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -376,10 +369,12 @@ def connect_existing_readonly(db_path: Path) -> sqlite3.Connection:
 
 
 def connect_existing(db_path: Path) -> sqlite3.Connection:
-    if not db_path.exists():
-        raise ValueError("database_not_found")
-    uri = f"{db_path.resolve().as_uri()}?mode=rw"
-    conn = sqlite3.connect(uri, uri=True)
+    absolute = db_path.expanduser().absolute()
+    uri = f"{absolute.as_uri()}?mode=rw"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        raise ValueError(sqlite_open_error_code(exc, path_exists=absolute.exists())) from exc
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -455,6 +450,121 @@ def _base_schema_compatibility(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+_SUPPORTED_SCHEMA_PREDECESSORS = frozenset(range(DATABASE_SCHEMA_VERSION))
+
+
+def _nullable_identity_only(error: dict[str, Any] | None, column: str) -> bool:
+    """Recognize the exact legacy rowid-table TEXT PRIMARY KEY contract."""
+
+    if not isinstance(error, dict) or set(error) != {"columns"}:
+        return False
+    columns = error.get("columns")
+    if not isinstance(columns, dict) or set(columns) != {column}:
+        return False
+    detail = columns[column]
+    return detail == {
+        "expected": {"type": "TEXT", "not_null": True, "default": None},
+        "actual": {"type": "TEXT", "not_null": False, "default": None},
+    }
+
+
+def _supported_predecessor_schema(status: dict[str, Any]) -> bool:
+    """Return whether *status* is an exact schema that this version can rebuild."""
+
+    version = int(status.get("current_database_schema_version", -1))
+    if version not in _SUPPORTED_SCHEMA_PREDECESSORS:
+        return False
+    if status.get("base_schema_compatible"):
+        return True
+    if (
+        status.get("database_schema_newer")
+        or status.get("missing_columns")
+        or status.get("object_type_mismatches")
+        or status.get("missing_foreign_keys")
+        or status.get("invalid_generation_rows")
+    ):
+        return False
+    missing_tables = set(status.get("missing_tables") or ())
+    if missing_tables - {"archive_generations"}:
+        return False
+    invalid = dict(status.get("invalid_tables") or {})
+    conversations = invalid.pop("conversations", None)
+    if not _nullable_identity_only(conversations, "conversation_id"):
+        return False
+    generations = invalid.pop("archive_generations", None)
+    if generations is not None and not _nullable_identity_only(generations, "name"):
+        return False
+    return not invalid
+
+
+def _identity_contains_null(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return conn.execute(
+        f'SELECT 1 FROM "{table}" WHERE "{column}" IS NULL LIMIT 1'
+    ).fetchone() is not None
+
+
+def _rebuild_nullable_identity_tables(conn: sqlite3.Connection, *, has_generations: bool) -> None:
+    """Apply the v3 NOT NULL identity migration inside the caller's transaction."""
+
+    if _identity_contains_null(conn, "conversations", "conversation_id"):
+        raise DatabaseMigrationError(
+            "database_schema_incompatible",
+            detail={"manual_repair_required": True, "null_identity": "conversations.conversation_id"},
+        )
+    if has_generations and _identity_contains_null(conn, "archive_generations", "name"):
+        raise DatabaseMigrationError(
+            "database_schema_incompatible",
+            detail={"manual_repair_required": True, "null_identity": "archive_generations.name"},
+        )
+
+    for name in GENERATION_TRIGGER_DDL:
+        conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+    conn.execute(
+        """CREATE TABLE conversations_v3 (
+            conversation_id TEXT NOT NULL PRIMARY KEY,
+            exported_id TEXT,
+            title TEXT,
+            create_time REAL,
+            update_time REAL,
+            current_node TEXT,
+            source_file TEXT,
+            source_array_index INTEGER,
+            aggregate_hash TEXT NOT NULL,
+            last_import_run_id INTEGER,
+            is_archived INTEGER,
+            is_starred INTEGER,
+            default_model_slug TEXT,
+            metadata_json TEXT,
+            FOREIGN KEY(last_import_run_id) REFERENCES import_runs(id)
+        )"""
+    )
+    conversation_columns = (
+        "conversation_id, exported_id, title, create_time, update_time, current_node, "
+        "source_file, source_array_index, aggregate_hash, last_import_run_id, is_archived, "
+        "is_starred, default_model_slug, metadata_json"
+    )
+    conn.execute(
+        f"INSERT INTO conversations_v3({conversation_columns}) "
+        f"SELECT {conversation_columns} FROM conversations"
+    )
+    conn.execute("DROP TABLE conversations")
+    conn.execute("ALTER TABLE conversations_v3 RENAME TO conversations")
+
+    if has_generations:
+        conn.execute(
+            """CREATE TABLE archive_generations_v3 (
+                name TEXT NOT NULL PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO archive_generations_v3(name, generation) "
+            "SELECT name, generation FROM archive_generations"
+        )
+        conn.execute("DROP TABLE archive_generations")
+        conn.execute("ALTER TABLE archive_generations_v3 RENAME TO archive_generations")
+
+
 def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False) -> dict[str, Any]:
     """Initialize or migrate the canonical schema in one protected transaction.
 
@@ -462,57 +572,68 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
     raised only after every required table, row, trigger, and index succeeds.
     """
 
+    if conn.in_transaction:
+        status = database_schema_status(conn)
+        if not status["base_schema_compatible"]:
+            raise DatabaseMigrationError(
+                "database_schema_incompatible", detail=_base_schema_compatibility(conn)
+            )
+        raise DatabaseMigrationError("database_transaction_active")
+    foreign_keys_before = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
     try:
+        # SQLite requires foreign_keys to be changed outside a transaction for
+        # a parent-table rebuild. BEGIN IMMEDIATE then excludes every writer;
+        # all authoritative inspection and both FK checks remain under that lock.
+        if foreign_keys_before:
+            conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN IMMEDIATE")
         has_objects = _database_has_user_objects(conn)
         current_version = _database_user_version(conn)
-    except sqlite3.Error as exc:
-        raise DatabaseMigrationError(
-            _migration_sqlite_error_code(exc),
-            detail={"error_type": type(exc).__name__},
-        ) from exc
-    if current_version > DATABASE_SCHEMA_VERSION:
-        raise DatabaseMigrationError(
-            "database_schema_newer",
-            detail={
-                "current_database_schema_version": current_version,
-                "required_database_schema_version": DATABASE_SCHEMA_VERSION,
-            },
-        )
-    if not has_objects and not allow_initialize:
-        raise DatabaseMigrationError("database_not_ready")
-    try:
-        if has_objects:
-            compatibility = _base_schema_compatibility(conn)
-            if not compatibility["compatible"]:
-                raise DatabaseMigrationError("database_schema_incompatible", detail=compatibility)
-            violation = conn.execute("PRAGMA foreign_key_check").fetchone()
-            if violation is not None:
-                raise DatabaseMigrationError("database_foreign_key_violation")
-        before = database_schema_status(conn)
-    except DatabaseMigrationError:
-        raise
-    except sqlite3.Error as exc:
-        raise DatabaseMigrationError(
-            _migration_sqlite_error_code(exc),
-            detail={"error_type": type(exc).__name__},
-        ) from exc
-    if before["schema_compatible"] and not before["migration_required"]:
-        return {"changed": False, "initialized": False, **before}
-
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        locked_status = database_schema_status(conn)
-        if locked_status["schema_compatible"] and not locked_status["migration_required"]:
+        if current_version > DATABASE_SCHEMA_VERSION:
+            raise DatabaseMigrationError(
+                "database_schema_newer",
+                detail={
+                    "current_database_schema_version": current_version,
+                    "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+                },
+            )
+        if not has_objects and not allow_initialize:
+            raise DatabaseMigrationError("database_not_ready")
+        locked_status = database_schema_status(conn) if has_objects else None
+        if locked_status is not None and current_version < DATABASE_SCHEMA_VERSION:
+            if not _supported_predecessor_schema(locked_status):
+                raise DatabaseMigrationError(
+                    "database_schema_incompatible", detail=_base_schema_compatibility(conn)
+                )
+        elif locked_status is not None and not locked_status["base_schema_compatible"]:
+            raise DatabaseMigrationError(
+                "database_schema_incompatible", detail=_base_schema_compatibility(conn)
+            )
+        if has_objects and conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise DatabaseMigrationError("database_foreign_key_violation")
+        if locked_status is not None and locked_status["schema_compatible"] and not locked_status["migration_required"]:
             conn.commit()
             return {"changed": False, "initialized": False, **locked_status}
+
+        initialized = not has_objects
+        upgrading_identity_contract = bool(has_objects and current_version < DATABASE_SCHEMA_VERSION)
+        if upgrading_identity_contract:
+            _rebuild_nullable_identity_tables(
+                conn,
+                has_generations="archive_generations" not in set(locked_status["missing_tables"]),
+            )
         if not has_objects:
             for statement in CANONICAL_TABLE_DDL:
                 conn.execute(statement)
         generation_infrastructure_changed = bool(
-            before.get("missing_generation_table")
-            or before.get("missing_generation_rows")
-            or before.get("missing_triggers")
-            or before.get("invalid_triggers")
+            upgrading_identity_contract
+            or (locked_status and locked_status.get("missing_generation_table"))
+            or (locked_status and locked_status.get("missing_generation_rows"))
+            or (locked_status and locked_status.get("invalid_generation_rows"))
+            or (locked_status and locked_status.get("missing_triggers"))
+            or (locked_status and locked_status.get("invalid_triggers"))
+            or (locked_status and locked_status.get("missing_indexes"))
+            or (locked_status and locked_status.get("invalid_indexes"))
         )
         if generation_infrastructure_changed and has_objects:
             failures = drop_optional_web_indexes(conn)
@@ -526,15 +647,27 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             "INSERT OR IGNORE INTO archive_generations(name, generation) VALUES (?, 0)",
             ((name,) for name in REQUIRED_GENERATION_ROWS),
         )
-        for name in locked_status.get("invalid_triggers", {}):
+        for name in (locked_status or {}).get("invalid_triggers", {}):
             conn.execute(f'DROP TRIGGER "{name}"')
         for statement in GENERATION_TRIGGER_DDL.values():
             conn.execute(statement)
-        for name in locked_status.get("invalid_indexes", {}):
+        for name in (locked_status or {}).get("invalid_indexes", {}):
             conn.execute(f'DROP INDEX "{name}"')
         for statement in REQUIRED_INDEX_DDL.values():
             conn.execute(statement)
-        conn.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+        pre_version = database_schema_status(conn)
+        if (
+            not pre_version["base_schema_compatible"]
+            or pre_version["missing_generation_rows"]
+            or pre_version["missing_triggers"]
+            or pre_version["invalid_triggers"]
+            or pre_version["missing_indexes"]
+            or pre_version["invalid_indexes"]
+            or conn.execute("PRAGMA foreign_key_check").fetchone() is not None
+        ):
+            raise DatabaseMigrationError("database_migration_incomplete", detail=pre_version)
+        if current_version < DATABASE_SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
         after = database_schema_status(conn)
         if not after["schema_compatible"] or after["migration_required"]:
             raise DatabaseMigrationError("database_migration_incomplete", detail=after)
@@ -550,7 +683,10 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             _migration_sqlite_error_code(exc),
             detail={"error_type": type(exc).__name__},
         ) from exc
-    return {"changed": True, "initialized": not has_objects, **after}
+    finally:
+        if foreign_keys_before and not conn.in_transaction:
+            conn.execute("PRAGMA foreign_keys = ON")
+    return {"changed": True, "initialized": initialized, **after}
 
 
 def init_db(conn: sqlite3.Connection) -> bool:
@@ -562,7 +698,7 @@ def init_db(conn: sqlite3.Connection) -> bool:
 
 OPTIONAL_WEB_TRIGRAM_TABLES = ("web_message_trigram", "web_title_trigram")
 OPTIONAL_WEB_NORM_TABLES = ("web_message_norm", "web_title_norm")
-OPTIONAL_WEB_METADATA_TABLES = ("web_index_metadata",)
+OPTIONAL_WEB_METADATA_TABLES = ("web_index_metadata", "web_index_oversized")
 OPTIONAL_WEB_INDEX_TABLES = OPTIONAL_WEB_TRIGRAM_TABLES + OPTIONAL_WEB_NORM_TABLES + OPTIONAL_WEB_METADATA_TABLES
 
 
@@ -1560,6 +1696,21 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
         or "archive_generations" in missing_columns
         or ("archive_generations" in tables and "archive_generations" in invalid_tables)
     )
+    legacy_identity_compatible = bool(
+        current_version in _SUPPORTED_SCHEMA_PREDECESSORS
+        and not base_missing_tables
+        and not base_missing_columns
+        and not missing_foreign_keys
+        and not base_object_mismatches
+        and not invalid_generation_rows
+        and _nullable_identity_only(invalid_tables.get("conversations"), "conversation_id")
+        and (
+            "archive_generations" not in tables
+            or _nullable_identity_only(invalid_tables.get("archive_generations"), "name")
+        )
+        and not (set(invalid_tables) - {"conversations", "archive_generations"})
+    )
+    migration_base_compatible = base_compatible or legacy_identity_compatible
     managed_missing = bool(
         "archive_generations" in missing_tables
         or missing_generation_rows
@@ -1570,12 +1721,16 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
     )
     version_migration_required = current_version < DATABASE_SCHEMA_VERSION
     schema_newer = current_version > DATABASE_SCHEMA_VERSION
-    migration_required = bool(base_compatible and not schema_newer and (version_migration_required or managed_missing))
+    migration_required = bool(
+        migration_base_compatible
+        and not schema_newer
+        and (version_migration_required or managed_missing)
+    )
     schema_compatible = bool(base_compatible and not schema_newer and not migration_required)
     return {
         "ok": schema_compatible,
         "schema_compatible": schema_compatible,
-        "base_schema_compatible": base_compatible,
+        "base_schema_compatible": migration_base_compatible,
         "migration_required": migration_required,
         "current_database_schema_version": current_version,
         "required_database_schema_version": DATABASE_SCHEMA_VERSION,

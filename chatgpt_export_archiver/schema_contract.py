@@ -2,9 +2,9 @@
 
 import re
 
-API_SCHEMA_VERSION = 2
-DATABASE_SCHEMA_VERSION = 2
-OPTIONAL_WEB_INDEX_FORMAT_VERSION = "2"
+API_SCHEMA_VERSION = 3
+DATABASE_SCHEMA_VERSION = 3
+OPTIONAL_WEB_INDEX_FORMAT_VERSION = "3"
 DISPLAY_TEXT_RESOLVER_VERSION = "1"
 NORMALIZATION_INDEX_FORMAT_VERSION = "1"
 
@@ -20,8 +20,12 @@ def parse_nonnegative_integer(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+        return value if 0 <= value <= 9_223_372_036_854_775_807 else None
+    if (
+        isinstance(value, str)
+        and len(value) <= 19
+        and re.fullmatch(r"(?:0|[1-9][0-9]*)", value)
+    ):
         parsed = int(value)
         return parsed if parsed <= 9_223_372_036_854_775_807 else None
     return None

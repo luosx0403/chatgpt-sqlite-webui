@@ -11,12 +11,100 @@ from .current_path import resolve_effective_current_collection
 from .db import export_query, record_export
 from .parser import recover_message_display_text
 from .search import _is_internal_message
-from .utils import epoch_to_date_part, epoch_to_display, finite_float_or_none, parse_date_boundary, safe_filename_part, sha256_bytes, sha256_text, truncate_utf8, write_bytes_if_changed
+from .utils import epoch_to_date_part, epoch_to_display, finite_float_or_none, parse_date_boundary, safe_filename_part, sha256_text, truncate_utf8, write_bytes_if_changed, write_chunks_if_changed
 
 
 MAX_EXPORT_BASENAME_BYTES = 240
 EXPORT_CONVERSATION_BATCH_SIZE = 200
-EXPORT_NODE_BATCH_SIZE = 200
+EXPORT_NODE_BATCH_SIZE = 8
+MAX_EXPORT_NODES_PER_CONVERSATION = 100_000
+MAX_EXPORT_NODE_INPUT_BYTES = 32 * 1024 * 1024
+MAX_EXPORT_CONVERSATION_INPUT_BYTES = 128 * 1024 * 1024
+MAX_EXPORT_HEADER_INPUT_BYTES = 4 * 1024 * 1024
+MAX_EXPORT_BATCH_INPUT_BYTES = 160 * 1024 * 1024
+MAX_EXPORT_OUTPUT_BYTES = 256 * 1024 * 1024
+
+
+class ExportResourceLimitError(ValueError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def check_conversation_export_budget(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+) -> dict[str, int]:
+    return check_conversation_export_budgets(conn, [conversation_id])[conversation_id]
+
+
+def check_conversation_export_budgets(
+    conn: sqlite3.Connection,
+    conversation_ids: Sequence[str],
+) -> dict[str, dict[str, int]]:
+    ids = [str(value) for value in conversation_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    results = {
+        conversation_id: {"node_count": 0, "input_bytes": 0, "max_node_bytes": 0, "header_bytes": 0}
+        for conversation_id in ids
+    }
+    rows = conn.execute(
+        f"""SELECT conversation_id, COUNT(*) AS node_count,
+                  COALESCE(SUM(
+                      COALESCE(length(CAST(content_text AS BLOB)), 0) +
+                      COALESCE(length(CAST(raw_message_json AS BLOB)), 0) +
+                      COALESCE(length(CAST(node_id AS BLOB)), 0) +
+                      COALESCE(length(CAST(parent_node_id AS BLOB)), 0) +
+                      COALESCE(length(CAST(children_json AS BLOB)), 0) +
+                      COALESCE(length(CAST(message_id AS BLOB)), 0) +
+                      COALESCE(length(CAST(role AS BLOB)), 0) +
+                      COALESCE(length(CAST(author_name AS BLOB)), 0) +
+                      COALESCE(length(CAST(content_type AS BLOB)), 0) +
+                      COALESCE(length(CAST(content_hash AS BLOB)), 0) +
+                      COALESCE(length(CAST(metadata_json AS BLOB)), 0)
+                  ), 0) AS input_bytes,
+                  COALESCE(MAX(
+                      COALESCE(length(CAST(content_text AS BLOB)), 0) +
+                      COALESCE(length(CAST(raw_message_json AS BLOB)), 0) +
+                      COALESCE(length(CAST(children_json AS BLOB)), 0) +
+                      COALESCE(length(CAST(metadata_json AS BLOB)), 0)
+                  ), 0) AS max_node_bytes
+            FROM conversation_nodes
+            WHERE conversation_id IN ({placeholders})
+            GROUP BY conversation_id""",
+        ids,
+    ).fetchall()
+    for row in rows:
+        results[str(row[0])].update({
+            "node_count": int(row[1] or 0),
+            "input_bytes": int(row[2] or 0),
+            "max_node_bytes": int(row[3] or 0),
+        })
+    header_rows = conn.execute(
+        f"""SELECT conversation_id,
+                  COALESCE(length(CAST(conversation_id AS BLOB)), 0) +
+                  COALESCE(length(CAST(title AS BLOB)), 0) +
+                  COALESCE(length(CAST(current_node AS BLOB)), 0) +
+                  COALESCE(length(CAST(source_file AS BLOB)), 0) +
+                  COALESCE(length(CAST(default_model_slug AS BLOB)), 0) +
+                  COALESCE(length(CAST(metadata_json AS BLOB)), 0)
+            FROM conversations WHERE conversation_id IN ({placeholders})""",
+        ids,
+    ).fetchall()
+    for row in header_rows:
+        results[str(row[0])]["header_bytes"] = int(row[1] or 0)
+    for result in results.values():
+        if result["node_count"] > MAX_EXPORT_NODES_PER_CONVERSATION:
+            raise ExportResourceLimitError("export_node_count_limit_exceeded")
+        if result["max_node_bytes"] > MAX_EXPORT_NODE_INPUT_BYTES:
+            raise ExportResourceLimitError("export_node_input_limit_exceeded")
+        if result["input_bytes"] > MAX_EXPORT_CONVERSATION_INPUT_BYTES:
+            raise ExportResourceLimitError("export_input_byte_limit_exceeded")
+        if result["header_bytes"] > MAX_EXPORT_HEADER_INPUT_BYTES:
+            raise ExportResourceLimitError("export_header_input_limit_exceeded")
+    return results
 
 
 def export_conversations(
@@ -45,49 +133,68 @@ def export_conversations(
     skipped = 0
 
     for batch_offset in range(0, len(conversations), conversation_batch_size):
-        conversation_batch = conversations[batch_offset : batch_offset + conversation_batch_size]
-        nodes_by_conversation = _nodes_for_conversation_batch(conn, conversation_batch)
-        for conv in conversation_batch:
-            nodes = prepare_export_nodes(
-                conv,
-                nodes_by_conversation.get(str(conv["conversation_id"]), []),
-                path=path,
-                include_internal=include_internal,
-            )
-            for fmt in formats:
-                rel_path = filenames[(conv["conversation_id"], fmt)]
-                output_path = out_dir / rel_path
-                text = render_markdown(conv, nodes) if fmt == "md" else render_txt(conv, nodes)
-                data = text.encode("utf-8")
-                output_hash = sha256_bytes(data)
-                changed = write_bytes_if_changed(output_path, data, force=force)
-                if changed:
-                    written += 1
-                else:
-                    skipped += 1
-                record_export(
-                    conn,
-                    conv["conversation_id"],
-                    fmt,
-                    output_path,
-                    output_hash,
-                    {
-                        "current_path_only": path == "current",
-                        "path": path,
-                        "include_internal": include_internal,
-                        "from": from_date,
-                        "to": to_date,
-                        "deterministic_export": True,
-                    },
-                )
-                manifest_rows.append(manifest_row(
+        requested_batch = conversations[batch_offset : batch_offset + conversation_batch_size]
+        budgets = check_conversation_export_budgets(
+            conn, [str(conv["conversation_id"]) for conv in requested_batch]
+        )
+        bounded_batches: list[list[sqlite3.Row]] = []
+        conversation_batch: list[sqlite3.Row] = []
+        batch_input_bytes = 0
+        for conv in requested_batch:
+            budget = budgets[str(conv["conversation_id"])]
+            if conversation_batch and batch_input_bytes + budget["input_bytes"] > MAX_EXPORT_BATCH_INPUT_BYTES:
+                bounded_batches.append(conversation_batch)
+                conversation_batch = []
+                batch_input_bytes = 0
+            conversation_batch.append(conv)
+            batch_input_bytes += budget["input_bytes"]
+        if conversation_batch:
+            bounded_batches.append(conversation_batch)
+        for conversation_batch in bounded_batches:
+            nodes_by_conversation = _nodes_for_conversation_batch(conn, conversation_batch)
+            for conv in conversation_batch:
+                nodes = prepare_export_nodes(
                     conv,
-                    fmt,
-                    rel_path,
-                    output_hash,
+                    nodes_by_conversation.get(str(conv["conversation_id"]), []),
                     path=path,
                     include_internal=include_internal,
-                ))
+                )
+                for fmt in formats:
+                    rel_path = filenames[(conv["conversation_id"], fmt)]
+                    output_path = out_dir / rel_path
+                    changed, output_hash, _output_bytes = write_chunks_if_changed(
+                        output_path,
+                        iter_rendered_conversation(conv, nodes, fmt),
+                        force=force,
+                        max_bytes=MAX_EXPORT_OUTPUT_BYTES,
+                    )
+                    if changed:
+                        written += 1
+                    else:
+                        skipped += 1
+                    record_export(
+                        conn,
+                        conv["conversation_id"],
+                        fmt,
+                        output_path,
+                        output_hash,
+                        {
+                            "current_path_only": path == "current",
+                            "path": path,
+                            "include_internal": include_internal,
+                            "from": from_date,
+                            "to": to_date,
+                            "deterministic_export": True,
+                        },
+                    )
+                    manifest_rows.append(manifest_row(
+                        conv,
+                        fmt,
+                        rel_path,
+                        output_hash,
+                        path=path,
+                        include_internal=include_internal,
+                    ))
     _validate_export_outputs(out_dir, manifest_rows, conversations, formats)
     write_manifest(out_dir, manifest_rows, force=force)
     conn.commit()
@@ -306,9 +413,18 @@ def iter_conversation_export_nodes(
 
     if path not in {"current", "all"}:
         raise ValueError("invalid_export_path")
-    batch_size = max(1, min(400, int(batch_size)))
+    check_conversation_export_budget(conn, str(conv["conversation_id"]))
+    batch_size = max(1, min(EXPORT_NODE_BATCH_SIZE, int(batch_size)))
+    if path == "all":
+        yield from _iter_all_export_nodes_keyset(
+            conn,
+            str(conv["conversation_id"]),
+            include_internal=include_internal,
+            batch_size=batch_size,
+        )
+        return
     skeletons = conn.execute(
-        """SELECT node_id, parent_node_id, children_json, is_on_current_path,
+        """SELECT node_id, parent_node_id, is_on_current_path,
                   create_time, update_time
            FROM conversation_nodes
            WHERE conversation_id = ?""",
@@ -330,6 +446,55 @@ def iter_conversation_export_nodes(
             resolved = _resolved_export_node(node, include_internal=include_internal)
             if resolved is not None:
                 yield resolved
+
+
+def _iter_all_export_nodes_keyset(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    *,
+    include_internal: bool,
+    batch_size: int,
+) -> Iterator[dict[str, Any]]:
+    """Stream all-node display order with a bounded keyset page."""
+
+    missing_expr = "CASE WHEN create_time IS NULL THEN 1 ELSE 0 END"
+    time_expr = "CASE WHEN create_time IS NOT NULL THEN create_time WHEN update_time IS NOT NULL THEN update_time ELSE 0 END"
+    last_key: tuple[int, Any, str] | None = None
+    while True:
+        params: list[Any] = [conversation_id]
+        predicate = ""
+        if last_key is not None:
+            predicate = f"""AND (
+                {missing_expr} > ? OR
+                ({missing_expr} = ? AND {time_expr} > ?) OR
+                ({missing_expr} = ? AND {time_expr} = ? AND node_id > ?)
+            )"""
+            params.extend([
+                last_key[0], last_key[0], last_key[1],
+                last_key[0], last_key[1], last_key[2],
+            ])
+        params.append(batch_size)
+        rows = conn.execute(
+            f"""SELECT *, {missing_expr} AS export_sort_missing,
+                       {time_expr} AS export_sort_time
+                FROM conversation_nodes
+                WHERE conversation_id = ? {predicate}
+                ORDER BY export_sort_missing, export_sort_time, node_id
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            resolved = _resolved_export_node(row, include_internal=include_internal)
+            if resolved is not None:
+                yield resolved
+        tail = rows[-1]
+        last_key = (
+            int(tail["export_sort_missing"]),
+            tail["export_sort_time"],
+            str(tail["node_id"]),
+        )
 
 
 def _optional_row_value(row: Any, key: str) -> Any:
@@ -406,9 +571,14 @@ def iter_rendered_conversation(
         fragment = render_node(node)
         if not fragment:
             continue
-        yield pending
+        yield from _bounded_text_chunks(pending)
         pending = fragment
-    yield pending.rstrip() + "\n"
+    yield from _bounded_text_chunks(pending.rstrip() + "\n")
+
+
+def _bounded_text_chunks(text: str, max_chars: int = 65_536) -> Iterator[str]:
+    for offset in range(0, len(text), max_chars):
+        yield text[offset : offset + max_chars]
 
 
 def render_markdown(conv: Mapping[str, Any], nodes: Iterable[Mapping[str, Any]]) -> str:

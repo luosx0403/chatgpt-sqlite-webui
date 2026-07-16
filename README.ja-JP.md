@@ -200,7 +200,7 @@ CLI と Web のエクスポートは、有効な現在パスと表示メッセ�
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
-`web-index` は、メッセージの走査と正規化、タイトル正規化、対応時の message/title trigram 構築、generation metadata 書き込み、commit を明示的で観測可能な段階として実行します。各データ段階は上限付き keyset batch を使い、各メッセージを一度だけ解決します。再構築は単一の atomic SQLite transaction 内で行われ、commit までは reader が以前の current 任意インデックスを参照します。cancel、generation/metadata failure、SQLite interrupt、disk error は置換オブジェクト全体を rollback します。大規模再構築中は writer slot を 1 つ保持し、一時 disk を使う場合があります。Web import job JSON は現在の build stage と processed/total を公開します。
+`web-index` は、メッセージの走査と正規化、タイトル正規化、対応時の message/title trigram 構築、generation metadata 書き込み、commit を明示的で観測可能な段階として実行します。各段階は上限付き keyset batch と byte budget を使い、各メッセージを一度だけ解決します。再構築は単一の atomic SQLite transaction 内で行われ、commit までは reader が以前の current 任意インデックスを参照します。generation/metadata failure、SQLite interrupt、disk error、または内部/CLI cancel callback は置換オブジェクト全体を rollback します。構築全体で `BEGIN IMMEDIATE` と writer slot を保持し、一時 disk を使う場合があります。Web import job JSON は stage と processed/total を公開しますが、独立した Web index build job や Web cancel endpoint はありません。budget 超過行は記録して canonical verifier で走査するため、index 構築によって recall は低下しません。
 
 Web UI を起動します。
 
@@ -472,7 +472,7 @@ tools/                             Delivery and support scripts
 
 メインデータベースは conversations、mapping nodes、import runs、warnings を保存します。message object だけが raw message JSON object を保持し、conversation と mapping-node object は正規化され、byte-for-byte 保存ではありません。入力 ZIP SHA-256 は任意で、`source_files`/`file_index` の entry SHA 列は予約済みですが現在は未設定です。CLI FTS テーブルは `message_fts` です。任意 Web 検索用の補助テーブルには `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram` と SQLite FTS5 shadow tables が含まれます。
 
-canonical DB は `PRAGMA user_version` で version 2 として管理されます。readonly CLI と Web request は migration DDL を実行しません。外部 backup を作成・検証してから `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db` を実行してください。完了前は health/API が `database_migration_required` を返します。FTS5 と Web 検索 index は任意で再構築可能です。
+canonical DB は `PRAGMA user_version` で version 3 として管理されます。version 3 は canonical TEXT identity に明示的な `NOT NULL` を追加します。migration は判断と再構築を同じ write-lock transaction 内で行い、NULL identity を推測せず、データベースを変更しないまま拒否します。readonly CLI と Web request は migration DDL を実行せず、古い compatible DB は migration まで `database_migration_required` で gate されます。外部 backup を作成・検証してから `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db` を実行してください。
 
 Health と `verify` は任意の `message_fts` の欠落と破損を区別します。破損時は `optional_message_fts_error` と `--rebuild-fts` の復旧ヒントを返します。一般的な malformed、locked、readonly、I/O、SQL runtime failure は能力欠落として扱わず、`database_malformed`、`database_locked`、`database_readonly`、`database_io_error`、`database_runtime_failure` を使います。
 
@@ -492,7 +492,7 @@ Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
 
-単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ有界なトップレベル配列の要素単位デコーダーと単一のインポートトランザクションを使用します。先頭の UTF-8 BOM は 1 個だけ許可し、重複・途中の BOM、UTF-16/32、混在または不正な UTF-8 は拒否します。会話とグラフの ID は Web の全アドレス指定と同じ 512 文字上限で、超過 ID は切り詰めず、内容を含まない warning として会話要素をスキップします。ZIP 読み取りでは暗号化、欠落、読み取り中の変更、CRC 失敗、その他の失敗を区別します。
+単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、上限は 128 Mi 文字です。ファイル先頭の UTF-8 BOM は 1 個だけ除去し、JSON 文字列内の U+FEFF は保持します。重複先頭 BOM、文字列外の途中 BOM、UTF-16/32、混在または不正な UTF-8 は拒否します。新しい canonical ID は 512 文字上限で切り詰めません。主要 Web アドレス指定は query-based `/api/by-id/*` で、slash や URL 記号を含む legacy ID を 16 Ki 文字まで曖昧さなく扱います。旧 path route は route-safe な 512 文字 ID 専用です。
 
 既定 message API は完全な表示本文を `display_text` 一つだけ返し、`content_text`/`render_text` を重複しません。Effective-current、pagination、around-node の意味は維持されます。
 
@@ -502,7 +502,11 @@ Release ZIP は固定 member metadata で byte-reproducible に生成し、全 p
 
 Rollback summary は `attempted_*` とゼロの `committed_*` を分離します。failed run は新しい接続で永続化し、secondary persistence failure も明示します。pre-job cleanup failure は primary HTTP code を保持し、安全な `cleanup_warning`/`cleanup_error_type` を追加します。job ID は小文字 32 桁 hex のみです。
 
-JSON は `NaN`/`Infinity` と `1e9999` のような overflow を拒否します。invalid timestamp は `NULL` と型だけの warning になります。`verify` と health は database 全体の `foreign_key_check` をストリーム処理します。total は exact、memory に保持する sample は bounded で、`foreign_key_check_complete`/`foreign_key_violations_exact` が契約を示しますが、CPU と SQLite VM work は database size に比例します。parent-cycle node と component は別々です。effective-current verify counter は conversation 単位で selected-chain と raw-flag topology の cycle/missing/cross/partial を独立して報告し、aggregate counter を selected-chain fault と誤表示しません。
+JSON は `NaN`/`Infinity` と `1e9999` のような overflow を拒否します。invalid timestamp は `NULL` と型だけの warning になります。通常の CLI/Web read と既定の `/api/health` は bounded schema gate のみを実行し、`foreign_key_check` は行いません。`verify` と `/api/health?deep=true` が全 database check を stream 処理します。total は exact、sample は bounded で、mode、完了時刻、generation、stale fields が契約を示しますが、CPU/VM work は database size に比例します。
+
+長い表示本文は revision-bound opaque cursor と SQLite incremental BLOB read を使います。numeric offset の compatibility scan は 1,048,576 文字までで、それ以降は cursor が必要です。raw preview は NUL-safe な bounded BLOB query 1 回で、byte size と exact 状態を返します。visible NUL と孤立 surrogate は一貫して U+FFFD、raw JSON は安全な escape のままです。検索結果 scalar は明示的な表示 budget と truncation/元 length metadata を持ち、ID は切り詰めません。
+
+CLI/Web conversation export は、materialize 前に 100,000 node、1 node の canonical/raw input 32 MiB、conversation input 合計 128 MiB を超える処理を拒否し、stream output は 256 MiB 上限です。effective-current の online materialization も conversation ごとに 100,000 node と graph ID input 128 MiB が上限です。CLI は同じ target directory の temporary file に分割書き込みし、hash と旧 file の streaming 比較を同時に行い、変更時だけ atomic replace します。browser copy は `ReadableStream` を使い、16 MiB UTF-8 または 8 Mi 文字を超えると clipboard write 前に中止して Download を案内し、partial text は書き込みません。
 
 message search page は常に `total_exact` を返します。empty DB または決定的な empty は true、通常の `count_total=false` probe は false で、conversation page はこの field を保証しません。around metadata は found、effective membership、requested membership、visible、applied を分離します。有界な valid raw text fallback は reader/search/highlight/copy/CLI/Web export で共通です。invalid、oversized、実際の non-text raw は placeholder のままです。
 

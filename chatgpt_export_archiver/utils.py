@@ -9,7 +9,7 @@ import tempfile
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -68,6 +68,73 @@ def write_bytes_if_changed(path: Path, data: bytes, force: bool = False) -> bool
                 pass
 
 
+def write_chunks_if_changed(
+    path: Path,
+    chunks: Iterable[str | bytes],
+    *,
+    force: bool = False,
+    max_bytes: int,
+) -> tuple[bool, str, int]:
+    """Atomically publish bounded streamed bytes while preserving unchanged mtimes.
+
+    The candidate is written and hashed once.  When an old regular file exists,
+    it is compared incrementally during that write; identical output discards the
+    temporary candidate instead of replacing the old inode.
+    """
+
+    if max_bytes < 0:
+        raise ValueError("invalid_stream_byte_budget")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = None
+    old_matches = not force
+    try:
+        if old_matches:
+            old = path.open("rb")
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        old = None
+        old_matches = False
+    fd: int | None = None
+    tmp_name: str | None = None
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "wb") as candidate:
+            fd = None
+            for chunk in chunks:
+                payload = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
+                total += len(payload)
+                if total > max_bytes:
+                    raise ValueError("export_output_byte_limit_exceeded")
+                candidate.write(payload)
+                digest.update(payload)
+                if old_matches and old is not None:
+                    if old.read(len(payload)) != payload:
+                        old_matches = False
+            if old_matches and old is not None and old.read(1) != b"":
+                old_matches = False
+            candidate.flush()
+            os.fsync(candidate.fileno())
+        output_hash = digest.hexdigest()
+        if old_matches:
+            os.unlink(tmp_name)
+            tmp_name = None
+            return False, output_hash, total
+        os.replace(tmp_name, path)
+        tmp_name = None
+        return True, output_hash, total
+    finally:
+        if old is not None:
+            old.close()
+        if fd is not None:
+            os.close(fd)
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+
 def _file_matches_bytes(path: Path, data: bytes, chunk_size: int = 1024 * 1024) -> bool:
     """Compare an existing file without reading the old payload all at once."""
 
@@ -97,7 +164,9 @@ def canonical_json(value: Any) -> str:
 
 
 def compact_json(value: Any, max_chars: int | None = None) -> str:
-    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    # ASCII escaping preserves raw JSON semantics while ensuring isolated
+    # surrogates never reach SQLite's UTF-8 binder.
+    text = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
     if max_chars is not None and len(text) > max_chars:
         return text[:max_chars] + "...[truncated]"
     return text

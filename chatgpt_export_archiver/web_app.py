@@ -15,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from .web_api import WebTrustPolicy, create_api_router
 from .web_jobs import ImportJobManager
 from .sqlite_errors import sqlite_runtime_error_code
+from .current_path import EffectiveCurrentResourceLimitError
+from .exporter import ExportResourceLimitError
 
 
 class _UploadBodyTooLarge(Exception):
@@ -384,6 +386,14 @@ def create_app(
             status_code=status,
             content={"detail": {"code": code, "error_type": type(exc).__name__}},
         )
+
+    @app.exception_handler(EffectiveCurrentResourceLimitError)
+    async def effective_current_limit_response(_request, exc: EffectiveCurrentResourceLimitError):
+        return FiniteJSONResponse(status_code=413, content={"detail": exc.code})
+
+    @app.exception_handler(ExportResourceLimitError)
+    async def export_limit_response(_request, exc: ExportResourceLimitError):
+        return FiniteJSONResponse(status_code=413, content={"detail": exc.code})
 
     app.include_router(create_api_router(db_path, manager, upload_policy=upload_policy, trust_policy=trust_policy))
     from .web_api import upload_body_limit

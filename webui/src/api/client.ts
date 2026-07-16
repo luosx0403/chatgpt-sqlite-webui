@@ -126,7 +126,7 @@ export function getConversations(args: {
 }
 
 export function getConversation(id: string, signal?: AbortSignal): Promise<ConversationSummary> {
-  return request<ConversationSummary>(`/api/conversations/${encodeURIComponent(id)}`, signal);
+  return request<ConversationSummary>(`/api/by-id/conversation?${params({ conversation_id: id })}`, signal);
 }
 
 export function getMessages(args: {
@@ -158,7 +158,7 @@ export function getMessages(args: {
     source: args.filters?.source,
     match_mode: args.matchMode
   });
-  return request<MessagePage>(`/api/conversations/${encodeURIComponent(args.id)}/messages?${query}`, args.signal);
+  return request<MessagePage>(`/api/by-id/messages?${params({ conversation_id: args.id })}&${query}`, args.signal);
 }
 
 export function getMessageHits(args: {
@@ -195,8 +195,31 @@ export function getMessageHits(args: {
 }
 
 export function exportUrl(id: string, format: "md" | "txt", path: PathMode, includeInternal = false): string {
-  const query = params({ format, path, include_internal: includeInternal });
-  return `/api/conversations/${encodeURIComponent(id)}/export?${query}`;
+  const query = params({ conversation_id: id, format, path, include_internal: includeInternal });
+  return `/api/by-id/export?${query}`;
+}
+
+export const MAX_BROWSER_COPY_BYTES = 16 * 1024 * 1024;
+export const MAX_BROWSER_COPY_CHARS = 8 * 1024 * 1024;
+
+export class CopyLimitError extends Error {
+  constructor() {
+    super("copy_limit_exceeded");
+    this.name = "CopyLimitError";
+  }
+}
+
+export class IncompleteDisplayRecoveryError extends Error {
+  constructor() {
+    super("display_recovery_incomplete");
+    this.name = "IncompleteDisplayRecoveryError";
+  }
+}
+
+export function assertBrowserCopyLimit(text: string): void {
+  if (text.length > MAX_BROWSER_COPY_CHARS || new TextEncoder().encode(text).byteLength > MAX_BROWSER_COPY_BYTES) {
+    throw new CopyLimitError();
+  }
 }
 
 export async function getConversationCopyText(
@@ -205,17 +228,45 @@ export async function getConversationCopyText(
   includeInternal = false,
   signal?: AbortSignal,
 ): Promise<string> {
-  const query = params({ path, include_internal: includeInternal });
-  const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/copy?${query}`, {
+  const query = params({ conversation_id: id, path, include_internal: includeInternal });
+  const response = await fetch(`/api/by-id/copy?${query}`, {
     signal,
     headers: { Accept: "text/plain" },
   });
   if (!response.ok) throw await responseError(response);
-  return response.text();
+  if (!response.body) throw new CopyLimitError();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let bytes = 0;
+  let chars = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_BROWSER_COPY_BYTES) throw new CopyLimitError();
+      const part = decoder.decode(value, { stream: true });
+      chars += part.length;
+      if (chars > MAX_BROWSER_COPY_CHARS) throw new CopyLimitError();
+      parts.push(part);
+    }
+    const tail = decoder.decode();
+    chars += tail.length;
+    if (chars > MAX_BROWSER_COPY_CHARS) throw new CopyLimitError();
+    parts.push(tail);
+    return parts.join("");
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal, maxChars = 50000): Promise<RawMessageResponse> {
-  return request<RawMessageResponse>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/raw?max_chars=${maxChars}`, signal);
+  const query = params({ conversation_id: conversationId, node_id: nodeId, max_chars: maxChars });
+  return request<RawMessageResponse>(`/api/by-id/raw?${query}`, signal);
 }
 
 export function getMessageDisplayChunk(
@@ -224,9 +275,10 @@ export function getMessageDisplayChunk(
   offset = 0,
   limit = 65536,
   signal?: AbortSignal,
+  cursor?: string | null,
 ): Promise<DisplayTextChunk> {
-  const query = params({ offset, limit });
-  return request<DisplayTextChunk>(`/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(nodeId)}/display?${query}`, signal);
+  const query = params({ conversation_id: conversationId, node_id: nodeId, offset, limit, cursor });
+  return request<DisplayTextChunk>(`/api/by-id/display?${query}`, signal);
 }
 
 export async function uploadImportZip(file: File, signal?: AbortSignal): Promise<ImportJob> {

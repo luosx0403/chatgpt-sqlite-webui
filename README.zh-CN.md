@@ -200,7 +200,7 @@ CLI 与 Web 导出默认使用有效当前路径，并且只包含可见消息�
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
-`web-index` 会按明确且可观察的阶段扫描并规范化消息、规范化标题、在支持时构建消息/标题 trigram 索引、写入 generation metadata，最后提交。每个数据阶段都使用有界 keyset 批次，并且每条消息只解析一次。重建位于单个原子 SQLite transaction 中：提交前，reader 继续看到旧的 current 可选索引；取消、generation/metadata 失败、SQLite 中断或磁盘错误会回滚全部替换对象。这个设计会在大型重建期间占用一个 writer slot，并可能使用临时磁盘；Web import job JSON 会报告当前构建阶段和 processed/total。
+`web-index` 会按明确且可观察的阶段扫描并规范化消息、规范化标题、在支持时构建消息/标题 trigram 索引、写入 generation metadata，最后提交。每个数据阶段都使用有界 keyset 批次和字节预算，并且每条消息只解析一次。重建位于单个原子 SQLite transaction 中：提交前，reader 继续看到旧的 current 可选索引；generation/metadata 失败、SQLite 中断、磁盘错误或内部/CLI 取消回调会回滚全部替换对象。这个设计会在完整构建期间持有 `BEGIN IMMEDIATE`、占用一个 writer slot，并可能使用临时磁盘。Web import job JSON 会报告当前构建阶段和 processed/total，但本版本没有独立 Web 索引构建任务或 Web 取消接口。超预算行会记录到专用表并由 canonical verifier 扫描，构建索引不会降低搜索召回率。
 
 启动 Web UI：
 
@@ -472,7 +472,7 @@ tools/                             交付检查和辅助脚本
 
 主数据库保存 conversations、mapping nodes、import runs 和 warnings。message object 的 raw JSON 字段按完整对象保留；conversation 和 mapping-node object 会规范化，不做逐字节原样保存。输入 ZIP SHA-256 是可选项，`source_files`/`file_index` 的逐 entry SHA 列为保留字段，目前不填充。CLI FTS 表是 `message_fts`。可选 Web 搜索辅助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-canonical 数据库使用 `PRAGMA user_version` 版本化（当前版本 2）。只读命令和 Web 请求绝不执行 migration DDL。升级旧库前先创建并验证外部备份，再运行 `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`；import writer 可在事务内升级可迁移数据库。完成前 health/API 返回 `database_migration_required`。FTS5 `message_fts` 与 Web 搜索表是可选、可重建能力，不属于 canonical 数据。
+canonical 数据库使用 `PRAGMA user_version` 版本化（当前版本 3）。版本 3 为 canonical TEXT identity 增加显式 `NOT NULL`；迁移只在同一写锁事务内判断和重建，发现 NULL identity 会保持数据库不变并拒绝猜测修复。旧的兼容数据库在迁移前由只读接口返回 `database_migration_required`。升级前先创建并验证外部备份。
 
 Health 与 `verify` 会区分可选 `message_fts` 缺失和损坏。损坏时报告 `optional_message_fts_error` 与 `--rebuild-fts` 恢复提示；通用的 malformed、locked、readonly、I/O 和 SQL 运行时错误不会被伪装成能力缺失，并使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
@@ -492,7 +492,7 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、显式 loopback bind 
 
 导入失败使用稳定的输入预检、source scan、source read、JSON decode、顶层契约和事务阶段。新增稳定 code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding` 和 `json_integer_too_large`。清理诊断使用结构化 `cleanup_warnings` 数组；旧 `cleanup_warning` 标量仅代表首项。任何响应都不泄漏临时路径。
 
-独立 JSON、目录成员和 ZIP 成员使用同一个有界、逐顶层数组元素的解码器，并处于同一导入事务。只接受文件开头恰好一个 UTF-8 BOM；重复或中间 BOM、UTF-16/32、混合编码和无效 UTF-8 都会拒绝。会话及图结构 ID 统一限制为 512 个字符，与全部 Web 寻址参数一致；超长 ID 会以不含内容的 warning 跳过该会话元素，绝不截断。ZIP source-read 会区分加密、缺失、读取期间变化、CRC 失败及其他读取失败。
+独立 JSON、目录成员和 ZIP 成员使用同一个单遍、逐顶层数组元素的解码器，并处于同一导入事务；每个元素只扫描和解码一次，最大 128 Mi 字符。只移除文件开头的一个 UTF-8 BOM；JSON 字符串内的 U+FEFF 会保留，重复开头 BOM、字符串外的中间 BOM、UTF-16/32、混合编码和无效 UTF-8 都会拒绝。新导入的 canonical 会话及图结构 ID 限制为 512 个字符，超长 ID 会以不含内容的 warning 跳过该会话元素，绝不截断。主要 Web 寻址使用 query-based `/api/by-id/*`，可无歧义接受最多 16 Ki 字符的 legacy ID（包括 slash、问号、井号、百分号和 Unicode）；旧 path route 只保留给 route-safe 的 512 字符 ID。ZIP source-read 会区分加密、缺失、读取期间变化、CRC 失败及其他读取失败。
 
 非标准 JSON `NaN` / `Infinity` 会被拒绝；字符串形式的非有限时间写成 `NULL` 并记录 warning。默认 message API 只返回一份完整用户正文 `display_text`，不再复制 `content_text`/`render_text` 别名。`verify` 会检测旧库非有限时间；effective-current、分页和 around-node 语义保持不变。
 
@@ -502,7 +502,11 @@ Release ZIP 使用固定 member metadata 与确定顺序，同一 payload 可生
 
 回滚摘要用 `attempted_*` 与归零的 `committed_*` 区分已尝试和已提交工作；失败 run 用新连接持久化，并明确报告二次持久化失败。pre-job 临时目录清理失败保留主要 HTTP 错误，同时返回安全的 `cleanup_warning`/`cleanup_error_type`。job 查询只接受 32 位小写十六进制 ID。
 
-JSON 会拒绝 `NaN`/`Infinity` 和 `1e9999` 等溢出数；无效 timestamp 写入 `NULL` 并产生只含字段与值类型的 warning。`verify` 与 health 会流式执行完整的全库 `foreign_key_check`：总数精确，内存只保留有界 sample，并用 `foreign_key_check_complete`/`foreign_key_violations_exact` 明确契约；CPU 与 SQLite VM 工作量仍随数据库大小增长。parent-cycle 节点数与 component 数继续分开。effective-current verify counter 以会话为单位，独立报告 selected-chain 与 raw-flag topology 的 cycle/missing/cross/partial，aggregate counter 不再误标为 selected-chain 问题。
+JSON 会拒绝 `NaN`/`Infinity` 和 `1e9999` 等溢出数；无效 timestamp 写入 `NULL` 并产生只含字段与值类型的 warning。普通 CLI/Web 读取和默认 `/api/health` 只执行有界 schema gate，不运行 `foreign_key_check`；`verify` 与 `/api/health?deep=true` 才会流式执行完整全库检查。总数精确，内存只保留有界 sample，并用完整性模式、完成时间、generation 与 stale 字段说明结果；CPU 与 SQLite VM 工作量仍随数据库大小增长。parent-cycle 节点数与 component 数继续分开。effective-current verify counter 以会话为单位，独立报告 selected-chain 与 raw-flag topology 的 cycle/missing/cross/partial，aggregate counter 不再误标为 selected-chain 问题。
+
+长消息正文通过绑定内容 revision 的 opaque cursor 与 SQLite 增量 BLOB 读取分页；数字 offset 兼容扫描最多 1,048,576 字符，之后必须使用 cursor。raw preview 用一次可处理 NUL 的有界 BLOB 查询，并报告字节大小及其是否精确。可见文本中的 NUL 与孤立 surrogate 一致替换为 U+FFFD，raw JSON 保持安全转义。搜索结果中的 title/source/role/author/content-type 等标量有明确显示预算及 truncation/原长度元数据，ID 不会截断。
+
+CLI 与 Web 会话导出在物化前实施固定总边界：每个会话最多 100,000 个 node、单 node canonical/raw 输入最多 32 MiB、会话输入合计最多 128 MiB，流式输出最多 256 MiB；effective-current 在线物化同样限制为每会话 100,000 node 与 128 MiB 图 ID 输入。CLI 在目标目录分块写临时文件，同时计算哈希并流式比较旧文件，只原子替换变化内容。浏览器复制通过 `ReadableStream` 读取，超过 16 MiB UTF-8 或 8 Mi 字符就会在写剪贴板前取消并提示使用下载，绝不会复制 partial text。
 
 message search page 始终包含 `total_exact`；空库或可确定为空时为 true，`count_total=false` 的普通探测为 false；conversation page 不承诺该字段。around metadata 分开表示 found、effective-current membership、requested-path membership、visible 与 applied。空 canonical 或 legacy placeholder 可从有界、有效的 raw text 恢复，reader、两类搜索、highlight、copy、CLI/Web export 使用同一 resolver；非法、过大或真实非文本 raw 保持 placeholder。
 
