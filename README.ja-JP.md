@@ -87,6 +87,8 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
+Python 3.12 constraints ファイルは解決済み Web 依存関係の全バージョンを固定しますが、クロスプラットフォームの hash lock ではありません。将来のリリース手順では、対応する Python/OS マトリクスごとの hash を生成・検証する必要があります。それまでは信頼できる package index のみを利用し、npm lockfile と audit を別個のフロントエンド制御として維持してください。
+
 ## クイックスタート
 
 ChatGPT エクスポート ZIP をリポジトリの外に置き、最速で安全なインポートコマンドを実行します。このコマンドは入力ハッシュ計算を省略し、最後に FTS を一度だけ再構築します。大きなアーカイブでは、行ごとに FTS を保守するよりかなり高速です。
@@ -216,6 +218,8 @@ python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_Z
 
 入力は ZIP、単体の `conversations.json`、または `conversations.json` か sharded `conversations-*.json` ファイルを含む展開済みディレクトリにできます。scanner discovery は `__MACOSX`、AppleDouble `._*` ファイル、`.DS_Store` などの macOS metadata paths を無視するため、これらのローカル artifact が conversation source になることはありません。
 
+ディレクトリ入力では、POSIX プラットフォームは利用可能な場合に各 component を `dir_fd` と `O_NOFOLLOW` で開きます。portable fallback は symlink/reparse component を拒否し、パスによる open の直前に containment を検証しますが、Python 標準ライブラリだけでは全プラットフォームのローカル replacement race を完全には排除できません。信頼できないローカルユーザーや並行プロセスが変更できる展開済みディレクトリをインポートせず、この脅威モデルでは元の読み取り専用 ZIP を使用してください。
+
 インポート後に SQLite の planner statistics と FTS インデックスをさらに整理したい場合は、次を使います。
 
 ```bash
@@ -252,6 +256,8 @@ reader が `around_node_id` でヒットへ移動する場合は、reader と同
 
 Web アップロードインポートが成功すると、バックエンドは CLI と同じコア import pipeline を使い、その後 `verify`、`stats`、`web-index` を実行します。アップロードされた ZIP はサーバー側の一時コピーであり、ディスク上の元ファイルとは独立して削除されます。
 
+preflight failure と terminal import job は複数の `cleanup_warnings` を返す場合があります。React UI は各 safe warning code と `path_kind` を localized user text で表示し、deprecated single `cleanup_warning` fallback も維持します。一時 path、filename、OS message、error class detail は表示せず、polling は同じ job snapshot を置換するため warning を重複追加しません。
+
 ビルド済み React アプリを提供できない場合の fallback HTML は、機能を限定した緊急 UI であり、完全な reader の代替ではありません。検索/reader 操作は少なく、download は明示指定しない限り internal node を除外します。完全な UI には `webui/dist` を再ビルドしてください。
 
 ## Web アップロードの安全制限
@@ -259,6 +265,8 @@ Web アップロードインポートが成功すると、バックエンドは 
 Web アップロードは、インポート job の開始前にアプリケーションレベルの安全制限を適用します。これらは環境変数で制御され、CLI の `import`（これらの制限を使用しません）とは独立しています。
 
 Web アップロードは、ファイル読み取り前に pending slot を予約するため、大きなアップロードが別の writer と競合することはありません。その予約後のあらゆるエラー、たとえば一時アップロードパスの作成失敗では、slot を解放し、サーバー側の一時ディレクトリを削除する必要があります。成功した import job は slot と一時コピーを引き継ぎます。
+
+process kill、OOM、または host crash は通常の cleanup を回避し、OS の一時ディレクトリに古い `chatgpt-archive-upload-*` ディレクトリを残す場合があります。本リリースは ownership/age の誤判定による無関係なデータ削除を避けるため、自動削除しません。サーバー停止後、管理者は正確な prefix、現在のアカウントの ownership、経過時間、symlink/reparse point がないこと、使用中 job がないことを確認した個別の古いディレクトリだけを削除できます。ユーザーの export ZIP や未確認 wildcard は絶対に削除しないでください。
 
 Web UI が loopback アドレス（`127.0.0.1`、`localhost`、`::1`）にバインドされている場合、デフォルトで大規模な信頼できるアーカイブを許可します：
 
@@ -373,6 +381,8 @@ python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```bash
 python chatgpt_archive.py verify --db archive/chatgpt_archive.db
 ```
+
+`message_fts_rebuildable` は定数ではなく実際の runtime capability です。FTS missing かつ FTS5 available なら `missing` と rebuildable true、FTS5 module unavailable なら `capability_unavailable` と rebuildable false、damaged table なら `damaged` を返し、rebuildability は同じ bounded runtime probe で決まります。その他の SQLite error は structured database error classifier に伝播します。
 
 `PRAGMA integrity_check` が `web_message_trigram` または `web_title_trigram` の FTS5 inverted index 破損を報告した場合、コアの会話データは構造的に有効で、任意の Web 検索インデックスだけが壊れている可能性があります。その場合、`verify` は `optional_web_index_error true` と復旧ヒントを表示します。任意 Web インデックスは次で再構築します。
 
@@ -492,7 +502,7 @@ Release ZIP は固定 member metadata で byte-reproducible に生成し、全 p
 
 Rollback summary は `attempted_*` とゼロの `committed_*` を分離します。failed run は新しい接続で永続化し、secondary persistence failure も明示します。pre-job cleanup failure は primary HTTP code を保持し、安全な `cleanup_warning`/`cleanup_error_type` を追加します。job ID は小文字 32 桁 hex のみです。
 
-JSON は `NaN`/`Infinity` と `1e9999` のような overflow を拒否します。invalid timestamp は `NULL` と型だけの warning になります。`verify` は `foreign_key_check` を実行し、parent-cycle node と component を別々に数えます。effective-current は selected-chain と raw-flag の cycle/missing/cross-parent を分離します。
+JSON は `NaN`/`Infinity` と `1e9999` のような overflow を拒否します。invalid timestamp は `NULL` と型だけの warning になります。`verify` と health は database 全体の `foreign_key_check` をストリーム処理します。total は exact、memory に保持する sample は bounded で、`foreign_key_check_complete`/`foreign_key_violations_exact` が契約を示しますが、CPU と SQLite VM work は database size に比例します。parent-cycle node と component は別々です。effective-current verify counter は conversation 単位で selected-chain と raw-flag topology の cycle/missing/cross/partial を独立して報告し、aggregate counter を selected-chain fault と誤表示しません。
 
 message search page は常に `total_exact` を返します。empty DB または決定的な empty は true、通常の `count_total=false` probe は false で、conversation page はこの field を保証しません。around metadata は found、effective membership、requested membership、visible、applied を分離します。有界な valid raw text fallback は reader/search/highlight/copy/CLI/Web export で共通です。invalid、oversized、実際の non-text raw は placeholder のままです。
 

@@ -87,6 +87,8 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
+El archivo de constraints para Python 3.12 fija todas las versiones resueltas de las dependencias Web, pero no es un hash lock multiplataforma. Un flujo de publicación futuro debería generar y verificar hashes específicos para la matriz Python/SO admitida; hasta entonces, instala solo desde un índice de paquetes de confianza y conserva el lockfile de npm y las auditorías como controles independientes del frontend.
+
 ## Inicio rápido
 
 Coloca el ZIP exportado por ChatGPT fuera del repositorio y ejecuta el comando de importación seguro más rápido. Omite el hash de entrada y reconstruye FTS una sola vez al final, lo que suele ser mucho más rápido en archivos grandes que mantener FTS fila por fila.
@@ -216,6 +218,8 @@ python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_Z
 
 La entrada puede ser un ZIP, un `conversations.json` suelto o un directorio extraído que contenga `conversations.json` o archivos sharded `conversations-*.json`. Scanner discovery ignora macOS metadata paths como `__MACOSX`, archivos AppleDouble `._*` y `.DS_Store`, por lo que esos artifact locales no se convierten en conversation source.
 
+Para entradas de directorio, las plataformas POSIX usan `dir_fd` y `O_NOFOLLOW` componente por componente cuando están disponibles. El fallback portable rechaza componentes symlink/reparse y verifica containment inmediatamente antes de abrir por ruta, pero la biblioteca estándar de Python no puede eliminar todas las carreras de reemplazo local en cada plataforma. No importes un directorio extraído que un usuario local no confiable o un proceso concurrente pueda modificar; usa el ZIP original de solo lectura para ese modelo de amenaza.
+
 Si quieres que SQLite dedique tiempo adicional a ordenar estadísticas del planner y el índice FTS después de importar, usa:
 
 ```bash
@@ -252,6 +256,8 @@ La Web UI puede usarse de dos formas. Si la base de datos ya existe, pásala de 
 
 Tras una importación Web correcta, el backend ejecuta el mismo import pipeline que la CLI y luego ejecuta `verify`, `stats` y `web-index`. El ZIP subido es una copia temporal del lado del servidor y se limpia de forma independiente del archivo original en tu disco.
 
+Los fallos preflight y los trabajos terminales pueden devolver varios `cleanup_warnings`. La React UI muestra cada warning code seguro y cada `path_kind` con texto localizado, y conserva el fallback obsoleto `cleanup_warning`. No muestra rutas temporales, nombres de archivo, mensajes del SO ni detalles de clases de error; cada polling reemplaza el snapshot del mismo trabajo en vez de añadir avisos duplicados.
+
 Si no puede servirse la app React preconstruida, el fallback HTML es una interfaz de emergencia deliberadamente limitada, no un sustituto del reader completo. Tiene menos controles y las descargas excluyen nodos internal salvo petición explícita. Reconstruye `webui/dist` para la UI completa.
 
 ## Límites de seguridad de subida Web
@@ -259,6 +265,8 @@ Si no puede servirse la app React preconstruida, el fallback HTML es una interfa
 Las subidas Web aplican límites de seguridad a nivel de aplicación antes de iniciar el job de importación. Estos se controlan mediante variables de entorno y son independientes del `import` de CLI (que no usa estos límites).
 
 La subida Web reserva un pending slot antes de leer el archivo para que una subida grande no compita con otro writer. Cualquier error posterior a esa reserva, incluida una falla al crear la ruta temporal de subida, debe liberar el slot y limpiar el directorio temporal del servidor; un import job iniciado correctamente toma posesión del slot y de la copia temporal.
+
+Un kill del proceso, OOM o fallo del host puede omitir la limpieza normal y dejar un directorio antiguo `chatgpt-archive-upload-*` en el directorio temporal del sistema operativo. Esta versión no los elimina automáticamente porque un error de ownership/age podría borrar datos ajenos. Con el servidor detenido, un administrador solo puede borrar individualmente un directorio antiguo tras comprobar el prefijo exacto, la propiedad de la cuenta actual, su antigüedad, la ausencia de symlinks/reparse points y que ningún job lo use; nunca debe borrar el ZIP exportado por el usuario ni usar un wildcard sin verificar.
 
 Cuando la Web UI está enlazada a una dirección loopback (`127.0.0.1`, `localhost`, `::1`), los valores por defecto permiten archivos grandes de confianza:
 
@@ -373,6 +381,8 @@ Si ejecutas manualmente `VACUUM`, `VACUUM INTO` o reescribes la base SQLite con 
 ```bash
 python chatgpt_archive.py verify --db archive/chatgpt_archive.db
 ```
+
+`message_fts_rebuildable` es una capacidad runtime real, no una constante: si falta FTS pero FTS5 está disponible informa `missing` y rebuildable true; sin módulo FTS5 informa `capability_unavailable` y false; una tabla dañada informa `damaged`, y la reconstrucción depende del mismo probe runtime acotado. Los demás errores SQLite se propagan al clasificador estructurado de base de datos.
 
 Si `PRAGMA integrity_check` informa de un inverted index FTS5 malformado en `web_message_trigram` o `web_title_trigram`, los datos principales de conversación pueden seguir siendo estructuralmente válidos mientras que el índice opcional de búsqueda Web está dañado. En ese caso `verify` informa `optional_web_index_error true` y muestra una pista de recuperación. Reconstruye los índices Web opcionales con:
 
@@ -492,7 +502,7 @@ El Release ZIP usa metadata fija para bytes reproducibles, verifica el manifest 
 
 El resumen de rollback separa `attempted_*` de `committed_*` en cero. Un run fallido se persiste con una conexión nueva y se informa cualquier fallo secundario. Un fallo de limpieza pre-job conserva el error HTTP principal y añade `cleanup_warning`/`cleanup_error_type` seguros. Los ID de job solo aceptan 32 caracteres hexadecimales en minúscula.
 
-JSON rechaza `NaN`/`Infinity` y desbordamientos como `1e9999`. Un timestamp inválido se guarda como `NULL` con warning que contiene solo campo y tipo. `verify` ejecuta `foreign_key_check`, cuenta por separado nodos y componentes de parent-cycle, y effective-current separa diagnósticos selected-chain y raw-flag.
+JSON rechaza `NaN`/`Infinity` y desbordamientos como `1e9999`. Un timestamp inválido se guarda como `NULL` con warning que contiene solo campo y tipo. `verify` y health procesan en stream un `foreign_key_check` completo de toda la base: el total es exacto, solo se conserva una sample acotada en memoria y `foreign_key_check_complete`/`foreign_key_violations_exact` declaran el contrato; el coste de CPU y SQLite VM crece con la base. Los nodos y componentes parent-cycle siguen separados. Los counters effective-current usan conversaciones como unidad y separan cycle/missing/cross/partial de selected-chain y raw-flag topology; un aggregate counter no se etiqueta como fallo selected-chain.
 
 Una página de message search siempre incluye `total_exact`: es true para DB vacía o resultado determinísticamente vacío, y false para un probe normal con `count_total=false`; conversation page no promete ese campo. Around metadata separa found, pertenencia effective-current, pertenencia requested-path, visible y applied. El fallback raw de texto válido está acotado y es común a reader, búsquedas, highlight, copy y export CLI/Web; raw inválido, sobredimensionado o realmente no textual conserva el placeholder.
 

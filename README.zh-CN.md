@@ -87,6 +87,8 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
+Python 3.12 constraints 文件会固定所有已解析 Web 依赖的版本，但它不是跨平台 hash lock。后续发布流程应为支持的 Python/OS 矩阵生成并校验各平台 hash；在此之前，只应从可信包索引安装，并把 npm lockfile 与 audit 检查作为独立的前端控制。
+
 ## 快速开始
 
 把 ChatGPT 导出 ZIP 放在仓库外部，然后运行最快的安全导入命令。这个命令跳过输入哈希，并在导入末尾一次性重建 FTS；对大型归档来说，比逐条维护 FTS 快得多。
@@ -216,6 +218,8 @@ python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_Z
 
 输入可以是 ZIP、单个 `conversations.json`，或包含 `conversations.json` 或分片 `conversations-*.json` 文件的解压目录。scanner discovery 会忽略 `__MACOSX`、AppleDouble `._*` 文件和 `.DS_Store` 等 macOS metadata paths，因此这些本地 artifact 不会成为 conversation source。
 
+对于目录输入，POSIX 平台会在可用时逐 component 使用 `dir_fd` 与 `O_NOFOLLOW`。便携 fallback 会拒绝 symlink/reparse component，并在按路径打开前立即校验 containment，但 Python 标准库无法在所有平台消除所有本地 replacement race。不要导入不可信本地用户或并发进程可修改的解压目录；此威胁模型应使用原始只读 ZIP。
+
 如果你愿意让 SQLite 在导入后额外花时间整理 planner statistics 和 FTS 索引，可以使用：
 
 ```bash
@@ -252,6 +256,8 @@ Web UI 有两种使用方式。如果数据库已经存在，可以显式传入�
 
 Web 上传导入成功后，后端使用与 CLI 相同的核心 import pipeline，然后运行 `verify`、`stats` 和 `web-index`。上传 ZIP 是服务端临时副本，会独立于你磁盘上的原始文件进行清理。
 
+预检失败与终态导入任务都可能返回多个 `cleanup_warnings`。React UI 会把每个安全 warning code 与 `path_kind` 显示为本地化用户文案，同时兼容已弃用的单值 `cleanup_warning`。这些提示不会显示临时路径、文件名、OS message 或 error class；重复轮询会替换同一任务快照，不会追加重复提示。
+
 如果无法提供预构建 React 应用，服务端 fallback HTML 只是功能受限的紧急界面，并非完整 reader 的替代品。它的搜索和阅读控制较少，下载默认排除 internal node；要使用完整 UI，请重新构建 `webui/dist`。
 
 ## Web 上传安全限制
@@ -259,6 +265,8 @@ Web 上传导入成功后，后端使用与 CLI 相同的核心 import pipeline�
 Web 上传在导入 job 启动前执行应用层安全限制。这些限制由环境变量控制，与 CLI `import` 无关（CLI 不使用这些限制）。
 
 Web 上传会在读取文件前先保留 pending slot，因此大型上传不能与另一个 writer 竞争。从保留 slot 之后发生的任何错误，包括临时上传路径创建失败，都必须释放 slot 并清理服务端临时目录；成功启动的 import job 会接管 slot 和临时副本。
+
+进程被 kill、OOM 或宿主崩溃可能绕过正常清理，在操作系统临时目录遗留旧的 `chatgpt-archive-upload-*` 目录。本版本不会自动删除它们，因为 ownership/age 判断错误可能删除无关数据。停止服务器后，管理员只能在确认精确前缀、当前账号 ownership、目录年龄、没有 symlink/reparse point 且没有任务使用后，逐个删除旧目录；绝不能删除用户导出 ZIP，也不要使用未经检查的 wildcard。
 
 当 Web UI 绑定到 loopback 地址（`127.0.0.1`、`localhost`、`::1`）时，默认允许大型可信归档：
 
@@ -373,6 +381,8 @@ python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```bash
 python chatgpt_archive.py verify --db archive/chatgpt_archive.db
 ```
+
+`message_fts_rebuildable` 来自真实 runtime capability，而不是常量：FTS 缺失但 FTS5 可用时报告 `missing` 且可重建；FTS5 模块不可用时报告 `capability_unavailable` 且不可重建；表损坏时报告 `damaged`，是否可重建仍由同一有界 runtime probe 决定。其他 SQLite 错误会交给结构化数据库错误分类器。
 
 如果 `PRAGMA integrity_check` 报告 `web_message_trigram` 或 `web_title_trigram` 的 FTS5 inverted index 损坏，核心会话数据仍可能是结构正常的，只是可选 Web 搜索索引损坏。此时 `verify` 会报告 `optional_web_index_error true` 并打印恢复提示。用下面的命令重建可选 Web 索引：
 
@@ -492,7 +502,7 @@ Release ZIP 使用固定 member metadata 与确定顺序，同一 payload 可生
 
 回滚摘要用 `attempted_*` 与归零的 `committed_*` 区分已尝试和已提交工作；失败 run 用新连接持久化，并明确报告二次持久化失败。pre-job 临时目录清理失败保留主要 HTTP 错误，同时返回安全的 `cleanup_warning`/`cleanup_error_type`。job 查询只接受 32 位小写十六进制 ID。
 
-JSON 会拒绝 `NaN`/`Infinity` 和 `1e9999` 等溢出数；无效 timestamp 写入 `NULL` 并产生只含字段与值类型的 warning。`verify` 执行 `foreign_key_check`，分别报告 parent-cycle 节点数和 component 数。effective-current 会分别报告 selected-chain 与 raw-flag 的 cycle/missing/cross-parent 诊断。
+JSON 会拒绝 `NaN`/`Infinity` 和 `1e9999` 等溢出数；无效 timestamp 写入 `NULL` 并产生只含字段与值类型的 warning。`verify` 与 health 会流式执行完整的全库 `foreign_key_check`：总数精确，内存只保留有界 sample，并用 `foreign_key_check_complete`/`foreign_key_violations_exact` 明确契约；CPU 与 SQLite VM 工作量仍随数据库大小增长。parent-cycle 节点数与 component 数继续分开。effective-current verify counter 以会话为单位，独立报告 selected-chain 与 raw-flag topology 的 cycle/missing/cross/partial，aggregate counter 不再误标为 selected-chain 问题。
 
 message search page 始终包含 `total_exact`；空库或可确定为空时为 true，`count_total=false` 的普通探测为 false；conversation page 不承诺该字段。around metadata 分开表示 found、effective-current membership、requested-path membership、visible 与 applied。空 canonical 或 legacy placeholder 可从有界、有效的 raw text 恢复，reader、两类搜索、highlight、copy、CLI/Web export 使用同一 resolver；非法、过大或真实非文本 raw 保持 placeholder。
 

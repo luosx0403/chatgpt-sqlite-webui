@@ -1,21 +1,42 @@
-import type { ConversationPage, ConversationSummary, DisplayTextChunk, Health, ImportJob, MatchMode, MessageItem, MessagePage, PathMode, RawMessageResponse, SearchFilters, SearchMessageHit, SearchMessagePage, SortMode, Stats } from "../types";
+import type { CleanupWarning, ConversationPage, ConversationSummary, DisplayTextChunk, Health, ImportJob, MatchMode, MessageItem, MessagePage, PathMode, RawMessageResponse, SearchFilters, SearchMessageHit, SearchMessagePage, SortMode, Stats } from "../types";
 
 export class ApiError extends Error {
   constructor(
     public readonly code: string,
     public readonly status: number,
-    public readonly cleanupWarning: string | null = null,
-    public readonly cleanupErrorType: string | null = null,
+    public readonly cleanupWarnings: CleanupWarning[] = [],
   ) {
     super(code);
     this.name = "ApiError";
   }
+
+  get cleanupWarning(): string | null {
+    return this.cleanupWarnings[0]?.code ?? null;
+  }
+
+  get cleanupErrorType(): string | null {
+    return this.cleanupWarnings[0]?.error_type ?? null;
+  }
+}
+
+const SAFE_DIAGNOSTIC = /^[A-Za-z0-9_:-]+$/;
+
+function cleanupWarningFrom(value: unknown): CleanupWarning | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as { code?: unknown; error_type?: unknown; path_kind?: unknown };
+  if (typeof item.code !== "string" || !SAFE_DIAGNOSTIC.test(item.code)) return null;
+  const errorType = typeof item.error_type === "string" && SAFE_DIAGNOSTIC.test(item.error_type)
+    ? item.error_type
+    : "UnknownError";
+  const pathKind = typeof item.path_kind === "string" && SAFE_DIAGNOSTIC.test(item.path_kind)
+    ? item.path_kind
+    : "import_job";
+  return { code: item.code, error_type: errorType, path_kind: pathKind };
 }
 
 async function responseError(response: Response): Promise<ApiError> {
   let code = `http_${response.status}`;
-  let cleanupWarning: string | null = null;
-  let cleanupErrorType: string | null = null;
+  const cleanupWarnings: CleanupWarning[] = [];
   try {
     const payload = await response.json() as { detail?: unknown; code?: unknown };
     const nestedCode = payload.detail && typeof payload.detail === "object" && "code" in payload.detail
@@ -24,14 +45,29 @@ async function responseError(response: Response): Promise<ApiError> {
     const detail = typeof payload.detail === "string" ? payload.detail : payload.code ?? nestedCode;
     if (typeof detail === "string" && /^[a-z0-9_:-]+$/.test(detail)) code = detail;
     if (payload.detail && typeof payload.detail === "object") {
-      const structured = payload.detail as { cleanup_warning?: unknown; cleanup_error_type?: unknown };
-      if (typeof structured.cleanup_warning === "string") cleanupWarning = structured.cleanup_warning;
-      if (typeof structured.cleanup_error_type === "string") cleanupErrorType = structured.cleanup_error_type;
+      const structured = payload.detail as { cleanup_warning?: unknown; cleanup_error_type?: unknown; cleanup_warnings?: unknown };
+      if (Array.isArray(structured.cleanup_warnings)) {
+        for (const value of structured.cleanup_warnings) {
+          const warning = cleanupWarningFrom(value);
+          if (warning && !cleanupWarnings.some((item) => item.code === warning.code && item.path_kind === warning.path_kind)) {
+            cleanupWarnings.push(warning);
+          }
+        }
+      }
+      if (cleanupWarnings.length === 0 && typeof structured.cleanup_warning === "string" && SAFE_DIAGNOSTIC.test(structured.cleanup_warning)) {
+        cleanupWarnings.push({
+          code: structured.cleanup_warning,
+          error_type: typeof structured.cleanup_error_type === "string" && SAFE_DIAGNOSTIC.test(structured.cleanup_error_type)
+            ? structured.cleanup_error_type
+            : "UnknownError",
+          path_kind: "import_job",
+        });
+      }
     }
   } catch {
     // Keep the stable HTTP fallback; never expose server prose in the UI.
   }
-  return new ApiError(code, response.status, cleanupWarning, cleanupErrorType);
+  return new ApiError(code, response.status, cleanupWarnings);
 }
 
 async function request<T>(url: string, signal?: AbortSignal): Promise<T> {

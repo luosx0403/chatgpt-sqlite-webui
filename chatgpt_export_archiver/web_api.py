@@ -414,6 +414,12 @@ def create_api_router(
                 "web_normalized_trigram_indexed": False,
                 "web_legacy_trigram_indexed": False,
                 "schema_compatible": False,
+                "foreign_key_violations": 0,
+                "foreign_key_violations_exact": False,
+                "foreign_key_check_complete": False,
+                "foreign_key_violation_sample_limit": 20,
+                "foreign_key_violations_by_table": [],
+                "foreign_key_violation_samples": [],
                 **access,
             }
         try:
@@ -435,6 +441,13 @@ def create_api_router(
                 "current_database_schema_version": None,
                 "required_database_schema_version": DATABASE_SCHEMA_VERSION,
                 "migration_required": False,
+                "schema_compatible": False,
+                "foreign_key_violations": 0,
+                "foreign_key_violations_exact": False,
+                "foreign_key_check_complete": False,
+                "foreign_key_violation_sample_limit": 20,
+                "foreign_key_violations_by_table": [],
+                "foreign_key_violation_samples": [],
                 **access,
             }
         try:
@@ -446,6 +459,9 @@ def create_api_router(
                 trigram = detect_trigram(conn)
                 foreign_keys = foreign_key_diagnostics(conn) if schema["base_schema_compatible"] else {
                     "foreign_key_violations": 0,
+                    "foreign_key_violations_exact": False,
+                    "foreign_key_check_complete": False,
+                    "foreign_key_violation_sample_limit": 20,
                     "foreign_key_violations_by_table": [],
                     "foreign_key_violation_samples": [],
                 }
@@ -580,6 +596,7 @@ def create_api_router(
             },
             "conversations": {
                 "endpoint": "/api/conversations",
+                "detail_endpoint": "/api/conversations/{conversation_id}",
                 "filters": ["q", "sort", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "path", "match_mode"],
                 "limits": {"q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH, "selected_id": MAX_ID_PARAM_LENGTH},
                 "path": ["current", "all"],
@@ -732,7 +749,14 @@ def create_api_router(
             "database_compatibility": {
                 "readonly_contract": "health and read endpoints inspect schema but never execute migration DDL",
                 "migration": "run the explicit CLI migrate command after creating and verifying an external backup; import initializes new databases and upgrades migratable databases, while web-index requires a current core schema",
-                "health_fields": ["readiness", "database_error_code", "schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "missing_tables", "missing_columns", "invalid_tables", "object_type_mismatches", "missing_indexes", "invalid_indexes", "missing_triggers", "invalid_triggers", "missing_generation_rows", "invalid_generation_rows", "missing_foreign_keys", "foreign_key_violations", "foreign_key_violation_samples"],
+                "health_fields": ["readiness", "database_error_code", "schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "missing_tables", "missing_columns", "invalid_tables", "object_type_mismatches", "missing_indexes", "invalid_indexes", "missing_triggers", "invalid_triggers", "missing_generation_rows", "invalid_generation_rows", "missing_foreign_keys", "foreign_key_violations", "foreign_key_violations_exact", "foreign_key_check_complete", "foreign_key_violation_sample_limit", "foreign_key_violation_samples"],
+                "foreign_key_check": "health and verify stream a complete database-wide PRAGMA foreign_key_check, retain only a bounded sample, and report an exact total; CPU and SQLite VM work remain proportional to database size",
+                "effective_current_verify_counters": {
+                    "unit": "conversation count",
+                    "selected_chain": ["selected_chain_cycles", "missing_parent_in_selected_chain", "cross_conversation_parent_in_selected_chain", "partial_selected_chain"],
+                    "raw_flag_topology": ["raw_flag_cycles", "missing_parent_in_raw_flag_topology", "cross_conversation_parent_in_raw_flag_topology", "partial_raw_flag_topology"],
+                    "aggregate": ["cycle_detected"],
+                },
                 "readiness_states": ["database_missing_or_uninitialized", "migration_required", "schema_newer", "schema_incompatible", "foreign_key_violation", "database_malformed", "database_locked", "database_readonly_or_io", "ready_empty", "ready_with_data"],
                 "errors": ["database_not_ready", "database_migration_required", "database_schema_newer", "database_schema_incompatible", "database_foreign_key_violation"],
                 "optional_fts_fields": ["message_fts_available", "message_fts_rebuildable", "message_fts_error", "optional_message_fts_error", "optional_message_fts_recovery_hint"],

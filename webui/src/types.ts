@@ -282,8 +282,17 @@ export interface Health {
   trusted_proxies?: string[];
   write_origin_required?: boolean;
   foreign_key_violations?: number;
+  foreign_key_violations_exact?: boolean;
+  foreign_key_check_complete?: boolean;
+  foreign_key_violation_sample_limit?: number;
   foreign_key_violations_by_table?: Array<{ table: string; count: number }>;
   foreign_key_violation_samples?: Array<{ table: string; rowid: number | null; parent_table: string; constraint_index: number }>;
+}
+
+export interface CleanupWarning {
+  code: string;
+  error_type: string;
+  path_kind: string;
 }
 
 export interface ImportJob {
@@ -306,7 +315,7 @@ export interface ImportJob {
   error_code: string | null;
   error_type: string | null;
   cleanup_warning: string | null;
-  cleanup_warnings: Array<{ code: string; error_type: string; path_kind: string }>;
+  cleanup_warnings: CleanupWarning[];
   log_tail: string[];
 }
 

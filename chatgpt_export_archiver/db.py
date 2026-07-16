@@ -1703,6 +1703,9 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             "parent_cycle_nodes": 0,
             "parent_cycle_components": 0,
             "foreign_key_violations": 0,
+            "foreign_key_violations_exact": False,
+            "foreign_key_check_complete": False,
+            "foreign_key_violation_sample_limit": 20,
             "foreign_key_violations_by_table": [],
             "foreign_key_violation_samples": [],
             "non_finite_timestamps": 0,
@@ -1710,8 +1713,12 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             "integrity_check": integrity,
             "optional_web_index_error": False,
             "optional_web_index_recovery_hint": "",
-            "message_fts_available": message_fts_available,
-            "message_fts_error": None if message_fts_available else "missing",
+            "message_fts_available": bool(message_fts_available and fts5_rebuildable),
+            "message_fts_error": (
+                None if message_fts_available and fts5_rebuildable
+                else "missing" if fts5_rebuildable
+                else "capability_unavailable"
+            ),
             "message_fts_rebuildable": fts5_rebuildable,
             "optional_message_fts_error": False,
             "optional_message_fts_recovery_hint": "",
@@ -1824,8 +1831,13 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         "integrity_check": integrity,
         "optional_web_index_error": optional_web_index_error,
         "optional_web_index_recovery_hint": optional_web_index_recovery_hint,
-        "message_fts_available": message_fts_available and not optional_message_fts_error,
-        "message_fts_error": "damaged" if optional_message_fts_error else (None if message_fts_available else "missing"),
+        "message_fts_available": bool(message_fts_available and fts5_rebuildable and not optional_message_fts_error),
+        "message_fts_error": (
+            "damaged" if optional_message_fts_error
+            else None if message_fts_available and fts5_rebuildable
+            else "missing" if fts5_rebuildable
+            else "capability_unavailable"
+        ),
         "message_fts_rebuildable": fts5_rebuildable,
         "optional_message_fts_error": optional_message_fts_error,
         "optional_message_fts_recovery_hint": optional_message_fts_recovery_hint,
@@ -1836,12 +1848,14 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def foreign_key_diagnostics(conn: sqlite3.Connection, *, sample_limit: int = 20) -> dict[str, Any]:
-    """Return bounded, content-free ``PRAGMA foreign_key_check`` diagnostics."""
+    """Stream a complete, exact FK check while retaining only bounded samples."""
 
-    rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+    sample_limit = max(0, int(sample_limit))
     counts: dict[str, int] = {}
     samples: list[dict[str, Any]] = []
-    for row in rows:
+    total = 0
+    for row in conn.execute("PRAGMA foreign_key_check"):
+        total += 1
         table = str(row[0])
         counts[table] = counts.get(table, 0) + 1
         if len(samples) < sample_limit:
@@ -1854,7 +1868,10 @@ def foreign_key_diagnostics(conn: sqlite3.Connection, *, sample_limit: int = 20)
                 }
             )
     return {
-        "foreign_key_violations": len(rows),
+        "foreign_key_violations": total,
+        "foreign_key_violations_exact": True,
+        "foreign_key_check_complete": True,
+        "foreign_key_violation_sample_limit": sample_limit,
         "foreign_key_violations_by_table": [
             {"table": table, "count": count}
             for table, count in sorted(counts.items())
@@ -1892,9 +1909,14 @@ def _effective_current_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
         "multiple_flag_leaves": 0,
         "invalid_current_node_flags_used": 0,
         "cycle_detected": 0,
+        "selected_chain_cycles": 0,
+        "raw_flag_cycles": 0,
         "missing_parent_in_selected_chain": 0,
         "cross_conversation_parent_in_selected_chain": 0,
         "partial_selected_chain": 0,
+        "missing_parent_in_raw_flag_topology": 0,
+        "cross_conversation_parent_in_raw_flag_topology": 0,
+        "partial_raw_flag_topology": 0,
     }
     for conversation in conversation_rows:
         conversation_id = str(conversation["conversation_id"])
@@ -1911,12 +1933,28 @@ def _effective_current_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
             counts["invalid_current_node_flags_used"] += 1
         if item.get("cycle_detected"):
             counts["cycle_detected"] += 1
-        if item.get("missing_parent"):
+        if item.get("selected_chain_cycle_detected"):
+            counts["selected_chain_cycles"] += 1
+        if item.get("raw_flag_cycle_detected"):
+            counts["raw_flag_cycles"] += 1
+        selected_missing = bool(item.get("selected_chain_missing_parent"))
+        selected_cross = bool(item.get("selected_chain_cross_conversation_parent"))
+        selected_cycle = bool(item.get("selected_chain_cycle_detected"))
+        raw_missing = bool(item.get("raw_flag_missing_parent"))
+        raw_cross = bool(item.get("raw_flag_cross_conversation_parent"))
+        raw_cycle = bool(item.get("raw_flag_cycle_detected"))
+        if selected_missing:
             counts["missing_parent_in_selected_chain"] += 1
-        if item.get("cross_conversation_parent"):
+        if selected_cross:
             counts["cross_conversation_parent_in_selected_chain"] += 1
-        if item.get("partial_chain"):
+        if selected_cycle or selected_missing or selected_cross:
             counts["partial_selected_chain"] += 1
+        if raw_missing:
+            counts["missing_parent_in_raw_flag_topology"] += 1
+        if raw_cross:
+            counts["cross_conversation_parent_in_raw_flag_topology"] += 1
+        if raw_cycle or raw_missing or raw_cross:
+            counts["partial_raw_flag_topology"] += 1
     return counts
 
 

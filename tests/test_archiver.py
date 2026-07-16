@@ -3112,6 +3112,11 @@ class ArchiverTests(unittest.TestCase):
             self.assertTrue(missing["ok"])
             self.assertFalse(missing["message_fts_available"])
             self.assertEqual(missing["message_fts_error"], "missing")
+            with mock.patch("chatgpt_export_archiver.db.detect_fts5_runtime", return_value=False):
+                unavailable = verify_database(conn)
+            self.assertFalse(unavailable["message_fts_available"])
+            self.assertFalse(unavailable["message_fts_rebuildable"])
+            self.assertEqual(unavailable["message_fts_error"], "capability_unavailable")
             with mock.patch(
                 "chatgpt_export_archiver.db._run_integrity_check",
                 return_value=["malformed inverted index for FTS5 table main.message_fts"],
@@ -3121,6 +3126,13 @@ class ArchiverTests(unittest.TestCase):
             self.assertTrue(damaged["optional_message_fts_error"])
             self.assertEqual(damaged["message_fts_error"], "damaged")
             self.assertIn("--rebuild-fts", damaged["optional_message_fts_recovery_hint"])
+            with mock.patch("chatgpt_export_archiver.db.detect_fts5_runtime", return_value=False), mock.patch(
+                "chatgpt_export_archiver.db._run_integrity_check",
+                return_value=["malformed inverted index for FTS5 table main.message_fts"],
+            ):
+                damaged_unavailable = verify_database(conn)
+            self.assertEqual(damaged_unavailable["message_fts_error"], "damaged")
+            self.assertFalse(damaged_unavailable["message_fts_rebuildable"])
             conn.close()
 
     def test_cli_sqlite_runtime_errors_are_classified_without_messages(self):
@@ -4027,6 +4039,121 @@ class ArchiverTests(unittest.TestCase):
             result["effective_current_diagnostics"]["flags_missing_current_chain_nodes"],
             count,
         )
+
+    def test_verify_separates_selected_chain_and_raw_flag_topology_diagnostics(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "path-diagnostics.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conversations = [
+                ("raw-missing", "a-current"),
+                ("raw-cycle", "b-current"),
+                ("selected-missing", "c-current"),
+                ("selected-cross", "d-current"),
+                ("raw-cross", "e-current"),
+                ("selected-cycle", "f-one"),
+                ("foreign-selected", "foreign-parent"),
+                ("foreign-raw", "foreign-raw-parent"),
+            ]
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id, current_node, aggregate_hash) VALUES (?, ?, ?)",
+                ((cid, current, f"hash-{cid}") for cid, current in conversations),
+            )
+            rows = [
+                ("raw-missing", "a-root", None, 0),
+                ("raw-missing", "a-current", "a-root", 0),
+                ("raw-missing", "a-raw", "absent-raw-parent", 1),
+                ("raw-cycle", "b-current", None, 0),
+                ("raw-cycle", "b-one", "b-two", 1),
+                ("raw-cycle", "b-two", "b-one", 1),
+                ("selected-missing", "c-current", "absent-selected-parent", 0),
+                ("selected-missing", "c-raw-root", None, 1),
+                ("selected-missing", "c-raw-leaf", "c-raw-root", 1),
+                ("selected-cross", "d-current", "foreign-parent", 0),
+                ("selected-cross", "d-raw", None, 1),
+                ("raw-cross", "e-current", None, 0),
+                ("raw-cross", "e-raw", "foreign-raw-parent", 1),
+                ("selected-cycle", "f-one", "f-two", 0),
+                ("selected-cycle", "f-two", "f-one", 0),
+                ("foreign-selected", "foreign-parent", None, 0),
+                ("foreign-raw", "foreign-raw-parent", None, 0),
+            ]
+            conn.executemany(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, parent_node_id, is_on_current_path) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+            diagnostics = verify_database(conn)["effective_current_diagnostics"]
+            conn.close()
+            self.assertEqual(diagnostics["selected_chain_cycles"], 1)
+            self.assertEqual(diagnostics["raw_flag_cycles"], 1)
+            self.assertEqual(diagnostics["missing_parent_in_selected_chain"], 1)
+            self.assertEqual(diagnostics["cross_conversation_parent_in_selected_chain"], 1)
+            self.assertEqual(diagnostics["partial_selected_chain"], 3)
+            self.assertEqual(diagnostics["missing_parent_in_raw_flag_topology"], 1)
+            self.assertEqual(diagnostics["cross_conversation_parent_in_raw_flag_topology"], 1)
+            self.assertEqual(diagnostics["partial_raw_flag_topology"], 3)
+            self.assertEqual(diagnostics["cycle_detected"], 2)
+
+    def test_foreign_key_diagnostics_streams_million_row_check_and_exact_orphans(self):
+        from chatgpt_export_archiver.db import foreign_key_diagnostics
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "foreign-keys.db"
+            conn = connect(db)
+            init_db(conn)
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, aggregate_hash) VALUES ('valid-parent', 'hash')"
+            )
+            conn.execute(
+                """WITH RECURSIVE seq(value) AS (
+                       VALUES(1) UNION ALL SELECT value + 1 FROM seq WHERE value < 1000000
+                   )
+                   INSERT INTO conversation_nodes(conversation_id, node_id)
+                   SELECT 'valid-parent', printf('valid-%07d', value) FROM seq"""
+            )
+            conn.commit()
+            no_violations = foreign_key_diagnostics(conn, sample_limit=20)
+            self.assertEqual(no_violations["foreign_key_violations"], 0)
+            self.assertTrue(no_violations["foreign_key_check_complete"])
+            self.assertTrue(no_violations["foreign_key_violations_exact"])
+
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                """WITH RECURSIVE seq(value) AS (
+                       VALUES(1) UNION ALL SELECT value + 1 FROM seq WHERE value < 100000
+                   )
+                   INSERT INTO conversation_nodes(conversation_id, node_id)
+                   SELECT printf('missing-%06d', value), 'orphan' FROM seq"""
+            )
+            conn.commit()
+            progress_calls = 0
+
+            def progress():
+                nonlocal progress_calls
+                progress_calls += 1
+                return 0
+
+            conn.set_progress_handler(progress, 10_000)
+            tracemalloc.start()
+            try:
+                violations = foreign_key_diagnostics(conn, sample_limit=20)
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+                conn.set_progress_handler(None, 0)
+                conn.close()
+            self.assertEqual(violations["foreign_key_violations"], 100_000)
+            self.assertEqual(violations["foreign_key_violations_by_table"], [
+                {"table": "conversation_nodes", "count": 100_000},
+            ])
+            self.assertEqual(len(violations["foreign_key_violation_samples"]), 20)
+            self.assertEqual(violations["foreign_key_violation_sample_limit"], 20)
+            self.assertTrue(violations["foreign_key_check_complete"])
+            self.assertTrue(violations["foreign_key_violations_exact"])
+            self.assertGreater(progress_calls, 0)
+            self.assertLess(peak, 16 * 1024 * 1024)
 
     def test_export_basenames_respect_utf8_component_budget_on_disk(self):
         from chatgpt_export_archiver.exporter import MAX_EXPORT_BASENAME_BYTES, export_conversations

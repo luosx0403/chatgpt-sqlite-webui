@@ -993,6 +993,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"parent_cycle_nodes {result.get('parent_cycle_nodes', result['parent_cycles'])}")
     print(f"parent_cycle_components {result.get('parent_cycle_components', 0)}")
     print(f"foreign_key_violations {result.get('foreign_key_violations', 0)}")
+    print(f"foreign_key_violations_exact {str(bool(result.get('foreign_key_violations_exact'))).lower()}")
+    print(f"foreign_key_check_complete {str(bool(result.get('foreign_key_check_complete'))).lower()}")
+    print(f"foreign_key_violation_sample_limit {result.get('foreign_key_violation_sample_limit', 0)}")
     for item in result.get("foreign_key_violations_by_table", []):
         print(f"foreign_key_violation_table {item['table']} count {item['count']}")
     for item in result.get("foreign_key_violation_samples", []):

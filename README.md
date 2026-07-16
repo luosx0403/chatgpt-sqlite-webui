@@ -87,6 +87,8 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
+The Python 3.12 constraints file pins every resolved Web dependency version, but it is not a cross-platform hash lock. A future release workflow should generate and verify platform-specific hashes for the supported Python/OS matrix; until then, install only from a trusted package index and retain the npm lockfile and audit checks as separate frontend controls.
+
 ## Quick start
 
 Put your ChatGPT export ZIP somewhere outside the repository, then run the fastest safe import command. This skips input hashing and rebuilds FTS once at the end, which is much faster for large archives than maintaining FTS row by row.
@@ -216,6 +218,8 @@ python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_Z
 
 The input may be a ZIP, a single `conversations.json`, or an extracted directory containing `conversations.json` or sharded `conversations-*.json` files. Scanner discovery ignores macOS metadata paths such as `__MACOSX`, AppleDouble `._*` files, and `.DS_Store`, so those local artifacts do not become conversation sources.
 
+For directory input, POSIX platforms use component-by-component `dir_fd` plus `O_NOFOLLOW` where available. The portable fallback rejects symlink/reparse components and verifies containment immediately before path-based open, but the Python standard library cannot eliminate every local replacement race on every platform. Do not import an extracted directory that an untrusted local user or concurrent process can modify; use the original read-only ZIP for that threat model.
+
 If you want SQLite to spend extra time tidying planner statistics and the FTS index after import, use:
 
 ```bash
@@ -252,6 +256,8 @@ The Web UI can be used in two ways. If the database already exists, pass it expl
 
 After a successful Web upload import, the backend runs the same core import pipeline as the CLI, then runs `verify`, `stats`, and `web-index`. The uploaded ZIP is a temporary server-side copy and is cleaned up independently from the original file on your disk.
 
+Preflight failures and terminal import jobs may return multiple `cleanup_warnings`. The React UI renders every safe warning code and `path_kind` with localized user-facing text, while retaining the deprecated single `cleanup_warning` fallback. It never displays temporary paths, filenames, OS messages, or error-class details from these warnings, and repeated polling replaces the same job snapshot instead of appending duplicate announcements.
+
 If the prebuilt React application cannot be served, the server's fallback HTML is an emergency, deliberately limited interface, not a substitute for the full reader. It has reduced search/reader controls and downloads exclude internal nodes unless explicitly requested. Rebuild `webui/dist` for the complete UI.
 
 ## Web upload security limits
@@ -259,6 +265,8 @@ If the prebuilt React application cannot be served, the server's fallback HTML i
 Web uploads enforce application-level safety limits before the import job starts. These are controlled by environment variables and are independent of CLI `import`, which does not use these limits.
 
 The Web upload pending slot is reserved before reading the file so a large upload cannot race with another writer. Any error after that reservation, including temporary upload path creation failure, must release the slot and clean the server-side temporary directory; a successful import job takes ownership of the slot and temporary copy.
+
+A process kill, OOM, or host crash can bypass normal cleanup and leave an old `chatgpt-archive-upload-*` directory under the operating-system temporary directory. This release does not delete such directories automatically because an ownership/age mistake could remove unrelated data. With the server stopped, an administrator may remove an individual old directory only after verifying the exact prefix, current-account ownership, age, absence of symlinks/reparse points, and that no job uses it; never delete a user export ZIP or use an unchecked wildcard.
 
 When the Web UI is bound to a loopback address (`127.0.0.1`, `localhost`, `::1`), the defaults allow large trusted archives:
 
@@ -374,6 +382,8 @@ If you manually run `VACUUM`, `VACUUM INTO`, or rewrite the SQLite database with
 python chatgpt_archive.py verify --db archive/chatgpt_archive.db
 ```
 
+`message_fts_rebuildable` is a runtime capability result, not a constant: missing FTS with available FTS5 reports `missing` and rebuildable true; an unavailable FTS5 module reports `capability_unavailable` and rebuildable false; a damaged table reports `damaged`, with rebuildability determined by the same bounded runtime probe. Other SQLite errors propagate through the structured database error classifier.
+
 If `PRAGMA integrity_check` reports a malformed FTS5 inverted index for `web_message_trigram` or `web_title_trigram`, the core conversation data may still be structurally valid while the optional Web search index is damaged. In that case `verify` reports `optional_web_index_error true` and prints a recovery hint. Rebuild the optional Web indexes with:
 
 ```bash
@@ -484,7 +494,7 @@ Import failures use stable preflight, source-scan, source-read, JSON-decode, top
 
 Standalone JSON, directory members, and ZIP members use the same bounded, element-by-element top-level-array decoder and one import transaction. Exactly one leading UTF-8 BOM is accepted; repeated or interior BOMs, UTF-16/32, mixed encodings, and invalid UTF-8 are rejected. Canonical conversation and graph IDs are limited to 512 characters, matching every Web addressing parameter; an overlong ID skips that conversation element with a content-free warning and is never truncated. ZIP source-read failures distinguish encrypted, missing, changed, CRC-failed, and other unreadable members.
 
-Non-standard JSON `NaN`/`Infinity`, including overflowing standard numbers such as `1e9999`, are rejected. Invalid finite timestamp values become `NULL` with an `invalid_timestamp` warning that records only field and value type. `verify` runs `foreign_key_check`, distinguishes parent-cycle nodes from components, and detects legacy non-finite timestamps. Effective-current responses separately expose selected-chain and raw-flag cycle/missing/cross-parent diagnostics. `internal_hidden_count` is canonical; `technical_hidden_count` is a deprecated identical alias. Message-search pages always contain `total_exact`; empty databases and deterministically empty searches return true, while `count_total=false` search probes return false. Conversation pages do not promise that field. Around-node responses distinguish found, effective-current membership, requested-path membership, visibility, and whether the target set the offset.
+Non-standard JSON `NaN`/`Infinity`, including overflowing standard numbers such as `1e9999`, are rejected. Invalid finite timestamp values become `NULL` with an `invalid_timestamp` warning that records only field and value type. `verify` and health stream a complete database-wide `foreign_key_check`: totals are exact, only a bounded sample is retained in memory, and `foreign_key_check_complete`/`foreign_key_violations_exact` state that contract; CPU and SQLite VM work still scale with database size. Parent-cycle nodes and components remain distinct. Effective-current verify counters use conversation units and independently report selected-chain and raw-flag-topology cycle/missing/cross/partial faults; aggregate counters are not mislabeled as selected-chain faults. `internal_hidden_count` is canonical; `technical_hidden_count` is a deprecated identical alias. Message-search pages always contain `total_exact`; empty databases and deterministically empty searches return true, while `count_total=false` search probes return false. Conversation pages do not promise that field. Around-node responses distinguish found, effective-current membership, requested-path membership, visibility, and whether the target set the offset.
 
 Legacy canonical text that is empty or a legacy placeholder may recover bounded readable text from a valid raw text message. The shared resolver is capped and is used consistently by the reader, message/conversation search, highlights, copy, CLI Markdown/TXT, and Web export. Default message APIs return one complete user-visible body, `display_text`; the duplicate `content_text`/`render_text` aliases are not returned. Invalid, oversized, or genuinely non-text raw payloads remain placeholders.
 

@@ -69,6 +69,8 @@ function assertStaticFrontendContracts() {
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
   assert.ok(clientSource.includes("getConversationCopyText"), "full conversation copy should use the dedicated server-side text stream");
+  assert.ok(clientSource.includes("structured.cleanup_warnings"), "ApiError should parse every structured cleanup warning");
+  assert.ok(appSource.includes("cleanupWarningLabel"), "cleanup warning codes and path kinds should render as localized safe text");
   assert.ok(paneSource.includes("getConversationCopyText"), "reader full-copy must not accumulate reader page objects");
   assert.ok(paneSource.includes("countTotal: false"), "reader hit navigation should request fast message-hit pages without exact total counts");
   assert.equal(paneSource.includes("while (items.length < MAX_NAVIGABLE_HIT_MESSAGES)"), false, "reader hit navigation must not serially prefetch ten pages on initial load");
@@ -661,7 +663,21 @@ async function main() {
     await noDbPage.route("**/api/import/upload", async (route) => {
       if (!failedUploadOnce) {
         failedUploadOnce = true;
-        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ detail: "synthetic upload failure" }) });
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({
+            detail: {
+              code: "upload_preflight_failed",
+              cleanup_warning: "upload_file_unlink_failed",
+              cleanup_error_type: "PermissionError",
+              cleanup_warnings: [
+                { code: "upload_file_unlink_failed", error_type: "PermissionError", path_kind: "upload_file" },
+                { code: "upload_directory_cleanup_failed", error_type: "PermissionError", path_kind: "upload_directory" },
+              ],
+            },
+          }),
+        });
         return;
       }
       await route.continue();
@@ -670,6 +686,11 @@ async function main() {
     await noDbPage.getByTestId("import-start-button").click();
     await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("could not be completed"), undefined, { timeout: 20_000 });
     assert.equal((await noDbPage.getByTestId("import-panel").textContent())?.includes("synthetic upload failure"), false, "upload API details must not leak into localized UI");
+    const preflightWarnings = await noDbPage.getByTestId("preflight-cleanup-warnings").textContent();
+    assert.ok(preflightWarnings?.includes("temporary uploaded file"), "preflight cleanup should show its localized file warning");
+    assert.ok(preflightWarnings?.includes("temporary upload directory"), "preflight cleanup should show every localized warning");
+    assert.equal(preflightWarnings?.includes("upload_file_unlink_failed"), false, "cleanup UI must not expose internal warning enum names");
+    assert.equal(preflightWarnings?.includes("PermissionError"), false, "cleanup UI must not expose OS error class details");
     assert.ok((await noDbPage.getByTestId("import-panel").textContent())?.includes("Selected ZIP"), "failed upload should keep selected file for retry");
     assert.equal(await noDbPage.getByTestId("import-start-button").count(), 1, "failed upload should keep retry button");
     let activeJobPolls = 0;
@@ -708,7 +729,19 @@ async function main() {
           await route.fulfill({
             status: 200,
             contentType: "application/json",
-            body: JSON.stringify({ job_id: jobId, status: "succeeded", stage: "succeeded", outcome: "succeeded", canonical_commit_succeeded: true, elapsed_seconds: 3.0 }),
+            body: JSON.stringify({
+              job_id: jobId,
+              status: "succeeded",
+              stage: "succeeded",
+              outcome: "succeeded",
+              canonical_commit_succeeded: true,
+              elapsed_seconds: 3.0,
+              cleanup_warning: "summary_update_after_commit_failed",
+              cleanup_warnings: [
+                { code: "summary_update_after_commit_failed", error_type: "OperationalError", path_kind: "import_summary" },
+                { code: "import_connection_close_failed", error_type: "OperationalError", path_kind: "database_connection" },
+              ],
+            }),
           });
         }
       } finally {
@@ -722,6 +755,10 @@ async function main() {
     await noDbPage.waitForTimeout(1_500);
     assert.equal(maxActiveJobPolls, 1, "import job polling must be serial even when one response exceeds the polling interval");
     assert.ok((await noDbPage.getByTestId("import-status").textContent())?.includes("succeeded"), "a late running response must not regress a terminal import status");
+    const terminalWarnings = await noDbPage.getByTestId("import-cleanup-warnings").textContent();
+    assert.ok(terminalWarnings?.includes("committed import summary"), "terminal cleanup should show the localized summary warning");
+    assert.ok(terminalWarnings?.includes("database connection"), "terminal cleanup should show every localized path kind");
+    assert.equal(terminalWarnings?.includes("summary_update_after_commit_failed"), false, "terminal cleanup must not expose internal warning enum names");
     await noDbPage.waitForFunction(() => !document.querySelector('[data-testid="import-panel"]')?.textContent?.includes("Selected ZIP"), undefined, { timeout: 20_000 });
     assert.equal(await noDbPage.getByTestId("import-start-button").count(), 0, "successful job creation should clear selected file and start button");
     await noDbPage.waitForFunction(() => document.querySelectorAll(".conversation-item").length >= 1, undefined, { timeout: 20_000 });

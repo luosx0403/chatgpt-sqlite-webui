@@ -6,7 +6,7 @@ import SettingsPanel from "./components/SettingsPanel";
 import { ApiError, getConversation, getConversations, getHealth, getImportJob, getStats, uploadImportZip } from "./api/client";
 import { applySettings, clampSettings, loadSettings, saveSettings, type Settings } from "./settings";
 import { createTranslator } from "./i18n";
-import type { ConversationSummary, Health, ImportJob, MatchMode, PathMode, SearchDiagnostics, SearchFilters, SearchScope, SortMode, Stats } from "./types";
+import type { CleanupWarning, ConversationSummary, Health, ImportJob, MatchMode, PathMode, SearchDiagnostics, SearchFilters, SearchScope, SortMode, Stats } from "./types";
 import { isInteractiveTarget } from "./utils/interaction";
 
 const DEFAULT_FILTERS: SearchFilters = {
@@ -245,6 +245,35 @@ function webIndexProgressLabel(t: (key: string) => string, progress: Record<stri
     .replace("{total}", String(total));
 }
 
+function cleanupWarningLabel(t: (key: string) => string, warning: CleanupWarning): string {
+  const messages: Record<string, string> = {
+    summary_update_after_commit_failed: t("cleanupSummaryAfterCommit"),
+    import_connection_close_failed: t("cleanupConnectionClose"),
+    summary_update_after_close_failed: t("cleanupSummaryAfterClose"),
+    upload_file_unlink_failed: t("cleanupUploadFile"),
+    upload_directory_cleanup_failed: t("cleanupUploadDirectory"),
+    upload_directory_cleanup_incomplete: t("cleanupUploadDirectoryIncomplete"),
+  };
+  const locations: Record<string, string> = {
+    import_summary: t("cleanupLocationImportSummary"),
+    database_connection: t("cleanupLocationDatabaseConnection"),
+    upload_file: t("cleanupLocationUploadFile"),
+    upload_directory: t("cleanupLocationUploadDirectory"),
+    import_job: t("cleanupLocationImportJob"),
+  };
+  return t("cleanupWarningItem")
+    .replace("{message}", messages[warning.code] || t("cleanupUnknown"))
+    .replace("{location}", locations[warning.path_kind] || t("cleanupLocationImportJob"));
+}
+
+function jobCleanupWarnings(job: ImportJob | null): CleanupWarning[] {
+  if (!job) return [];
+  if (Array.isArray(job.cleanup_warnings) && job.cleanup_warnings.length > 0) return job.cleanup_warnings;
+  return job.cleanup_warning
+    ? [{ code: job.cleanup_warning, error_type: "UnknownError", path_kind: "import_job" }]
+    : [];
+}
+
 function importErrorLabel(t: (key: string) => string, code: string | null | undefined): string {
   const direct = new Set([
     "no_conversation_sources",
@@ -327,7 +356,7 @@ export default function App() {
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importJob, setImportJob] = useState<ImportJob | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
-  const [preflightCleanupWarning, setPreflightCleanupWarning] = useState(false);
+  const [preflightCleanupWarnings, setPreflightCleanupWarnings] = useState<CleanupWarning[]>([]);
   const [uploadingImport, setUploadingImport] = useState(false);
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [showInternal, setShowInternal] = useState(() => new URLSearchParams(window.location.search).get("show_internal") === "true" || (new URLSearchParams(window.location.search).get("show_internal") === null && loadSettings().showInternalDefault));
@@ -595,7 +624,7 @@ export default function App() {
     if (archiveImportBlocked(health) || !importFile || uploadingImport || (importJob && ["queued", "running"].includes(importJob.status))) return;
     setUploadingImport(true);
     setImportError(null);
-    setPreflightCleanupWarning(false);
+    setPreflightCleanupWarnings([]);
     uploadImportZip(importFile)
       .then((job) => {
         setImportJob(job);
@@ -604,7 +633,7 @@ export default function App() {
       })
       .catch((err: unknown) => {
         setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null));
-        setPreflightCleanupWarning(err instanceof ApiError && Boolean(err.cleanupWarning));
+        setPreflightCleanupWarnings(err instanceof ApiError ? err.cleanupWarnings : []);
       })
       .finally(() => setUploadingImport(false));
   };
@@ -723,13 +752,26 @@ export default function App() {
             )}
             {importError && <span className="error-text">{importError}</span>}
             {importJob?.error_code && <span className="error-text">{importErrorLabel(t, importJob.error_code)}</span>}
-            {(importJob?.cleanup_warning || (importJob?.cleanup_warnings?.length ?? 0) > 0) && (
-              <span className="warning-text" data-testid="import-cleanup-warnings">
-                {t("importCleanupWarning")}
-                {(importJob?.cleanup_warnings?.length ?? 0) > 1 ? ` (${importJob?.cleanup_warnings.length})` : ""}
-              </span>
+            {jobCleanupWarnings(importJob).length > 0 && (
+              <div className="warning-text" data-testid="import-cleanup-warnings" role="status">
+                <span>{t("importCleanupWarning")}</span>
+                <ul>
+                  {jobCleanupWarnings(importJob).map((warning, index) => (
+                    <li key={`${warning.code}:${warning.path_kind}:${index}`}>{cleanupWarningLabel(t, warning)}</li>
+                  ))}
+                </ul>
+              </div>
             )}
-            {preflightCleanupWarning && <span className="warning-text">{t("importCleanupWarning")}</span>}
+            {preflightCleanupWarnings.length > 0 && (
+              <div className="warning-text" data-testid="preflight-cleanup-warnings" role="status">
+                <span>{t("importCleanupWarning")}</span>
+                <ul>
+                  {preflightCleanupWarnings.map((warning, index) => (
+                    <li key={`${warning.code}:${warning.path_kind}:${index}`}>{cleanupWarningLabel(t, warning)}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
         <ConversationPane

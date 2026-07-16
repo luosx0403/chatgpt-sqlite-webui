@@ -168,6 +168,9 @@ class WebApiTests(unittest.TestCase):
         self.addCleanup(td.cleanup)
         health = client.get("/api/health").json()
         self.assertTrue(health["ok"])
+        self.assertTrue(health["foreign_key_check_complete"])
+        self.assertTrue(health["foreign_key_violations_exact"])
+        self.assertEqual(health["foreign_key_violation_sample_limit"], 20)
         self.assertEqual(health["database"]["name"], "database")
         self.assertNotIn(db.name, json.dumps(health))
         self.assertEqual(client.get("/api/stats").json()["conversations"], 3)
@@ -318,6 +321,8 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(health["readiness"], "foreign_key_violation")
             self.assertEqual(health["database_error_code"], "database_foreign_key_violation")
             self.assertGreater(health["foreign_key_violations"], 0)
+            self.assertTrue(health["foreign_key_check_complete"])
+            self.assertTrue(health["foreign_key_violations_exact"])
             sample = health["foreign_key_violation_samples"][0]
             self.assertEqual(set(sample), {"table", "rowid", "parent_table", "constraint_index"})
             response = damaged_client.get("/api/stats")
@@ -3766,6 +3771,7 @@ class WebApiTests(unittest.TestCase):
             ["around_target_found", "around_target_in_effective_collection", "around_target_in_requested_collection", "around_target_visible", "around_target_applied"],
         )
         self.assertIn("effective all collection", schema["messages"]["around_node_id"]["description"])
+        self.assertEqual(schema["conversations"]["detail_endpoint"], "/api/conversations/{conversation_id}")
         self.assertEqual(schema["export"]["copy_endpoint"], "/api/conversations/{conversation_id}/copy")
         self.assertIn("default false", schema["export"]["include_internal"])
         self.assertIn("bounded server-side node batches", schema["export"]["streaming"])
@@ -3785,6 +3791,11 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(schema["jobs"]["web_index_progress"], [
             "status", "build_stage", "processed", "total", "complete", "batch_size",
         ])
+        self.assertIn("foreign_key_check_complete", schema["database_compatibility"]["health_fields"])
+        self.assertEqual(
+            schema["database_compatibility"]["effective_current_verify_counters"]["unit"],
+            "conversation count",
+        )
 
     def test_schema_field_lists_match_actual_page_contracts(self):
         td, client, _db = self.make_client()
