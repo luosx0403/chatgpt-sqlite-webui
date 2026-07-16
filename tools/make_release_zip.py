@@ -65,6 +65,7 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "webui/src/utils/format.ts",
     "webui/src/utils/interaction.ts",
     "webui/src/utils/querySyntax.ts",
+    "tests/__init__.py",
     "tests/test_archiver.py",
     "tests/test_web_api.py",
     "tests/fixtures/legacy-fa37b3d.sql",

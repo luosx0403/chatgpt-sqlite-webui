@@ -862,7 +862,7 @@ class WebApiTests(unittest.TestCase):
                     self.assertEqual(len(legacy_items), 30)
                     self.assertEqual(calls["count"], 34 if include_internal else 33)
 
-    def test_long_message_response_has_one_full_text_copy(self):
+    def test_long_message_response_is_bounded_but_complete_streams_are_full(self):
         from chatgpt_export_archiver import web_api as web_api_module
 
         td, client, db = self.make_client()
@@ -893,7 +893,9 @@ class WebApiTests(unittest.TestCase):
         self.assertLessEqual(returned, 65_536)
         self.assertEqual(by_id["u1"]["display_text"], canonical[:returned])
         self.assertTrue(by_id["u1"]["display_text_truncated"])
-        self.assertEqual(by_id["u1"]["display_text_total_chars"], len(canonical))
+        self.assertFalse(by_id["u1"]["display_text_total_chars_exact"])
+        self.assertGreater(by_id["u1"]["display_text_total_chars"], returned)
+        self.assertFalse(by_id["u1"]["display_text_resolver_input_truncated"])
         self.assertEqual(by_id["u1"]["display_text_returned_chars"], returned)
         recovered_returned = by_id["a1"]["display_text_returned_chars"]
         self.assertEqual(by_id["a1"]["display_text"], recovered[:recovered_returned])
@@ -1048,8 +1050,10 @@ class WebApiTests(unittest.TestCase):
         self.assertLessEqual(len(item["raw_preview"]), 20_001)
         self.assertTrue(item["raw_preview_truncated"])
         normalized_sql = [re.sub(r"\s+", "", sql).lower() for sql in statements]
-        self.assertTrue(any("substr(coalesce(raw_message_json,''),1," in sql for sql in normalized_sql))
+        self.assertFalse(any("length(raw_message_json)" in sql for sql in normalized_sql))
+        self.assertFalse(any("substr(coalesce(raw_message_json,''),1," in sql for sql in normalized_sql))
         self.assertFalse(any("selectraw_message_json" in sql for sql in normalized_sql))
+        self.assertFalse(any("selectcontent_text" in sql for sql in normalized_sql))
 
     def test_full_raw_endpoint_is_explicit(self):
         td, client, _db = self.make_client()
@@ -1972,10 +1976,26 @@ class WebApiTests(unittest.TestCase):
             self.assertTrue(page["page_text_budget_exhausted"])
             self.assertLessEqual(page["response_budget_estimated"], page["response_budget_limit"])
             self.assertTrue(all(item["display_text_truncated"] for item in page["items"]))
-            self.assertTrue(all(item["display_text_total_chars"] == len(long_text) for item in page["items"]))
+            self.assertTrue(all(
+                item["display_text_total_chars"] > len(item["display_text"])
+                for item in page["items"]
+            ))
+            self.assertTrue(all(
+                item["display_text_total_chars_exact"] is False
+                for item in page["items"]
+            ))
+            self.assertTrue(all(
+                item["display_text_resolver_input_truncated"] is False
+                for item in page["items"]
+            ))
             self.assertTrue(page["items"][0]["highlight_truncated"])
             self.assertEqual(page["items"][0]["highlight_ranges"], [])
-            self.assertTrue(any("substr(COALESCE(content_text" in sql for sql in statements))
+            self.assertFalse(any(
+                "LENGTH(COALESCE(CONTENT_TEXT" in sql.upper()
+                or "SUBSTR(COALESCE(CONTENT_TEXT" in sql.upper()
+                or "LENGTH(COALESCE(RAW_MESSAGE_JSON" in sql.upper()
+                for sql in statements
+            ))
             self.assertFalse(any(re.search(r"SELECT\s+content_text\s*,\s*raw_message_json", sql, re.I) for sql in statements))
             raw_page = get_messages(
                 conn,
@@ -1988,6 +2008,7 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(raw_page["items"][0]["node_id"], "raw-large")
             self.assertTrue(raw_page["items"][0]["raw_preview_truncated"])
             self.assertTrue(raw_page["items"][0]["display_text_truncated"])
+            self.assertTrue(raw_page["items"][0]["display_text_resolver_input_truncated"])
             conn.close()
 
             client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
@@ -3765,6 +3786,9 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(schema["messages"]["limits"]["around_node_id"], 16 * 1024)
         self.assertEqual(schema["conversations"]["limits"]["selected_id"], 16 * 1024)
         self.assertEqual(schema["id_addressing"]["new_import_id_max_chars"], 512)
+        self.assertEqual(schema["import_contract"]["max_element_utf8_bytes"], 128 * 1024 * 1024)
+        self.assertEqual(schema["import_contract"]["max_element_decoded_chars"], 128 * 1024 * 1024)
+        self.assertIn("conversation_json_element_too_large", schema["jobs"]["failure_codes"])
         self.assertIn("visible-only reader pagination collection", schema["messages"]["around_node_id"]["description"])
         self.assertEqual(
             schema["messages"]["around_node_id"]["response"],
@@ -5940,7 +5964,7 @@ class WebApiTests(unittest.TestCase):
 
     def test_round6_nul_display_and_index_recall_are_consistent(self):
         from chatgpt_export_archiver.db import init_db
-        from chatgpt_export_archiver.search import get_message_display_chunk, parse_query, search_messages
+        from chatgpt_export_archiver.search import get_message_display_chunk, get_messages, parse_query, search_messages
         from chatgpt_export_archiver.web_db import create_web_indexes, connect_readonly
 
         with tempfile.TemporaryDirectory() as td:
@@ -5962,6 +5986,11 @@ class WebApiTests(unittest.TestCase):
             conn.commit()
             first = get_message_display_chunk(conn, "c", "n", offset=0, limit=4)
             self.assertEqual(first["display_text"], "abc\ufffd")
+            reader_page = get_messages(
+                conn, "c", path="all", limit=10, offset=0, include_internal=True
+            )
+            self.assertEqual(reader_page["items"][0]["display_text"], "abc\ufffddef needle")
+            self.assertTrue(reader_page["items"][0]["display_text_total_chars_exact"])
             before = search_messages(conn, parse_query("needle"), conversation_id="c")
             self.assertEqual([item["node_id"] for item in before["items"]], ["n"])
             conn.close()
@@ -6013,6 +6042,41 @@ class WebApiTests(unittest.TestCase):
             client.get("/api/conversations", params={"offset": 1 << 63}).status_code,
             422,
         )
+
+    def test_round6_list_and_detail_bound_oversized_scalar_projection(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        huge = "界" * 400_000
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO conversations(conversation_id, title, source_file, current_node, aggregate_hash, update_time) "
+            "VALUES ('huge-scalar', ?, ?, 'n', 'h', 9999999999)",
+            (huge, huge),
+        )
+        conn.execute(
+            "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_type, content_text, "
+            "content_hash, is_on_current_path) VALUES ('huge-scalar', 'n', 'assistant', 'text', 'zz', 'nh', 1)"
+        )
+        conn.commit()
+        conn.close()
+        listing = client.get("/api/conversations", params={"limit": 1}).json()["items"][0]
+        detail = client.get(
+            "/api/by-id/conversation", params={"conversation_id": "huge-scalar"}
+        ).json()
+        conversation_search = next(
+            item for item in client.get("/api/search", params={"q": "zz"}).json()["items"]
+            if item["conversation_id"] == "huge-scalar"
+        )
+        message_search = next(
+            item for item in client.get("/api/search/messages", params={"q": "zz"}).json()["items"]
+            if item["conversation_id"] == "huge-scalar"
+        )
+        for item in (listing, detail, conversation_search, message_search):
+            self.assertLessEqual(len(item["title"]), 4096)
+            self.assertLessEqual(len(item["source_file"]), 4096)
+            self.assertTrue(item["title_truncated"])
+            self.assertTrue(item["source_file_truncated"])
+        self.assertLess(len(json.dumps(detail, ensure_ascii=False).encode("utf-8")), 40_000)
 
     def test_round6_display_cursor_is_sequential_and_legacy_revision_bound(self):
         from chatgpt_export_archiver.db import init_db
@@ -6199,6 +6263,32 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(export_result[0].status_code, 200)
         self.assertIn(old_body, export_result[0].text)
         self.assertNotIn("new committed body", export_result[0].text)
+
+    def test_round6_streaming_export_failure_releases_snapshot_connection(self):
+        import chatgpt_export_archiver.web_api as web_api_module
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+
+        def failing_render(*_args, **_kwargs):
+            yield "synthetic-prefix"
+            raise RuntimeError("synthetic stream failure")
+
+        with mock.patch.object(
+            web_api_module, "iter_rendered_conversation", side_effect=failing_render
+        ):
+            with self.assertRaises(Exception):
+                client.get(
+                    "/api/by-id/export",
+                    params={"conversation_id": "web-1", "format": "txt"},
+                )
+
+        writer = sqlite3.connect(db, timeout=0.25)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.rollback()
+        finally:
+            writer.close()
 
     def test_round6_ordinary_reads_never_run_database_wide_foreign_key_check(self):
         import chatgpt_export_archiver.web_api as web_api_module

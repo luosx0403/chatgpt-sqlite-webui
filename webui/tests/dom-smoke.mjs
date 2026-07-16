@@ -81,8 +81,9 @@ function assertStaticFrontendContracts() {
   assert.equal(paneSource.includes("while (items.length < MAX_NAVIGABLE_HIT_MESSAGES)"), false, "reader hit navigation must not serially prefetch ten pages on initial load");
   assert.ok(paneSource.includes("HIT_PREFETCH_THRESHOLD"), "reader hit navigation should lazily append near the loaded boundary");
   assert.ok(messageBlockSource.includes("getMessageDisplayChunk"), "truncated reader messages should have an explicit bounded expansion path");
-  assert.ok(messageBlockSource.includes("chunk.resolver_input_truncated || !chunk.total_chars_exact"), "single-message expansion/copy must detect incomplete raw recovery on every chunk");
-  assert.ok(paneSource.includes("chunk.resolver_input_truncated || !chunk.total_chars_exact"), "Copy visible must detect incomplete raw recovery on every chunk");
+  assert.ok(messageBlockSource.includes("chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)"), "single-message expansion/copy must distinguish normal intermediate chunks from terminal incomplete raw recovery");
+  assert.ok(paneSource.includes("chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)"), "Copy visible must distinguish normal intermediate chunks from terminal incomplete raw recovery");
+  assert.ok(messageBlockSource.includes("message.display_text_resolver_input_truncated"), "initial reader metadata must expose resolver incompleteness separately from unknown total length");
   assert.ok(paneSource.includes("new IncompleteDisplayRecoveryError()"), "Copy visible must reject incomplete recovered text before clipboard mutation");
   assert.ok(i18nSource.includes("displayRecoveryIncomplete"), "incomplete raw recovery should have an accessible localized warning");
   assert.ok(messageBlockSource.includes("JSON.stringify([conversationId, message.node_id"), "message state keys should use collision-free tuple serialization");
@@ -1241,6 +1242,14 @@ async function main() {
       return url.pathname === "/api/by-id/display" && url.searchParams.get("node_id") === "long-body";
     }).length);
     assert.equal(displayRequestsAfterLayout - displayRequestsBeforeExpand, 2, "long-body expansion should be chunked and layout must not refetch it");
+    assert.equal(
+      await page.getByText("The stored raw payload exceeded the safe recovery limit", { exact: false }).count(),
+      0,
+      "normal intermediate canonical chunks with an inexact running total must not be labelled incomplete",
+    );
+    await page.evaluate(() => { window.__copiedText = ""; });
+    await page.locator('[data-node-id="long-body"]').getByRole("button", { name: "Copy", exact: true }).click();
+    await page.waitForFunction(() => String(window.__copiedText || "").includes("DOM-LONG-BODY-END"), undefined, { timeout: 20_000 });
 
     const incompleteDisplayRoute = async (route) => {
       const url = new URL(route.request().url());

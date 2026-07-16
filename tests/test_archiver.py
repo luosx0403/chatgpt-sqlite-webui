@@ -3409,7 +3409,7 @@ class ArchiverTests(unittest.TestCase):
                 "README.md", "README.zh-CN.md", "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md",
                 "requirements-web.txt", "constraints-web-py312.txt", "LICENSE", "AGENTS.md", "chatgpt_archive.py",
                 "chatgpt_export_archiver/search.py", "chatgpt_export_archiver/web_api.py",
-                "tests/test_archiver.py", "tests/test_web_api.py",
+                "tests/__init__.py", "tests/test_archiver.py", "tests/test_web_api.py",
                 "tools/check_delivery_clean.py", "tools/clean_generated_artifacts.py", "tools/make_release_zip.py",
                 "webui/src/App.tsx", "webui/src/i18n.ts", "webui/src/components/ConversationPane.tsx",
                 "webui/tests/dom-smoke.mjs", "webui/index.html", "webui/package.json",
@@ -3478,6 +3478,7 @@ class ArchiverTests(unittest.TestCase):
                 "chatgpt_export_archiver/utils.py",
                 "tools/benchmark_effective_current.py",
                 "tools/clean_generated_artifacts.py",
+                "tests/__init__.py",
             ):
                 target = work / relative
                 original = target.read_bytes()
@@ -5021,6 +5022,14 @@ class ArchiverTests(unittest.TestCase):
             ).fetchall())
             with self.assertRaises(sqlite3.IntegrityError):
                 valid.execute("INSERT INTO conversations(conversation_id, aggregate_hash) VALUES(NULL, 'x')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                valid.execute(
+                    "UPDATE conversations SET conversation_id=NULL WHERE conversation_id='legacy-synthetic'"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                valid.execute("INSERT INTO archive_generations(name, generation) VALUES(NULL, 0)")
+            with self.assertRaises(sqlite3.IntegrityError):
+                valid.execute("UPDATE archive_generations SET name=NULL WHERE name='title'")
             valid.close()
 
             damaged = sqlite3.connect(Path(td) / "null.db")
@@ -5036,6 +5045,26 @@ class ArchiverTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM conversations WHERE conversation_id IS NULL"
             ).fetchone()[0], 1)
             damaged.close()
+
+            generation_null = sqlite3.connect(Path(td) / "generation-null.db")
+            generation_null.row_factory = sqlite3.Row
+            generation_null.executescript(fixture.read_text(encoding="utf-8"))
+            generation_null.execute(
+                "CREATE TABLE archive_generations(name TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0)"
+            )
+            generation_null.executemany(
+                "INSERT INTO archive_generations(name, generation) VALUES (?, 0)",
+                (("title",), ("message",), (None,), (None,)),
+            )
+            generation_null.commit()
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(generation_null)
+            self.assertEqual(caught.exception.code, "database_schema_incompatible")
+            self.assertEqual(generation_null.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertEqual(generation_null.execute(
+                "SELECT COUNT(*) FROM archive_generations WHERE name IS NULL"
+            ).fetchone()[0], 2)
+            generation_null.close()
 
     def test_round6_delete_input_replacement_is_preserved(self):
         from chatgpt_export_archiver.cli import run_import_pipeline
@@ -5070,6 +5099,59 @@ class ArchiverTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM import_warnings WHERE warning_type='delete_input_changed'"
             ).fetchone()[0], 1)
             conn.close()
+
+    @unittest.skipUnless(hasattr(os, "link"), "hardlink support required")
+    def test_round6_delete_input_hardlink_is_conservatively_preserved(self):
+        from chatgpt_export_archiver.cli import run_import_pipeline
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "source.zip"
+            sibling = base / "same-object.zip"
+            write_zip(source, {"conversations.json": [conversation("hardlink-safe")]})
+            os.link(source, sibling)
+            result = run_import_pipeline(
+                base / "archive.db", str(source), cwd=base,
+                no_input_sha256=True, delete_input_on_success=True,
+            )
+            self.assertTrue(source.exists())
+            self.assertTrue(sibling.exists())
+            self.assertIsNone(result["deleted_input"])
+            self.assertTrue(result["delete_input_changed"])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_round6_delete_input_retargeted_symlink_is_preserved(self):
+        from chatgpt_export_archiver.cli import run_import_pipeline
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            original = base / "original.zip"
+            replacement = base / "replacement.zip"
+            link = base / "source.zip"
+            write_zip(original, {"conversations.json": [conversation("symlink-original")]})
+            write_zip(replacement, {"conversations.json": [conversation("symlink-replacement")]})
+            link.symlink_to(original)
+            retargeted = False
+
+            def progress(stage, _summary):
+                nonlocal retargeted
+                if stage == "import_index_rebuild_complete" and not retargeted:
+                    link.unlink()
+                    link.symlink_to(replacement)
+                    retargeted = True
+
+            result = run_import_pipeline(
+                base / "archive.db", str(link), cwd=base,
+                no_input_sha256=True, delete_input_on_success=True,
+                progress_callback=progress,
+            )
+            self.assertTrue(retargeted)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), replacement.resolve())
+            self.assertTrue(original.exists())
+            self.assertTrue(replacement.exists())
+            self.assertIsNone(result["deleted_input"])
+            self.assertTrue(result["delete_input_changed"])
 
     def test_round6_streamed_export_compare_and_failure_preserve_old_output(self):
         from chatgpt_export_archiver.utils import write_chunks_if_changed
@@ -5147,12 +5229,109 @@ class ArchiverTests(unittest.TestCase):
                 list(scanner._iter_json_array(iter(["[{\"padding\":\"" + "x" * 256 + "\"}]"])))
             with self.assertRaises(scanner.ConversationJsonElementTooLargeError):
                 list(scanner._iter_json_array(iter(["[!" + " " * 256 + "]"])))
+        with mock.patch.object(scanner, "MAX_JSON_ELEMENT_BYTES", 16):
+            self.assertEqual(
+                list(scanner._iter_json_array(iter(['["中中中中"]']))),
+                ["中中中中"],
+            )
+            with self.assertRaises(scanner.ConversationJsonElementTooLargeError):
+                list(scanner._iter_json_array(iter(['["中中中中中"]'])))
         with self.assertRaises(scanner.InvalidConversationEncodingError):
             list(scanner._iter_json_array(iter(["[{\"x\":1}\ufeff]"])))
         self.assertEqual(
             list(scanner._iter_json_array(iter(["[{\"literal\":\"a\ufeffb\",\"escaped\":\"a\\ufeffb\"}]"]))),
             [{"literal": "a\ufeffb", "escaped": "a\ufeffb"}],
         )
+
+    def test_round6_cli_stats_and_export_use_one_snapshot(self):
+        import threading
+        import chatgpt_export_archiver.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "archive.db"
+            seed = connect(db)
+            init_db(seed)
+            seed.execute("PRAGMA journal_mode=WAL")
+            seed.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) "
+                "VALUES ('snapshot', 'old title', 'n', 'h')"
+            )
+            seed.execute(
+                "INSERT INTO conversation_nodes(conversation_id, node_id, role, content_type, "
+                "content_text, content_hash, is_on_current_path) "
+                "VALUES ('snapshot', 'n', 'assistant', 'text', 'old body', 'old', 1)"
+            )
+            seed.commit()
+            seed.close()
+
+            stats_entered = threading.Event()
+            stats_release = threading.Event()
+            original_stats = cli_module.get_stats
+
+            def paused_stats(conn):
+                stats_entered.set()
+                self.assertTrue(stats_release.wait(5))
+                return original_stats(conn)
+
+            stats_result: list[tuple[int, str]] = []
+            with mock.patch.object(cli_module, "get_stats", side_effect=paused_stats):
+                thread = threading.Thread(
+                    target=lambda: stats_result.append(run_cli(["--db", str(db), "stats"])),
+                    daemon=True,
+                )
+                thread.start()
+                self.assertTrue(stats_entered.wait(5))
+                writer = sqlite3.connect(db)
+                writer.execute(
+                    "INSERT INTO conversations(conversation_id, title, aggregate_hash) "
+                    "VALUES ('later', 'later', 'later')"
+                )
+                writer.commit()
+                writer.close()
+                stats_release.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(stats_result[0][0], 0)
+            self.assertIn("conversations 1", stats_result[0][1])
+
+            export_entered = threading.Event()
+            export_release = threading.Event()
+            original_export = cli_module.export_conversations
+
+            def paused_export(conn, *args, **kwargs):
+                export_entered.set()
+                self.assertTrue(export_release.wait(5))
+                return original_export(conn, *args, **kwargs)
+
+            output = base / "exports"
+            export_result: list[tuple[int, str]] = []
+            with mock.patch.object(cli_module, "export_conversations", side_effect=paused_export):
+                thread = threading.Thread(
+                    target=lambda: export_result.append(run_cli([
+                        "--db", str(db), "export", "--out", str(output), "--format", "txt",
+                    ])),
+                    daemon=True,
+                )
+                thread.start()
+                self.assertTrue(export_entered.wait(5))
+                writer = sqlite3.connect(db)
+                writer.execute(
+                    "UPDATE conversation_nodes SET content_text='new body', content_hash='new' "
+                    "WHERE conversation_id='snapshot' AND node_id='n'"
+                )
+                writer.commit()
+                writer.close()
+                export_release.set()
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(export_result[0][0], 0, export_result[0][1])
+            exported = "\n".join(path.read_text(encoding="utf-8") for path in output.glob("*.txt"))
+            self.assertIn("old body", exported)
+            self.assertNotIn("new body", exported)
+            check = sqlite3.connect(db)
+            self.assertGreaterEqual(check.execute("SELECT COUNT(*) FROM exports").fetchone()[0], 1)
+            check.close()
 
 if __name__ == "__main__":
     unittest.main()

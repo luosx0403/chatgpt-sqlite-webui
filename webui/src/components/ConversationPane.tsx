@@ -488,7 +488,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   };
   const messageText = (m: MessageItem) => m.display_text || "";
   const completeMessageText = async (message: MessageItem, signal: AbortSignal): Promise<string> => {
-    if (message.display_text_total_chars_exact === false) throw new IncompleteDisplayRecoveryError();
+    if (message.display_text_resolver_input_truncated) throw new IncompleteDisplayRecoveryError();
     if (!message.display_text_truncated) return messageText(message);
     let offset = 0;
     let cursor: string | null = null;
@@ -496,7 +496,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     let completeBytes = 0;
     for (;;) {
       const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 65536, signal, cursor);
-      if (chunk.resolver_input_truncated || !chunk.total_chars_exact) throw new IncompleteDisplayRecoveryError();
+      if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
+        throw new IncompleteDisplayRecoveryError();
+      }
       completeBytes += new TextEncoder().encode(chunk.display_text).byteLength;
       if (complete.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || completeBytes > MAX_BROWSER_COPY_BYTES) {
         throw new CopyLimitError();

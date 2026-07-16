@@ -492,9 +492,9 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bi
 
 匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。
 
-獨立 JSON、目錄成員與 ZIP 成員使用同一個單遍、逐頂層陣列元素的解碼器，並位於同一匯入交易；每個元素只掃描和解碼一次，上限為 128 Mi 字元。只移除檔案開頭的一個 UTF-8 BOM；JSON 字串內的 U+FEFF 會保留，重複開頭 BOM、字串外的中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。新匯入 canonical 對話與圖 ID 上限為 512 字元，超長 ID 會用不含內容的 warning 跳過，絕不截斷。主要 Web 尋址使用 query-based `/api/by-id/*`，可無歧義接受最多 16 Ki 字元的 legacy ID；舊 path route 僅保留給 route-safe 的 512 字元 ID。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
+獨立 JSON、目錄成員與 ZIP 成員使用同一個單遍、逐頂層陣列元素的解碼器，並位於同一匯入交易；每個元素只掃描和解碼一次，UTF-8 輸入上限為 128 MiB，解碼後字元數也限制為 128 Mi。只移除檔案開頭的一個 UTF-8 BOM；JSON 字串內的 U+FEFF 會保留，重複開頭 BOM、字串外的中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。新匯入 canonical 對話與圖 ID 上限為 512 字元，超長 ID 會用不含內容的 warning 跳過，絕不截斷。主要 Web 尋址使用 query-based `/api/by-id/*`，可無歧義接受最多 16 Ki 字元的 legacy ID；舊 path route 僅保留給 route-safe 的 512 字元 ID。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
 
-非標準 JSON `NaN` / `Infinity` 會被拒絕。預設 message API 只回傳一份完整可見正文 `display_text`，不複製 `content_text`/`render_text`。Effective-current、分頁與 around-node 語義維持不變。
+非標準 JSON `NaN` / `Infinity`（包括 `1e9999` 這類溢出的標準數值）會被拒絕；無效時間寫成 `NULL` 並記錄不含內容的 warning。預設 message API 只回傳一份受 reader 預算限制的 `display_text`，並以 truncation/total-exactness metadata 表示能否完整復原，不複製 `content_text`/`render_text`。普通 CLI/Web 讀取和預設 `/api/health` 使用有界 schema gate，不執行 `foreign_key_check`；`verify` 與 `/api/health?deep=true` 執行完整精確檢查並提供 freshness 欄位。每個多語句 CLI/Web 邏輯讀取都在 schema/capability probe 前建立一個 SQLite read snapshot，串流回應正常結束或失敗時都會釋放。Effective-current、分頁與 around-node 語義維持不變。
 
 「複製 URL」永遠明確寫入 `match_mode`、`layout`、`show_internal` 與可分享的搜尋/reader 狀態。URL 明確值優先於 `localStorage`，缺少值才可回退本機設定。本版本使用 `replaceState`，瀏覽器上一頁/下一頁不會還原逐步搜尋或選擇歷程。
 

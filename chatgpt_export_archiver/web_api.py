@@ -36,7 +36,14 @@ from .db import (
 from .logging_utils import get_logger
 from .identifiers import MAX_CANONICAL_ID_LENGTH
 from .parser import normalize_display_text
-from .scanner import SourceEntry, is_conversation_json_source, is_metadata_path, select_conversation_sources
+from .scanner import (
+    MAX_JSON_ELEMENT_BYTES,
+    MAX_JSON_ELEMENT_CHARS,
+    SourceEntry,
+    is_conversation_json_source,
+    is_metadata_path,
+    select_conversation_sources,
+)
 from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
 from .sqlite_errors import sqlite_runtime_error_code
 from .search import DisplayCursorError, _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_messages
@@ -672,8 +679,8 @@ def create_api_router(
                 "filters": ["q", "after", "before", "role", "title", "scope", "exact", "exclude", "source", "match_mode"],
                 "limits": {"conversation_id": MAX_LEGACY_ID_PARAM_LENGTH, "around_node_id": MAX_LEGACY_ID_PARAM_LENGTH, "q": 500, "title": 200, "exact": 300, "exclude": 200, "source": 200, "after": MAX_DATE_PARAM_LENGTH, "before": MAX_DATE_PARAM_LENGTH, "offset": MAX_SQLITE_OFFSET},
                 "raw": "message pages return raw_preview only; capped raw preview is available per message endpoint",
-                "item_fields": ["node_id", "parent_node_id", "message_id", "role", "author_name", "create_time", "update_time", "content_type", "display_text", "display_text_truncated", "display_text_total_chars", "display_text_total_chars_exact", "display_text_returned_chars", "has_text", "has_raw", "raw_preview", "raw_preview_truncated", "content_hash", "is_on_current_path", "effective_visible_in_current_view", "is_internal", "is_empty_mapping_node", "highlight_ranges", "highlight_ranges_truncated", "highlight_scanned_chars", "highlight_range_limit_reached"],
-                "display_text_contract": "display_text is the bounded reader preview of the resolved user-visible body; use the display chunk endpoint for explicit expansion and copy",
+                "item_fields": ["node_id", "parent_node_id", "message_id", "role", "author_name", "create_time", "update_time", "content_type", "display_text", "display_text_truncated", "display_text_total_chars", "display_text_total_chars_exact", "display_text_resolver_input_truncated", "display_text_returned_chars", "has_text", "has_raw", "raw_preview", "raw_preview_truncated", "content_hash", "is_on_current_path", "effective_visible_in_current_view", "is_internal", "is_empty_mapping_node", "highlight_ranges", "highlight_ranges_truncated", "highlight_scanned_chars", "highlight_range_limit_reached"],
+                "display_text_contract": "display_text is the bounded reader preview of the resolved user-visible body; total_chars_exact=false can mean a normal cursor-expandable canonical body, while display_text_resolver_input_truncated=true means raw fallback cannot be completely recovered; use the display chunk endpoint for explicit expansion and copy",
                 "budgets": {
                     "message_display_chars": effective_reader_budget.message_display_chars,
                     "page_display_chars": effective_reader_budget.page_display_chars,
@@ -789,7 +796,7 @@ def create_api_router(
                     "content_length": "canonical nonnegative ASCII decimal with at most 20 digits; duplicates and alternate numeric syntax are rejected before multipart parsing",
                     "forwarded_headers": "strict edge-proxy model: ignored from untrusted peers; a trusted direct edge must overwrite client values and provide at most one Forwarded element or one X-Forwarded-Host/Proto value; duplicates, chains, malformed syntax, and conflicts are rejected",
                 },
-                "limits_note": "ZIP size checks run before import; JSON parsing and SQLite writes still consume memory, disk, and CPU proportional to decoded conversation JSON size; one top-level JSON element is capped at 128 Mi characters.",
+                "limits_note": "ZIP size checks run before import; JSON parsing and SQLite writes still consume memory, disk, and CPU proportional to decoded conversation JSON size; one top-level JSON element is capped at 128 MiB of UTF-8 input and 128 Mi decoded characters.",
             },
             "jobs": {
                 "endpoints": ["/api/import/jobs", "/api/import/jobs/{job_id}"],
@@ -798,12 +805,14 @@ def create_api_router(
                 "outcomes": ["queued", "import_running", "import_job_start_failed", "input_preflight_failed", "source_scan_failed", "source_read_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
                 "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index"],
                 "web_index_progress": ["status", "build_stage", "processed", "total", "complete", "batch_size"],
-                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
+                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "conversation_json_element_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
                 "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"]},
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
             },
             "import_contract": {
-                "top_level": "conversation JSON must be one array; a single-pass incremental framer scans each element once, then decodes it once; one element is capped at 128 Mi characters",
+                "top_level": "conversation JSON must be one array; a single-pass incremental framer scans each element once, then decodes it once; one element is capped at 128 MiB of UTF-8 input and 128 Mi decoded characters",
+                "max_element_utf8_bytes": MAX_JSON_ELEMENT_BYTES,
+                "max_element_decoded_chars": MAX_JSON_ELEMENT_CHARS,
                 "encoding": "UTF-8 only; exactly one file-leading UTF-8 BOM is removed; repeated or JSON-outside-string U+FEFF, UTF-16/32, mixed, and invalid encodings are rejected, while U+FEFF inside a JSON string is preserved",
                 "canonical_id_max_chars": MAX_CANONICAL_ID_LENGTH,
                 "id_fields": ["conversation_id", "exported_conversation_id", "mapping_node_key", "node_id", "message_id", "current_node", "parent", "children"],

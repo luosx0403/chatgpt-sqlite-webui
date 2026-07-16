@@ -492,9 +492,9 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、显式 loopback bind 
 
 导入失败使用稳定的输入预检、source scan、source read、JSON decode、顶层契约和事务阶段。新增稳定 code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding` 和 `json_integer_too_large`。清理诊断使用结构化 `cleanup_warnings` 数组；旧 `cleanup_warning` 标量仅代表首项。任何响应都不泄漏临时路径。
 
-独立 JSON、目录成员和 ZIP 成员使用同一个单遍、逐顶层数组元素的解码器，并处于同一导入事务；每个元素只扫描和解码一次，最大 128 Mi 字符。只移除文件开头的一个 UTF-8 BOM；JSON 字符串内的 U+FEFF 会保留，重复开头 BOM、字符串外的中间 BOM、UTF-16/32、混合编码和无效 UTF-8 都会拒绝。新导入的 canonical 会话及图结构 ID 限制为 512 个字符，超长 ID 会以不含内容的 warning 跳过该会话元素，绝不截断。主要 Web 寻址使用 query-based `/api/by-id/*`，可无歧义接受最多 16 Ki 字符的 legacy ID（包括 slash、问号、井号、百分号和 Unicode）；旧 path route 只保留给 route-safe 的 512 字符 ID。ZIP source-read 会区分加密、缺失、读取期间变化、CRC 失败及其他读取失败。
+独立 JSON、目录成员和 ZIP 成员使用同一个单遍、逐顶层数组元素的解码器，并处于同一导入事务；每个元素只扫描和解码一次，UTF-8 输入上限为 128 MiB，解码后字符数也限制为 128 Mi。只移除文件开头的一个 UTF-8 BOM；JSON 字符串内的 U+FEFF 会保留，重复开头 BOM、字符串外的中间 BOM、UTF-16/32、混合编码和无效 UTF-8 都会拒绝。新导入的 canonical 会话及图结构 ID 限制为 512 个字符，超长 ID 会以不含内容的 warning 跳过该会话元素，绝不截断。主要 Web 寻址使用 query-based `/api/by-id/*`，可无歧义接受最多 16 Ki 字符的 legacy ID（包括 slash、问号、井号、百分号和 Unicode）；旧 path route 只保留给 route-safe 的 512 字符 ID。ZIP source-read 会区分加密、缺失、读取期间变化、CRC 失败及其他读取失败。
 
-非标准 JSON `NaN` / `Infinity` 会被拒绝；字符串形式的非有限时间写成 `NULL` 并记录 warning。默认 message API 只返回一份完整用户正文 `display_text`，不再复制 `content_text`/`render_text` 别名。`verify` 会检测旧库非有限时间；effective-current、分页和 around-node 语义保持不变。
+非标准 JSON `NaN` / `Infinity`（包括 `1e9999` 这类溢出标准数值）会被拒绝；无效时间写成 `NULL` 并记录不含内容的 warning。默认 message API 只返回一份受 reader 预算限制的 `display_text`，并以 truncation/total-exactness metadata 说明能否完整恢复，不复制 `content_text`/`render_text` 别名。普通 CLI/Web 读取和默认 `/api/health` 使用有界 schema gate，不执行 `foreign_key_check`；`verify` 与 `/api/health?deep=true` 执行完整精确检查并提供 freshness 字段。每个多语句 CLI/Web 逻辑读取都在 schema/capability probe 前建立一个 SQLite read snapshot，流式响应正常结束或失败时均会释放。Effective-current、分页和 around-node 语义保持不变。
 
 “复制 URL”始终显式写入 `match_mode`、`layout`、`show_internal` 及可共享搜索/reader 状态。URL 显式值优先于 `localStorage`，缺失值才可回退本地设置。本版本使用 `replaceState`，浏览器前进/后退不会恢复逐步搜索或选择历史。
 

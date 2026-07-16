@@ -48,6 +48,24 @@ MAX_LEGACY_DISPLAY_OFFSET = 1_048_576
 MAX_SQLITE_CURSOR_OFFSET = 9_223_372_036_854_775_807
 
 
+def _bounded_scalar_projection(expression: str, alias: str, limit: int) -> str:
+    return (
+        f"substr(CAST(COALESCE({expression}, '') AS BLOB), 1, {limit * 4 + 4}) "
+        f"AS {alias}"
+    )
+
+
+def _conversation_api_columns(alias: str = "c") -> str:
+    return ", ".join((
+        f"{alias}.conversation_id",
+        _bounded_scalar_projection(f"{alias}.title", "title", MAX_API_TITLE_CHARS),
+        f"{alias}.create_time",
+        f"{alias}.update_time",
+        f"{alias}.current_node",
+        _bounded_scalar_projection(f"{alias}.source_file", "source_file", MAX_API_SOURCE_CHARS),
+    ))
+
+
 class DisplayCursorError(ValueError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -655,8 +673,7 @@ def list_conversations(
     }.get(sort, "COALESCE(c.update_time, c.create_time, 0) DESC, c.conversation_id ASC")
     rows = conn.execute(
         f"""
-        SELECT c.conversation_id, c.title, c.create_time, c.update_time, c.current_node,
-               c.source_file
+        SELECT {_conversation_api_columns('c')}
         FROM conversations c
         {where}
         ORDER BY {order}
@@ -670,8 +687,7 @@ def list_conversations(
     if selected_id and selected_in_results and selected_id not in page_ids:
         selected_where = f"{where} {'AND' if where else 'WHERE'} c.conversation_id = ?"
         selected_row = conn.execute(
-            f"""SELECT c.conversation_id, c.title, c.create_time, c.update_time,
-                       c.current_node, c.source_file
+            f"""SELECT {_conversation_api_columns('c')}
                 FROM conversations c
                 {selected_where}
                 LIMIT 1""",
@@ -895,8 +911,8 @@ def _is_title_only_candidate_context(parsed: ParsedQuery) -> bool:
 def get_conversation(conn: sqlite3.Connection, conversation_id: str) -> dict[str, Any] | None:
     ensure_effective_current_views(conn, [conversation_id])
     row = conn.execute(
-        """
-        SELECT c.*, COUNT(n.node_id) AS node_count,
+        f"""
+        SELECT {_conversation_api_columns('c')}, COUNT(n.node_id) AS node_count,
                SUM(CASE WHEN n.is_on_current_path = 1 THEN 1 ELSE 0 END) AS current_path_nodes
         FROM conversations c
         LEFT JOIN conversation_nodes n ON n.conversation_id = c.conversation_id
@@ -1142,28 +1158,63 @@ def _hydrate_reader_rows(
     placeholders = ",".join("?" for _ in node_ids)
     text_rows = conn.execute(
         f"""
-        SELECT node_id,
-               length(COALESCE(content_text, '')) AS content_text_total_chars,
-               substr(COALESCE(content_text, ''), 1, ?) AS content_text,
-               length(COALESCE(raw_message_json, '')) AS raw_message_total_chars,
-               substr(COALESCE(raw_message_json, ''), 1, ?) AS raw_message_json
+        SELECT rowid AS storage_rowid, node_id,
+               content_text IS NULL AS content_text_is_null,
+               raw_message_json IS NULL AS raw_message_is_null
         FROM conversation_nodes
         WHERE conversation_id = ? AND node_id IN ({placeholders})
         """,
-        [display_limit + 1, raw_limit + 1, conversation_id, *node_ids],
+        [conversation_id, *node_ids],
     ).fetchall()
     by_id = {str(row["node_id"]): row for row in text_rows}
     for row in output:
         text_row = by_id[str(row["node_id"])]
-        content = str(text_row["content_text"] or "")
-        raw = str(text_row["raw_message_json"] or "")
-        row["content_text"] = content[:display_limit]
-        row["content_text_total_chars"] = int(text_row["content_text_total_chars"] or 0)
-        row["content_text_source_truncated"] = len(content) > display_limit
-        row["raw_message_json"] = raw[:raw_limit]
-        row["raw_message_total_chars"] = int(text_row["raw_message_total_chars"] or 0)
-        row["raw_message_source_truncated"] = len(raw) > raw_limit
+        storage_rowid = int(text_row["storage_rowid"])
+        content, content_total, content_exact, content_truncated = _bounded_row_blob_text(
+            conn,
+            storage_rowid,
+            "content_text",
+            display_limit,
+            is_null=bool(text_row["content_text_is_null"]),
+        )
+        raw, raw_total, raw_exact, raw_truncated = _bounded_row_blob_text(
+            conn,
+            storage_rowid,
+            "raw_message_json",
+            raw_limit,
+            is_null=bool(text_row["raw_message_is_null"]),
+        )
+        row["content_text"] = content
+        row["content_text_total_chars"] = content_total
+        row["content_text_total_chars_exact"] = content_exact
+        row["content_text_source_truncated"] = content_truncated
+        row["raw_message_json"] = raw
+        row["raw_message_total_chars"] = raw_total
+        row["raw_message_total_chars_exact"] = raw_exact
+        row["raw_message_source_truncated"] = raw_truncated
     return output
+
+
+def _bounded_row_blob_text(
+    conn: sqlite3.Connection,
+    storage_rowid: int,
+    column: str,
+    limit: int,
+    *,
+    is_null: bool,
+) -> tuple[str, int, bool, bool]:
+    """Read at most ``limit + 1`` UTF-8 characters from one SQLite value."""
+
+    if is_null:
+        return "", 0, True, False
+    with conn.blobopen("conversation_nodes", column, storage_rowid, readonly=True) as blob:
+        text, _next_byte, has_more, _invalid_utf8 = _read_utf8_blob_chunk(
+            blob, 0, limit + 1
+        )
+    truncated = has_more or len(text) > limit
+    exact = not has_more
+    total_or_lower_bound = len(text)
+    return text[:limit], total_or_lower_bound, exact, truncated
 
 
 def _conversation_rows(conn: sqlite3.Connection, conversation_id: str) -> list[sqlite3.Row]:
@@ -1551,8 +1602,11 @@ def _fts_message_rows(conn: sqlite3.Connection, parsed: ParsedQuery, fts_query: 
         SELECT n.conversation_id, n.node_id, n.role, n.create_time, n.update_time,
                n.content_type, n.content_text, n.is_on_current_path,
                CASE WHEN {effective_expression} THEN 1 ELSE 0 END AS effective_visible_in_current_view,
-               c.title, c.create_time AS conversation_create_time, c.update_time AS conversation_update_time,
-               c.current_node, c.source_file, bm25(message_fts) AS bm25_score
+               {_bounded_scalar_projection("c.title", "title", MAX_API_TITLE_CHARS)},
+               c.create_time AS conversation_create_time, c.update_time AS conversation_update_time,
+               c.current_node,
+               {_bounded_scalar_projection("c.source_file", "source_file", MAX_API_SOURCE_CHARS)},
+               bm25(message_fts) AS bm25_score
         FROM message_fts
         JOIN conversation_nodes n
           ON n.conversation_id = message_fts.conversation_id AND n.node_id = message_fts.node_id
@@ -1641,11 +1695,11 @@ def _message_search_base_select(
                    {_sql_display_text('n')} AS resolved_text,
                    {score_expr} AS candidate_score,
                    {f"COALESCE(mn.content_norm, web_norm({_sql_display_text('n')}))" if has_norm else "NULL"} AS resolved_norm,
-                   c.title AS conversation_title,
+                   {_bounded_scalar_projection("c.title", "conversation_title", MAX_API_TITLE_CHARS)},
                    c.create_time AS conversation_create_time,
                    c.update_time AS conversation_update_time,
                    c.current_node AS conversation_current_node,
-                   c.source_file AS conversation_source_file
+                   {_bounded_scalar_projection("c.source_file", "conversation_source_file", MAX_API_SOURCE_CHARS)}
             FROM {source_sql}
             JOIN conversations c ON c.conversation_id = n.conversation_id
             {norm_join}
@@ -1851,7 +1905,7 @@ def _title_rows(conn: sqlite3.Connection, parsed: ParsedQuery, limit: int | None
     limit_clause, limit_params = _limit_clause(limit)
     return conn.execute(
         f"""
-        SELECT c.conversation_id, c.title, c.create_time, c.update_time, c.current_node, c.source_file
+        SELECT {_conversation_api_columns("c")}
         FROM conversations c
         {norm_join}
         {where}
@@ -1904,7 +1958,7 @@ def _conversation_search_page(
             GROUP BY conversation_id
         ),
         filtered AS (
-            SELECT c.conversation_id, c.title, c.create_time, c.update_time, c.current_node, c.source_file,
+            SELECT {_conversation_api_columns("c")},
                    grouped.hit_count, grouped.score, grouped.message_match, grouped.title_match
             FROM grouped
             JOIN conversations c ON c.conversation_id = grouped.conversation_id
@@ -1927,11 +1981,10 @@ def _conversation_search_page(
         items.append(
             {
                 "conversation_id": row["conversation_id"],
-                "title": row["title"],
+                **_conversation_scalar_fields(row),
                 "create_time": row["create_time"],
                 "update_time": row["update_time"],
                 "current_node": row["current_node"],
-                "source_file": row["source_file"],
                 "hit_count": int(row["hit_count"] or 0),
                 "snippets": [],
                 "reasons": reasons,
@@ -1948,7 +2001,7 @@ def _filter_conversation_page(conn: sqlite3.Connection, parsed: ParsedQuery, lim
     order = _conversation_search_order(sort)
     rows = conn.execute(
         f"""
-        SELECT c.conversation_id, c.title, c.create_time, c.update_time, c.current_node, c.source_file,
+        SELECT {_conversation_api_columns("c")},
                1.0 AS score,
                COUNT(*) OVER() AS total_rows
         FROM conversations c
@@ -1968,7 +2021,7 @@ def _filter_conversation_item(conn: sqlite3.Connection, parsed: ParsedQuery, con
     where, params = _filter_conversation_where(parsed, conversation_id=conversation_id)
     row = conn.execute(
         f"""
-        SELECT c.conversation_id, c.title, c.create_time, c.update_time, c.current_node, c.source_file
+        SELECT {_conversation_api_columns("c")}
         FROM conversations c
         {where}
         LIMIT 1
@@ -1981,11 +2034,10 @@ def _filter_conversation_item(conn: sqlite3.Connection, parsed: ParsedQuery, con
 def _filter_conversation_summary(row: sqlite3.Row, parsed: ParsedQuery) -> dict[str, Any]:
     return {
         "conversation_id": row["conversation_id"],
-        "title": row["title"],
+        **_conversation_scalar_fields(row),
         "create_time": row["create_time"],
         "update_time": row["update_time"],
         "current_node": row["current_node"],
-        "source_file": row["source_file"],
         "hit_count": 0,
         "snippets": [],
         "reasons": _filter_reasons(parsed),
@@ -2090,7 +2142,7 @@ def _conversation_search_item_inner(conn: sqlite3.Connection, parsed: ParsedQuer
             FROM raw_matches
             GROUP BY conversation_id
         )
-        SELECT c.conversation_id, c.title, c.create_time, c.update_time, c.current_node, c.source_file,
+        SELECT {_conversation_api_columns("c")},
                grouped.hit_count, grouped.score, grouped.message_match, grouped.title_match
         FROM grouped
         JOIN conversations c ON c.conversation_id = grouped.conversation_id
@@ -2108,11 +2160,10 @@ def _conversation_search_item_inner(conn: sqlite3.Connection, parsed: ParsedQuer
         reasons.append("title match")
     return {
         "conversation_id": row["conversation_id"],
-        "title": row["title"],
+        **_conversation_scalar_fields(row),
         "create_time": row["create_time"],
         "update_time": row["update_time"],
         "current_node": row["current_node"],
-        "source_file": row["source_file"],
         "hit_count": int(row["hit_count"] or 0),
         "snippets": [],
         "reasons": reasons,
@@ -2966,6 +3017,9 @@ def _message_payload(
         "display_text_truncated": bool(fields.get("display_text_truncated")),
         "display_text_total_chars": fields.get("display_text_total_chars", len(fields["display_text"])),
         "display_text_total_chars_exact": bool(fields.get("display_text_total_chars_exact", True)),
+        "display_text_resolver_input_truncated": bool(
+            fields.get("display_text_resolver_input_truncated", False)
+        ),
         "display_text_returned_chars": len(fields["display_text"]),
         "has_text": bool(fields["display_text"]),
         "has_raw": bool(fields.get("raw_size") or fields["raw_preview"]),
@@ -2997,6 +3051,8 @@ def _message_display_fields(
     raw_message_json = row["raw_message_json"] or ""
     content_total = int(row.get("content_text_total_chars", len(text)))
     raw_total = int(row.get("raw_message_total_chars", len(raw_message_json)))
+    content_total_exact = bool(row.get("content_text_total_chars_exact", True))
+    raw_total_exact = bool(row.get("raw_message_total_chars_exact", True))
     content_source_truncated = bool(row.get("content_text_source_truncated", content_total > len(text)))
     raw_source_truncated = bool(row.get("raw_message_source_truncated", raw_total > len(raw_message_json)))
     parsed_message: Any = RAW_MESSAGE_NOT_PARSED
@@ -3016,13 +3072,13 @@ def _message_display_fields(
     placeholder_text = _is_placeholder_text(text)
     if text and not placeholder_text:
         display_total = content_total
-        display_total_exact = True
+        display_total_exact = content_total_exact
     elif resolved_display_text != text:
         display_total = len(resolved_display_text)
-        display_total_exact = not raw_source_truncated
+        display_total_exact = raw_total_exact and not raw_source_truncated
     else:
         display_total = content_total if text else len(resolved_display_text)
-        display_total_exact = not raw_source_truncated
+        display_total_exact = raw_total_exact and not raw_source_truncated
     display_text = resolved_display_text[:display_limit] if display_limit is not None else resolved_display_text
     display_truncated = (
         content_source_truncated
@@ -3037,6 +3093,9 @@ def _message_display_fields(
         "display_text_truncated": display_truncated,
         "display_text_total_chars": display_total,
         "display_text_total_chars_exact": display_total_exact,
+        "display_text_resolver_input_truncated": bool(
+            raw_source_truncated and (not text or placeholder_text)
+        ),
         "display_text_returned_chars": len(display_text),
         "raw_preview": raw_preview,
         "raw_preview_truncated": bool(raw_total > len(raw_preview)),
@@ -3155,7 +3214,10 @@ def _sanitize_raw_preview(value: Any) -> Any:
 def _bounded_api_scalar(value: Any, limit: int) -> tuple[str | None, bool, int]:
     if value is None:
         return None, False, 0
-    text = normalize_display_text(str(value))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        text = normalize_display_text(bytes(value).decode("utf-8", errors="replace"))
+    else:
+        text = normalize_display_text(str(value))
     return text[:limit], len(text) > limit, len(text)
 
 

@@ -85,6 +85,7 @@ export interface MessageItem {
   display_text_truncated?: boolean;
   display_text_total_chars?: number;
   display_text_total_chars_exact?: boolean;
+  display_text_resolver_input_truncated?: boolean;
   display_text_returned_chars?: number;
   has_text: boolean;
   has_raw: boolean;

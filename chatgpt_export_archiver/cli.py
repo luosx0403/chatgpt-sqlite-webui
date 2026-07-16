@@ -25,6 +25,7 @@ from .db import (
     init_db,
     migrate_database,
     optimize_after_import,
+    read_snapshot,
     recreate_import_rebuildable_indexes,
     require_current_database_schema,
     record_source_entries,
@@ -926,18 +927,19 @@ def _elapsed(start: float) -> float:
 def cmd_export(args: argparse.Namespace) -> int:
     conn = connect_existing(Path(args.db))
     try:
-        require_current_database_schema(conn)
-        formats = ["md", "txt"] if args.format == "all" else [args.format]
-        result = export_conversations(
-            conn,
-            Path(args.out),
-            formats,
-            args.from_date,
-            args.to_date,
-            args.force,
-            path=args.path,
-            include_internal=args.include_internal,
-        )
+        with read_snapshot(conn):
+            require_current_database_schema(conn)
+            formats = ["md", "txt"] if args.format == "all" else [args.format]
+            result = export_conversations(
+                conn,
+                Path(args.out),
+                formats,
+                args.from_date,
+                args.to_date,
+                args.force,
+                path=args.path,
+                include_internal=args.include_internal,
+            )
     finally:
         conn.close()
     print(f"exported_conversations {result['conversations']}")
@@ -951,8 +953,9 @@ def cmd_export(args: argparse.Namespace) -> int:
 def cmd_stats(args: argparse.Namespace) -> int:
     conn = connect_existing_readonly(Path(args.db))
     try:
-        require_current_database_schema(conn)
-        stats = get_stats(conn)
+        with read_snapshot(conn):
+            require_current_database_schema(conn)
+            stats = get_stats(conn)
     finally:
         conn.close()
     for key, value in stats.items():
@@ -966,7 +969,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
 def cmd_verify(args: argparse.Namespace) -> int:
     conn = connect_existing_readonly(Path(args.db))
     try:
-        result = verify_database(conn)
+        with read_snapshot(conn):
+            result = verify_database(conn)
     finally:
         conn.close()
     print(f"ok {str(result['ok']).lower()}")
@@ -1045,12 +1049,13 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     conn = connect_existing_readonly(Path(args.db))
     try:
-        require_current_database_schema(conn)
-        parsed = parse_query(args.query)
-        if parsed.errors:
-            print("invalid_query true")
-            return 2
-        page = search_messages(conn, parsed, limit=args.limit, count_total=False)
+        with read_snapshot(conn):
+            require_current_database_schema(conn)
+            parsed = parse_query(args.query)
+            if parsed.errors:
+                print("invalid_query true")
+                return 2
+            page = search_messages(conn, parsed, limit=args.limit, count_total=False)
     finally:
         conn.close()
     for row in page["items"]:

@@ -492,9 +492,9 @@ Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
 
-単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、上限は 128 Mi 文字です。ファイル先頭の UTF-8 BOM は 1 個だけ除去し、JSON 文字列内の U+FEFF は保持します。重複先頭 BOM、文字列外の途中 BOM、UTF-16/32、混在または不正な UTF-8 は拒否します。新しい canonical ID は 512 文字上限で切り詰めません。主要 Web アドレス指定は query-based `/api/by-id/*` で、slash や URL 記号を含む legacy ID を 16 Ki 文字まで曖昧さなく扱います。旧 path route は route-safe な 512 文字 ID 専用です。
+単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、UTF-8 入力は 128 MiB、decode 後の文字数も 128 Mi に制限されます。ファイル先頭の UTF-8 BOM は 1 個だけ除去し、JSON 文字列内の U+FEFF は保持します。重複先頭 BOM、文字列外の途中 BOM、UTF-16/32、混在または不正な UTF-8 は拒否します。新しい canonical ID は 512 文字上限で切り詰めません。主要 Web アドレス指定は query-based `/api/by-id/*` で、slash や URL 記号を含む legacy ID を 16 Ki 文字まで曖昧さなく扱います。旧 path route は route-safe な 512 文字 ID 専用です。
 
-既定 message API は完全な表示本文を `display_text` 一つだけ返し、`content_text`/`render_text` を重複しません。Effective-current、pagination、around-node の意味は維持されます。
+非標準 JSON `NaN` / `Infinity`（`1e9999` のような overflow する標準数値を含む）は拒否され、無効な timestamp は内容を含まない warning とともに `NULL` になります。既定 message API は reader budget で制限された `display_text` を一つだけ返し、truncation/total-exactness metadata で完全復元の可否を示し、`content_text`/`render_text` を重複しません。通常の CLI/Web read と既定 `/api/health` は bounded schema gate を使い、`foreign_key_check` を実行しません。`verify` と `/api/health?deep=true` は完全で正確な検査と freshness fields を返します。複数 statement の CLI/Web logical read は schema/capability probe 前に一つの SQLite read snapshot を開始し、stream の完了・失敗時に解放します。Effective-current、pagination、around-node の意味は維持されます。
 
 「URL をコピー」は `match_mode`、`layout`、`show_internal` と共有可能な search/reader state を必ず明示します。URL の明示値は `localStorage` より優先され、欠落値だけがローカル設定を使います。本版は `replaceState` を使い、ブラウザーの戻る/進むで段階的な検索・選択履歴を復元しません。
 

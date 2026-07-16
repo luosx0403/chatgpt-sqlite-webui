@@ -126,7 +126,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
   );
   const [displayNextCursor, setDisplayNextCursor] = useState<string | null>(() => savedState?.displayNextCursor ?? null);
   const [displayRecoveryIncomplete, setDisplayRecoveryIncomplete] = useState(
-    () => savedState?.displayRecoveryIncomplete ?? message.display_text_total_chars_exact === false,
+    () => savedState?.displayRecoveryIncomplete ?? Boolean(message.display_text_resolver_input_truncated),
   );
   const [displayLoading, setDisplayLoading] = useState(false);
   const [displayError, setDisplayError] = useState("");
@@ -155,7 +155,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
   const messageIdentityRef = useRef(messageIdentity);
   messageIdentityRef.current = messageIdentity;
   const copy = async () => {
-    if (message.display_text_total_chars_exact === false || displayRecoveryIncomplete) {
+    if (message.display_text_resolver_input_truncated || displayRecoveryIncomplete) {
       setDisplayRecoveryIncomplete(true);
       setDisplayError(t("displayRecoveryIncomplete"));
       return;
@@ -179,7 +179,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
       while (true) {
         const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal, cursor);
         if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
-        if (chunk.resolver_input_truncated || !chunk.total_chars_exact) {
+        if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
           setDisplayRecoveryIncomplete(true);
           throw new IncompleteDisplayRecoveryError();
         }
@@ -259,7 +259,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     setExpandedText(null);
     setDisplayNextOffset(0);
     setDisplayNextCursor(null);
-    setDisplayRecoveryIncomplete(message.display_text_total_chars_exact === false);
+    setDisplayRecoveryIncomplete(Boolean(message.display_text_resolver_input_truncated));
     setDisplayLoading(false);
     setDisplayError("");
     notifySizeMayChange();
@@ -345,7 +345,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     try {
       const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal, displayNextCursor);
       if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
-      const incomplete = chunk.resolver_input_truncated || !chunk.total_chars_exact;
+      const incomplete = chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact);
       if (incomplete) setDisplayRecoveryIncomplete(true);
       setExpandedText((current) => offset === 0 ? chunk.display_text : `${current ?? ""}${chunk.display_text}`);
       setDisplayNextOffset(chunk.next_offset);

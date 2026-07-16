@@ -4,8 +4,9 @@ import json
 import math
 import re
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .current_path import effective_current_metadata, ensure_effective_current_views
 
@@ -379,6 +380,30 @@ def connect_existing(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Keep one logical multi-query read operation on one SQLite snapshot.
+
+    A caller-owned transaction is preserved.  Otherwise this context begins
+    before schema/capability probes and releases the snapshot on every success
+    or failure path.  Writable callers may deliberately upgrade and commit the
+    transaction themselves after producing snapshot-consistent output.
+    """
+
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        if owns_transaction and conn.in_transaction:
+            conn.rollback()
+        raise
+    else:
+        if owns_transaction and conn.in_transaction:
+            conn.commit()
 
 
 def configure_bulk_write_connection(conn: sqlite3.Connection) -> None:

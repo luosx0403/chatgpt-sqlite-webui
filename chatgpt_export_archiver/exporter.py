@@ -129,6 +129,7 @@ def export_conversations(
     filenames = build_filename_map(conversations, formats)
     _validate_filename_plan(filenames, conversations, formats)
     manifest_rows: list[dict[str, Any]] = []
+    export_records: list[tuple[str, str, Path, str, dict[str, Any]]] = []
     written = 0
     skipped = 0
 
@@ -172,9 +173,8 @@ def export_conversations(
                         written += 1
                     else:
                         skipped += 1
-                    record_export(
-                        conn,
-                        conv["conversation_id"],
+                    export_records.append((
+                        str(conv["conversation_id"]),
                         fmt,
                         output_path,
                         output_hash,
@@ -186,7 +186,7 @@ def export_conversations(
                             "to": to_date,
                             "deterministic_export": True,
                         },
-                    )
+                    ))
                     manifest_rows.append(manifest_row(
                         conv,
                         fmt,
@@ -197,7 +197,20 @@ def export_conversations(
                     ))
     _validate_export_outputs(out_dir, manifest_rows, conversations, formats)
     write_manifest(out_dir, manifest_rows, force=force)
+    # End the canonical read snapshot before recording export bookkeeping.
+    # This lets WAL writers commit during a long CLI export and avoids trying
+    # to upgrade an old read snapshot after another writer has committed.
     conn.commit()
+    try:
+        for conversation_id, fmt, output_path, output_hash, options in export_records:
+            record_export(
+                conn, conversation_id, fmt, output_path, output_hash, options,
+            )
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     return {"conversations": len(conversations), "formats": formats, "written": written, "skipped_unchanged": skipped}
 
 

@@ -19,6 +19,10 @@ from .utils import classify_file
 SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
 MAX_JSON_INTEGER_DIGITS = 1000
 JSON_STREAM_CHUNK_BYTES = 64 * 1024
+# Both limits are intentional.  The byte limit is the externally documented
+# resource contract; the character limit independently bounds the Python
+# decoded representation for ASCII-heavy input.
+MAX_JSON_ELEMENT_BYTES = 128 * 1024 * 1024
 MAX_JSON_ELEMENT_CHARS = 128 * 1024 * 1024
 
 
@@ -463,6 +467,7 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
     phase = "start"
     parts: list[str] = []
     element_chars = 0
+    element_bytes = 0
     kind = ""
     depth = 0
     in_string = False
@@ -470,19 +475,24 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
     saw_element = False
 
     def append_part(value: str) -> None:
-        nonlocal element_chars
+        nonlocal element_chars, element_bytes
         if not value:
             return
         element_chars += len(value)
-        if element_chars > MAX_JSON_ELEMENT_CHARS:
+        element_bytes += len(value.encode("utf-8"))
+        if (
+            element_chars > MAX_JSON_ELEMENT_CHARS
+            or element_bytes > MAX_JSON_ELEMENT_BYTES
+        ):
             raise ConversationJsonElementTooLargeError("conversation_json_element_too_large")
         parts.append(value)
 
     def finish_element() -> Any:
-        nonlocal parts, element_chars
+        nonlocal parts, element_chars, element_bytes
         value = decoder.decode("".join(parts))
         parts = []
         element_chars = 0
+        element_bytes = 0
         return value
 
     for chunk in chunks:
