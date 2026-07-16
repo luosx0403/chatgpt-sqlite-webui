@@ -6,10 +6,23 @@ from dataclasses import dataclass
 from typing import Any
 
 from .identifiers import MAX_CANONICAL_ID_LENGTH, canonical_id_length, canonical_id_text, unicode_scalar_text
+from .json_safety import JsonSafetyLimitError, validate_json_lexical_limits
 from .utils import canonical_json, compact_json, sha256_text
 
 
 RAW_MESSAGE_NOT_PARSED = object()
+
+
+def is_generated_non_text_placeholder(value: str | None) -> bool:
+    """Return true only for the complete canonical placeholder grammar."""
+
+    stripped = normalize_display_text(value).strip()
+    for prefix in ("[non-text content:", "[non-text part:"):
+        if not stripped.startswith(prefix) or not stripped.endswith("]"):
+            continue
+        payload = stripped[len(prefix) : -1]
+        return bool(payload.strip()) and "]" not in payload and "\n" not in payload and "\r" not in payload
+    return False
 
 
 @dataclass
@@ -281,6 +294,16 @@ def _canonical_graph_id_warning(
                 candidates.append(("message_id", message.get("id"), False))
     for field, candidate, strip in candidates:
         length = canonical_id_length(candidate, strip=strip)
+        if candidate is not None and length == 0:
+            return WarningRecord(
+                source_file=source_file,
+                array_index=array_index,
+                warning_type="canonical_id_empty",
+                keys_json=compact_json(
+                    {"field": field, "length": 0, "value_type": type(candidate).__name__}
+                ),
+                raw_json=None,
+            )
         if length is not None and length > MAX_CANONICAL_ID_LENGTH:
             return WarningRecord(
                 source_file=source_file,
@@ -434,16 +457,16 @@ def recover_message_display_text(
     """Resolve legacy placeholder text without parsing unbounded raw payloads."""
 
     canonical = normalize_display_text(content_text)
-    stripped = canonical.strip()
-    placeholder = stripped.startswith("[non-text content:") or stripped.startswith("[non-text part:")
+    placeholder = is_generated_non_text_placeholder(canonical)
     if canonical and not placeholder:
         return canonical
     if not raw_message_json or len(raw_message_json) > max_raw_chars:
         return canonical
     if parsed_message is RAW_MESSAGE_NOT_PARSED:
         try:
+            validate_json_lexical_limits(raw_message_json)
             message = json.loads(raw_message_json)
-        except (TypeError, json.JSONDecodeError):
+        except (TypeError, json.JSONDecodeError, JsonSafetyLimitError, RecursionError):
             return canonical
     else:
         message = parsed_message

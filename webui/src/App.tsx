@@ -3,7 +3,7 @@ import Sidebar from "./components/Sidebar";
 import ConversationPane from "./components/ConversationPane";
 import SearchHelp from "./components/SearchHelp";
 import SettingsPanel from "./components/SettingsPanel";
-import { ApiError, getConversation, getConversations, getHealth, getImportJob, getStats, uploadImportZip } from "./api/client";
+import { ApiError, cancelWebIndex, getConversation, getConversations, getHealth, getImportJob, getStats, uploadImportZip } from "./api/client";
 import { applySettings, clampSettings, loadSettings, saveSettings, type Settings } from "./settings";
 import { createTranslator } from "./i18n";
 import type { CleanupWarning, ConversationSummary, Health, ImportJob, MatchMode, PathMode, SearchDiagnostics, SearchFilters, SearchScope, SortMode, Stats } from "./types";
@@ -210,6 +210,7 @@ function importStageLabel(t: (key: string) => string, stage: string): string {
     webindex: t("stageWebIndex"),
     web_index_recovery: t("stageWebIndexRecovery"),
     webindex_recovery: t("stageWebIndexRecovery"),
+    web_index_cancelled: t("webIndexCancelled"),
     finished: t("stageFinished"),
     succeeded: t("stageFinished"),
     postcheck_failed: t("stagePostcheckFailed"),
@@ -296,6 +297,8 @@ function importErrorLabel(t: (key: string) => string, code: string | null | unde
     "verify_failed",
     "stats_failed",
     "web_index_failed",
+    "web_index_cancelled",
+    "web_index_not_cancellable",
     "import_job_active",
     "import_job_start_failed",
     "upload_preflight_failed",
@@ -308,6 +311,13 @@ function importErrorLabel(t: (key: string) => string, code: string | null | unde
     "upload_duplicate_sec_fetch_site",
   ]);
   if (code && direct.has(code)) return t(`importError_${code}`);
+  if (code && new Set([
+    "source_member_limit_exceeded",
+    "json_nesting_limit_exceeded",
+    "json_scalar_limit_exceeded",
+    "conversation_json_element_too_large",
+  ]).has(code)) return t("importError_upload_limits");
+  if (code === "canonical_id_empty") return t("importError_invalid_conversation_json");
   if (code === "upload_content_length_required") return t("importError_upload_content_length_required");
   if (code && (code.includes("too_large") || code.includes("too_many") || code.includes("compression_ratio"))) return t("importError_upload_limits");
   if (code && (code.includes("not_zip") || code.includes("invalid_zip") || code.includes("valid_zip"))) return t("importError_invalid_zip");
@@ -320,6 +330,7 @@ function archiveReadinessLabel(t: (key: string) => string, health: Health): stri
       return `${t("archiveMigrationRequired")} ${t("archiveSchemaVersions")}: ${health.current_database_schema_version ?? "?"} → ${health.required_database_schema_version ?? "?"}. ${t("archiveMigrationBackup")}`;
     case "schema_newer": return t("archiveSchemaNewer");
     case "schema_incompatible": return t("archiveSchemaIncompatible");
+    case "data_incompatible": return t("archiveDataIncompatible");
     case "foreign_key_violation": return t("archiveForeignKeyViolation");
     case "database_malformed": return t("archiveMalformed");
     case "database_locked": return t("archiveLocked");
@@ -377,6 +388,11 @@ export default function App() {
   const selectedRef = useRef<ConversationSummary | null>(null);
   const importPollGenerationRef = useRef(0);
   const importRefreshDoneRef = useRef<string | null>(null);
+  const refreshControllerRef = useRef<AbortController | null>(null);
+  const uploadControllerRef = useRef<AbortController | null>(null);
+  const webIndexCancelControllerRef = useRef<AbortController | null>(null);
+  const uploadRequestRef = useRef(0);
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
   const filtersKey = JSON.stringify(filters);
   const searchContextKey = JSON.stringify({ q: debouncedQuery, sort, path, matchMode, filters, listPageSize: settings.listPageSize });
   const searchContextRef = useRef(searchContextKey);
@@ -432,10 +448,22 @@ export default function App() {
   }, []);
 
   const refreshArchiveState = useCallback(() => {
+    refreshControllerRef.current?.abort();
     const controller = new AbortController();
+    refreshControllerRef.current = controller;
     getHealth(controller.signal).then(setHealth).catch(() => undefined);
     getStats(controller.signal).then(setStats).catch(() => undefined);
     return controller;
+  }, []);
+
+  useEffect(() => () => {
+    detailControllerRef.current?.abort();
+    listControllerRef.current?.abort();
+    refreshControllerRef.current?.abort();
+    uploadControllerRef.current?.abort();
+    webIndexCancelControllerRef.current?.abort();
+    resizeCleanupRef.current?.();
+    importPollGenerationRef.current += 1;
   }, []);
 
   useEffect(() => {
@@ -507,6 +535,7 @@ export default function App() {
     })
       .then((page) => {
         if (requestId !== listRequestRef.current || searchContextRef.current !== requestedContextKey) return;
+        if (!Array.isArray(page.items)) throw new Error("invalid_response");
         setConversations((current) => {
           const merged = append ? [...current, ...page.items] : page.items;
           const seen = new Set<string>();
@@ -579,6 +608,9 @@ export default function App() {
             refreshArchiveState();
             loadConversationPage(0, false);
           }
+          controller.abort();
+          if (timer !== null) window.clearTimeout(timer);
+          timer = null;
           return;
         }
         timer = window.setTimeout(poll, 1200);
@@ -625,17 +657,45 @@ export default function App() {
     setUploadingImport(true);
     setImportError(null);
     setPreflightCleanupWarnings([]);
-    uploadImportZip(importFile)
+    uploadControllerRef.current?.abort();
+    const controller = new AbortController();
+    uploadControllerRef.current = controller;
+    const requestId = ++uploadRequestRef.current;
+    uploadImportZip(importFile, controller.signal)
       .then((job) => {
+        if (controller.signal.aborted || requestId !== uploadRequestRef.current) return;
         setImportJob(job);
         setImportFile(null);
         if (importInputRef.current) importInputRef.current.value = "";
       })
       .catch((err: unknown) => {
+        if (controller.signal.aborted || requestId !== uploadRequestRef.current) return;
         setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null));
         setPreflightCleanupWarnings(err instanceof ApiError ? err.cleanupWarnings : []);
       })
-      .finally(() => setUploadingImport(false));
+      .finally(() => {
+        if (requestId === uploadRequestRef.current) {
+          uploadControllerRef.current = null;
+          setUploadingImport(false);
+        }
+      });
+  };
+
+  const cancelImportWebIndex = () => {
+    if (!importJob || importJob.status !== "running" || !["building", "cancelling"].includes(String(importJob.web_index?.status || ""))) return;
+    webIndexCancelControllerRef.current?.abort();
+    const controller = new AbortController();
+    webIndexCancelControllerRef.current = controller;
+    cancelWebIndex(importJob.job_id, controller.signal)
+      .then((job) => {
+        if (!controller.signal.aborted) setImportJob(job);
+      })
+      .catch((err: unknown) => {
+        if (!controller.signal.aborted) setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null));
+      })
+      .finally(() => {
+        if (webIndexCancelControllerRef.current === controller) webIndexCancelControllerRef.current = null;
+      });
   };
 
   const header = useMemo(() => {
@@ -688,14 +748,24 @@ export default function App() {
           updateSettings({ ...settings, sidebarWidth: width });
         }}
         onPointerDown={(event) => {
-          event.currentTarget.setPointerCapture(event.pointerId);
+          resizeCleanupRef.current?.();
+          const resizer = event.currentTarget;
+          resizer.setPointerCapture(event.pointerId);
           const move = (moveEvent: PointerEvent) => updateSettings({ ...settings, sidebarWidth: moveEvent.clientX });
-          const up = () => {
+          const finish = () => {
             window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", up);
+            window.removeEventListener("pointerup", finish);
+            window.removeEventListener("pointercancel", finish);
+            window.removeEventListener("blur", finish);
+            resizer.removeEventListener("lostpointercapture", finish);
+            resizeCleanupRef.current = null;
           };
+          resizeCleanupRef.current = finish;
           window.addEventListener("pointermove", move);
-          window.addEventListener("pointerup", up);
+          window.addEventListener("pointerup", finish);
+          window.addEventListener("pointercancel", finish);
+          window.addEventListener("blur", finish);
+          resizer.addEventListener("lostpointercapture", finish);
         }}
       />
       <section className="main-column">
@@ -744,9 +814,19 @@ export default function App() {
                 <span>{t("jobStage")}: {importStageLabel(t, importJob.stage)}</span>
                 <span>{t("jobElapsed")}: {importJob.elapsed_seconds.toFixed(1)}s</span>
                 {importJob.summary && <span>{String(importJob.summary.valid_conversations ?? 0)} {t("conversations")}</span>}
-                {importJob.web_index?.status === "building" ? (
+                {importJob.web_index && ["building", "cancelling"].includes(String(importJob.web_index.status || "")) ? (
                   <span data-testid="web-index-progress">{webIndexProgressLabel(t, importJob.web_index)}</span>
-                ) : importJob.web_index ? <span>{t("webIndexOk")}</span> : null}
+                ) : importJob.web_index?.status === "cancelled" ? <span>{t("webIndexCancelled")}</span> : importJob.web_index ? <span>{t("webIndexOk")}</span> : null}
+                {importJob.status === "running" && ["building", "cancelling"].includes(String(importJob.web_index?.status || "")) && (
+                  <button
+                    type="button"
+                    data-testid="web-index-cancel-button"
+                    disabled={importJob.web_index?.status === "cancelling"}
+                    onClick={cancelImportWebIndex}
+                  >
+                    {importJob.web_index?.status === "cancelling" ? t("cancellingWebIndex") : t("cancelWebIndex")}
+                  </button>
+                )}
                 {["queued", "running"].includes(importJob.status) && <span>{t("importProgressVolatile")}</span>}
               </div>
             )}

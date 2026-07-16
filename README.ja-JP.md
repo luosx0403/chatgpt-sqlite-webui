@@ -200,7 +200,7 @@ CLI と Web のエクスポートは、有効な現在パスと表示メッセ�
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
-`web-index` は、メッセージの走査と正規化、タイトル正規化、対応時の message/title trigram 構築、generation metadata 書き込み、commit を明示的で観測可能な段階として実行します。各段階は上限付き keyset batch と byte budget を使い、各メッセージを一度だけ解決します。再構築は単一の atomic SQLite transaction 内で行われ、commit までは reader が以前の current 任意インデックスを参照します。generation/metadata failure、SQLite interrupt、disk error、または内部/CLI cancel callback は置換オブジェクト全体を rollback します。構築全体で `BEGIN IMMEDIATE` と writer slot を保持し、一時 disk を使う場合があります。Web import job JSON は stage と processed/total を公開しますが、独立した Web index build job や Web cancel endpoint はありません。budget 超過行は記録して canonical verifier で走査するため、index 構築によって recall は低下しません。
+`web-index` は、メッセージの走査と正規化、タイトル正規化、対応時の message/title trigram 構築、generation metadata 書き込み、commit を明示的で観測可能な段階として実行します。各段階は上限付き keyset batch と byte budget を使い、各メッセージを一度だけ解決します。再構築は単一の atomic SQLite transaction 内で行われ、commit までは reader が以前の current 任意インデックスを参照します。generation/metadata failure、SQLite interrupt、disk error、または cancel は置換オブジェクト全体を rollback します。構築全体で `BEGIN IMMEDIATE` と writer slot を保持し、一時 disk を使う場合があります。Web import job JSON は stage と processed/total を公開し、import job の index stage 中は React UI または `POST /api/import/jobs/{job_id}/web-index/cancel` で取消を要求できます。これは独立した Web index build job ではありません。budget 超過行は記録して canonical verifier で走査するため、index 構築によって recall は低下しません。
 
 Web UI を起動します。
 
@@ -488,11 +488,13 @@ Health と `verify` は任意の `message_fts` の欠落と破損を区別しま
 
 アップロード入口は `Origin`、`Content-Length`、`Sec-Fetch-Site` をそれぞれ 1 値だけ受け付けます。Origin は userinfo、path、query、fragment、制御文字、カンマチェーンを含まない単一の HTTP(S) origin、Content-Length は正規形の非負 ASCII 10 進整数でなければなりません。重複または不正な安全ヘッダーは multipart 解析前に拒否し、無効または非有限の圧縮率設定は有限な安全 profile 既定値へ戻します。
 
-Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では実際の browser hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS` で指定し、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES` は厳格な単一 edge proxy モデルです。未信頼 peer の forwarded header は無視し、信頼済み direct edge は client 値を上書きする必要があります。重複 Host/Forwarded、カンマ区切り chain、不正構文、`Forwarded` と `X-Forwarded-Host/Proto` の競合は拒否されます。全リクエストで Host を検証し、remote write は same-origin `Origin` が必要です。
+Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では実際の browser hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（または `--allowed-hosts`）で指定し、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（または `--trusted-proxies`）は厳格な単一 edge proxy モデルです。未信頼 peer の forwarded header は無視し、信頼済み direct edge は client 値を上書きする必要があります。重複 Host/Forwarded、カンマ区切り chain、不正構文、`Forwarded` と `X-Forwarded-Host/Proto` の競合は拒否されます。全リクエストで Host を検証し、remote write は same-origin `Origin` が必要です。Origin のない client を許容するのは信頼済み loopback profile だけで、upload は常に `Sec-Fetch-Site: cross-site` を拒否します。
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
 
-単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、UTF-8 入力は 128 MiB、decode 後の文字数も 128 Mi に制限されます。ファイル先頭の UTF-8 BOM は 1 個だけ除去し、JSON 文字列内の U+FEFF は保持します。重複先頭 BOM、文字列外の途中 BOM、UTF-16/32、混在または不正な UTF-8 は拒否します。新しい canonical ID は 512 文字上限で切り詰めません。主要 Web アドレス指定は query-based `/api/by-id/*` で、slash や URL 記号を含む legacy ID を 16 Ki 文字まで曖昧さなく扱います。旧 path route は route-safe な 512 文字 ID 専用です。
+単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、UTF-8 入力と decode 後文字数は各 32 MiB、nesting は 256、scalar は 100,000 に制限されます。legacy raw の iterative sanitizer は traversal 100,000 nodes、raw preview 80,000 bytes、sanitized API payload 全体 4 MiB を上限にします。ZIP central directory と directory の全 entry は 100,000 member 上限に数えます。先頭 BOM は 1 個だけ除去し、他の不正 encoding は拒否します。新 canonical ID は 512 文字上限で切り詰めず、query-based `/api/by-id/*` は legacy ID を 16 Ki 文字まで扱います。それ以上の旧 ID は readiness を `database_data_incompatible` にします。
+
+descriptor-bound stat/hash/read で file identity を検証し、directory child は open 時に再検証します。`--delete-input-on-success` は atomic staged rename と最終 identity barrier を使い、変更された target を削除しません。migration は明示 predecessor だけを受け入れ、DDL 前に dependent custom view/trigger/index を inventory し、安全でない rebuild は `database_custom_objects_require_manual_migration` で拒否します。
 
 非標準 JSON `NaN` / `Infinity`（`1e9999` のような overflow する標準数値を含む）は拒否され、無効な timestamp は内容を含まない warning とともに `NULL` になります。既定 message API は reader budget で制限された `display_text` を一つだけ返し、truncation/total-exactness metadata で完全復元の可否を示し、`content_text`/`render_text` を重複しません。通常の CLI/Web read と既定 `/api/health` は bounded schema gate を使い、`foreign_key_check` を実行しません。`verify` と `/api/health?deep=true` は完全で正確な検査と freshness fields を返します。複数 statement の CLI/Web logical read は schema/capability probe 前に一つの SQLite read snapshot を開始し、stream の完了・失敗時に解放します。Effective-current、pagination、around-node の意味は維持されます。
 
@@ -508,6 +510,16 @@ JSON は `NaN`/`Infinity` と `1e9999` のような overflow を拒否します�
 
 CLI/Web conversation export は、materialize 前に 100,000 node、1 node の canonical/raw input 32 MiB、conversation input 合計 128 MiB を超える処理を拒否し、stream output は 256 MiB 上限です。effective-current の online materialization も conversation ごとに 100,000 node と graph ID input 128 MiB が上限です。CLI は同じ target directory の temporary file に分割書き込みし、hash と旧 file の streaming 比較を同時に行い、変更時だけ atomic replace します。browser copy は `ReadableStream` を使い、16 MiB UTF-8 または 8 Mi 文字を超えると clipboard write 前に中止して Download を案内し、partial text は書き込みません。
 
+archive-wide export は conversation を 1 回 keyset scan して同じ output directory の temporary SQLite plan に置き、filename allocation、hash、JSONL/CSV manifest を stream 処理します。上限は 1,000,000 conversations、plan metadata 1 GiB、manifest ごと 2 GiB です。global effective-current は 100,000 conversations、1,000,000 nodes、graph input 512 MiB、推定 temp 1 GiB、batch 20,000 rows/nodes と 64 MiB input に制限されます。
+
 message search page は常に `total_exact` を返します。empty DB または決定的な empty は true、通常の `count_total=false` probe は false で、conversation page はこの field を保証しません。around metadata は found、effective membership、requested membership、visible、applied を分離します。有界な valid raw text fallback は reader/search/highlight/copy/CLI/Web export で共通です。invalid、oversized、実際の non-text raw は placeholder のままです。
 
 filter-only/exclude-only は conversation を絞れますが、message hit、reader highlight、hit navigation には正の message text term が必要です。Copy URL は同じ applied search/list/selection context を使い、debounce 前の入力を古い selection と混ぜません。日本語とスペイン語 UI は partial translation と明示表示されます。release は collector とは独立した authoritative required-file list を先に検証し、必要な source/config/doc が欠ければ旧 ZIP を置換せず失敗します。
+
+request validation response は最大 16 件の安全な item のみで、allowlist 済み `location`、`field`、stable public `code` だけを含み、body/path/query 値や framework validation type を echo しません。Raw API は exact UTF-8 byte と character 単位を分離します。message-search verifier、snippet、enrichment、response size は bounded で、oversized input は partial diagnostics を明示します。SQLite rowid BLOB prefix は unbounded text materialization を避け、Web index は実際に read/normalize した byte を計測します。Release payload は whole-file buffer ではなく chunk stream で hash/write/verify します。
+
+Python `zipfile` と本プロジェクトの import pipeline は ZIP64 構造をサポートし、小さな forced-ZIP64 member の回帰テストがあります。ただし通常の acceptance suite では物理サイズ 4 GiB 超の ZIP は生成していません。member、byte、compression ratio、disk、CPU の全上限は引き続き適用されます。
+
+長時間の CLI/Web streaming export は、完了、失敗、または client disconnect まで一つの SQLite read snapshot を保持します。WAL mode では長い reader が checkpoint を遅らせ、concurrent writer により WAL が増える場合があります。duration、CPU/VM work、WAL、temporary disk は選択データ量に比例し、snapshot consistency を壊して早期 checkpoint してはいけません。
+
+`npm run build` は `webui/scripts/build.mjs` を使い、typecheck 後に同階層の staging directory へ build し、staged `index.html` が参照する全 asset を検証して、asset を先に公開し、最後に `dist/index.html` を atomic replace します。failure injection self-test は失敗時にも旧 entry point とその asset が使用可能なことを確認します。

@@ -38,6 +38,7 @@ from .db import (
 )
 from .exporter import export_conversations
 from .logging_utils import configure_logging, get_logger
+from .json_safety import JsonSafetyLimitError
 from .parser import WarningRecord, conversation_id_from_value, parse_conversation, validate_conversation_element
 from .scanner import (
     ConversationJsonTopLevelError,
@@ -51,16 +52,17 @@ from .scanner import (
     ZipMemberCrcError,
     ZipMemberNotFoundError,
     ZipMemberReadError,
-    delete_input_identity_is_current,
+    delete_input_if_unchanged,
     is_legacy_conversations_source,
     is_shard_conversation_source,
     iter_json_array_from_source,
     list_source_entries,
     resolve_input,
     select_conversation_sources,
+    sha256_input_source,
 )
 from .sqlite_errors import sqlite_runtime_error_code
-from .utils import compact_json, epoch_to_display, sha256_file, sha256_text
+from .utils import compact_json, epoch_to_display, sha256_text
 from .web_db import create_web_indexes
 
 LOGGER = get_logger("cli")
@@ -315,6 +317,8 @@ def _classify_source_load_error(exc: BaseException) -> tuple[str, str]:
         return "json_integer_too_large", "json_decode"
     if isinstance(exc, ConversationJsonElementTooLargeError):
         return "conversation_json_element_too_large", "json_decode"
+    if isinstance(exc, JsonSafetyLimitError):
+        return exc.code, "json_decode"
     if isinstance(exc, NonFiniteJsonNumberError):
         return "non_finite_json_number", "json_decode"
     if isinstance(exc, (UnicodeDecodeError, InvalidConversationEncodingError)):
@@ -332,6 +336,8 @@ def _classify_source_load_error(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, json.JSONDecodeError):
         return "invalid_conversation_json", "json_decode"
     raw_code = str(exc).split(" ", 1)[0] if isinstance(exc, ValueError) else ""
+    if raw_code == "source_changed_during_read":
+        return raw_code, "source_read"
     if raw_code == "input_source_open_failed":
         return raw_code, "source_read"
     if raw_code == "input_source_not_regular_file":
@@ -490,7 +496,7 @@ def run_import_pipeline(
         conn = connect(db_path)
         configure_import_connection(conn)
         init_db(conn)
-        input_sha = None if no_input_sha256 or source.kind != "zip" else sha256_file(source.path)
+        input_sha = None if no_input_sha256 or source.kind != "zip" else sha256_input_source(source)
         run_id = begin_import_run(conn, source, input_sha)
     except Exception:
         if conn is not None:
@@ -591,7 +597,12 @@ def run_import_pipeline(
                 "ambiguous_conversation_sources"
                 if raw_code in {"duplicate_conversation_json_source", "ambiguous_conversation_source_identity"}
                 else raw_code
-                if raw_code in {"input_symlink_not_allowed", "input_source_outside_root"}
+                if raw_code in {
+                    "input_symlink_not_allowed",
+                    "input_source_outside_root",
+                    "source_member_limit_exceeded",
+                    "source_changed_during_read",
+                }
                 else "source_scan_failed"
             )
             summary["failure_code"] = code
@@ -807,7 +818,13 @@ def run_import_pipeline(
     if not import_succeeded:
         raise RuntimeError("import did not complete")
     if delete_input_on_success:
-        if not delete_input_identity_is_current(source):
+        try:
+            delete_succeeded = delete_input_if_unchanged(source)
+            delete_error: OSError | None = None
+        except OSError as exc:
+            delete_succeeded = False
+            delete_error = exc
+        if not delete_succeeded and delete_error is None:
             result["delete_input_changed"] = True
             summary["delete_input_changed"] = True
             summary["warnings"] += 1
@@ -817,27 +834,23 @@ def run_import_pipeline(
                 WarningRecord("input", None, "delete_input_changed", None, None),
                 summary,
             )
+        elif delete_error is not None:
+            error_type = type(delete_error).__name__
+            result["delete_input_failed"] = True
+            result["delete_input_error_type"] = error_type
+            summary["delete_input_failed"] = True
+            summary["delete_input_error_type"] = error_type
+            summary["warnings"] += 1
+            _record_post_import_warning(
+                db_path,
+                run_id,
+                WarningRecord("input", None, "delete_input_failed", compact_json({"error_type": error_type}), None),
+                summary,
+            )
         else:
-            try:
-                delete_target = source.delete_target or source.path
-                delete_target.unlink()
-            except OSError as exc:
-                error_type = type(exc).__name__
-                result["delete_input_failed"] = True
-                result["delete_input_error_type"] = error_type
-                summary["delete_input_failed"] = True
-                summary["delete_input_error_type"] = error_type
-                summary["warnings"] += 1
-                _record_post_import_warning(
-                    db_path,
-                    run_id,
-                    WarningRecord("input", None, "delete_input_failed", compact_json({"error_type": error_type}), None),
-                    summary,
-                )
-            else:
-                result["deleted_input"] = True
-                summary["deleted_input"] = True
-                _update_post_import_summary(db_path, run_id, summary)
+            result["deleted_input"] = True
+            summary["deleted_input"] = True
+            _update_post_import_summary(db_path, run_id, summary)
     LOGGER.info(
         "import_finished run_id=%s valid=%s inserted=%s updated=%s unchanged=%s seconds=%s",
         run_id,

@@ -200,7 +200,7 @@ CLI 與 Web 匯出預設使用有效目前路徑，且只包含可見訊息。�
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
-`web-index` 會依明確且可觀察的階段掃描並正規化訊息、正規化標題、在支援時建立訊息/標題 trigram 索引、寫入 generation metadata，最後提交。每個資料階段都使用有界 keyset 批次與位元組預算，且每則訊息只解析一次。重建位於單一原子 SQLite transaction 中：提交前 reader 仍看到舊的 current 可選索引；generation/metadata 失敗、SQLite 中斷、磁碟錯誤或內部/CLI 取消 callback 會回復全部替換物件。完整建置期間會持有 `BEGIN IMMEDIATE`、占用一個 writer slot，並可能使用暫存磁碟。Web import job JSON 會回報 stage 與 processed/total，但本版本沒有獨立 Web index 建置工作或 Web 取消介面。超出預算的資料列會記錄並由 canonical verifier 掃描，建立 index 不會降低搜尋召回率。
+`web-index` 會依明確且可觀察的階段掃描並正規化訊息、正規化標題、在支援時建立訊息/標題 trigram 索引、寫入 generation metadata，最後提交。每個資料階段都使用有界 keyset 批次與位元組預算，且每則訊息只解析一次。重建位於單一原子 SQLite transaction 中：提交前 reader 仍看到舊的 current 可選索引；generation/metadata 失敗、SQLite 中斷、磁碟錯誤或取消會回復全部替換物件。完整建置期間會持有 `BEGIN IMMEDIATE`、占用一個 writer slot，並可能使用暫存磁碟。Web import job JSON 會回報 stage 與 processed/total；在匯入工作的 index 階段，React UI 與 `POST /api/import/jobs/{job_id}/web-index/cancel` 可要求取消，但它不是獨立 Web index 建置工作。超出預算的資料列會記錄並由 canonical verifier 掃描，建立 index 不會降低搜尋召回率。
 
 啟動 Web UI：
 
@@ -492,7 +492,9 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bi
 
 匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。
 
-獨立 JSON、目錄成員與 ZIP 成員使用同一個單遍、逐頂層陣列元素的解碼器，並位於同一匯入交易；每個元素只掃描和解碼一次，UTF-8 輸入上限為 128 MiB，解碼後字元數也限制為 128 Mi。只移除檔案開頭的一個 UTF-8 BOM；JSON 字串內的 U+FEFF 會保留，重複開頭 BOM、字串外的中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。新匯入 canonical 對話與圖 ID 上限為 512 字元，超長 ID 會用不含內容的 warning 跳過，絕不截斷。主要 Web 尋址使用 query-based `/api/by-id/*`，可無歧義接受最多 16 Ki 字元的 legacy ID；舊 path route 僅保留給 route-safe 的 512 字元 ID。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
+獨立 JSON、目錄成員與 ZIP 成員使用同一個單遍、逐頂層陣列元素的解碼器，並位於同一匯入交易；每個元素只掃描和解碼一次，UTF-8 輸入與解碼後字元數各限制為 32 MiB，巢狀最多 256 層、scalar 最多 100,000 個。legacy raw 使用迭代 sanitizer，遍歷最多 100,000 個 node、raw preview 最多 80,000 bytes、完整 sanitized API payload 最多 4 MiB。ZIP 中央目錄全部 entry 與目錄全部 entry 都計入 100,000 member 上限。只移除檔案開頭的一個 UTF-8 BOM；JSON 字串內的 U+FEFF 會保留，重複開頭 BOM、字串外的中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。新 canonical ID 上限為 512 字元且不截斷；主要 query-based `/api/by-id/*` 最多接受 16 Ki 字元 legacy ID，更長舊 ID 會使 readiness 回報 `database_data_incompatible`。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
+
+檔案身份透過 descriptor-bound stat/hash/read 驗證，目錄 child 在開啟時再次核對；`--delete-input-on-success` 採原子暫存 rename 與最後身份屏障，目標變化時恢復或保留，絕不刪除替換檔。migration 只接受明確 predecessor，DDL 前清點依賴的自訂 view/trigger/index；不安全 rebuild 以 `database_custom_objects_require_manual_migration` 拒絕，current-version managed drift 仍可明確修復。
 
 非標準 JSON `NaN` / `Infinity`（包括 `1e9999` 這類溢出的標準數值）會被拒絕；無效時間寫成 `NULL` 並記錄不含內容的 warning。預設 message API 只回傳一份受 reader 預算限制的 `display_text`，並以 truncation/total-exactness metadata 表示能否完整復原，不複製 `content_text`/`render_text`。普通 CLI/Web 讀取和預設 `/api/health` 使用有界 schema gate，不執行 `foreign_key_check`；`verify` 與 `/api/health?deep=true` 執行完整精確檢查並提供 freshness 欄位。每個多語句 CLI/Web 邏輯讀取都在 schema/capability probe 前建立一個 SQLite read snapshot，串流回應正常結束或失敗時都會釋放。Effective-current、分頁與 around-node 語義維持不變。
 
@@ -508,6 +510,16 @@ JSON 會拒絕 `NaN`/`Infinity` 與 `1e9999` 等溢位數；無效 timestamp 寫
 
 CLI 與 Web 對話匯出在物化前採用固定總邊界：每個對話最多 100,000 個 node、單 node canonical/raw 輸入最多 32 MiB、對話輸入合計最多 128 MiB，串流輸出最多 256 MiB；effective-current 線上物化同樣限制每對話 100,000 node 與 128 MiB 圖 ID 輸入。CLI 在目標目錄分塊寫入暫存檔，同時計算 hash 並串流比較舊檔，只原子替換變更內容。瀏覽器複製以 `ReadableStream` 讀取，超過 16 MiB UTF-8 或 8 Mi 字元會在寫入剪貼簿前取消並提示改用下載，不會寫入 partial text。
 
+全封存匯出只掃描一次 conversation 並寫入同輸出目錄的暫存 SQLite plan，在磁碟分配 collision-safe 檔名並串流產生 hash 與 JSONL/CSV manifest；上限為 1,000,000 conversation、1 GiB plan metadata、每個 manifest 2 GiB。全域 effective-current 上限為 100,000 conversation、1,000,000 node、512 MiB 圖輸入及 1 GiB 估算暫存資料，batch 最多 20,000 row/node 與 64 MiB 輸入。
+
 message search page 一律含 `total_exact`；空資料庫或可確定為空時是 true，`count_total=false` 的一般探測是 false；conversation page 不保證此欄位。around metadata 分開表示 found、effective-current membership、requested-path membership、visible 與 applied。空 canonical 或 legacy placeholder 可從有界且有效的 raw text 恢復，reader、兩種搜尋、highlight、copy、CLI/Web export 共用 resolver；非法、過大或真正非文字 raw 維持 placeholder。
 
 僅篩選和僅排除可篩選 conversation；只有正向訊息正文詞會產生 message hit、reader 醒目提示與 hit navigation。「複製 URL」使用同一個已套用的 search/list/selected context，不會混入 debounce 中的新輸入。日文與西班牙文在選擇器明確標為部分翻譯。release 收集前會驗證獨立的權威必要檔案清單，缺少任何必要 source/config/doc 都會失敗且不覆蓋舊 ZIP。
+
+request validation 回應最多包含 16 個安全項目，每項只有白名單化的 `location`、`field` 與穩定公開 `code`，絕不回顯 body、path/query 原值或框架驗證類型。Raw API 分開回報精確 UTF-8 byte 與 character 單位。message search verifier、snippet、enrichment 與回應大小都有界，超大輸入以 partial diagnostics 明示；SQLite rowid BLOB prefix 避免物化無界正文，Web index 以實際讀取和正規化的 byte 計量。Release payload 採分塊串流 hash、寫入與驗證，不載入整個檔案。
+
+Python `zipfile` 與本專案匯入管線支援 ZIP64 結構，並有小型強制 ZIP64 member 回歸測試；一般驗收未建立實體大小超過 4 GiB 的 ZIP。所有 member、byte、壓縮比、磁碟與 CPU 限制仍然適用。
+
+長時間 CLI/Web 串流匯出會刻意保持同一個 SQLite read snapshot，直到完成、失敗或用戶端中斷。在 WAL 模式下，長 reader 可能延遲 checkpoint，並在並行寫入時造成 WAL 增長；持續時間、CPU/VM 工作、WAL 與暫存磁碟仍隨所選資料規模增長，不能藉由破壞 snapshot 一致性來提早 checkpoint。
+
+`npm run build` 使用 `webui/scripts/build.mjs`，先 typecheck，再建置到同層 staging 目錄，驗證 staged `index.html` 引用的所有資源，先發布資源，最後原子取代 `dist/index.html`。注入失敗自我測試保證失敗建置仍保留舊入口及其引用資源可用。

@@ -14,12 +14,18 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
+from .json_safety import (
+    JsonSafetyLimitError,
+    MAX_RAW_PREVIEW_BYTES,
+    sanitize_json_value,
+    validate_json_lexical_limits,
+)
 from .current_path import (
     effective_current_metadata,
     ensure_effective_current_views,
     resolve_effective_current_collection,
 )
-from .parser import RAW_MESSAGE_NOT_PARSED, extract_message_content, normalize_display_text, recover_message_display_text
+from .parser import RAW_MESSAGE_NOT_PARSED, extract_message_content, is_generated_non_text_placeholder, normalize_display_text, recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
@@ -40,6 +46,10 @@ HIGHLIGHT_MESSAGE_SCAN_CHARS = 100_000
 READER_MIN_TEXT_HYDRATION_CHARS = 4096
 MAX_API_TITLE_CHARS = 4096
 MAX_API_SOURCE_CHARS = 4096
+SEARCH_CANDIDATE_SCAN_CHARS = 200_000
+SEARCH_HIT_PREVIEW_CHARS = 8_192
+SEARCH_SNIPPET_SCAN_CHARS = 16_384
+SEARCH_PAGE_ESTIMATED_BYTES = 2 * 1024 * 1024
 MAX_API_ROLE_CHARS = 256
 MAX_API_AUTHOR_CHARS = 4096
 MAX_API_CONTENT_TYPE_CHARS = 256
@@ -290,9 +300,40 @@ def _ensure_search_functions(conn: sqlite3.Connection) -> None:
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
     conn.create_function("web_display_text", 2, recover_message_display_text)
 
+    def bounded_display_from_storage(
+        storage_rowid: int, content_is_null: int, raw_is_null: int
+    ) -> str:
+        values: list[str] = []
+        for column, is_null in (
+            ("content_text", content_is_null),
+            ("raw_message_json", raw_is_null),
+        ):
+            if is_null:
+                values.append("")
+                continue
+            with conn.blobopen(
+                "conversation_nodes", column, int(storage_rowid), readonly=True
+            ) as blob:
+                value, _next, _more, _invalid = _read_utf8_blob_chunk(
+                    blob, 0, SEARCH_CANDIDATE_SCAN_CHARS + 1
+                )
+            values.append(value)
+        return recover_message_display_text(values[0], values[1])
+
+    # The rowid-based resolver reads a fixed BLOB prefix.  It preserves NUL
+    # bytes while avoiding full TEXT projection or CAST for oversized rows.
+    conn.create_function("web_search_display", 3, bounded_display_from_storage)
+
 
 def _sql_display_text(alias: str = "n") -> str:
     return f"web_display_text({alias}.content_text, substr({alias}.raw_message_json, 1, 200001))"
+
+
+def _sql_search_display_text(alias: str = "n") -> str:
+    return (
+        f"web_search_display({alias}.rowid, "
+        f"{alias}.content_text IS NULL, {alias}.raw_message_json IS NULL)"
+    )
 
 
 def parse_query(
@@ -756,9 +797,56 @@ def search_messages(
         )
         for row in rows
     ]
-    result = _page_payload(items, total, limit, offset, extra={"total_exact": bool(count_total)})
+    oversized_inputs = _message_search_has_oversized_inputs(conn, conversation_id)
+    total_exact = bool(count_total and not oversized_inputs)
+    result = _page_payload(items, total, limit, offset, extra={"total_exact": total_exact})
+    estimated_response_bytes = sum(
+        len(str(item.get("display_text") or "").encode("utf-8"))
+        + len(str(item.get("snippet") or "").encode("utf-8"))
+        + 768
+        for item in items
+    )
+    diagnostics.update(
+        {
+            "resource_contract": "bounded_message_search_v1",
+            "candidate_scan_chars_per_row": SEARCH_CANDIDATE_SCAN_CHARS,
+            "hit_preview_chars": SEARCH_HIT_PREVIEW_CHARS,
+            "snippet_scan_chars": SEARCH_SNIPPET_SCAN_CHARS,
+            "response_estimated_bytes": estimated_response_bytes,
+            "response_estimated_bytes_limit": SEARCH_PAGE_ESTIMATED_BYTES,
+            "partial_due_to_oversized_input": oversized_inputs,
+            "continuation_available": False,
+        }
+    )
     result["diagnostics"] = diagnostics
     return result
+
+
+def _message_search_has_oversized_inputs(
+    conn: sqlite3.Connection, conversation_id: str | None
+) -> bool:
+    where = "WHERE conversation_id = ?" if conversation_id is not None else ""
+    params = (conversation_id,) if conversation_id is not None else ()
+    cursor = conn.execute(
+        f"""SELECT rowid AS storage_rowid,
+                   content_text IS NULL AS content_is_null,
+                   raw_message_json IS NULL AS raw_is_null
+            FROM conversation_nodes {where}""",
+        params,
+    )
+    byte_limit = SEARCH_CANDIDATE_SCAN_CHARS * 4
+    for row in cursor:
+        rowid = int(row["storage_rowid"])
+        for column, null_key in (
+            ("content_text", "content_is_null"),
+            ("raw_message_json", "raw_is_null"),
+        ):
+            if bool(row[null_key]):
+                continue
+            with conn.blobopen("conversation_nodes", column, rowid, readonly=True) as blob:
+                if len(blob) > byte_limit:
+                    return True
+    return False
 
 
 def search_conversations(
@@ -1013,6 +1101,7 @@ def get_message_display_chunk(
     row = conn.execute(
         """
         SELECT n.rowid AS storage_rowid,
+               n.content_type,
                COALESCE(g.generation, 0) AS message_generation
         FROM conversation_nodes n
         LEFT JOIN archive_generations g ON g.name = 'message'
@@ -1071,15 +1160,21 @@ def get_message_display_chunk(
     else:
         raw_row = conn.execute(
             """
-            SELECT length(CAST(COALESCE(raw_message_json, '') AS BLOB)) AS raw_bytes,
-                   substr(CAST(COALESCE(raw_message_json, '') AS BLOB), 1, 800004) AS raw_bounded_bytes
+            SELECT raw_message_json IS NULL AS raw_is_null
             FROM conversation_nodes
             WHERE rowid = ?
             """,
             (storage_rowid,),
         ).fetchone()
-        raw_bytes = int(raw_row["raw_bytes"] or 0)
-        raw_bounded_bytes = bytes(raw_row["raw_bounded_bytes"] or b"")
+        if bool(raw_row["raw_is_null"]):
+            raw_bytes = 0
+            raw_bounded_bytes = b""
+        else:
+            with conn.blobopen(
+                "conversation_nodes", "raw_message_json", storage_rowid, readonly=True
+            ) as raw_blob:
+                raw_bytes = len(raw_blob)
+                raw_bounded_bytes = raw_blob.read(min(raw_bytes, 800_004))
         raw_bounded = normalize_display_text(raw_bounded_bytes.decode("utf-8", errors="replace"))
         resolver_input_truncated = raw_bytes > len(raw_bounded_bytes) or len(raw_bounded) > 200_000
         canonical = content_prefix
@@ -1692,9 +1787,9 @@ def _message_search_base_select(
     sql = f"""
         WITH resolved_source AS (
             SELECT n.*,
-                   {_sql_display_text('n')} AS resolved_text,
+                   {_sql_search_display_text('n')} AS resolved_text,
                    {score_expr} AS candidate_score,
-                   {f"COALESCE(mn.content_norm, web_norm({_sql_display_text('n')}))" if has_norm else "NULL"} AS resolved_norm,
+                   {f"COALESCE(mn.content_norm, web_norm({_sql_search_display_text('n')}))" if has_norm else "NULL"} AS resolved_norm,
                    {_bounded_scalar_projection("c.title", "conversation_title", MAX_API_TITLE_CHARS)},
                    c.create_time AS conversation_create_time,
                    c.update_time AS conversation_update_time,
@@ -1734,7 +1829,13 @@ def _message_match_source(conn: sqlite3.Connection, parsed: ParsedQuery, *, use_
                     WHERE web_message_trigram MATCH ?
                     UNION ALL
                     SELECT conversation_id, node_id, NULL AS fts_rank
-                    FROM web_index_oversized WHERE kind = 'message'
+                    FROM web_index_oversized oversized
+                    WHERE kind = 'message'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM web_message_norm normalized
+                          WHERE normalized.conversation_id = oversized.conversation_id
+                            AND normalized.node_id = oversized.node_id
+                      )
                 ) mk
                 JOIN conversation_nodes n
                   ON n.conversation_id = mk.conversation_id AND n.node_id = mk.node_id
@@ -1751,7 +1852,13 @@ def _message_match_source(conn: sqlite3.Connection, parsed: ParsedQuery, *, use_
                 WHERE web_message_trigram MATCH ?
                 UNION ALL
                 SELECT source_rowid AS node_rowid, NULL AS fts_rank
-                FROM web_index_oversized WHERE kind = 'message'
+                FROM web_index_oversized oversized
+                WHERE kind = 'message'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM web_message_norm normalized
+                      WHERE normalized.conversation_id = oversized.conversation_id
+                        AND normalized.node_id = oversized.node_id
+                  )
             ) mk
             JOIN conversation_nodes n ON n.rowid = mk.node_rowid
             """,
@@ -2191,9 +2298,9 @@ def _message_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, 
         f"""
         WITH resolved_source AS (
             SELECT n.*,
-                   {_sql_display_text('n')} AS resolved_text,
+                   {_sql_search_display_text('n')} AS resolved_text,
                    {score_expr} AS candidate_score,
-                   {f"COALESCE(mn.content_norm, web_norm({_sql_display_text('n')}))" if has_norm else "NULL"} AS resolved_norm
+                   {f"COALESCE(mn.content_norm, web_norm({_sql_search_display_text('n')}))" if has_norm else "NULL"} AS resolved_norm
             FROM {source_sql}
             JOIN conversations c ON c.conversation_id = n.conversation_id
             {norm_join}
@@ -2329,6 +2436,10 @@ def _batch_conversation_enrichment(
             WITH matched AS ({base_sql}),
             page_matches AS (
                 SELECT matched.*,
+                       MAX(CASE WHEN {_sql_internal_content_condition('matched')} THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY matched.conversation_id) AS any_internal_hit,
+                       MAX(CASE WHEN NOT matched.effective_visible_in_current_view THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY matched.conversation_id) AS any_branch_hit,
                        row_number() OVER (
                            PARTITION BY matched.conversation_id
                            ORDER BY matched.create_time IS NULL,
@@ -2339,6 +2450,7 @@ def _batch_conversation_enrichment(
                 WHERE matched.conversation_id IN ({placeholders})
             )
             SELECT * FROM page_matches
+            WHERE snippet_rank <= 3
             ORDER BY conversation_id, snippet_rank
             """,
             params + ids,
@@ -2352,6 +2464,10 @@ def _batch_conversation_enrichment(
             WITH matched AS ({base_sql}),
             page_matches AS (
                 SELECT matched.*,
+                       MAX(CASE WHEN {_sql_internal_content_condition('matched')} THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY matched.conversation_id) AS any_internal_hit,
+                       MAX(CASE WHEN NOT matched.effective_visible_in_current_view THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY matched.conversation_id) AS any_branch_hit,
                        row_number() OVER (
                            PARTITION BY matched.conversation_id
                            ORDER BY matched.create_time IS NULL,
@@ -2362,6 +2478,7 @@ def _batch_conversation_enrichment(
                 WHERE matched.conversation_id IN ({placeholders})
             )
             SELECT * FROM page_matches
+            WHERE snippet_rank <= 3
             ORDER BY conversation_id, snippet_rank
             """,
             params + ids,
@@ -2373,8 +2490,8 @@ def _batch_conversation_enrichment(
             continue
         internal = _is_internal_message(row["role"], row["content_type"], row["content_text"])
         effective_visible = bool(row["effective_visible_in_current_view"])
-        item["has_internal_hits"] = bool(item["has_internal_hits"] or internal)
-        item["has_branch_hits"] = bool(item["has_branch_hits"] or not effective_visible)
+        item["has_internal_hits"] = bool(item["has_internal_hits"] or row["any_internal_hit"])
+        item["has_branch_hits"] = bool(item["has_branch_hits"] or row["any_branch_hit"])
         if int(row["snippet_rank"] or 0) <= 3:
             item["snippets"].append(
                 {
@@ -2523,8 +2640,9 @@ def _message_text_filter(
     clauses.extend(required_clauses)
     clauses.extend(exclude_clauses)
     clauses.append(
-        f"NOT (trim({display_expression}) LIKE '[non-text content:%' "
-        f"OR trim({display_expression}) LIKE '[non-text part:%')"
+        f"NOT (lower(COALESCE(n.content_type, '')) NOT IN ('text', 'code', 'multimodal_text') "
+        f"AND (trim({display_expression}) LIKE '[non-text content:%' "
+        f"OR trim({display_expression}) LIKE '[non-text part:%'))"
     )
     return (" AND " + " AND ".join(clauses) if clauses else ""), params
 
@@ -2828,7 +2946,9 @@ def _message_search_payload(
     current_path_fallback_to_all: bool = False,
     effective_visible_in_current_view: bool | None = None,
 ) -> dict[str, Any]:
-    text = row["content_text"] or ""
+    resolved_text = row["content_text"] or ""
+    text = resolved_text[:SEARCH_HIT_PREVIEW_CHARS]
+    preview_truncated = len(resolved_text) > len(text)
     reasons = {reason}
     score = 10.0
     effective_visible = (
@@ -2865,6 +2985,11 @@ def _message_search_payload(
         "content_type_truncated": content_type_truncated,
         "content_type_length": content_type_length,
         "display_text": text,
+        "display_preview": text,
+        "display_preview_truncated": preview_truncated,
+        "display_preview_returned_chars": len(text),
+        "display_text_total_chars": len(resolved_text),
+        "display_text_total_chars_exact": not preview_truncated,
         "snippet": make_snippet(text, _highlight_terms(parsed), parsed.match_mode),
         "is_on_current_path": bool(row["is_on_current_path"]),
         "current_path_fallback_to_all": current_path_fallback_to_all,
@@ -2881,6 +3006,7 @@ def _message_search_payload(
         "source_file_length": source_length,
         "reasons": sorted(reasons),
         "score": score,
+        "response_text_bounded": True,
     }
 
 
@@ -3059,9 +3185,10 @@ def _message_display_fields(
     parsed_ok = False
     if raw_message_json and not raw_source_truncated and len(raw_message_json) <= 200_000:
         try:
+            validate_json_lexical_limits(raw_message_json)
             parsed_message = json_loads(raw_message_json)
             parsed_ok = True
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             parsed_message = None
     raw_preview = _raw_preview(raw_message_json, parsed_message=parsed_message, parsed_ok=parsed_ok)
     resolved_display_text = recover_message_display_text(
@@ -3069,7 +3196,14 @@ def _message_display_fields(
         raw_message_json,
         parsed_message=parsed_message if parsed_message is not RAW_MESSAGE_NOT_PARSED else None,
     )
-    placeholder_text = _is_placeholder_text(text)
+    marker_text = is_generated_non_text_placeholder(text)
+    placeholder_text = bool(
+        marker_text
+        and (
+            (row["content_type"] or "").casefold() not in {"text", "code", "multimodal_text"}
+            or resolved_display_text != text
+        )
+    )
     if text and not placeholder_text:
         display_total = content_total
         display_total_exact = content_total_exact
@@ -3141,8 +3275,10 @@ def _message_row_matches_highlight(
         for title_filter in (parsed.title, parsed.required_title):
             if title_filter and not _fragment_matches(conversation.get("title") or "", title_filter, parsed.match_mode):
                 return False
-    text = display_text if display_text is not None else recover_message_display_text(row["content_text"], row["raw_message_json"])
-    if not text or _is_placeholder_text(text):
+    text = display_text if display_text is not None else recover_message_display_text(
+        row["content_text"], row["raw_message_json"]
+    )
+    if not text or _is_placeholder_text(text, row["content_type"]):
         return False
     for excluded in parsed.exclude:
         if excluded and _fragment_matches(text, excluded, parsed.match_mode):
@@ -3164,7 +3300,7 @@ def _text_from_raw_message(raw_message_json: str) -> str:
 
 def _raw_preview(
     raw_message_json: str | None,
-    limit: int = 20000,
+    limit: int = min(20000, MAX_RAW_PREVIEW_BYTES),
     *,
     parsed_message: Any = RAW_MESSAGE_NOT_PARSED,
     parsed_ok: bool = False,
@@ -3172,11 +3308,15 @@ def _raw_preview(
     if not raw_message_json:
         return ""
     if parsed_ok:
-        return compact_json(_sanitize_raw_preview(parsed_message), limit)
+        try:
+            return compact_json(_sanitize_raw_preview(parsed_message), limit)
+        except JsonSafetyLimitError:
+            return raw_message_json[:limit]
     if parsed_message is RAW_MESSAGE_NOT_PARSED and len(raw_message_json) <= 200_000:
         try:
+            validate_json_lexical_limits(raw_message_json)
             return compact_json(_sanitize_raw_preview(json_loads(raw_message_json)), limit)
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
     return raw_message_json[:limit]
 
@@ -3198,17 +3338,13 @@ def _is_internal_message(role: str | None, content_type: str | None, text: str |
     } or text_value.startswith("source analysis msg id:")
 
 
-def _is_placeholder_text(text: str) -> bool:
-    stripped = text.strip()
-    return stripped.startswith("[non-text content:") or stripped.startswith("[non-text part:")
+def _is_placeholder_text(text: str, content_type: str | None = None) -> bool:
+    has_marker = is_generated_non_text_placeholder(text)
+    return has_marker and (content_type or "").casefold() not in {"text", "code", "multimodal_text"}
 
 
 def _sanitize_raw_preview(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _sanitize_raw_preview(v) for k, v in value.items() if k != "metadata"}
-    if isinstance(value, list):
-        return [_sanitize_raw_preview(item) for item in value]
-    return value
+    return sanitize_json_value(value, omit_metadata=True)
 
 
 def _bounded_api_scalar(value: Any, limit: int) -> tuple[str | None, bool, int]:
@@ -3404,7 +3540,8 @@ def _highlight_ranges_with_meta(
 def make_snippet(text: str, terms: list[tuple[str, str]], match_mode: str = "contains", radius: int = 80) -> str:
     if not text:
         return ""
-    normalized, spans = _normalized_with_codepoint_spans(text)
+    bounded_text = text[:SEARCH_SNIPPET_SCAN_CHARS]
+    normalized, spans = _normalized_with_codepoint_spans(bounded_text)
     positions = []
     for term, term_match_mode in terms:
         needle = normalize_search_text(term)
@@ -3425,10 +3562,10 @@ def make_snippet(text: str, terms: list[tuple[str, str]], match_mode: str = "con
             break
     center = min(positions) if positions else 0
     start = max(0, center - radius)
-    end = min(len(text), center + radius)
+    end = min(len(bounded_text), center + radius)
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(text) else ""
-    return prefix + text[start:end].replace("\n", " ") + suffix
+    return prefix + bounded_text[start:end].replace("\n", " ") + suffix
 
 
 def _normalized_with_codepoint_spans(text: str) -> tuple[str, list[int]]:

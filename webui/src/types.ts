@@ -117,6 +117,11 @@ export interface SearchMessageHit {
   update_time: number | null;
   content_type: string | null;
   display_text: string;
+  display_preview?: string;
+  display_preview_truncated?: boolean;
+  display_preview_returned_chars?: number;
+  display_text_total_chars?: number;
+  display_text_total_chars_exact?: boolean;
   snippet: string;
   is_on_current_path: boolean;
   current_path_fallback_to_all?: boolean;
@@ -229,6 +234,14 @@ export interface SearchDiagnostics {
   diagnostics_accuracy?: "best_effort" | UnknownApiEnum;
   actual_fallback_note?: string;
   estimated_backend_note?: string;
+  resource_contract?: string;
+  candidate_scan_chars_per_row?: number;
+  hit_preview_chars?: number;
+  snippet_scan_chars?: number;
+  response_estimated_bytes?: number;
+  response_estimated_bytes_limit?: number;
+  partial_due_to_oversized_input?: boolean;
+  continuation_available?: boolean;
 }
 
 export interface Stats {
@@ -251,6 +264,7 @@ export interface Health {
     | "migration_required"
     | "schema_newer"
     | "schema_incompatible"
+    | "data_incompatible"
     | "foreign_key_violation"
     | "database_malformed"
     | "database_locked"
@@ -312,7 +326,7 @@ export interface ImportJob {
   job_id: string;
   status: "queued" | "running" | "succeeded" | "failed" | "postcheck_failed";
   stage: string;
-  outcome: "queued" | "import_running" | "import_job_start_failed" | "input_preflight_failed" | "source_scan_failed" | "source_read_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "succeeded";
+  outcome: "queued" | "import_running" | "import_job_start_failed" | "input_preflight_failed" | "source_scan_failed" | "source_read_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "web_index_cancelled" | "succeeded";
   canonical_commit_succeeded: boolean;
   filename: string;
   size: number;
@@ -324,6 +338,8 @@ export interface ImportJob {
   verify: Record<string, unknown> | null;
   stats: Stats | null;
   web_index: Record<string, unknown> | null;
+  web_index_cancel_requested: boolean;
+  web_index_cancelled: boolean;
   error: string | null;
   error_code: string | null;
   error_type: string | null;
@@ -338,8 +354,16 @@ export interface RawMessageResponse {
   raw_message: unknown;
   raw_text?: string;
   raw_size: number;
+  raw_size_unit: "bytes" | UnknownApiEnum;
   raw_size_exact: boolean;
+  raw_size_chars?: number | null;
+  raw_size_chars_exact?: boolean;
   raw_size_bytes: number;
+  raw_size_bytes_exact?: boolean;
+  parsed?: boolean;
+  incomplete?: boolean;
+  error_code?: string;
+  limit?: number;
   truncated: boolean;
 }
 

@@ -153,6 +153,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     getMessages({ id: conversation.conversation_id, q: highlightQuery, path: effectivePath, filters: effectiveFilters, offset, limit: settings.messagePageSize, aroundNodeId, includeInternal: showInternal, matchMode, signal: controller.signal })
       .then((page) => {
         if (requestId !== messageRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
+        if (!Array.isArray(page.items)) throw new Error("invalid_response");
         setMessages((current) => append ? [...current, ...page.items] : page.items);
         setMessageTotal(page.total);
         setVisibleTotal(page.visible_total ?? page.total);
@@ -230,6 +231,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     loadHits()
       .then((page) => {
         if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
+        if (!Array.isArray(page.items)) throw new Error("invalid_response");
         setHitItems(page.items);
         setHitNextOffset(page.next_offset);
         setHitHasMore(Boolean(page.has_more && page.next_offset !== null));
@@ -338,6 +340,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     })
       .then((page) => {
         if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
+        if (!Array.isArray(page.items)) throw new Error("invalid_response");
         const loadedCount = Math.min(MAX_NAVIGABLE_HIT_MESSAGES, hitItems.length + page.items.length);
         setHitItems((current) => [...current, ...page.items].slice(0, MAX_NAVIGABLE_HIT_MESSAGES));
         setHitNextOffset(page.next_offset);

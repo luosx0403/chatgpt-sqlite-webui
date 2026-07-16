@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 INCLUDE_PATHS = [
     "chatgpt_archive.py", "chatgpt_export_archiver/", "tests/", "tools/",
-    "webui/dist/", "webui/src/", "webui/tests/", "webui/index.html",
+    "webui/dist/", "webui/src/", "webui/tests/", "webui/scripts/", "webui/index.html",
     "webui/tsconfig.json", "webui/vite.config.ts", "webui/package.json",
     "webui/package-lock.json", "README.md", "README.zh-CN.md",
     "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md", "LICENSE",
@@ -30,6 +30,7 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "chatgpt_export_archiver/search.py",
     "chatgpt_export_archiver/exporter.py",
     "chatgpt_export_archiver/identifiers.py",
+    "chatgpt_export_archiver/json_safety.py",
     "chatgpt_export_archiver/logging_utils.py",
     "chatgpt_export_archiver/cli.py",
     "chatgpt_export_archiver/db.py",
@@ -71,6 +72,7 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "tests/fixtures/legacy-fa37b3d.sql",
     "tests/fixtures/legacy-fa37b3d.json",
     "webui/tests/dom-smoke.mjs",
+    "webui/scripts/build.mjs",
     "webui/package.json",
     "webui/package-lock.json",
     "requirements-web.txt",
@@ -162,6 +164,87 @@ def _collect_payload(root: Path) -> dict[str, bytes]:
     return dict(sorted(payload.items()))
 
 
+def _collect_payload_paths(root: Path) -> list[tuple[str, Path]]:
+    payload: dict[str, Path] = {}
+    for include in INCLUDE_PATHS:
+        source = root / include
+        paths = [source] if source.is_file() else sorted(source.rglob("*"))
+        for path in paths:
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if not _matches_any(relative):
+                payload[relative] = path
+    return sorted(payload.items())
+
+
+def _file_manifest(payload: list[tuple[str, Path]]) -> list[dict[str, object]]:
+    manifest: list[dict[str, object]] = []
+    for relative, path in payload:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        manifest.append({"path": relative, "size": size, "sha256": digest.hexdigest()})
+    return manifest
+
+
+def _fixed_zip_info(relative: str) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+    info.create_system = 3
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = (0o100644 & 0xFFFF) << 16
+    info.internal_attr = 0
+    info.extra = b""
+    info.comment = b""
+    return info
+
+
+def _write_archive_paths(
+    path: Path,
+    payload: list[tuple[str, Path]],
+    manifest: list[dict[str, object]],
+) -> None:
+    manifest_bytes = _manifest_bytes(payload, manifest=manifest)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        archive.comment = b""
+        for relative, source_path in payload:
+            with source_path.open("rb") as source, archive.open(
+                _fixed_zip_info(relative), "w", force_zip64=True
+            ) as destination:
+                while chunk := source.read(1024 * 1024):
+                    destination.write(chunk)
+        with archive.open(_fixed_zip_info(MANIFEST_NAME), "w", force_zip64=True) as destination:
+            destination.write(manifest_bytes)
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _verify_archive_paths(
+    path: Path,
+    manifest: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    expected_names = {str(item["path"]) for item in manifest} | {MANIFEST_NAME}
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)) or set(names) != expected_names:
+            raise ValueError("release_member_set_mismatch")
+        if json.loads(archive.read(MANIFEST_NAME)) != manifest:
+            raise ValueError("release_manifest_mismatch")
+        for item in manifest:
+            digest = hashlib.sha256()
+            size = 0
+            with archive.open(str(item["path"])) as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+            if size != item["size"] or digest.hexdigest() != item["sha256"]:
+                raise ValueError(f"release_hash_mismatch {item['path']}")
+    return manifest
+
+
 def _manifest(payload: dict[str, bytes]) -> list[dict[str, object]]:
     return [
         {"path": path, "size": len(data), "sha256": _sha256(data)}
@@ -169,11 +252,23 @@ def _manifest(payload: dict[str, bytes]) -> list[dict[str, object]]:
     ]
 
 
-def _manifest_bytes(payload: dict[str, bytes]) -> bytes:
-    return (json.dumps(_manifest(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+def _manifest_bytes(
+    payload: dict[str, bytes] | list[tuple[str, Path]],
+    *,
+    manifest: list[dict[str, object]] | None = None,
+) -> bytes:
+    records = manifest if manifest is not None else _manifest(payload)  # type: ignore[arg-type]
+    return (json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def _write_archive(path: Path, payload: dict[str, bytes]) -> None:
+def _write_archive(
+    path: Path,
+    payload: dict[str, bytes] | tuple[list[tuple[str, Path]], list[dict[str, object]]],
+) -> None:
+    if isinstance(payload, tuple):
+        paths, manifest = payload
+        _write_archive_paths(path, paths, manifest)
+        return
     def write_member(archive: zipfile.ZipFile, relative: str, data: bytes) -> None:
         info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
         info.create_system = 3
@@ -240,11 +335,11 @@ def _fsync_directory(path: Path) -> None:
 def build_release(root: Path, output: Path, *, check: bool = True) -> tuple[list[dict[str, object]], int]:
     _validate_required(root)
     assets = _dist_assets(root)
-    payload = _collect_payload(root)
+    payload = _collect_payload_paths(root)
     authoritative_payload = set(AUTHORITATIVE_REQUIRED_FILES) | {
         f"webui/dist/{asset}" for asset in assets
     }
-    missing_payload = sorted(authoritative_payload - set(payload))
+    missing_payload = sorted(authoritative_payload - {relative for relative, _path in payload})
     if missing_payload:
         raise ValueError("required_release_payload_missing " + " ".join(missing_payload))
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -252,8 +347,9 @@ def build_release(root: Path, output: Path, *, check: bool = True) -> tuple[list
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        _write_archive(temporary, payload)
-        manifest = _verify_archive(temporary, payload)
+        manifest = _file_manifest(payload)
+        _write_archive(temporary, (payload, manifest))
+        manifest = _verify_archive_paths(temporary, manifest)
         if check:
             _delivery_check(root, temporary)
         os.replace(temporary, output)

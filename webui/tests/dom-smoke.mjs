@@ -62,8 +62,11 @@ function assertStaticFrontendContracts() {
   const i18nSource = fs.readFileSync(path.join(webRoot, "src/i18n.ts"), "utf8");
   const stylesSource = fs.readFileSync(path.join(webRoot, "src/styles.css"), "utf8");
   const interactionSource = fs.readFileSync(path.join(webRoot, "src/utils/interaction.ts"), "utf8");
+  const buildSource = fs.readFileSync(path.join(webRoot, "scripts/build.mjs"), "utf8");
   assert.ok(appSource.includes('web_index_recovery: t("stageWebIndexRecovery")'), "web-index-recovery import stage should use a localized label");
   assert.ok(appSource.includes('data-testid="web-index-progress"'), "Web index processed/total progress should be visible without exposing internal field names");
+  assert.ok(appSource.includes('data-testid="web-index-cancel-button"'), "active Web index builds should expose a cancellable import-job control");
+  assert.ok(clientSource.includes("/web-index/cancel"), "Web index cancellation should use the dedicated bounded endpoint");
   assert.ok(appSource.includes('scan_normalize_messages: t("webIndexStageScanMessages")'), "Web index build stages should use localized labels");
   assert.ok(appSource.includes("has_internal_hits: meta.has_internal_hits"), "selected conversation merge must preserve hidden/internal search metadata after detail load");
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
@@ -117,6 +120,8 @@ function assertStaticFrontendContracts() {
   assert.ok(appSource.includes("importInputRef"), "successful upload should be able to clear the file input");
   assert.ok(appSource.includes('data-testid="import-zip-button"'), "ZIP import should expose a visible keyboard-focusable button");
   assert.ok(i18nSource.includes('PARTIAL_LANGUAGES = ["ja", "es"]'), "partial Japanese and Spanish coverage should be explicit");
+  assert.ok(buildSource.includes("failBeforeIndex"), "dist publication should exercise an injected pre-index failure");
+  assert.ok(buildSource.indexOf("for (const relative of newFiles)") < buildSource.indexOf('path.join(dist, "index.html")'), "dist assets must publish before the atomic index entry point");
   assert.ok(stylesSource.includes(".search-diagnostics-hint"), "diagnostics hint styles should target the current class");
   assert.equal(stylesSource.includes(".diagnostics-hint"), false, "stale diagnostics-hint selector should not return");
 }
@@ -436,6 +441,12 @@ function makeSyntheticConversations() {
     };
     conversations.push(conversation(id, `Synthetic Conversation ${idx}`, mapping, "a", 1_800_000_000 + idx));
   }
+  const fallbackId = "fallback/id?hash%:漢字";
+  const fallbackMapping = {
+    root: root(["u"]),
+    u: node("u", "root", "user", "<script>window.__fallbackInjected=true</script> safe text", 2_100_000_001),
+  };
+  conversations.push(conversation(fallbackId, "<img src=x onerror=window.__fallbackInjected=true>", fallbackMapping, "u", 2_100_000_000));
   return conversations;
 }
 
@@ -644,6 +655,7 @@ async function main() {
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "chatgpt-export-archiver-dom-"));
   let server;
   let noDbServer;
+  let fallbackServer;
   let browser;
   try {
     browser = await launchBrowser();
@@ -715,7 +727,29 @@ async function main() {
     let maxActiveJobPolls = 0;
     let delayedFirstJobPoll = true;
     let allowTerminalJobPoll = false;
+    let webIndexCancelCalls = 0;
     await noDbPage.route("**/api/import/jobs/*", async (route) => {
+      const requestUrl = new URL(route.request().url());
+      if (route.request().method() === "POST" && requestUrl.pathname.endsWith("/web-index/cancel")) {
+        webIndexCancelCalls += 1;
+        const jobId = requestUrl.pathname.split("/").at(-3);
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            job_id: jobId,
+            status: "running",
+            stage: "web-index",
+            outcome: "canonical_commit_succeeded",
+            canonical_commit_succeeded: true,
+            elapsed_seconds: 1.8,
+            web_index_cancel_requested: true,
+            web_index_cancelled: false,
+            web_index: { status: "cancelling", processed: 100, total: 250, complete: false },
+          }),
+        });
+        return;
+      }
       activeJobPolls += 1;
       maxActiveJobPolls = Math.max(maxActiveJobPolls, activeJobPolls);
       try {
@@ -777,6 +811,10 @@ async function main() {
       throw new Error(`web-index progress did not render; active=${activeJobPolls} max=${maxActiveJobPolls} panel=${JSON.stringify(panelText)} cause=${error instanceof Error ? error.message : String(error)}`);
     }
     assert.ok((await noDbPage.getByTestId("web-index-progress").textContent())?.includes("Normalizing messages · 100/250"), "Web index progress should use a localized stage label and bounded counts");
+    await noDbPage.getByTestId("web-index-cancel-button").click();
+    await noDbPage.waitForFunction(() => document.querySelector('[data-testid="web-index-cancel-button"]')?.textContent?.includes("Cancelling"), undefined, { timeout: 20_000 });
+    assert.equal(webIndexCancelCalls, 1, "Web index cancellation should issue exactly one POST request");
+    assert.equal(await noDbPage.getByTestId("web-index-cancel-button").isDisabled(), true, "the cancellation button should disable after acknowledgement");
     allowTerminalJobPoll = true;
     await noDbPage.waitForFunction(() => document.querySelector('[data-testid="import-status"]')?.textContent?.includes("succeeded"), undefined, { timeout: 60_000 });
     await noDbPage.waitForTimeout(1_500);
@@ -821,7 +859,65 @@ async function main() {
     server.stderr.on("data", () => undefined);
     await waitForHealth(baseUrl);
 
+    const fallbackPort = port + 1;
+    const fallbackUrl = `http://127.0.0.1:${fallbackPort}/`;
+    fallbackServer = spawn(python.command, [...python.args, "-c", "import pathlib,sys,uvicorn; from chatgpt_export_archiver.web_app import create_app; uvicorn.run(create_app(pathlib.Path(sys.argv[1]), static_dir=pathlib.Path(sys.argv[2]), allow_fallback=True), host='127.0.0.1', port=int(sys.argv[3]))", db, path.join(tmp, "missing-dist"), String(fallbackPort)], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    fallbackServer.stdout.on("data", () => undefined);
+    fallbackServer.stderr.on("data", () => undefined);
+    await waitForHealth(fallbackUrl);
+
+    const fallbackContext = await browser.newContext({ viewport: { width: 1000, height: 760 }, locale: "en-US" });
+    const fallbackPage = await fallbackContext.newPage();
+    const fallbackRequests = [];
+    fallbackPage.on("request", (request) => fallbackRequests.push(request.url()));
+    await fallbackPage.goto(fallbackUrl, { waitUntil: "networkidle" });
+    const fallbackItem = fallbackPage.locator("button.item").filter({ hasText: "<img src=x onerror=window.__fallbackInjected=true>" });
+    await fallbackItem.waitFor({ state: "visible", timeout: 20_000 });
+    await fallbackItem.click();
+    await fallbackPage.getByRole("heading", { name: "<img src=x onerror=window.__fallbackInjected=true>" }).waitFor({ state: "visible", timeout: 20_000 });
+    assert.equal(await fallbackPage.evaluate(() => Boolean(window.__fallbackInjected)), false, "fallback title/body must render as text, never executable HTML");
+    assert.ok(fallbackRequests.some((url) => new URL(url).pathname === "/api/by-id/conversation"), "fallback detail must use by-id query routing");
+    assert.ok(fallbackRequests.some((url) => new URL(url).pathname === "/api/by-id/messages"), "fallback messages must use by-id query routing");
+    for (const label of ["Download visible MD", "Download visible TXT", "Bounded raw preview", "Display chunk"]) {
+      const href = await fallbackPage.getByRole("link", { name: label }).first().getAttribute("href");
+      assert.equal(new URL(href, fallbackUrl).searchParams.get("conversation_id"), "fallback/id?hash%:漢字", `${label} must preserve the complete fallback conversation ID`);
+    }
+    await fallbackPage.getByRole("button", { name: "Open around message" }).click();
+    await fallbackPage.waitForTimeout(300);
+    assert.ok(fallbackRequests.some((url) => new URL(url).pathname === "/api/by-id/messages" && new URL(url).searchParams.has("around_node_id")), "fallback around navigation must use the by-id query route");
+    await fallbackContext.close();
+    fallbackServer.kill("SIGTERM");
+    await new Promise((resolve) => fallbackServer.once("exit", resolve));
+    fallbackServer = undefined;
+
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "en-US" });
+    const lifecyclePage = await context.newPage();
+    await lifecyclePage.addInitScript(() => {
+      if (!window.name) window.name = "0";
+      const NativeAbortController = window.AbortController;
+      window.AbortController = class extends NativeAbortController {
+        abort(reason) {
+          window.name = String(Number(window.name || "0") + 1);
+          return super.abort(reason);
+        }
+      };
+    });
+    await lifecyclePage.route("**/api/stats", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 10_000));
+      await route.continue();
+    });
+    await lifecyclePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await lifecyclePage.waitForSelector(".app-shell", { timeout: 20_000 });
+    const abortsBeforeUnmount = Number(await lifecyclePage.evaluate(() => window.name));
+    await lifecyclePage.evaluate(() => window.dispatchEvent(new Event("chatgpt-archive:teardown")));
+    await lifecyclePage.waitForFunction(() => !document.querySelector(".app-shell"), undefined, { timeout: 20_000 });
+    const abortsAfterUnmount = Number(await lifecyclePage.evaluate(() => window.name));
+    assert.ok(abortsAfterUnmount > abortsBeforeUnmount, "App unmount must abort pending refresh/list requests");
+    await lifecyclePage.close();
+
     const page = await context.newPage();
     await page.addInitScript(() => {
       window.__copiedText = "";
@@ -836,7 +932,10 @@ async function main() {
     });
     const browserDiagnostics = [];
     page.on("console", (message) => browserDiagnostics.push(`${message.type()}: ${message.text()}`));
-    page.on("pageerror", (error) => browserDiagnostics.push(`pageerror: ${error.message}`));
+    page.on("pageerror", (error) => browserDiagnostics.push(`pageerror: ${error.stack || error.message}`));
+    page.on("response", (response) => {
+      if (response.status() >= 400) browserDiagnostics.push(`http_${response.status()}: ${response.url()}`);
+    });
     await page.goto(baseUrl, { waitUntil: "networkidle" });
     try {
       await waitForCount(page, ".conversation-item", 20);
@@ -952,6 +1051,19 @@ async function main() {
     await resizer.focus();
     await page.keyboard.press("ArrowRight");
     assert.equal(Number(await resizer.getAttribute("aria-valuenow")), widthBefore + 10, "sidebar resizer should support keyboard arrows");
+    const pointerWidths = await resizer.evaluate((node) => {
+      node.setPointerCapture = () => undefined;
+      node.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 7, clientX: 410 }));
+      window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 7, clientX: 430 }));
+      const during = Number(node.getAttribute("aria-valuenow"));
+      window.dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 7, clientX: 430 }));
+      window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 7, clientX: 520 }));
+      return new Promise((resolve) => requestAnimationFrame(() => resolve({
+        during,
+        afterCancel: Number(node.getAttribute("aria-valuenow")),
+      })));
+    });
+    assert.equal(pointerWidths.afterCancel, pointerWidths.during, "pointercancel must remove sidebar drag listeners immediately");
 
     let delayedProgressRequest = false;
     await page.route("**/api/conversations**", async (route) => {
@@ -1829,6 +1941,12 @@ async function main() {
       if (noDbServer.exitCode === null && noDbServer.signalCode === null) {
         noDbServer.kill("SIGTERM");
         await new Promise((resolve) => noDbServer.once("exit", resolve));
+      }
+    }
+    if (fallbackServer) {
+      if (fallbackServer.exitCode === null && fallbackServer.signalCode === null) {
+        fallbackServer.kill("SIGTERM");
+        await new Promise((resolve) => fallbackServer.once("exit", resolve));
       }
     }
     await fsp.rm(tmp, { recursive: true, force: true });

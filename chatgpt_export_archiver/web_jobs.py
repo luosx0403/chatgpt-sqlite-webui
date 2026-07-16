@@ -15,7 +15,7 @@ from .cli import ImportPipelineError, run_import_pipeline
 from .db import connect, get_stats, verify_database
 from .logging_utils import get_logger, parse_log_level
 from .utils import safe_filename_part
-from .web_db import create_web_indexes
+from .web_db import WebIndexBuildCancelled, create_web_indexes
 
 LOGGER = get_logger("web_jobs")
 
@@ -57,6 +57,8 @@ class ImportJob:
     verify: dict[str, Any] | None = None
     stats: dict[str, Any] | None = None
     web_index: dict[str, Any] | None = None
+    web_index_cancel_requested: bool = False
+    web_index_cancelled: bool = False
     error: str | None = None
     error_code: str | None = None
     error_type: str | None = None
@@ -64,6 +66,7 @@ class ImportJob:
     canonical_commit_succeeded: bool = False
     cleanup_warning: str | None = None
     cleanup_warnings: list[dict[str, str]] = field(default_factory=list)
+    _web_index_cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=1000))
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -85,6 +88,8 @@ class ImportJob:
                 "verify": dict(self.verify) if self.verify is not None else None,
                 "stats": dict(self.stats) if self.stats is not None else None,
                 "web_index": dict(self.web_index) if self.web_index is not None else None,
+                "web_index_cancel_requested": self.web_index_cancel_requested,
+                "web_index_cancelled": self.web_index_cancelled,
                 "error": self.error,
                 "error_code": self.error_code,
                 "error_type": self.error_type,
@@ -181,6 +186,25 @@ class ImportJobManager:
         with self._lock:
             self._prune_jobs_locked()
             return sorted(self._jobs.values(), key=lambda job: job.created_at, reverse=True)[:20]
+
+    def request_web_index_cancel(self, job_id: str) -> tuple[ImportJob | None, bool]:
+        """Request cancellation only while an import job is rebuilding the optional index."""
+
+        with self._lock:
+            self._prune_jobs_locked()
+            job = self._jobs.get(job_id)
+        if job is None:
+            return None, False
+        with job._lock:
+            if job.status != "running" or job.stage not in {"web-index", "web-index-recovery"}:
+                return job, False
+            job.web_index_cancel_requested = True
+            if job.web_index is None:
+                job.web_index = {"status": "cancelling"}
+            else:
+                job.web_index = {**job.web_index, "status": "cancelling"}
+            job._web_index_cancel_event.set()
+        return job, True
 
     def _prune_jobs_locked(self) -> None:
         now = time.time()
@@ -296,6 +320,7 @@ class ImportJobManager:
                         web_index_result = create_web_indexes(
                             self.db_path,
                             progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
+                            cancel_callback=job._web_index_cancel_event.is_set,
                         )
                         web_index_result["recovered_optional_web_index"] = True
                         conn = connect(self.db_path)
@@ -306,6 +331,9 @@ class ImportJobManager:
                         with job._lock:
                             job.web_index = web_index_result
                             job.verify = verify_result
+                    except WebIndexBuildCancelled:
+                        self._web_index_cancelled(job, postcheck_failed=True)
+                        return
                     except Exception as exc:
                         self._set_outcome(job, status="postcheck_failed", outcome="web_index_failed", error_code="web_index_failed")
                         self._log(job, "error", f"web_index_failed error_type={type(exc).__name__}")
@@ -339,9 +367,13 @@ class ImportJobManager:
                     web_index_result = create_web_indexes(
                         self.db_path,
                         progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
+                        cancel_callback=job._web_index_cancel_event.is_set,
                     )
                     with job._lock:
                         job.web_index = web_index_result
+                except WebIndexBuildCancelled:
+                    self._web_index_cancelled(job, postcheck_failed=False)
+                    return
                 except Exception as exc:
                     self._set_outcome(job, status="postcheck_failed", outcome="web_index_failed", error_code="web_index_failed")
                     self._log(job, "error", f"web_index_failed error_type={type(exc).__name__}")
@@ -428,7 +460,21 @@ class ImportJobManager:
     def _web_index_progress(self, job: ImportJob, stage: str, progress: dict[str, Any]) -> None:
         with job._lock:
             job.stage = "web-index"
-            job.web_index = {"status": "building", "build_stage": stage, **progress}
+            status = "cancelling" if job.web_index_cancel_requested else "building"
+            job.web_index = {"status": status, "build_stage": stage, **progress}
+
+    def _web_index_cancelled(self, job: ImportJob, *, postcheck_failed: bool) -> None:
+        with job._lock:
+            job.web_index_cancel_requested = True
+            job.web_index_cancelled = True
+            job.web_index = {"status": "cancelled", "complete": True}
+        self._set_outcome(
+            job,
+            status="postcheck_failed" if postcheck_failed else "succeeded",
+            outcome="web_index_cancelled",
+            error_code="web_index_cancelled" if postcheck_failed else None,
+        )
+        self._set_stage(job, "web_index_cancelled")
 
 
 def make_upload_path() -> tuple[Path, Path]:

@@ -2013,6 +2013,15 @@ class WebApiTests(unittest.TestCase):
 
             client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
             self.addCleanup(client.close)
+            large_page_response = client.get(
+                "/api/conversations/budget/messages?path=all&include_internal=true&limit=300"
+            )
+            self.assertEqual(large_page_response.status_code, 200)
+            large_page = large_page_response.json()
+            self.assertIn("items", large_page)
+            self.assertNotIn("detail", large_page)
+            self.assertEqual(len(large_page["items"]), 300)
+            self.assertLess(len(large_page_response.content), 4 * 1024 * 1024)
             schema = client.get("/api/schema").json()
             self.assertEqual(schema["messages"]["budgets"]["display_chunk_chars"], 4096)
             first = client.get("/api/conversations/budget/messages/n-000/display?offset=0&limit=4096")
@@ -2821,6 +2830,16 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("if(!r.ok)", html)
         self.assertIn("Array.isArray(data.items)", html)
         self.assertIn("database_migration_required", html)
+        for route in (
+            "/api/by-id/conversation",
+            "/api/by-id/messages",
+            "/api/by-id/export",
+            "/api/by-id/copy",
+            "/api/by-id/raw",
+            "/api/by-id/display",
+        ):
+            self.assertIn(route, html)
+        self.assertNotIn("/api/conversations/${", html)
 
     def test_react_build_served_when_present_not_fallback(self):
         td, _client, db = self.make_client()
@@ -3391,6 +3410,81 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(job.status, "succeeded")
             self.assertTrue(job.web_index["atomic_publish"])
 
+    def test_web_job_cancel_request_reaches_atomic_index_builder(self):
+        from chatgpt_export_archiver.web_db import WebIndexBuildCancelled
+        from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upload = base / "upload.zip"
+            upload.write_bytes(b"synthetic")
+            manager = ImportJobManager(base / "archive.db")
+            job_id = "a" * 32
+            job = ImportJob(job_id, base / "archive.db", upload, "synthetic.zip", upload.stat().st_size)
+            with manager._lock:
+                manager._jobs[job_id] = job
+                manager._running_job_id = job_id
+
+            def cancel_during_build(_path, *, progress_callback, cancel_callback, **_kwargs):
+                progress_callback("scan_normalize_messages", {"processed": 1, "total": 2, "complete": False})
+                self.assertFalse(cancel_callback())
+                requested, accepted = manager.request_web_index_cancel(job_id)
+                self.assertIs(requested, job)
+                self.assertTrue(accepted)
+                self.assertTrue(cancel_callback())
+                raise WebIndexBuildCancelled()
+
+            with mock.patch("chatgpt_export_archiver.web_jobs.run_import_pipeline", return_value={"summary": {"valid_conversations": 1}}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.connect"), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.verify_database", return_value={"ok": True}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.get_stats", return_value={"conversations": 1}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.create_web_indexes", side_effect=cancel_during_build):
+                manager._run_job(job)
+
+            snapshot = job.snapshot()
+            self.assertEqual(snapshot["status"], "succeeded")
+            self.assertEqual(snapshot["stage"], "web_index_cancelled")
+            self.assertEqual(snapshot["outcome"], "web_index_cancelled")
+            self.assertTrue(snapshot["canonical_commit_succeeded"])
+            self.assertTrue(snapshot["web_index_cancel_requested"])
+            self.assertTrue(snapshot["web_index_cancelled"])
+            self.assertEqual(snapshot["web_index"]["status"], "cancelled")
+            self.assertIsNone(snapshot["error_code"])
+
+    def test_web_index_cancel_endpoint_has_bounded_state_contract(self):
+        from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            manager = ImportJobManager(base / "archive.db")
+            job_id = "b" * 32
+            job = ImportJob(job_id, base / "archive.db", base / "upload.zip", "synthetic.zip", 1)
+            job.status = "running"
+            job.stage = "web-index"
+            job.web_index = {"status": "building", "processed": 1, "total": 2}
+            with manager._lock:
+                manager._jobs[job_id] = job
+                manager._running_job_id = job_id
+            with mock.patch("chatgpt_export_archiver.web_app.ImportJobManager", return_value=manager):
+                client = TestClient(create_app(base / "archive.db", static_dir=self.make_build_dir(base)))
+            self.addCleanup(client.close)
+
+            response = client.post(f"/api/import/jobs/{job_id}/web-index/cancel")
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload["web_index_cancel_requested"])
+            self.assertEqual(payload["web_index"]["status"], "cancelling")
+            self.assertNotIn(str(base), response.text)
+
+            repeated = client.post(f"/api/import/jobs/{job_id}/web-index/cancel")
+            self.assertEqual(repeated.status_code, 200)
+            self.assertEqual(client.post("/api/import/jobs/invalid/web-index/cancel").status_code, 400)
+            job.status = "succeeded"
+            job.stage = "succeeded"
+            refused = client.post(f"/api/import/jobs/{job_id}/web-index/cancel")
+            self.assertEqual(refused.status_code, 409)
+            self.assertEqual(refused.json()["detail"], "web_index_not_cancellable")
+
     def test_web_job_marks_postcheck_failed_without_rollback_implication(self):
         from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 
@@ -3786,8 +3880,14 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(schema["messages"]["limits"]["around_node_id"], 16 * 1024)
         self.assertEqual(schema["conversations"]["limits"]["selected_id"], 16 * 1024)
         self.assertEqual(schema["id_addressing"]["new_import_id_max_chars"], 512)
-        self.assertEqual(schema["import_contract"]["max_element_utf8_bytes"], 128 * 1024 * 1024)
-        self.assertEqual(schema["import_contract"]["max_element_decoded_chars"], 128 * 1024 * 1024)
+        self.assertEqual(schema["import_contract"]["max_element_utf8_bytes"], 32 * 1024 * 1024)
+        self.assertEqual(schema["import_contract"]["max_element_decoded_chars"], 32 * 1024 * 1024)
+        self.assertEqual(schema["request_validation"]["detail_code"], "invalid_request")
+        self.assertEqual(schema["request_validation"]["item_fields"], ["location", "field", "code"])
+        self.assertEqual(schema["raw"]["units"].split(";")[0], "raw_size is always exact UTF-8 bytes for compatibility")
+        self.assertEqual(schema["export"]["resource_limits"]["archive_max_conversations"], 1_000_000)
+        self.assertEqual(schema["export"]["resource_limits"]["effective_current_batch_rows"], 20_000)
+        self.assertEqual(schema["export"]["resource_limits"]["effective_current_batch_input_bytes"], 64 * 1024 * 1024)
         self.assertIn("conversation_json_element_too_large", schema["jobs"]["failure_codes"])
         self.assertIn("visible-only reader pagination collection", schema["messages"]["around_node_id"]["description"])
         self.assertEqual(
@@ -3812,6 +3912,10 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertIn("processed", schema["web_index_build"]["progress"])
         self.assertIn("rolls back", schema["web_index_build"]["publication"])
+        self.assertIn("/web-index/cancel", schema["web_index_build"]["cancellation"])
+        self.assertTrue(schema["import_contract"]["zip64"]["runtime_supported"])
+        self.assertFalse(schema["import_contract"]["zip64"]["physical_over_4_gib_acceptance_tested"])
+        self.assertIn("delay WAL checkpoint", schema["export"]["snapshot"]["wal_operational_limit"])
         self.assertEqual(schema["jobs"]["web_index_progress"], [
             "status", "build_stage", "processed", "total", "complete", "batch_size",
         ])
@@ -6328,6 +6432,202 @@ class WebApiTests(unittest.TestCase):
         with mock.patch.object(web_api_module, "connect_readonly", side_effect=deep_connect):
             self.assertEqual(client.get("/api/health?deep=true").status_code, 200)
         self.assertTrue(any("FOREIGN_KEY_CHECK" in sql.upper() for sql in deep_statements))
+
+    def test_round7_request_validation_is_bounded_and_never_echoes_input(self):
+        td, client, _db = self.make_client()
+        self.addCleanup(td.cleanup)
+        secret = "ROUND7_PRIVATE_" + "x" * 10_000
+        response = client.get("/api/conversations", params={"offset": secret})
+        self.assertEqual(response.status_code, 422)
+        self.assertLess(len(response.content), 8192)
+        self.assertNotIn("ROUND7_PRIVATE_", response.text)
+        payload = response.json()["detail"]
+        self.assertEqual(payload["code"], "invalid_request")
+        self.assertLessEqual(len(payload["errors"]), 16)
+        self.assertEqual(
+            payload["errors"][0],
+            {"location": "query", "field": "offset", "code": "invalid_integer"},
+        )
+        self.assertNotIn("input", response.text.casefold())
+
+        cases = (
+            ("/api/conversations?offset=-1", "invalid_offset", "offset"),
+            ("/api/conversations?limit=1000", "invalid_limit", "limit"),
+            ("/api/by-id/conversation", "missing_parameter", "conversation_id"),
+            (
+                "/api/conversations?selected_id=" + ("i" * (16 * 1024 + 1)),
+                "string_parameter_too_long",
+                "selected_id",
+            ),
+        )
+        for url, expected_code, expected_field in cases:
+            with self.subTest(url=url[:80]):
+                invalid = client.get(url)
+                self.assertEqual(invalid.status_code, 422)
+                item = invalid.json()["detail"]["errors"][0]
+                self.assertEqual(item["code"], expected_code)
+                self.assertEqual(item["field"], expected_field)
+                self.assertIn(item["location"], {"query", "path", "body", "header", "cookie", "request"})
+                self.assertNotIn("input", invalid.text.casefold())
+
+        missing_upload = client.post("/api/import/upload", data={})
+        self.assertEqual(missing_upload.status_code, 422)
+        upload_item = missing_upload.json()["detail"]["errors"][0]
+        self.assertEqual(upload_item["code"], "invalid_upload_metadata")
+        self.assertEqual(upload_item["field"], "file")
+        openapi = client.get("/openapi.json").json()
+        response_schema = openapi["paths"]["/api/conversations"]["get"]["responses"]["422"]
+        serialized = json.dumps(response_schema, sort_keys=True)
+        self.assertIn("invalid_request", serialized)
+        self.assertIn("invalid_upload_metadata", serialized)
+        self.assertNotIn("HTTPValidationError", serialized)
+        self.assertNotIn('"input"', serialized)
+        custom = client.get("/api/schema").json()["request_validation"]
+        self.assertEqual(custom["max_errors"], 16)
+        self.assertIn("invalid_integer", custom["codes"])
+
+    def test_round7_overlong_legacy_ids_gate_database_readiness(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        legacy_id = "l" * (16 * 1024 + 1)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES (?, 'legacy', 'h')",
+            (legacy_id,),
+        )
+        conn.commit()
+        conn.close()
+        health = client.get("/api/health").json()
+        self.assertFalse(health["db_ready"])
+        self.assertEqual(health["database_error_code"], "database_data_incompatible")
+        page = client.get("/api/conversations")
+        self.assertEqual(page.status_code, 409)
+        self.assertNotIn(legacy_id[:256], page.text)
+
+    def test_round7_deep_legacy_raw_is_bounded_and_reports_incomplete(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        raw = "[" * 300 + "0" + "]" * 300
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE conversation_nodes SET raw_message_json=? WHERE conversation_id='web-1' AND node_id='a1'",
+            (raw,),
+        )
+        conn.commit()
+        conn.close()
+        response = client.get(
+            "/api/by-id/raw", params={"conversation_id": "web-1", "node_id": "a1"}
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["parsed"])
+        self.assertTrue(body["incomplete"])
+        self.assertEqual(body["error_code"], "json_nesting_limit_exceeded")
+        self.assertEqual(body["raw_size_unit"], "bytes")
+        self.assertLess(len(response.content), 100_000)
+
+    def test_round7_literal_placeholder_prefix_remains_canonical_everywhere(self):
+        from chatgpt_export_archiver.web_db import create_web_indexes
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        literal = "[non-text content: image] literal-round7-canonical"
+        raw = json.dumps(
+            {
+                "id": "msg-a1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": ["different raw fallback"]},
+            },
+            ensure_ascii=False,
+        )
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE conversation_nodes SET content_type='text', content_text=?, raw_message_json=? "
+            "WHERE conversation_id='web-1' AND node_id='a1'",
+            (literal, raw),
+        )
+        conn.commit()
+        conn.close()
+
+        page = client.get("/api/by-id/messages", params={"conversation_id": "web-1", "path": "all"}).json()
+        item = next(row for row in page["items"] if row["node_id"] == "a1")
+        self.assertEqual(item["display_text"], literal)
+        self.assertNotIn("different raw fallback", item["display_text"])
+        hit = client.get("/api/search/messages", params={"q": "literal-round7-canonical", "path": "all"}).json()
+        self.assertEqual([row["node_id"] for row in hit["items"]], ["a1"])
+        self.assertEqual(
+            client.get("/api/search/messages", params={"q": "different raw fallback", "path": "all"}).json()["items"],
+            [],
+        )
+        exported = client.get(
+            "/api/by-id/export",
+            params={"conversation_id": "web-1", "format": "txt", "path": "all", "include_internal": "true"},
+        ).text
+        self.assertIn(literal, exported)
+        self.assertNotIn("different raw fallback", exported)
+
+        create_web_indexes(db)
+        indexed_hit = client.get(
+            "/api/search/messages", params={"q": "literal-round7-canonical", "path": "all"}
+        ).json()
+        self.assertEqual([row["node_id"] for row in indexed_hit["items"]], ["a1"])
+        self.assertEqual(
+            client.get("/api/search/messages", params={"q": "different raw fallback", "path": "all"}).json()["items"],
+            [],
+        )
+
+    def test_round7_raw_size_units_cover_ascii_cjk_emoji_and_nul(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        raw = json.dumps({"text": "A中文🙂\\u0000"}, ensure_ascii=False)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE conversation_nodes SET raw_message_json=? "
+            "WHERE conversation_id='web-1' AND node_id='a1'",
+            (raw,),
+        )
+        conn.commit()
+        conn.close()
+
+        complete = client.get(
+            "/api/by-id/raw",
+            params={"conversation_id": "web-1", "node_id": "a1", "max_chars": 200000},
+        ).json()
+        self.assertEqual(complete["raw_size"], len(raw.encode("utf-8")))
+        self.assertEqual(complete["raw_size_bytes"], len(raw.encode("utf-8")))
+        self.assertEqual(complete["raw_size_chars"], len(raw))
+        self.assertEqual(complete["raw_size_unit"], "bytes")
+        self.assertTrue(complete["raw_size_chars_exact"])
+        self.assertTrue(complete["raw_size_bytes_exact"])
+
+        truncated = client.get(
+            "/api/by-id/raw",
+            params={"conversation_id": "web-1", "node_id": "a1", "max_chars": 3},
+        ).json()
+        self.assertTrue(truncated["truncated"])
+        self.assertEqual(truncated["raw_size_bytes"], len(raw.encode("utf-8")))
+        self.assertIsNone(truncated["raw_size_chars"])
+        self.assertFalse(truncated["raw_size_chars_exact"])
+
+    def test_round7_message_search_response_is_bounded_and_partial_is_explicit(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        text = "round7-needle " + "z" * (2 * 1024 * 1024)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE conversation_nodes SET content_text=? WHERE conversation_id='web-1' AND node_id='a1'",
+            (text,),
+        )
+        conn.commit()
+        conn.close()
+        response = client.get("/api/search/messages", params={"q": "round7-needle"})
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(len(response.content), 40_000)
+        body = response.json()
+        self.assertFalse(body["total_exact"])
+        self.assertTrue(body["diagnostics"]["partial_due_to_oversized_input"])
+        self.assertLessEqual(len(body["items"][0]["display_text"]), 8192)
+
 
 if __name__ == "__main__":
     unittest.main()

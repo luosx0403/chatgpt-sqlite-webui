@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import math
 import re
 import sqlite3
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.openapi.utils import get_openapi
 from fastapi.staticfiles import StaticFiles
 
 from .web_api import WebTrustPolicy, create_api_router
@@ -17,6 +18,7 @@ from .web_jobs import ImportJobManager
 from .sqlite_errors import sqlite_runtime_error_code
 from .current_path import EffectiveCurrentResourceLimitError
 from .exporter import ExportResourceLimitError
+from .json_safety import JsonSafetyLimitError, sanitize_json_value
 
 
 class _UploadBodyTooLarge(Exception):
@@ -24,18 +26,59 @@ class _UploadBodyTooLarge(Exception):
 
 
 def _json_finite(value):
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {key: _json_finite(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_finite(item) for item in value]
-    return value
+    try:
+        return sanitize_json_value(value)
+    except JsonSafetyLimitError:
+        return {"detail": {"code": "response_resource_limit_exceeded"}}
 
 
 class FiniteJSONResponse(JSONResponse):
     def render(self, content) -> bytes:
         return super().render(_json_finite(content))
+
+
+_VALIDATION_LOCATIONS = frozenset({"query", "path", "body", "header", "cookie"})
+_IDENTIFIER_FIELDS = frozenset(
+    {"conversation_id", "node_id", "around_node_id", "selected_id", "job_id", "cursor"}
+)
+_LIMIT_FIELDS = frozenset({"limit", "max_chars"})
+
+
+def _safe_validation_location_and_field(raw_location) -> tuple[str, str]:
+    parts = raw_location if isinstance(raw_location, (list, tuple)) else ()
+    location = str(parts[0]).casefold() if parts else "request"
+    if location not in _VALIDATION_LOCATIONS:
+        location = "request"
+    field = "parameter"
+    for part in reversed(parts[1:]):
+        candidate = str(part)
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", candidate):
+            field = candidate
+            break
+    return location, field
+
+
+def _validation_public_code(*, location: str, field: str, error_type: str) -> str:
+    kind = error_type.casefold()
+    if "missing" in kind:
+        return "invalid_upload_metadata" if location == "body" and field == "file" else "missing_parameter"
+    if "int_parsing" in kind or "int_type" in kind:
+        return "invalid_integer"
+    if any(marker in kind for marker in ("greater_than", "less_than", "multiple_of", "finite_number")):
+        if field == "offset":
+            return "invalid_offset"
+        if field in _LIMIT_FIELDS:
+            return "invalid_limit"
+        return "numeric_parameter_out_of_range"
+    if "too_long" in kind or "max_length" in kind:
+        return "string_parameter_too_long"
+    if "literal" in kind or "enum" in kind:
+        return "invalid_enum_value"
+    if field in _IDENTIFIER_FIELDS and any(marker in kind for marker in ("pattern", "string", "value_error")):
+        return "invalid_identifier_token"
+    if location == "body":
+        return "invalid_upload_metadata" if field == "file" else "invalid_body"
+    return "invalid_request"
 
 
 def _host_name(value: str) -> str | None:
@@ -378,6 +421,37 @@ def create_app(
         default_response_class=FiniteJSONResponse,
     )
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_response(_request, exc: RequestValidationError):
+        validation_errors = exc.errors()
+        errors = []
+        for item in validation_errors[:16]:
+            raw_loc = item.get("loc") if isinstance(item, dict) else ()
+            location, field = _safe_validation_location_and_field(raw_loc)
+            error_type = str(item.get("type", "invalid")) if isinstance(item, dict) else "invalid"
+            errors.append(
+                {
+                    "location": location,
+                    "field": field,
+                    "code": _validation_public_code(
+                        location=location,
+                        field=field,
+                        error_type=error_type,
+                    ),
+                }
+            )
+        return FiniteJSONResponse(
+            status_code=422,
+            content={
+                "detail": {
+                    "code": "invalid_request",
+                    "errors": errors,
+                    "error_count": min(len(validation_errors), 10_000),
+                    "errors_truncated": len(validation_errors) > len(errors),
+                }
+            },
+        )
+
     @app.exception_handler(sqlite3.Error)
     async def sqlite_error_response(_request, exc: sqlite3.Error):
         code = sqlite_runtime_error_code(exc)
@@ -396,6 +470,63 @@ def create_app(
         return FiniteJSONResponse(status_code=413, content={"detail": exc.code})
 
     app.include_router(create_api_router(db_path, manager, upload_policy=upload_policy, trust_policy=trust_policy))
+
+    def safe_openapi():
+        if app.openapi_schema is not None:
+            return app.openapi_schema
+        schema = get_openapi(title=app.title, version="1", routes=app.routes)
+        invalid_request_schema = {
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "const": "invalid_request"},
+                        "errors": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "location": {"type": "string", "enum": sorted(_VALIDATION_LOCATIONS | {"request"})},
+                                    "field": {"type": "string", "maxLength": 64},
+                                    "code": {
+                                        "type": "string",
+                                        "enum": [
+                                            "invalid_request",
+                                            "invalid_integer",
+                                            "numeric_parameter_out_of_range",
+                                            "invalid_offset",
+                                            "invalid_limit",
+                                            "string_parameter_too_long",
+                                            "invalid_identifier_token",
+                                            "missing_parameter",
+                                            "invalid_enum_value",
+                                            "invalid_body",
+                                            "invalid_upload_metadata",
+                                        ],
+                                    },
+                                },
+                                "required": ["location", "field", "code"],
+                            },
+                        },
+                        "error_count": {"type": "integer"},
+                        "errors_truncated": {"type": "boolean"},
+                    },
+                }
+            },
+        }
+        for path_item in schema.get("paths", {}).values():
+            for operation in path_item.values():
+                if not isinstance(operation, dict):
+                    continue
+                response = operation.get("responses", {}).get("422")
+                if response is not None:
+                    response["content"] = {"application/json": {"schema": invalid_request_schema}}
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = safe_openapi
     from .web_api import upload_body_limit
 
     app.add_middleware(
@@ -466,7 +597,16 @@ def create_app(
               const safeError=e=>({database_migration_required:'Database migration required. Create a verified backup, then run the CLI migrate command.',database_schema_newer:'Database schema is newer than this app.',database_schema_incompatible:'Database schema is incompatible. Run CLI verify.',database_foreign_key_violation:'Database references are damaged. Run CLI verify.',database_locked:'Database is locked; retry after the writer finishes.',database_malformed:'Database is malformed; restore a verified backup.',database_readonly:'Database cannot be opened read-only.',database_io_error:'Database I/O error.'}[e&&e.message]||'The local archive request failed.');
               function showError(target,error){target.textContent=safeError(error); target.className='meta';}
               async function loadList(){try{const p=new URLSearchParams({q:q.value,sort:sort.value,path:pathSel.value,limit:'50'}); const data=await api('/api/conversations?'+p); const items=Array.isArray(data.items)?data.items:[]; list.innerHTML=items.map(x=>`<button class="item ${x.conversation_id===selected?'selected':''}" data-id="${esc(x.conversation_id)}"><span class="title">${esc(x.title||'untitled')}</span><div class="meta">${date(x.update_time??x.create_time)}${x.hit_count?' · '+x.hit_count+' hits':''}</div><div class="snippet">${esc((x.snippets&&x.snippets[0]&&x.snippets[0].snippet)||'')}</div></button>`).join('')}catch(error){showError(list,error)}}
-              async function openConv(id){try{selected=id; const d=await api('/api/conversations/'+encodeURIComponent(id)); heading.textContent=d.title||'untitled'; info.textContent=`Created ${date(d.create_time)} · Updated ${date(d.update_time)} · ${d.current_path_nodes??0}/${d.node_count??0} raw current flags; effective path ${d.effective_path||pathSel.value}`; actions.innerHTML=`<a href="/api/conversations/${encodeURIComponent(id)}/export?format=md&path=${pathSel.value}&include_internal=false">Download visible MD</a><a href="/api/conversations/${encodeURIComponent(id)}/export?format=txt&path=${pathSel.value}&include_internal=false">Download visible TXT</a>`; const p=new URLSearchParams({q:q.value,path:pathSel.value,limit:'300',include_internal:'false'}); const page=await api('/api/conversations/'+encodeURIComponent(id)+'/messages?'+p); const items=Array.isArray(page.items)?page.items:[]; messages.innerHTML=items.map(m=>`<article class="msg ${esc(m.role||'message')}"><div class="role">${esc(m.role||'message')} · ${date(m.create_time??m.update_time)}</div><pre>${esc(m.display_text||'[empty]')}</pre></article>`).join(''); await loadList()}catch(error){showError(messages,error)}}
+              function byId(route,id,extra={}){const u=new URL(route,location.origin); u.search=new URLSearchParams({conversation_id:id,...extra}).toString(); return u.pathname+u.search}
+              async function openConv(id,aroundNodeId=''){try{
+                selected=id; const d=await api(byId('/api/by-id/conversation',id)); heading.textContent=d.title||'untitled'; info.textContent=`Created ${date(d.create_time)} · Updated ${date(d.update_time)} · ${d.current_path_nodes??0}/${d.node_count??0} raw current flags; effective path ${d.effective_path||pathSel.value}`;
+                actions.replaceChildren();
+                for(const fmt of ['md','txt']){const a=document.createElement('a'); a.href=byId('/api/by-id/export',id,{format:fmt,path:pathSel.value,include_internal:'false'}); a.textContent=`Download visible ${fmt.toUpperCase()}`; actions.append(a)}
+                const copy=document.createElement('button'); copy.type='button'; copy.textContent='Copy visible current conversation'; copy.addEventListener('click',async()=>{try{const r=await fetch(byId('/api/by-id/copy',id,{path:pathSel.value,include_internal:'false'})); if(!r.ok)throw new Error('request_failed'); await navigator.clipboard.writeText(await r.text())}catch(error){showError(info,error)}}); actions.append(copy);
+                const page=await api(byId('/api/by-id/messages',id,{q:q.value,path:pathSel.value,limit:'300',include_internal:'false',...(aroundNodeId?{around_node_id:aroundNodeId}:{})})); const items=Array.isArray(page.items)?page.items:[]; messages.replaceChildren();
+                for(const m of items){const article=document.createElement('article'); article.className='msg '+String(m.role||'message').replace(/[^a-z0-9_-]/gi,'_'); const role=document.createElement('div'); role.className='role'; role.textContent=`${m.role||'message'} · ${date(m.create_time??m.update_time)}`; const pre=document.createElement('pre'); pre.textContent=m.display_text||'[empty]'; const row=document.createElement('div'); row.className='row'; const raw=document.createElement('a'); raw.href=byId('/api/by-id/raw',id,{node_id:String(m.node_id),max_chars:'50000'}); raw.textContent='Bounded raw preview'; const display=document.createElement('a'); display.href=byId('/api/by-id/display',id,{node_id:String(m.node_id),offset:'0',limit:'65536'}); display.textContent='Display chunk'; const around=document.createElement('button'); around.type='button'; around.textContent='Open around message'; around.addEventListener('click',()=>openConv(id,String(m.node_id))); row.append(raw,display,around); article.append(role,pre,row); messages.append(article)}
+                await loadList()
+              }catch(error){showError(messages,error)}}
               list.addEventListener('click',e=>{const b=e.target.closest('button[data-id]'); if(b) openConv(b.dataset.id);});
               q.addEventListener('input',()=>{clearTimeout(timer); timer=setTimeout(loadList,220)}); sort.addEventListener('change',loadList); pathSel.addEventListener('change',()=>selected?openConv(selected):loadList());
               window.addEventListener('keydown',e=>{const t=e.target; const typing=t&&(['INPUT','TEXTAREA','SELECT'].includes(t.tagName)||t.isContentEditable); if((!typing&&e.key==='/')||((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k')){e.preventDefault();q.focus();}});

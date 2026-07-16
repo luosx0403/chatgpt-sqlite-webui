@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
+import tempfile
 import unicodedata
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .current_path import resolve_effective_current_collection
-from .db import export_query, record_export
+from .db import record_export
 from .parser import recover_message_display_text
 from .search import _is_internal_message
 from .utils import epoch_to_date_part, epoch_to_display, finite_float_or_none, parse_date_boundary, safe_filename_part, sha256_text, truncate_utf8, write_bytes_if_changed, write_chunks_if_changed
@@ -23,12 +26,66 @@ MAX_EXPORT_CONVERSATION_INPUT_BYTES = 128 * 1024 * 1024
 MAX_EXPORT_HEADER_INPUT_BYTES = 4 * 1024 * 1024
 MAX_EXPORT_BATCH_INPUT_BYTES = 160 * 1024 * 1024
 MAX_EXPORT_OUTPUT_BYTES = 256 * 1024 * 1024
+MAX_ARCHIVE_EXPORT_CONVERSATIONS = 1_000_000
+MAX_ARCHIVE_EXPORT_METADATA_BYTES = 1024 * 1024 * 1024
+MAX_ARCHIVE_EXPORT_MANIFEST_BYTES = 2 * 1024 * 1024 * 1024
+EXPORT_PLAN_BATCH_SIZE = 2_000
 
 
 class ExportResourceLimitError(ValueError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+_EXPORT_BUDGET_TOKEN_SEAL = object()
+EXPORT_BUDGET_CONTRACT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ValidatedConversationExportBudget:
+    conversation_id: str
+    path: str
+    include_internal: bool
+    data_version: int
+    generation_snapshot: tuple[int, int]
+    node_count: int
+    input_bytes: int
+    contract_version: int
+    _seal: object
+
+
+def _export_snapshot_identity(conn: sqlite3.Connection) -> tuple[int, tuple[int, int]]:
+    data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+    generations = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            "SELECT name, generation FROM archive_generations WHERE name IN ('message', 'title')"
+        )
+    }
+    return data_version, (generations.get("message", -1), generations.get("title", -1))
+
+
+def validate_conversation_export_budget(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    *,
+    path: str,
+    include_internal: bool,
+) -> ValidatedConversationExportBudget:
+    budget = check_conversation_export_budget(conn, conversation_id)
+    data_version, generations = _export_snapshot_identity(conn)
+    return ValidatedConversationExportBudget(
+        conversation_id=str(conversation_id),
+        path=path,
+        include_internal=bool(include_internal),
+        data_version=data_version,
+        generation_snapshot=generations,
+        node_count=budget["node_count"],
+        input_bytes=budget["input_bytes"],
+        contract_version=EXPORT_BUDGET_CONTRACT_VERSION,
+        _seal=_EXPORT_BUDGET_TOKEN_SEAL,
+    )
 
 
 def check_conversation_export_budget(
@@ -45,56 +102,69 @@ def check_conversation_export_budgets(
     ids = [str(value) for value in conversation_ids]
     if not ids:
         return {}
-    placeholders = ",".join("?" for _ in ids)
     results = {
         conversation_id: {"node_count": 0, "input_bytes": 0, "max_node_bytes": 0, "header_bytes": 0}
         for conversation_id in ids
     }
-    rows = conn.execute(
-        f"""SELECT conversation_id, COUNT(*) AS node_count,
-                  COALESCE(SUM(
-                      COALESCE(length(CAST(content_text AS BLOB)), 0) +
-                      COALESCE(length(CAST(raw_message_json AS BLOB)), 0) +
-                      COALESCE(length(CAST(node_id AS BLOB)), 0) +
-                      COALESCE(length(CAST(parent_node_id AS BLOB)), 0) +
-                      COALESCE(length(CAST(children_json AS BLOB)), 0) +
-                      COALESCE(length(CAST(message_id AS BLOB)), 0) +
-                      COALESCE(length(CAST(role AS BLOB)), 0) +
-                      COALESCE(length(CAST(author_name AS BLOB)), 0) +
-                      COALESCE(length(CAST(content_type AS BLOB)), 0) +
-                      COALESCE(length(CAST(content_hash AS BLOB)), 0) +
-                      COALESCE(length(CAST(metadata_json AS BLOB)), 0)
-                  ), 0) AS input_bytes,
-                  COALESCE(MAX(
-                      COALESCE(length(CAST(content_text AS BLOB)), 0) +
-                      COALESCE(length(CAST(raw_message_json AS BLOB)), 0) +
-                      COALESCE(length(CAST(children_json AS BLOB)), 0) +
-                      COALESCE(length(CAST(metadata_json AS BLOB)), 0)
-                  ), 0) AS max_node_bytes
-            FROM conversation_nodes
-            WHERE conversation_id IN ({placeholders})
-            GROUP BY conversation_id""",
+    node_columns = (
+        "conversation_id", "node_id", "parent_node_id", "children_json", "message_id",
+        "role", "author_name", "content_type", "content_text", "raw_message_json",
+        "content_hash", "metadata_json",
+    )
+    large_node_columns = {"children_json", "content_text", "raw_message_json", "metadata_json"}
+    header_columns = (
+        "conversation_id", "title", "current_node", "source_file",
+        "default_model_slug", "metadata_json",
+    )
+    placeholders = ",".join("?" for _ in ids)
+    node_presence = ", ".join(f'"{column}" IS NOT NULL AS "has_{column}"' for column in node_columns)
+    for row in conn.execute(
+        f"""SELECT rowid AS storage_rowid, conversation_id, {node_presence}
+            FROM conversation_nodes WHERE conversation_id IN ({placeholders})""",
         ids,
-    ).fetchall()
-    for row in rows:
-        results[str(row[0])].update({
-            "node_count": int(row[1] or 0),
-            "input_bytes": int(row[2] or 0),
-            "max_node_bytes": int(row[3] or 0),
-        })
-    header_rows = conn.execute(
-        f"""SELECT conversation_id,
-                  COALESCE(length(CAST(conversation_id AS BLOB)), 0) +
-                  COALESCE(length(CAST(title AS BLOB)), 0) +
-                  COALESCE(length(CAST(current_node AS BLOB)), 0) +
-                  COALESCE(length(CAST(source_file AS BLOB)), 0) +
-                  COALESCE(length(CAST(default_model_slug AS BLOB)), 0) +
-                  COALESCE(length(CAST(metadata_json AS BLOB)), 0)
+    ):
+        conversation_id = str(row["conversation_id"])
+        result = results[conversation_id]
+        result["node_count"] += 1
+        node_bytes = 0
+        large_node_bytes = 0
+        for column in node_columns:
+            column_bytes = _sqlite_value_bytes(
+                conn,
+                "conversation_nodes",
+                column,
+                int(row["storage_rowid"]),
+                present=bool(row[f"has_{column}"]),
+            )
+            node_bytes += column_bytes
+            if column in large_node_columns:
+                large_node_bytes += column_bytes
+        result["input_bytes"] += node_bytes
+        result["max_node_bytes"] = max(result["max_node_bytes"], large_node_bytes)
+        if result["node_count"] > MAX_EXPORT_NODES_PER_CONVERSATION:
+            raise ExportResourceLimitError("export_node_count_limit_exceeded")
+        if result["max_node_bytes"] > MAX_EXPORT_NODE_INPUT_BYTES:
+            raise ExportResourceLimitError("export_node_input_limit_exceeded")
+        if result["input_bytes"] > MAX_EXPORT_CONVERSATION_INPUT_BYTES:
+            raise ExportResourceLimitError("export_input_byte_limit_exceeded")
+
+    header_presence = ", ".join(f'"{column}" IS NOT NULL AS "has_{column}"' for column in header_columns)
+    for row in conn.execute(
+        f"""SELECT rowid AS storage_rowid, conversation_id, {header_presence}
             FROM conversations WHERE conversation_id IN ({placeholders})""",
         ids,
-    ).fetchall()
-    for row in header_rows:
-        results[str(row[0])]["header_bytes"] = int(row[1] or 0)
+    ):
+        header_bytes = sum(
+            _sqlite_value_bytes(
+                conn,
+                "conversations",
+                column,
+                int(row["storage_rowid"]),
+                present=bool(row[f"has_{column}"]),
+            )
+            for column in header_columns
+        )
+        results[str(row["conversation_id"])]["header_bytes"] = header_bytes
     for result in results.values():
         if result["node_count"] > MAX_EXPORT_NODES_PER_CONVERSATION:
             raise ExportResourceLimitError("export_node_count_limit_exceeded")
@@ -105,6 +175,22 @@ def check_conversation_export_budgets(
         if result["header_bytes"] > MAX_EXPORT_HEADER_INPUT_BYTES:
             raise ExportResourceLimitError("export_header_input_limit_exceeded")
     return results
+
+
+def _sqlite_value_bytes(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    rowid: int,
+    *,
+    present: bool,
+) -> int:
+    """Read only SQLite's BLOB length metadata, never the value payload."""
+
+    if not present:
+        return 0
+    with conn.blobopen(table, column, rowid, readonly=True) as blob:
+        return len(blob)
 
 
 def export_conversations(
@@ -125,93 +211,548 @@ def export_conversations(
     out_dir.mkdir(parents=True, exist_ok=True)
     start_ts = parse_date_boundary(from_date)
     end_ts = parse_date_boundary(to_date, end_of_day=True)
-    conversations = export_query(conn, start_ts, end_ts)
-    filenames = build_filename_map(conversations, formats)
-    _validate_filename_plan(filenames, conversations, formats)
-    manifest_rows: list[dict[str, Any]] = []
-    export_records: list[tuple[str, str, Path, str, dict[str, Any]]] = []
-    written = 0
-    skipped = 0
-
-    for batch_offset in range(0, len(conversations), conversation_batch_size):
-        requested_batch = conversations[batch_offset : batch_offset + conversation_batch_size]
-        budgets = check_conversation_export_budgets(
-            conn, [str(conv["conversation_id"]) for conv in requested_batch]
+    plan_path: str | None = None
+    plan: sqlite3.Connection | None = None
+    try:
+        plan_fd, plan_path = tempfile.mkstemp(
+            prefix=".chatgpt-archive-export-plan-", suffix=".sqlite3", dir=out_dir
         )
-        bounded_batches: list[list[sqlite3.Row]] = []
-        conversation_batch: list[sqlite3.Row] = []
-        batch_input_bytes = 0
-        for conv in requested_batch:
-            budget = budgets[str(conv["conversation_id"])]
-            if conversation_batch and batch_input_bytes + budget["input_bytes"] > MAX_EXPORT_BATCH_INPUT_BYTES:
-                bounded_batches.append(conversation_batch)
-                conversation_batch = []
-                batch_input_bytes = 0
-            conversation_batch.append(conv)
-            batch_input_bytes += budget["input_bytes"]
-        if conversation_batch:
-            bounded_batches.append(conversation_batch)
-        for conversation_batch in bounded_batches:
-            nodes_by_conversation = _nodes_for_conversation_batch(conn, conversation_batch)
-            for conv in conversation_batch:
-                nodes = prepare_export_nodes(
-                    conv,
-                    nodes_by_conversation.get(str(conv["conversation_id"]), []),
-                    path=path,
-                    include_internal=include_internal,
-                )
-                for fmt in formats:
-                    rel_path = filenames[(conv["conversation_id"], fmt)]
-                    output_path = out_dir / rel_path
-                    changed, output_hash, _output_bytes = write_chunks_if_changed(
-                        output_path,
-                        iter_rendered_conversation(conv, nodes, fmt),
-                        force=force,
-                        max_bytes=MAX_EXPORT_OUTPUT_BYTES,
-                    )
-                    if changed:
-                        written += 1
-                    else:
-                        skipped += 1
-                    export_records.append((
-                        str(conv["conversation_id"]),
-                        fmt,
-                        output_path,
-                        output_hash,
-                        {
-                            "current_path_only": path == "current",
-                            "path": path,
-                            "include_internal": include_internal,
-                            "from": from_date,
-                            "to": to_date,
-                            "deterministic_export": True,
-                        },
-                    ))
-                    manifest_rows.append(manifest_row(
+        os.close(plan_fd)
+        plan = sqlite3.connect(plan_path)
+        plan.row_factory = sqlite3.Row
+        plan.execute("PRAGMA journal_mode=OFF")
+        plan.execute("PRAGMA synchronous=OFF")
+        _create_archive_export_plan(plan)
+        conversation_count = _populate_archive_export_plan(
+            conn, plan, start_ts=start_ts, end_ts=end_ts, formats=formats
+        )
+        _allocate_archive_export_filenames(plan, formats)
+
+        written = 0
+        skipped = 0
+        last_order = 0
+        while True:
+            requested_batch = plan.execute(
+                "SELECT * FROM conversations WHERE plan_order > ? ORDER BY plan_order LIMIT ?",
+                (last_order, conversation_batch_size),
+            ).fetchall()
+            if not requested_batch:
+                break
+            last_order = int(requested_batch[-1]["plan_order"])
+            budgets = check_conversation_export_budgets(
+                conn, [str(conv["conversation_id"]) for conv in requested_batch]
+            )
+            bounded_batches: list[list[sqlite3.Row]] = []
+            bounded_batch: list[sqlite3.Row] = []
+            batch_input_bytes = 0
+            for conv in requested_batch:
+                budget = budgets[str(conv["conversation_id"])]
+                if bounded_batch and batch_input_bytes + budget["input_bytes"] > MAX_EXPORT_BATCH_INPUT_BYTES:
+                    bounded_batches.append(bounded_batch)
+                    bounded_batch = []
+                    batch_input_bytes = 0
+                bounded_batch.append(conv)
+                batch_input_bytes += budget["input_bytes"]
+            if bounded_batch:
+                bounded_batches.append(bounded_batch)
+
+            for conversation_batch in bounded_batches:
+                nodes_by_conversation = _nodes_for_conversation_batch(conn, conversation_batch)
+                ids = [str(conv["conversation_id"]) for conv in conversation_batch]
+                placeholders = ",".join("?" for _ in ids)
+                filename_rows = plan.execute(
+                    f"SELECT conversation_id, format, output_path FROM requests WHERE conversation_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                filenames = {
+                    (str(row["conversation_id"]), str(row["format"])): Path(str(row["output_path"]))
+                    for row in filename_rows
+                }
+                for conv in conversation_batch:
+                    conversation_id = str(conv["conversation_id"])
+                    nodes = prepare_export_nodes(
                         conv,
-                        fmt,
-                        rel_path,
-                        output_hash,
+                        nodes_by_conversation.get(conversation_id, []),
                         path=path,
                         include_internal=include_internal,
-                    ))
-    _validate_export_outputs(out_dir, manifest_rows, conversations, formats)
-    write_manifest(out_dir, manifest_rows, force=force)
-    # End the canonical read snapshot before recording export bookkeeping.
-    # This lets WAL writers commit during a long CLI export and avoids trying
-    # to upgrade an old read snapshot after another writer has committed.
-    conn.commit()
-    try:
-        for conversation_id, fmt, output_path, output_hash, options in export_records:
-            record_export(
-                conn, conversation_id, fmt, output_path, output_hash, options,
+                    )
+                    for fmt in formats:
+                        rel_path = filenames[(conversation_id, fmt)]
+                        changed, output_hash, _output_bytes = write_chunks_if_changed(
+                            out_dir / rel_path,
+                            iter_rendered_conversation(conv, nodes, fmt),
+                            force=force,
+                            max_bytes=MAX_EXPORT_OUTPUT_BYTES,
+                        )
+                        written += int(changed)
+                        skipped += int(not changed)
+                        plan.execute(
+                            "UPDATE requests SET output_hash = ? WHERE conversation_id = ? AND format = ?",
+                            (output_hash, conversation_id, fmt),
+                        )
+                plan.commit()
+
+        _validate_archive_export_outputs(plan, out_dir, conversation_count, formats)
+        _write_manifest_from_plan(
+            plan,
+            out_dir,
+            path=path,
+            include_internal=include_internal,
+            force=force,
+        )
+        # End the canonical read snapshot before recording export bookkeeping.
+        conn.commit()
+        _record_archive_exports(
+            conn,
+            plan,
+            out_dir,
+            path=path,
+            include_internal=include_internal,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        return {
+            "conversations": conversation_count,
+            "formats": formats,
+            "written": written,
+            "skipped_unchanged": skipped,
+        }
+    finally:
+        if plan is not None:
+            plan.close()
+        if plan_path is not None:
+            try:
+                os.unlink(plan_path)
+            except FileNotFoundError:
+                pass
+
+
+def _create_archive_export_plan(plan: sqlite3.Connection) -> None:
+    plan.executescript(
+        """
+        CREATE TABLE conversations (
+            plan_order INTEGER PRIMARY KEY,
+            conversation_id TEXT NOT NULL UNIQUE,
+            title TEXT,
+            create_time REAL,
+            update_time REAL,
+            current_node TEXT,
+            source_file TEXT,
+            aggregate_hash TEXT NOT NULL
+        );
+        CREATE TABLE requests (
+            conversation_id TEXT NOT NULL,
+            format TEXT NOT NULL,
+            natural_name TEXT NOT NULL,
+            collision_key TEXT NOT NULL,
+            output_path TEXT,
+            output_collision_key TEXT,
+            output_hash TEXT,
+            PRIMARY KEY (conversation_id, format)
+        );
+        CREATE INDEX requests_natural_key ON requests(collision_key, format, conversation_id);
+        CREATE UNIQUE INDEX requests_output_key ON requests(output_collision_key)
+            WHERE output_collision_key IS NOT NULL;
+        CREATE TABLE natural_counts (
+            collision_key TEXT PRIMARY KEY,
+            request_count INTEGER NOT NULL,
+            next_suffix INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE allocated_names (collision_key TEXT PRIMARY KEY);
+        """
+    )
+
+
+def _iter_export_conversation_rows(
+    conn: sqlite3.Connection,
+    *,
+    start_ts: float | None,
+    end_ts: float | None,
+    batch_size: int = EXPORT_PLAN_BATCH_SIZE,
+) -> Iterator[sqlite3.Row]:
+    where: list[str] = []
+    params: list[Any] = []
+    if start_ts is not None:
+        where.append("COALESCE(update_time, create_time, 0) >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        where.append("COALESCE(update_time, create_time, 0) < ?")
+        params.append(end_ts)
+    last_key: tuple[Any, str] | None = None
+    sort_expr = "COALESCE(create_time, update_time, 0)"
+    while True:
+        page_where = list(where)
+        page_params = list(params)
+        if last_key is not None:
+            page_where.append(
+                f"({sort_expr} > ? OR ({sort_expr} = ? AND conversation_id > ?))"
             )
+            page_params.extend((last_key[0], last_key[0], last_key[1]))
+        clause = "WHERE " + " AND ".join(page_where) if page_where else ""
+        page_params.append(max(1, min(EXPORT_PLAN_BATCH_SIZE, int(batch_size))))
+        cursor = conn.execute(
+            f"""SELECT conversation_id, title, create_time, update_time,
+                       current_node, source_file, aggregate_hash,
+                       {sort_expr} AS export_sort_time,
+                       COALESCE(length(CAST(conversation_id AS BLOB)), 0) +
+                       COALESCE(length(CAST(title AS BLOB)), 0) +
+                       COALESCE(length(CAST(current_node AS BLOB)), 0) +
+                       COALESCE(length(CAST(source_file AS BLOB)), 0) +
+                       COALESCE(length(CAST(aggregate_hash AS BLOB)), 0) + 24
+                           AS export_metadata_bytes
+                FROM conversations
+                {clause}
+                ORDER BY export_sort_time, conversation_id
+                LIMIT ?""",
+            page_params,
+        )
+        row_count = 0
+        tail: sqlite3.Row | None = None
+        for row in cursor:
+            row_count += 1
+            tail = row
+            yield row
+        if row_count == 0 or tail is None:
+            return
+        last_key = (tail["export_sort_time"], str(tail["conversation_id"]))
+
+
+def _populate_archive_export_plan(
+    conn: sqlite3.Connection,
+    plan: sqlite3.Connection,
+    *,
+    start_ts: float | None,
+    end_ts: float | None,
+    formats: Sequence[str],
+) -> int:
+    conversation_count = 0
+    metadata_bytes = 0
+    pending_conversations: list[tuple[Any, ...]] = []
+    pending_requests: list[tuple[str, str, str, str]] = []
+    for row in _iter_export_conversation_rows(conn, start_ts=start_ts, end_ts=end_ts):
+        conversation_count += 1
+        if conversation_count > MAX_ARCHIVE_EXPORT_CONVERSATIONS:
+            raise ExportResourceLimitError("archive_export_conversation_limit_exceeded")
+        row_bytes = int(row["export_metadata_bytes"] or 0)
+        if row_bytes > MAX_EXPORT_HEADER_INPUT_BYTES:
+            raise ExportResourceLimitError("export_header_input_limit_exceeded")
+        metadata_bytes += row_bytes
+        if metadata_bytes > MAX_ARCHIVE_EXPORT_METADATA_BYTES:
+            raise ExportResourceLimitError("archive_export_metadata_limit_exceeded")
+        conversation_id = str(row["conversation_id"])
+        pending_conversations.append((
+            conversation_count,
+            conversation_id,
+            row["title"],
+            row["create_time"],
+            row["update_time"],
+            row["current_node"],
+            row["source_file"],
+            row["aggregate_hash"],
+        ))
+        for fmt in formats:
+            natural_name = _base_filename(row, fmt)
+            pending_requests.append((
+                conversation_id, fmt, natural_name, _filename_collision_key(natural_name)
+            ))
+        if len(pending_conversations) >= EXPORT_PLAN_BATCH_SIZE:
+            plan.executemany(
+                "INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                pending_conversations,
+            )
+            plan.executemany(
+                "INSERT INTO requests(conversation_id, format, natural_name, collision_key) VALUES (?, ?, ?, ?)",
+                pending_requests,
+            )
+            plan.commit()
+            pending_conversations.clear()
+            pending_requests.clear()
+    if pending_conversations:
+        plan.executemany(
+            "INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            pending_conversations,
+        )
+        plan.executemany(
+            "INSERT INTO requests(conversation_id, format, natural_name, collision_key) VALUES (?, ?, ?, ?)",
+            pending_requests,
+        )
+    plan.execute(
+        "INSERT INTO natural_counts(collision_key, request_count) SELECT collision_key, COUNT(*) FROM requests GROUP BY collision_key"
+    )
+    plan.commit()
+    return conversation_count
+
+
+def _allocate_archive_export_filenames(
+    plan: sqlite3.Connection, formats: Sequence[str]
+) -> None:
+    del formats
+    cursor = plan.execute(
+        """SELECT r.conversation_id, r.format, r.natural_name, r.collision_key,
+                  n.request_count, n.next_suffix,
+                  c.title, c.create_time, c.update_time, c.current_node,
+                  c.source_file, c.aggregate_hash
+           FROM requests AS r
+           JOIN natural_counts AS n ON n.collision_key = r.collision_key
+           JOIN conversations AS c ON c.conversation_id = r.conversation_id
+           ORDER BY r.collision_key, r.format, r.conversation_id"""
+    )
+    for row in cursor:
+        if int(row["request_count"]) == 1:
+            candidate = str(row["natural_name"])
+        else:
+            suffix_index = int(
+                plan.execute(
+                    "SELECT next_suffix FROM natural_counts WHERE collision_key = ?",
+                    (row["collision_key"],),
+                ).fetchone()[0]
+            )
+            while True:
+                candidate = _base_filename(
+                    row, str(row["format"]), collision_suffix=f"_{suffix_index:03d}"
+                )
+                candidate_key = _filename_collision_key(candidate)
+                reserved = plan.execute(
+                    "SELECT 1 FROM natural_counts WHERE collision_key = ?",
+                    (candidate_key,),
+                ).fetchone()
+                allocated = plan.execute(
+                    "SELECT 1 FROM allocated_names WHERE collision_key = ?",
+                    (candidate_key,),
+                ).fetchone()
+                suffix_index += 1
+                if reserved is None and allocated is None:
+                    plan.execute(
+                        "UPDATE natural_counts SET next_suffix = ? WHERE collision_key = ?",
+                        (suffix_index, row["collision_key"]),
+                    )
+                    break
+        candidate_key = _filename_collision_key(candidate)
+        plan.execute("INSERT INTO allocated_names(collision_key) VALUES (?)", (candidate_key,))
+        plan.execute(
+            """UPDATE requests SET output_path = ?, output_collision_key = ?
+               WHERE conversation_id = ? AND format = ?""",
+            (candidate, candidate_key, row["conversation_id"], row["format"]),
+        )
+    plan.commit()
+
+
+def _validate_archive_export_outputs(
+    plan: sqlite3.Connection,
+    out_dir: Path,
+    conversation_count: int,
+    formats: Sequence[str],
+) -> None:
+    expected = conversation_count * len(formats)
+    actual = int(plan.execute(
+        "SELECT COUNT(*) FROM requests WHERE output_path IS NOT NULL AND output_hash IS NOT NULL"
+    ).fetchone()[0])
+    if actual != expected:
+        raise RuntimeError("export_output_validation_failed")
+    cursor = plan.execute("SELECT output_path FROM requests ORDER BY output_path")
+    for row in cursor:
+        path = Path(str(row[0]))
+        if (
+            path.parent != Path(".")
+            or len(path.name.encode("utf-8")) > MAX_EXPORT_BASENAME_BYTES
+            or not (out_dir / path).is_file()
+        ):
+            raise RuntimeError("export_output_validation_failed")
+
+
+_MANIFEST_FIELDS = [
+    "aggregate_hash", "conversation_id", "create_time", "current_node", "format",
+    "include_internal", "output_hash", "output_path", "path", "source_file",
+    "title", "update_time",
+]
+
+
+def _iter_manifest_rows_from_plan(
+    plan: sqlite3.Connection, *, path: str, include_internal: bool
+) -> Iterator[dict[str, Any]]:
+    cursor = plan.execute(
+        """SELECT c.aggregate_hash, c.conversation_id, c.create_time, c.current_node,
+                  r.format, r.output_hash, r.output_path, c.source_file, c.title,
+                  c.update_time
+           FROM requests AS r JOIN conversations AS c USING(conversation_id)
+           ORDER BY r.output_path, c.conversation_id, r.format"""
+    )
+    for row in cursor:
+        yield {
+            "aggregate_hash": row["aggregate_hash"],
+            "conversation_id": row["conversation_id"],
+            "create_time": finite_float_or_none(row["create_time"]),
+            "current_node": row["current_node"],
+            "format": row["format"],
+            "include_internal": include_internal,
+            "output_hash": row["output_hash"],
+            "output_path": row["output_path"],
+            "path": path,
+            "source_file": row["source_file"],
+            "title": row["title"],
+            "update_time": finite_float_or_none(row["update_time"]),
+        }
+
+
+def _iter_jsonl_manifest(
+    plan: sqlite3.Connection, *, path: str, include_internal: bool
+) -> Iterator[str]:
+    for row in _iter_manifest_rows_from_plan(plan, path=path, include_internal=include_internal):
+        yield json.dumps(
+            row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ) + "\n"
+
+
+def _iter_csv_manifest(
+    plan: sqlite3.Connection, *, path: str, include_internal: bool
+) -> Iterator[str]:
+    from io import StringIO
+
+    buffer = StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=_MANIFEST_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    yield buffer.getvalue()
+    for row in _iter_manifest_rows_from_plan(plan, path=path, include_internal=include_internal):
+        buffer.seek(0)
+        buffer.truncate(0)
+        writer.writerow(row)
+        yield buffer.getvalue()
+
+
+def _files_equal(left: Path, right: Path, chunk_size: int = 1024 * 1024) -> bool:
+    try:
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        with left.open("rb") as a, right.open("rb") as b:
+            while True:
+                left_chunk = a.read(chunk_size)
+                if left_chunk != b.read(chunk_size):
+                    return False
+                if not left_chunk:
+                    return True
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        return False
+
+
+def _write_manifest_from_plan(
+    plan: sqlite3.Connection,
+    out_dir: Path,
+    *,
+    path: str,
+    include_internal: bool,
+    force: bool,
+) -> None:
+    candidates: dict[Path, Path] = {}
+    backups: dict[Path, Path] = {}
+    published: set[Path] = set()
+    try:
+        for target, chunks in (
+            (out_dir / "manifest.jsonl", _iter_jsonl_manifest(plan, path=path, include_internal=include_internal)),
+            (out_dir / "manifest.csv", _iter_csv_manifest(plan, path=path, include_internal=include_internal)),
+        ):
+            fd, candidate_name = tempfile.mkstemp(
+                prefix=f".{target.name}.candidate-", suffix=".tmp", dir=out_dir
+            )
+            os.close(fd)
+            candidate = Path(candidate_name)
+            # Register before the first write so a generator/disk failure can
+            # never strand a partially written candidate.
+            candidates[target] = candidate
+            write_chunks_if_changed(
+                candidate, chunks, force=True, max_bytes=MAX_ARCHIVE_EXPORT_MANIFEST_BYTES
+            )
+
+        changed = {
+            target for target, candidate in candidates.items()
+            if force or not _files_equal(target, candidate)
+        }
+        for target in changed:
+            if target.exists():
+                backup_fd, backup_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.backup-", suffix=".tmp", dir=out_dir
+                )
+                os.close(backup_fd)
+                os.unlink(backup_name)
+                backup = Path(backup_name)
+                os.replace(target, backup)
+                backups[target] = backup
+        for target in changed:
+            os.replace(candidates[target], target)
+            published.add(target)
+        for backup in backups.values():
+            try:
+                os.unlink(backup)
+            except OSError:
+                # Publication is already complete. A stale private backup is
+                # preferable to rolling back only part of the manifest pair.
+                pass
+        for target, candidate in candidates.items():
+            if target not in changed:
+                os.unlink(candidate)
+    except BaseException:
+        for target in published:
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+        for target, backup in backups.items():
+            if backup.exists():
+                os.replace(backup, target)
+        raise
+    finally:
+        for candidate in candidates.values():
+            try:
+                os.unlink(candidate)
+            except FileNotFoundError:
+                pass
+        for backup in backups.values():
+            try:
+                os.unlink(backup)
+            except FileNotFoundError:
+                pass
+
+
+def _record_archive_exports(
+    conn: sqlite3.Connection,
+    plan: sqlite3.Connection,
+    out_dir: Path,
+    *,
+    path: str,
+    include_internal: bool,
+    from_date: str | None,
+    to_date: str | None,
+) -> None:
+    options = {
+        "current_path_only": path == "current",
+        "path": path,
+        "include_internal": include_internal,
+        "from": from_date,
+        "to": to_date,
+        "deterministic_export": True,
+    }
+    cursor = plan.execute(
+        "SELECT conversation_id, format, output_path, output_hash FROM requests ORDER BY conversation_id, format"
+    )
+    pending = 0
+    try:
+        for row in cursor:
+            record_export(
+                conn,
+                str(row["conversation_id"]),
+                str(row["format"]),
+                out_dir / str(row["output_path"]),
+                str(row["output_hash"]),
+                options,
+            )
+            pending += 1
+            if pending >= EXPORT_PLAN_BATCH_SIZE:
+                conn.commit()
+                pending = 0
         conn.commit()
     except BaseException:
         if conn.in_transaction:
             conn.rollback()
         raise
-    return {"conversations": len(conversations), "formats": formats, "written": written, "skipped_unchanged": skipped}
 
 
 def build_filename_map(conversations: list[sqlite3.Row], formats: list[str]) -> dict[tuple[str, str], Path]:
@@ -421,12 +962,31 @@ def iter_conversation_export_nodes(
     path: str,
     include_internal: bool,
     batch_size: int = EXPORT_NODE_BATCH_SIZE,
+    validated_budget: ValidatedConversationExportBudget | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield complete export rows without accumulating reader page payloads."""
 
     if path not in {"current", "all"}:
         raise ValueError("invalid_export_path")
-    check_conversation_export_budget(conn, str(conv["conversation_id"]))
+    conversation_id = str(conv["conversation_id"])
+    if validated_budget is None:
+        validated_budget = validate_conversation_export_budget(
+            conn,
+            conversation_id,
+            path=path,
+            include_internal=include_internal,
+        )
+    current_identity = _export_snapshot_identity(conn)
+    if (
+        validated_budget._seal is not _EXPORT_BUDGET_TOKEN_SEAL
+        or validated_budget.contract_version != EXPORT_BUDGET_CONTRACT_VERSION
+        or validated_budget.conversation_id != conversation_id
+        or validated_budget.path != path
+        or validated_budget.include_internal != bool(include_internal)
+        or current_identity
+        != (validated_budget.data_version, validated_budget.generation_snapshot)
+    ):
+        raise ExportResourceLimitError("export_budget_token_stale")
     batch_size = max(1, min(EXPORT_NODE_BATCH_SIZE, int(batch_size)))
     if path == "all":
         yield from _iter_all_export_nodes_keyset(

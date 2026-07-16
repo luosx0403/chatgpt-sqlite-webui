@@ -28,7 +28,7 @@ from chatgpt_export_archiver.db import connect, export_query, init_db, verify_da
 from chatgpt_export_archiver.logging_utils import configure_logging, get_logger, parse_log_level
 from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
-from chatgpt_export_archiver.scanner import iter_json_array_from_source, list_source_entries, load_json_from_source, resolve_input
+from chatgpt_export_archiver.scanner import _load_json_from_source_for_tests, iter_json_array_from_source, list_source_entries, resolve_input
 from chatgpt_export_archiver.search import parse_query
 from chatgpt_export_archiver.utils import epoch_to_date_part, epoch_to_display, parse_date_boundary, safe_filename_part
 from chatgpt_export_archiver.web_db import connect_readonly, create_web_indexes
@@ -824,6 +824,7 @@ class ArchiverTests(unittest.TestCase):
             "webui/dist",
             "webui/src",
             "webui/tests",
+            "webui/scripts",
             "webui/node_modules",
             "webui/tsconfig.tsbuildinfo",
             "message_fts",
@@ -880,6 +881,13 @@ class ArchiverTests(unittest.TestCase):
             "*.zip",
             "archive/",
             "exports/",
+            "ZIP64",
+            "WAL",
+            "/web-index/cancel",
+            "--allowed-hosts",
+            "--trusted-proxies",
+            "Sec-Fetch-Site: cross-site",
+            "staging",
         ]
         localized_required = {
             "README.md": ["Copy current path conversation", "Copy visible", "bounded larger raw preview", "current reader path", "conversation-level"],
@@ -1465,8 +1473,8 @@ class ArchiverTests(unittest.TestCase):
         fallback = conversation("", title=None)
         fallback["conversation_id"] = "fallback-id"
         warning = validate_conversation_element(fallback, "conversations.json", 0)
-        self.assertIsNone(warning)
-        self.assertEqual(parse_conversation(fallback, "conversations.json", 0).conversation_id, "fallback-id")
+        self.assertIsNotNone(warning)
+        self.assertEqual(warning.warning_type, "canonical_id_empty")
         bad_title = conversation("bad-title", title={"PRIVATE_TITLE": "hidden"})
         parsed = parse_conversation(bad_title, "conversations.json", 0)
         self.assertIsNone(parsed.title)
@@ -1616,6 +1624,33 @@ class ArchiverTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_small_forced_zip64_member_uses_production_streaming_import(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            archive_path = base / "forced-zip64.zip"
+            payload = json.dumps([conversation("forced-zip64")], separators=(",", ":")).encode("utf-8")
+            with zipfile.ZipFile(archive_path, "w", allowZip64=True) as archive:
+                with archive.open("conversations.json", "w", force_zip64=True) as member:
+                    member.write(payload)
+
+            source = resolve_input(str(archive_path), Path.cwd())
+            self.assertEqual(
+                [entry.source_path for entry in list_source_entries(source) if entry.is_selected_conversation_source],
+                ["conversations.json"],
+            )
+            self.assertEqual(
+                [item["id"] for item in iter_json_array_from_source(source, "conversations.json")],
+                ["forced-zip64"],
+            )
+            db = base / "archive.db"
+            code, output = run_cli(["--db", str(db), "import", "--input", str(archive_path), "--no-input-sha256"])
+            self.assertEqual(code, 0, output)
+            conn = sqlite3.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT conversation_id FROM conversations").fetchone()[0], "forced-zip64")
+            finally:
+                conn.close()
+
     def test_standalone_conversations_json_is_detected_and_imported(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -1625,7 +1660,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertEqual(source.kind, "json")
             entries = list_source_entries(source)
             self.assertEqual([entry.source_path for entry in entries if entry.is_selected_conversation_source], ["conversations.json"])
-            self.assertEqual(load_json_from_source(source, "conversations.json")[0]["id"], "standalone-json")
+            self.assertEqual(_load_json_from_source_for_tests(source, "conversations.json")[0]["id"], "standalone-json")
             db = base / "archive.db"
             self.assertEqual(main(["--db", str(db), "import", "--input", str(source_json), "--no-input-sha256"]), 0)
             conn = sqlite3.connect(db)
@@ -1973,7 +2008,7 @@ class ArchiverTests(unittest.TestCase):
             member.rename(root / "original.json")
             member.symlink_to(outside_json)
             with self.assertRaisesRegex(ValueError, "input_symlink_not_allowed"):
-                load_json_from_source(source, "conversations.json")
+                _load_json_from_source_for_tests(source, "conversations.json")
 
             for name in ("notes.txt", "other.json", "image.png", "empty"):
                 path = base / name
@@ -2609,7 +2644,7 @@ class ArchiverTests(unittest.TestCase):
             z = base / "locked.zip"
             db = base / "archive.db"
             write_zip(z, {"conversations.json": [conversation("delete-unlink-failure")]})
-            with mock.patch("pathlib.Path.unlink", side_effect=PermissionError("synthetic lock")):
+            with mock.patch("chatgpt_export_archiver.scanner.os.unlink", side_effect=PermissionError("synthetic lock")):
                 code, output = run_cli([
                     "--db",
                     str(db),
@@ -2812,8 +2847,8 @@ class ArchiverTests(unittest.TestCase):
                 with (
                     mock.patch.object(exporter, "write_chunks_if_changed", return_value=(False, "synthetic-hash", 0)),
                     mock.patch.object(exporter, "record_export"),
-                    mock.patch.object(exporter, "write_manifest"),
-                    mock.patch.object(exporter, "_validate_export_outputs"),
+                    mock.patch.object(exporter, "_write_manifest_from_plan"),
+                    mock.patch.object(exporter, "_validate_archive_export_outputs"),
                 ):
                     result = exporter.export_conversations(
                         conn,
@@ -2834,6 +2869,55 @@ class ArchiverTests(unittest.TestCase):
             self.assertEqual(len(node_selects), count // 200)
             self.assertFalse(any("WHERE conversation_id = 'export-" in sql for sql in statements))
             self.assertLess(peak, 160 * 1024 * 1024)
+
+    @unittest.skipUnless(
+        os.environ.get("CHATGPT_ARCHIVE_ROUND7_SCALE_TEST") == "1",
+        "set CHATGPT_ARCHIVE_ROUND7_SCALE_TEST=1 for the million-conversation acceptance",
+    )
+    def test_round7_archive_export_one_million_conversation_production_path(self):
+        from chatgpt_export_archiver import exporter
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            conn = sqlite3.connect(base / "scale.db")
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            count = 1_000_000
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES (?, 'scale', 'h')",
+                ((f"scale-{index:07d}",) for index in range(count)),
+            )
+            conn.commit()
+
+            def synthetic_budgets(_conn, conversation_ids):
+                return {
+                    str(conversation_id): {
+                        "node_count": 0,
+                        "input_bytes": 0,
+                        "max_node_bytes": 0,
+                        "header_bytes": 0,
+                    }
+                    for conversation_id in conversation_ids
+                }
+
+            tracemalloc.start()
+            started = time.perf_counter()
+            with (
+                mock.patch.object(exporter, "check_conversation_export_budgets", new=synthetic_budgets),
+                mock.patch.object(exporter, "write_chunks_if_changed", new=lambda *_args, **_kwargs: (False, "synthetic-hash", 0)),
+                mock.patch.object(exporter, "_write_manifest_from_plan", new=lambda *_args, **_kwargs: None),
+                mock.patch.object(exporter, "_validate_archive_export_outputs", new=lambda *_args, **_kwargs: None),
+                mock.patch.object(exporter, "record_export", new=lambda *_args, **_kwargs: None),
+            ):
+                result = exporter.export_conversations(conn, base / "output", ["txt"])
+            elapsed = time.perf_counter() - started
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            self.assertEqual(result["conversations"], count)
+            self.assertLess(peak, 256 * 1024 * 1024)
+            self.assertLess(elapsed, 600)
+            self.assertFalse(list((base / "output").glob(".chatgpt-archive-export-plan-*.sqlite3")))
+            conn.close()
 
     def test_no_chat_content_in_cli_logs_for_import_export_verify(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5332,6 +5416,442 @@ class ArchiverTests(unittest.TestCase):
             check = sqlite3.connect(db)
             self.assertGreaterEqual(check.execute("SELECT COUNT(*) FROM exports").fetchone()[0], 1)
             check.close()
+
+    def test_round7_json_nesting_limit_is_lexical_and_stable(self):
+        from chatgpt_export_archiver import scanner
+        from chatgpt_export_archiver.json_safety import MAX_JSON_NESTING_DEPTH, JsonSafetyLimitError
+
+        accepted = "[" + "[" * (MAX_JSON_NESTING_DEPTH - 1) + "0" + "]" * (MAX_JSON_NESTING_DEPTH - 1) + "]"
+        self.assertEqual(len(list(scanner._iter_json_array([accepted]))), 1)
+        rejected = "[" + "[" * (MAX_JSON_NESTING_DEPTH + 1) + "0" + "]" * (MAX_JSON_NESTING_DEPTH + 1) + "]"
+        with self.assertRaises(JsonSafetyLimitError) as caught:
+            list(scanner._iter_json_array([rejected]))
+        self.assertEqual(caught.exception.code, "json_nesting_limit_exceeded")
+
+    def test_round7_large_integer_failures_are_stable_and_content_free(self):
+        for digits in (5_000, 100_000):
+            with self.subTest(digits=digits), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                archive = base / "input.zip"
+                sentinel = b"7" * digits
+                with zipfile.ZipFile(archive, "w") as zf:
+                    zf.writestr(
+                        "conversations.json",
+                        b'[{"id":"bounded","mapping":{},"metadata":' + sentinel + b"}]",
+                    )
+                code, output = run_cli([
+                    "--db", str(base / "archive.db"), "import",
+                    "--input", str(archive), "--no-input-sha256",
+                ])
+                self.assertEqual(code, 2, output)
+                self.assertIn("json_integer_too_large", output)
+                self.assertLess(len(output), 4096)
+                self.assertNotIn("7" * 256, output)
+
+    def test_round7_import_nesting_and_scalar_limits_use_stable_json_decode_codes(self):
+        fixtures = {
+            "json_nesting_limit_exceeded": (
+                b'[{"id":"deep","mapping":{},"metadata":'
+                + b"[" * 300 + b"0" + b"]" * 300 + b"}]"
+            ),
+            "json_scalar_limit_exceeded": (
+                b'[{"id":"many","mapping":{},"metadata":['
+                + b",".join([b"0"] * 100_001) + b"]}]"
+            ),
+        }
+        for expected, payload in fixtures.items():
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                source = base / "conversations.json"
+                source.write_bytes(payload)
+                code, output = run_cli([
+                    "--db", str(base / "archive.db"), "import",
+                    "--input", str(source), "--no-input-sha256",
+                ])
+                self.assertEqual(code, 2, output)
+                self.assertIn(expected, output)
+                self.assertLess(len(output), 4096)
+
+    def test_round7_identity_rebuild_refuses_dependent_user_objects_before_ddl(self):
+        from chatgpt_export_archiver.db import DatabaseMigrationError, migrate_database
+
+        fixture = (Path(__file__).resolve().parent / "fixtures" / "legacy-fa37b3d.sql").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "custom.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            conn.executescript(fixture)
+            conn.executescript(
+                """
+                CREATE UNIQUE INDEX "user quoted index"
+                    ON conversations(lower(title)) WHERE title IS NOT NULL;
+                CREATE VIEW user_conversation_view AS
+                    SELECT conversation_id, title FROM conversations;
+                CREATE TRIGGER user_conversation_trigger AFTER UPDATE OF title ON conversations
+                    BEGIN SELECT NEW.title; END;
+                """
+            )
+            conn.commit()
+            before = list(conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name"))
+            with self.assertRaises(DatabaseMigrationError) as caught:
+                migrate_database(conn)
+            self.assertEqual(caught.exception.code, "database_custom_objects_require_manual_migration")
+            self.assertNotIn("sql", caught.exception.detail)
+            self.assertEqual(
+                {item["type"] for item in caught.exception.detail["objects"]},
+                {"index", "trigger", "view"},
+            )
+            self.assertEqual(before, list(conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")))
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertIsNone(conn.execute("SELECT name FROM sqlite_schema WHERE name LIKE '%_v3'").fetchone())
+            conn.close()
+
+    def test_round7_export_budget_token_avoids_second_aggregate(self):
+        from chatgpt_export_archiver.db import init_db
+        from chatgpt_export_archiver.exporter import iter_conversation_export_nodes, validate_conversation_export_budget
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        conn.execute("INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES ('c', 't', 'h')")
+        conn.execute("INSERT INTO conversation_nodes(conversation_id, node_id, content_text) VALUES ('c', 'n', 'body')")
+        conn.commit()
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        conv = conn.execute("SELECT * FROM conversations WHERE conversation_id='c'").fetchone()
+        token = validate_conversation_export_budget(conn, "c", path="all", include_internal=True)
+        list(iter_conversation_export_nodes(conn, conv, path="all", include_internal=True, validated_budget=token))
+        budget_scans = [
+            sql for sql in statements
+            if "FROM conversation_nodes WHERE conversation_id IN" in sql
+            and "storage_rowid" in sql
+        ]
+        self.assertEqual(len(budget_scans), 1)
+        self.assertFalse(any("length(CAST(content_text AS BLOB))" in sql for sql in statements))
+        conn.close()
+
+    def test_round7_delete_barrier_never_unlinks_replacement_after_identity_check(self):
+        from chatgpt_export_archiver import scanner
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "input.zip"
+            path.write_bytes(b"original synthetic bytes")
+            source = scanner.InputSource(
+                path=path, kind="zip", size=path.stat().st_size, delete_target=path
+            )
+            replacement = b"replacement synthetic bytes"
+
+            def replace_after_check(_source):
+                path.unlink()
+                path.write_bytes(replacement)
+                return True
+
+            with mock.patch.object(
+                scanner, "delete_input_identity_is_current", side_effect=replace_after_check
+            ):
+                self.assertFalse(scanner.delete_input_if_unchanged(source))
+            self.assertEqual(path.read_bytes(), replacement)
+            self.assertFalse(any(Path(td).glob(".chatgpt-archive-delete-*")))
+
+    def test_round7_directory_source_open_rejects_post_scan_replacement(self):
+        from chatgpt_export_archiver.scanner import SourceChangedDuringReadError
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source_path = base / "conversations.json"
+            source_path.write_text("[]", encoding="utf-8")
+            source = resolve_input(str(base), base)
+            entries = list_source_entries(source)
+            self.assertEqual([entry.source_path for entry in entries], ["conversations.json"])
+            replacement = base / "replacement.json"
+            replacement.write_text("[]", encoding="utf-8")
+            os.replace(replacement, source_path)
+            with self.assertRaises((SourceChangedDuringReadError, ValueError)) as caught:
+                list(iter_json_array_from_source(source, "conversations.json"))
+            self.assertIn("source_changed_during_read", str(caught.exception))
+
+    def test_round7_file_descriptor_hash_rejects_post_resolution_replacement(self):
+        from chatgpt_export_archiver import scanner
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            path = base / "conversations.json"
+            path.write_text("[]", encoding="utf-8")
+            source = resolve_input(str(path), base)
+            replacement = base / "replacement.json"
+            replacement.write_text("[]", encoding="utf-8")
+            os.replace(replacement, path)
+            with self.assertRaises(scanner.SourceChangedDuringReadError):
+                scanner.sha256_input_source(source)
+
+    def test_round7_source_total_member_limit_counts_zip_metadata_and_directories(self):
+        from chatgpt_export_archiver import scanner
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            archive = base / "members.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("__MACOSX/", b"")
+                zf.writestr("conversations.json", b"[]")
+            source = scanner.resolve_input(str(archive), base)
+            with mock.patch.object(scanner, "MAX_SOURCE_TOTAL_MEMBERS", 1), self.assertRaisesRegex(
+                ValueError, "source_member_limit_exceeded"
+            ):
+                scanner.list_source_entries(source)
+
+            directory = base / "directory"
+            directory.mkdir()
+            (directory / "conversations.json").write_text("[]", encoding="utf-8")
+            (directory / "nested").mkdir()
+            (directory / "nested" / "other.txt").write_text("synthetic", encoding="utf-8")
+            with mock.patch.object(scanner, "MAX_SOURCE_TOTAL_MEMBERS", 2), self.assertRaisesRegex(
+                ValueError, "source_member_limit_exceeded"
+            ):
+                scanner.list_source_entries(scanner.resolve_input(str(directory), base))
+
+    def test_round7_migration_preserves_unrelated_user_objects_and_behavior(self):
+        from chatgpt_export_archiver.db import DATABASE_SCHEMA_VERSION, migrate_database
+
+        fixture = (Path(__file__).resolve().parent / "fixtures" / "legacy-fa37b3d.sql").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "unrelated.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            conn.executescript(fixture)
+            conn.executescript(
+                """
+                CREATE TABLE user_notes(note_id INTEGER PRIMARY KEY, note TEXT NOT NULL);
+                CREATE INDEX user_notes_text ON user_notes(note);
+                CREATE TRIGGER user_notes_default AFTER INSERT ON user_notes
+                WHEN NEW.note = '' BEGIN
+                    UPDATE user_notes SET note = 'synthetic-default' WHERE note_id = NEW.note_id;
+                END;
+                """
+            )
+            before = list(conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name LIKE 'user_notes%' ORDER BY type, name"
+            ))
+            result = migrate_database(conn)
+            self.assertTrue(result["changed"])
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], DATABASE_SCHEMA_VERSION)
+            self.assertEqual(before, list(conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name LIKE 'user_notes%' ORDER BY type, name"
+            )))
+            conn.execute("INSERT INTO user_notes(note) VALUES ('')")
+            self.assertEqual(conn.execute("SELECT note FROM user_notes").fetchone()[0], "synthetic-default")
+            plan = " ".join(str(row[3]) for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT note_id FROM user_notes WHERE note='synthetic-default'"
+            ))
+            self.assertIn("user_notes_text", plan)
+            conn.close()
+
+    def test_round7_read_capability_cache_is_cheap_and_invalidates_external_data(self):
+        from chatgpt_export_archiver.db import (
+            init_db,
+            invalidate_read_capability_cache,
+            read_request_capabilities,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "capabilities.db"
+            writer = sqlite3.connect(db)
+            writer.row_factory = sqlite3.Row
+            init_db(writer)
+            writer.commit()
+            reader = sqlite3.connect(db)
+            reader.row_factory = sqlite3.Row
+            invalidate_read_capability_cache()
+            self.assertTrue(read_request_capabilities(reader).schema_status["schema_compatible"])
+            statements: list[str] = []
+            reader.set_trace_callback(statements.append)
+            cached = read_request_capabilities(reader)
+            self.assertTrue(cached.schema_status["data_compatible"])
+            self.assertLessEqual(len(statements), 6)
+            self.assertFalse(any("sqlite_schema" in sql or "pragma_table" in sql.casefold() for sql in statements))
+
+            overlong = "x" * (16 * 1024 + 1)
+            writer.execute(
+                "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES (?, 'synthetic', 'h')",
+                (overlong,),
+            )
+            writer.commit()
+            statements.clear()
+            refreshed = read_request_capabilities(reader)
+            self.assertFalse(refreshed.schema_status["data_compatible"])
+            self.assertEqual(refreshed.schema_status["data_error_code"], "database_data_incompatible")
+            self.assertTrue(any("FROM conversations" in sql for sql in statements))
+            reader.close()
+            writer.close()
+
+    def test_round7_read_capability_cache_invalidates_database_file_replacement(self):
+        from chatgpt_export_archiver.db import (
+            init_db,
+            invalidate_read_capability_cache,
+            read_request_capabilities,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            active = base / "active.db"
+            replacement = base / "replacement.db"
+            for path in (active, replacement):
+                conn = sqlite3.connect(path)
+                conn.row_factory = sqlite3.Row
+                init_db(conn)
+                conn.commit()
+                conn.close()
+            replacement_conn = sqlite3.connect(replacement)
+            replacement_conn.execute(
+                "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES (?, 'synthetic', 'h')",
+                ("r" * (16 * 1024 + 1),),
+            )
+            replacement_conn.commit()
+            replacement_conn.close()
+
+            invalidate_read_capability_cache()
+            first = sqlite3.connect(active)
+            first.row_factory = sqlite3.Row
+            self.assertTrue(read_request_capabilities(first).schema_status["data_compatible"])
+            first.close()
+            original_inode = active.stat().st_ino
+            os.replace(replacement, active)
+            self.assertNotEqual(active.stat().st_ino, original_inode)
+            second = sqlite3.connect(active)
+            second.row_factory = sqlite3.Row
+            status = read_request_capabilities(second).schema_status
+            self.assertFalse(status["data_compatible"])
+            self.assertEqual(status["data_error_code"], "database_data_incompatible")
+            second.close()
+
+    def test_round7_manifest_generation_failure_retains_previous_pair(self):
+        from chatgpt_export_archiver import exporter
+        from chatgpt_export_archiver.db import init_db
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "archive.db"
+            out = base / "export"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.execute("INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES ('c', 'title', 'h')")
+            conn.execute("INSERT INTO conversation_nodes(conversation_id, node_id, content_text) VALUES ('c', 'n', 'body')")
+            conn.commit()
+            exporter.export_conversations(conn, out, ["txt"])
+            previous = {
+                name: (out / name).read_bytes()
+                for name in ("manifest.jsonl", "manifest.csv")
+            }
+
+            def fail_csv(*_args, **_kwargs):
+                yield b"conversation_id\n"
+                raise OSError("synthetic disk full")
+
+            with mock.patch.object(exporter, "_iter_csv_manifest", side_effect=fail_csv), self.assertRaises(OSError):
+                exporter.export_conversations(conn, out, ["txt"], force=True)
+            for name, data in previous.items():
+                self.assertEqual((out / name).read_bytes(), data)
+            self.assertFalse(list(out.glob(".*.candidate-*.tmp")))
+            self.assertFalse(list(out.glob(".*.backup-*.tmp")))
+            conn.close()
+
+    def test_round7_archive_export_record_failure_keeps_valid_outputs_and_cleans_plan(self):
+        from chatgpt_export_archiver import exporter
+        from chatgpt_export_archiver.db import init_db
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            out = base / "export"
+            conn = sqlite3.connect(base / "archive.db")
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.execute("INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES ('c', 'title', 'h')")
+            conn.execute("INSERT INTO conversation_nodes(conversation_id, node_id, content_text) VALUES ('c', 'n', 'body')")
+            conn.commit()
+            with mock.patch.object(
+                exporter, "record_export", side_effect=sqlite3.OperationalError("synthetic")
+            ), self.assertRaises(sqlite3.OperationalError):
+                exporter.export_conversations(conn, out, ["txt"])
+            rows = [json.loads(line) for line in (out / "manifest.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            output = out / rows[0]["output_path"]
+            self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(), rows[0]["output_hash"])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM exports").fetchone()[0], 0)
+            self.assertFalse(list(out.glob(".archive-export-plan-*.sqlite3")))
+            conn.close()
+
+    def test_round7_manifest_interrupt_cleans_candidates_and_preserves_previous_pair(self):
+        from chatgpt_export_archiver import exporter
+        from chatgpt_export_archiver.db import init_db
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            out = base / "export"
+            conn = sqlite3.connect(base / "archive.db")
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.execute("INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES ('c', 'title', 'h')")
+            conn.execute("INSERT INTO conversation_nodes(conversation_id, node_id, content_text) VALUES ('c', 'n', 'body')")
+            conn.commit()
+            exporter.export_conversations(conn, out, ["txt"])
+            previous = {(out / name): (out / name).read_bytes() for name in ("manifest.jsonl", "manifest.csv")}
+
+            def interrupt(*_args, **_kwargs):
+                yield b"partial"
+                raise KeyboardInterrupt()
+
+            with mock.patch.object(exporter, "_iter_jsonl_manifest", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+                exporter.export_conversations(conn, out, ["txt"], force=True)
+            for path, data in previous.items():
+                self.assertEqual(path.read_bytes(), data)
+            self.assertFalse(list(out.glob(".*.candidate-*.tmp")))
+            self.assertFalse(list(out.glob(".archive-export-plan-*.sqlite3")))
+            conn.close()
+
+    def test_round7_release_path_writer_streams_large_payload(self):
+        from tools import make_release_zip
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "large.bin"
+            source.write_bytes(b"round7-streaming-payload\n" * 500_000)
+            output = base / "large.zip"
+            payload = [("large.bin", source)]
+            manifest = make_release_zip._file_manifest(payload)
+            tracemalloc.start()
+            make_release_zip._write_archive_paths(output, payload, manifest)
+            make_release_zip._verify_archive_paths(output, manifest)
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            self.assertLess(peak, 8 * 1024 * 1024)
+            self.assertEqual(manifest[0]["size"], source.stat().st_size)
+
+    def test_round7_effective_current_metadata_never_uses_cardinality_as_identity(self):
+        from chatgpt_export_archiver.current_path import (
+            effective_current_metadata,
+            ensure_effective_current_views,
+        )
+        from chatgpt_export_archiver.db import init_db
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        ids = [f"c{index:03d}" for index in range(401)]
+        conn.executemany(
+            "INSERT INTO conversations(conversation_id, title, aggregate_hash) VALUES (?, ?, 'h')",
+            ((conversation_id, conversation_id) for conversation_id in ids),
+        )
+        conn.executemany(
+            "INSERT INTO conversation_nodes(conversation_id, node_id, content_text) VALUES (?, ?, 'body')",
+            ((conversation_id, f"n{index:03d}") for index, conversation_id in enumerate(ids)),
+        )
+        conn.commit()
+        ensure_effective_current_views(conn, None)
+        requested = ids[:-1] + ["missing"]
+        result = effective_current_metadata(conn, requested)
+        self.assertEqual(set(result), set(ids[:-1]))
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

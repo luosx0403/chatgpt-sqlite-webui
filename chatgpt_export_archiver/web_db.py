@@ -10,6 +10,7 @@ from .db import (
     _drop_table_with_shadows,
     configure_bulk_write_connection,
     database_schema_status,
+    invalidate_read_capability_cache,
 )
 from .parser import recover_message_display_text
 from .schema_contract import (
@@ -107,8 +108,12 @@ def connect_writable(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def check_schema(conn: sqlite3.Connection) -> dict[str, Any]:
-    status = database_schema_status(conn)
+def check_schema(
+    conn: sqlite3.Connection,
+    *,
+    schema_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status = dict(schema_status) if schema_status is not None else database_schema_status(conn)
     tables = {
         row["name"]
         for row in conn.execute(
@@ -127,8 +132,12 @@ def check_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def web_index_status(conn: sqlite3.Connection) -> dict[str, Any]:
-    schema = check_schema(conn)
+def web_index_status(
+    conn: sqlite3.Connection,
+    *,
+    schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    schema = check_schema(conn) if schema is None else schema
     metadata: dict[str, str] = {}
     if schema["web_index_metadata"]:
         columns = {
@@ -269,6 +278,11 @@ def create_web_indexes(
     batch_size = max(1, min(1_000, int(batch_size)))
     conn = connect_writable(db_path)
     cancelled = False
+    resource_progress = {
+        "input_materialized_bytes": 0,
+        "normalized_materialized_bytes": 0,
+        "oversized_rows": 0,
+    }
 
     def check_cancel() -> None:
         nonlocal cancelled
@@ -291,6 +305,7 @@ def create_web_indexes(
                 "total": total,
                 "complete": processed >= total,
                 "batch_size": batch_size,
+                **resource_progress,
             })
         check_cancel()
 
@@ -353,87 +368,166 @@ def create_web_indexes(
         message_processed = 0
         indexed_messages = 0
         oversized_messages = 0
-        row_limit = min(batch_size, max(1, WEB_INDEX_BATCH_INPUT_BYTES // WEB_INDEX_MAX_INPUT_BYTES))
+        row_limit = batch_size
+        message_materialized_bytes = 0
+        normalized_materialized_bytes = 0
         while True:
             rows = conn.execute(
-                """SELECT rowid, conversation_id, node_id,
-                          length(CAST(COALESCE(content_text, '') AS BLOB)) AS content_bytes,
-                          length(CAST(COALESCE(raw_message_json, '') AS BLOB)) AS raw_bytes,
-                          CASE WHEN length(CAST(COALESCE(content_text, '') AS BLOB)) <= ?
-                                    AND length(CAST(COALESCE(raw_message_json, '') AS BLOB)) <= ?
-                               THEN content_text END AS content_text,
-                          CASE WHEN length(CAST(COALESCE(content_text, '') AS BLOB)) <= ?
-                                    AND length(CAST(COALESCE(raw_message_json, '') AS BLOB)) <= ?
-                               THEN substr(raw_message_json, 1, 200001) END AS raw_message_json
+                """SELECT rowid, conversation_id, node_id, content_type,
+                          content_text IS NULL AS content_is_null,
+                          raw_message_json IS NULL AS raw_is_null
                    FROM conversation_nodes
                    WHERE rowid > ?
                    ORDER BY rowid
                    LIMIT ?""",
-                (
-                    WEB_INDEX_MAX_INPUT_BYTES, WEB_INDEX_MAX_INPUT_BYTES,
-                    WEB_INDEX_MAX_INPUT_BYTES, WEB_INDEX_MAX_INPUT_BYTES,
-                    last_rowid, row_limit,
-                ),
+                (last_rowid, row_limit),
             ).fetchall()
             if not rows:
                 break
             normalized_rows: list[tuple[str, str, str]] = []
+            batch_materialized_bytes = 0
+            processed_in_batch = 0
             for row in rows:
-                input_bytes = max(int(row["content_bytes"] or 0), int(row["raw_bytes"] or 0))
-                if input_bytes > WEB_INDEX_MAX_INPUT_BYTES:
+                check_cancel()
+                rowid = int(row["rowid"])
+                content_size = 0
+                content_prefix_bytes = b""
+                if not row["content_is_null"]:
+                    with conn.blobopen("conversation_nodes", "content_text", rowid, readonly=True) as blob:
+                        content_size = len(blob)
+                        content_prefix_bytes = blob.read(min(len(blob), 256))
+                content_prefix = content_prefix_bytes.decode("utf-8", errors="replace")
+                marker_prefix = (
+                    content_prefix.strip().startswith("[non-text content:")
+                    or content_prefix.strip().startswith("[non-text part:")
+                )
+                canonical_usable = bool(content_prefix) and not (
+                    marker_prefix
+                    and str(row["content_type"] or "").casefold()
+                    not in {"text", "code", "multimodal_text"}
+                )
+                chosen_size = content_size
+                raw_size = 0
+                if not canonical_usable and not row["raw_is_null"]:
+                    with conn.blobopen("conversation_nodes", "raw_message_json", rowid, readonly=True) as blob:
+                        raw_size = len(blob)
+                    chosen_size = raw_size
+                input_bytes = chosen_size if canonical_usable else len(content_prefix_bytes) + raw_size
+                if chosen_size > WEB_INDEX_MAX_INPUT_BYTES:
                     conn.execute(
                         "INSERT INTO web_index_oversized VALUES ('message', ?, ?, ?, ?, 'input_bytes')",
-                        (row["rowid"], row["conversation_id"], row["node_id"], input_bytes),
+                        (rowid, row["conversation_id"], row["node_id"], chosen_size),
                     )
                     oversized_messages += 1
+                    last_rowid = rowid
+                    processed_in_batch += 1
                     continue
-                display_text = recover_message_display_text(row["content_text"], row["raw_message_json"])
+                if processed_in_batch and batch_materialized_bytes + input_bytes > WEB_INDEX_BATCH_INPUT_BYTES:
+                    break
+                if canonical_usable:
+                    with conn.blobopen("conversation_nodes", "content_text", rowid, readonly=True) as blob:
+                        content_value = blob.read().decode("utf-8", errors="replace")
+                    raw_value = None
+                    actual_bytes = len(content_value.encode("utf-8"))
+                else:
+                    content_value = content_prefix
+                    if raw_size:
+                        with conn.blobopen("conversation_nodes", "raw_message_json", rowid, readonly=True) as blob:
+                            raw_value = blob.read().decode("utf-8", errors="replace")
+                    else:
+                        raw_value = None
+                    actual_bytes = len(content_prefix_bytes) + (len(raw_value.encode("utf-8")) if raw_value else 0)
+                batch_materialized_bytes += actual_bytes
+                message_materialized_bytes += actual_bytes
+                display_text = recover_message_display_text(content_value, raw_value)
                 content_norm = normalize_search_text(display_text)
                 if content_norm:
                     normalized_bytes = len(content_norm.encode("utf-8"))
+                    normalized_materialized_bytes += normalized_bytes
                     if (
                         normalized_bytes > WEB_INDEX_MAX_NORMALIZED_BYTES
                         or normalized_bytes * 4 > WEB_INDEX_MAX_DERIVED_BYTES
                     ):
                         conn.execute(
                             "INSERT INTO web_index_oversized VALUES ('message', ?, ?, ?, ?, 'derived_bytes')",
-                            (row["rowid"], row["conversation_id"], row["node_id"], input_bytes),
+                            (rowid, row["conversation_id"], row["node_id"], actual_bytes),
                         )
                         oversized_messages += 1
+                        # Keep a strictly bounded compatibility tier searchable
+                        # while the row remains marked for canonical fallback.
+                        # This preserves exact recall for moderately oversized
+                        # legacy rows without ever materializing inputs above the
+                        # 4 MiB hard input budget.
+                        if (
+                            normalized_bytes <= WEB_INDEX_MAX_INPUT_BYTES
+                            and normalized_bytes * 4 <= WEB_INDEX_MAX_DERIVED_BYTES * 2
+                        ):
+                            normalized_rows.append(
+                                (row["conversation_id"], row["node_id"], content_norm)
+                            )
+                        last_rowid = rowid
+                        processed_in_batch += 1
                         continue
                     normalized_rows.append((row["conversation_id"], row["node_id"], content_norm))
+                last_rowid = rowid
+                processed_in_batch += 1
             if normalized_rows:
                 conn.executemany(
                     "INSERT INTO web_message_norm(conversation_id, node_id, content_norm) VALUES (?, ?, ?)",
                     normalized_rows,
                 )
                 indexed_messages += len(normalized_rows)
-            last_rowid = int(rows[-1]["rowid"])
-            message_processed += len(rows)
+            message_processed += processed_in_batch
+            resource_progress.update(
+                input_materialized_bytes=message_materialized_bytes,
+                normalized_materialized_bytes=normalized_materialized_bytes,
+                oversized_rows=oversized_messages,
+            )
             report("scan_normalize_messages", message_processed, message_total)
 
         report("normalize_titles", 0, title_total)
         last_rowid = 0
         title_processed = 0
         oversized_titles = 0
+        title_materialized_bytes = 0
+        title_normalized_materialized_bytes = 0
         while True:
             rows = conn.execute(
-                """SELECT rowid, conversation_id,
-                          length(CAST(COALESCE(title, '') AS BLOB)) AS title_bytes,
-                          CASE WHEN length(CAST(COALESCE(title, '') AS BLOB)) <= ? THEN title END AS title
+                """SELECT rowid, conversation_id, title IS NULL AS title_is_null
                    FROM conversations
                    WHERE rowid > ?
                    ORDER BY rowid
                    LIMIT ?""",
-                (WEB_INDEX_MAX_INPUT_BYTES, last_rowid, row_limit),
+                (last_rowid, row_limit),
             ).fetchall()
             if not rows:
                 break
             title_rows: list[tuple[str, str]] = []
+            processed_in_batch = 0
+            batch_materialized_bytes = 0
             for row in rows:
-                input_bytes = int(row["title_bytes"] or 0)
-                title_norm = normalize_search_text(row["title"] or "") if input_bytes <= WEB_INDEX_MAX_INPUT_BYTES else ""
+                check_cancel()
+                rowid = int(row["rowid"])
+                input_bytes = 0
+                if not row["title_is_null"]:
+                    with conn.blobopen("conversations", "title", rowid, readonly=True) as blob:
+                        input_bytes = len(blob)
+                if input_bytes > WEB_INDEX_MAX_INPUT_BYTES:
+                    title_value = ""
+                else:
+                    if processed_in_batch and batch_materialized_bytes + input_bytes > WEB_INDEX_BATCH_INPUT_BYTES:
+                        break
+                    if input_bytes:
+                        with conn.blobopen("conversations", "title", rowid, readonly=True) as blob:
+                            title_value = blob.read().decode("utf-8", errors="replace")
+                    else:
+                        title_value = ""
+                    actual_bytes = len(title_value.encode("utf-8"))
+                    batch_materialized_bytes += actual_bytes
+                    title_materialized_bytes += actual_bytes
+                title_norm = normalize_search_text(title_value) if input_bytes <= WEB_INDEX_MAX_INPUT_BYTES else ""
                 normalized_bytes = len(title_norm.encode("utf-8"))
+                title_normalized_materialized_bytes += normalized_bytes
                 if (
                     input_bytes > WEB_INDEX_MAX_INPUT_BYTES
                     or normalized_bytes > WEB_INDEX_MAX_NORMALIZED_BYTES
@@ -441,18 +535,26 @@ def create_web_indexes(
                 ):
                     conn.execute(
                         "INSERT INTO web_index_oversized VALUES ('title', ?, ?, NULL, ?, 'byte_budget')",
-                        (row["rowid"], row["conversation_id"], input_bytes),
+                        (rowid, row["conversation_id"], input_bytes),
                     )
                     oversized_titles += 1
                 else:
                     title_rows.append((row["conversation_id"], title_norm))
+                last_rowid = rowid
+                processed_in_batch += 1
             if title_rows:
                 conn.executemany(
                     "INSERT INTO web_title_norm(conversation_id, title_norm) VALUES (?, ?)",
                     title_rows,
                 )
-            last_rowid = int(rows[-1]["rowid"])
-            title_processed += len(rows)
+            title_processed += processed_in_batch
+            resource_progress.update(
+                input_materialized_bytes=message_materialized_bytes + title_materialized_bytes,
+                normalized_materialized_bytes=(
+                    normalized_materialized_bytes + title_normalized_materialized_bytes
+                ),
+                oversized_rows=oversized_messages + oversized_titles,
+            )
             report("normalize_titles", title_processed, title_total)
         indexed_titles = title_processed - oversized_titles
 
@@ -554,6 +656,7 @@ def create_web_indexes(
         report("commit_swap", 0, 1)
         conn.commit()
         invalidate_capability_cache(conn)
+        invalidate_read_capability_cache()
         if progress_callback is not None:
             try:
                 progress_callback("commit_swap", {
@@ -573,6 +676,10 @@ def create_web_indexes(
             "indexed_titles": indexed_titles,
             "oversized_messages": oversized_messages,
             "oversized_titles": oversized_titles,
+            "input_materialized_bytes": message_materialized_bytes + title_materialized_bytes,
+            "normalized_materialized_bytes": (
+                normalized_materialized_bytes + title_normalized_materialized_bytes
+            ),
             "max_input_bytes": WEB_INDEX_MAX_INPUT_BYTES,
             "max_normalized_bytes": WEB_INDEX_MAX_NORMALIZED_BYTES,
             "max_derived_bytes": WEB_INDEX_MAX_DERIVED_BYTES,

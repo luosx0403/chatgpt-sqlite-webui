@@ -295,6 +295,16 @@ export function getImportJob(jobId: string, signal?: AbortSignal): Promise<Impor
   return request<ImportJob>(`/api/import/jobs/${encodeURIComponent(jobId)}`, signal);
 }
 
+export async function cancelWebIndex(jobId: string, signal?: AbortSignal): Promise<ImportJob> {
+  const response = await fetch(`/api/import/jobs/${encodeURIComponent(jobId)}/web-index/cancel`, {
+    method: "POST",
+    signal,
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<ImportJob>;
+}
+
 export function getImportJobs(signal?: AbortSignal): Promise<{ items: ImportJob[] }> {
   return request<{ items: ImportJob[] }>("/api/import/jobs", signal);
 }

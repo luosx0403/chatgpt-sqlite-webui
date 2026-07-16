@@ -17,28 +17,53 @@ from starlette.responses import StreamingResponse
 
 from .exporter import (
     ExportResourceLimitError,
+    MAX_ARCHIVE_EXPORT_CONVERSATIONS,
+    MAX_ARCHIVE_EXPORT_MANIFEST_BYTES,
+    MAX_ARCHIVE_EXPORT_METADATA_BYTES,
     MAX_EXPORT_CONVERSATION_INPUT_BYTES,
     MAX_EXPORT_NODE_INPUT_BYTES,
     MAX_EXPORT_NODES_PER_CONVERSATION,
     MAX_EXPORT_OUTPUT_BYTES,
-    check_conversation_export_budget,
     iter_conversation_export_nodes,
     iter_copy_conversation,
     iter_rendered_conversation,
+    validate_conversation_export_budget,
 )
-from .current_path import MAX_EFFECTIVE_CURRENT_GRAPH_BYTES_PER_CONVERSATION, MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION
+from .current_path import (
+    EFFECTIVE_CURRENT_SCOPE_BATCH_INPUT_BYTES,
+    EFFECTIVE_CURRENT_SCOPE_BATCH_NODES,
+    EFFECTIVE_CURRENT_SCOPE_BATCH_ROWS,
+    MAX_EFFECTIVE_CURRENT_CONVERSATIONS,
+    MAX_EFFECTIVE_CURRENT_GRAPH_BYTES_PER_CONVERSATION,
+    MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION,
+    MAX_EFFECTIVE_CURRENT_SCOPE_INPUT_BYTES,
+    MAX_EFFECTIVE_CURRENT_SCOPE_NODES,
+    MAX_EFFECTIVE_CURRENT_TEMP_BYTES,
+)
 from .db import (
     DatabaseMigrationError,
     database_schema_error_code,
     foreign_key_diagnostics,
+    read_request_capabilities,
     require_current_database_schema,
 )
 from .logging_utils import get_logger
 from .identifiers import MAX_CANONICAL_ID_LENGTH
+from .json_safety import (
+    JsonSafetyLimitError,
+    MAX_JSON_NESTING_DEPTH,
+    MAX_JSON_SCALAR_COUNT,
+    MAX_RAW_PREVIEW_BYTES,
+    MAX_RAW_PREVIEW_NODES,
+    MAX_SANITIZED_OUTPUT_BYTES,
+    sanitize_json_value,
+    validate_json_lexical_limits,
+)
 from .parser import normalize_display_text
 from .scanner import (
     MAX_JSON_ELEMENT_BYTES,
     MAX_JSON_ELEMENT_CHARS,
+    MAX_SOURCE_TOTAL_MEMBERS,
     SourceEntry,
     is_conversation_json_source,
     is_metadata_path,
@@ -46,7 +71,7 @@ from .scanner import (
 )
 from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
 from .sqlite_errors import sqlite_runtime_error_code
-from .search import DisplayCursorError, _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_messages
+from .search import DisplayCursorError, SEARCH_CANDIDATE_SCAN_CHARS, SEARCH_HIT_PREVIEW_CHARS, SEARCH_PAGE_ESTIMATED_BYTES, SEARCH_SNIPPET_SCAN_CHARS, _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_messages
 from .utils import finite_float_or_none, safe_filename_part, utc_now_iso
 from .web_db import (
     DISPLAY_TEXT_RESOLVER_VERSION,
@@ -58,8 +83,6 @@ from .web_db import (
     WEB_INDEX_FORMAT_VERSION,
     check_schema,
     connect_readonly,
-    detect_fts5,
-    detect_trigram,
     message_fts_status,
     web_index_status,
 )
@@ -497,11 +520,18 @@ def create_api_router(
         try:
             conn.execute("BEGIN")
             try:
-                schema = check_schema(conn)
-                web_status = web_index_status(conn)
-                fts5 = detect_fts5(conn)
+                capabilities = read_request_capabilities(conn)
+                if deep:
+                    schema = check_schema(conn)
+                    schema.update(capabilities.schema_status)
+                else:
+                    schema = check_schema(
+                        conn, schema_status=capabilities.schema_status
+                    )
+                web_status = web_index_status(conn, schema=schema)
+                fts5 = capabilities.fts5_available
                 fts_status = message_fts_status(conn, fts5_available=fts5)
-                trigram = detect_trigram(conn)
+                trigram = capabilities.trigram_available
                 foreign_keys = foreign_key_diagnostics(conn) if deep and schema["base_schema_compatible"] else {
                     "foreign_key_violations": 0,
                     "foreign_key_violations_exact": False,
@@ -514,7 +544,7 @@ def create_api_router(
                 foreign_key_checked_at = utc_now_iso() if foreign_keys["foreign_key_check_complete"] else None
                 conversation_count = (
                     int(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
-                    if schema["schema_compatible"] and foreign_keys["foreign_key_violations"] == 0
+                    if database_schema_error_code(schema) is None and foreign_keys["foreign_key_violations"] == 0
                     else 0
                 )
             except sqlite3.Error as exc:
@@ -549,8 +579,8 @@ def create_api_router(
             else ("ready_with_data" if conversation_count else "ready_empty")
         )
         return {
-            "ok": schema["ok"] and foreign_keys["foreign_key_violations"] == 0,
-            "db_ready": schema["ok"] and foreign_keys["foreign_key_violations"] == 0,
+            "ok": database_schema_error_code(schema) is None and foreign_keys["foreign_key_violations"] == 0,
+            "db_ready": database_schema_error_code(schema) is None and foreign_keys["foreign_key_violations"] == 0,
             "readiness": readiness,
             "database_error_code": database_error_code,
             "schema_compatible": schema["schema_compatible"],
@@ -659,6 +689,7 @@ def create_api_router(
                 "new_import_id_max_chars": MAX_CANONICAL_ID_LENGTH,
                 "endpoints": ["/api/by-id/conversation", "/api/by-id/messages", "/api/by-id/raw", "/api/by-id/display", "/api/by-id/copy", "/api/by-id/export"],
                 "legacy_path_routes": "retained only for route-safe IDs up to the new-import limit",
+                "incompatible_legacy_data": "IDs above the bounded by-id limit make health/readiness fail with database_data_incompatible; unusable rows are never listed as ready",
             },
             "conversations": {
                 "endpoint": "/api/conversations",
@@ -708,8 +739,9 @@ def create_api_router(
             },
             "raw": {
                 "endpoint": "/api/by-id/raw?conversation_id=...&node_id=...",
-                "max_chars": "1-200000, default 50000; when raw_size exceeds max_chars, returns truncated raw_text; max_chars=0 is rejected",
-                "response": ["raw_message", "raw_text", "raw_size", "raw_size_exact", "raw_size_bytes", "truncated"],
+                "max_chars": "1-200000, default 50000; when the bounded UTF-8 preview cannot cover the full value, returns truncated raw_text; max_chars=0 is rejected",
+                "response": ["raw_message", "raw_text", "raw_size", "raw_size_unit", "raw_size_exact", "raw_size_chars", "raw_size_chars_exact", "raw_size_bytes", "raw_size_bytes_exact", "parsed", "incomplete", "error_code", "truncated"],
+                "units": "raw_size is always exact UTF-8 bytes for compatibility; raw_size_chars is characters and is null with raw_size_chars_exact=false when a truncated byte prefix cannot establish the total",
                 "truncated": "when true, use raw_text as plain preview; raw_message is a compat field in truncated mode",
             },
             "export": {
@@ -719,6 +751,10 @@ def create_api_router(
                 "include_internal": "boolean; default false, matching CLI export and the visible reader; true includes internal/technical nodes",
                 "copy_endpoint": "/api/by-id/copy?conversation_id=...",
                 "streaming": "export and full-conversation copy use complete canonical display text from bounded server-side node batches and never accumulate reader page payloads",
+                "snapshot": {
+                    "consistency": "one SQLite read snapshot is held from schema/capability checks through the final streamed byte and is released on completion, error, or client disconnect",
+                    "wal_operational_limit": "a long reader can delay WAL checkpoint progress; WAL size, CPU, VM work, temporary disk, and duration remain proportional to the selected data",
+                },
                 "resource_limits": {
                     "max_nodes_per_conversation": MAX_EXPORT_NODES_PER_CONVERSATION,
                     "max_node_input_bytes": MAX_EXPORT_NODE_INPUT_BYTES,
@@ -726,16 +762,27 @@ def create_api_router(
                     "max_output_bytes": MAX_EXPORT_OUTPUT_BYTES,
                     "effective_current_max_nodes_per_conversation": MAX_EFFECTIVE_CURRENT_NODES_PER_CONVERSATION,
                     "effective_current_max_graph_bytes_per_conversation": MAX_EFFECTIVE_CURRENT_GRAPH_BYTES_PER_CONVERSATION,
+                    "effective_current_max_scope_nodes": MAX_EFFECTIVE_CURRENT_SCOPE_NODES,
+                    "effective_current_max_scope_input_bytes": MAX_EFFECTIVE_CURRENT_SCOPE_INPUT_BYTES,
+                    "effective_current_max_temp_bytes": MAX_EFFECTIVE_CURRENT_TEMP_BYTES,
+                    "effective_current_max_conversations": MAX_EFFECTIVE_CURRENT_CONVERSATIONS,
+                    "effective_current_batch_rows": EFFECTIVE_CURRENT_SCOPE_BATCH_ROWS,
+                    "effective_current_batch_nodes": EFFECTIVE_CURRENT_SCOPE_BATCH_NODES,
+                    "effective_current_batch_input_bytes": EFFECTIVE_CURRENT_SCOPE_BATCH_INPUT_BYTES,
+                    "archive_max_conversations": MAX_ARCHIVE_EXPORT_CONVERSATIONS,
+                    "archive_max_plan_metadata_bytes": MAX_ARCHIVE_EXPORT_METADATA_BYTES,
+                    "archive_max_manifest_bytes": MAX_ARCHIVE_EXPORT_MANIFEST_BYTES,
+                    "archive_planning": "one keyset conversation scan into a same-output-directory temporary SQLite plan; filenames, hashes, and manifests are streamed without an archive-sized Python collection",
                     "browser_copy": "16 MiB UTF-8 and 8 Mi characters; over-limit copy is aborted before clipboard write and the UI directs users to Download",
                 },
             },
             "web_index_build": {
                 "command": "python chatgpt_archive.py web-index --db <archive.db>",
                 "stages": list(WEB_INDEX_BUILD_STAGES),
-                "progress": ["build_stage", "processed", "total", "complete", "batch_size"],
+                "progress": ["build_stage", "processed", "total", "complete", "batch_size", "input_materialized_bytes", "normalized_materialized_bytes", "oversized_rows"],
                 "bounded": {"row_keyset": True, "max_input_bytes": WEB_INDEX_MAX_INPUT_BYTES, "max_normalized_bytes": WEB_INDEX_MAX_NORMALIZED_BYTES, "max_derived_bytes": WEB_INDEX_MAX_DERIVED_BYTES, "oversized_recall": "web_index_oversized rows are unioned into candidates and verified against canonical text"},
                 "publication": "one SQLite transaction keeps the previous current optional index visible until commit; failure or internal cancellation rolls back all replacement objects and metadata",
-                "cancellation": "no Web build job or Web cancel endpoint is exposed; only the internal/CLI builder callback and SQLite progress handler can request rollback",
+                "cancellation": "a running import job exposes POST /api/import/jobs/{job_id}/web-index/cancel; the internal callback and SQLite progress handler roll back every staging object and retain the previous optional index",
                 "locking": "the atomic build holds BEGIN IMMEDIATE for scan, normalization, trigram construction, metadata validation, and commit; other writers may wait or time out while readers retain the old index",
             },
             "search": {
@@ -743,6 +790,13 @@ def create_api_router(
                 "parameters": ["q", "title", "exact", "exclude", "role", "source", "after", "before", "scope", "path", "match_mode", "order", "conversation_id", "count_total"],
                 "message_order": ["relevance", "display"],
                 "count_total": "boolean; false disables the exact count and returns total_exact=false with a known lower-bound total",
+                "message_resource_contract": {
+                    "candidate_scan_chars_per_row": SEARCH_CANDIDATE_SCAN_CHARS,
+                    "hit_preview_chars": SEARCH_HIT_PREVIEW_CHARS,
+                    "snippet_scan_chars": SEARCH_SNIPPET_SCAN_CHARS,
+                    "response_estimated_bytes": SEARCH_PAGE_ESTIMATED_BYTES,
+                    "partial": "oversized canonical inputs that exceed the bounded verifier set total_exact=false and diagnostics.partial_due_to_oversized_input=true; no exact continuation is claimed",
+                },
                 "filter_only": "filter-only and exclude-only queries may filter conversation results; message hits and reader highlights require a positive message-text term, and role/source/date filters alone do not create hit navigation",
                 "raw_query_override": "path: and scope: modifiers in q override sidebar path/scope selectors",
                 "current_path_candidates": "global path=current searches derive path-independent conversation candidates first and materialize effective-current only for that scope; exclusion-only queries may require the explicit full-database fallback",
@@ -796,28 +850,39 @@ def create_api_router(
                     "content_length": "canonical nonnegative ASCII decimal with at most 20 digits; duplicates and alternate numeric syntax are rejected before multipart parsing",
                     "forwarded_headers": "strict edge-proxy model: ignored from untrusted peers; a trusted direct edge must overwrite client values and provide at most one Forwarded element or one X-Forwarded-Host/Proto value; duplicates, chains, malformed syntax, and conflicts are rejected",
                 },
-                "limits_note": "ZIP size checks run before import; JSON parsing and SQLite writes still consume memory, disk, and CPU proportional to decoded conversation JSON size; one top-level JSON element is capped at 128 MiB of UTF-8 input and 128 Mi decoded characters.",
+                "limits_note": "ZIP size checks run before import; JSON parsing and SQLite writes still consume memory, disk, and CPU proportional to decoded conversation JSON size; one top-level JSON element is capped at 32 MiB of UTF-8 input and 32 Mi decoded characters.",
+                "zip64": "Python zipfile and this pipeline accept ZIP64 structures, including forced-ZIP64 members; a physical archive above 4 GiB is not part of the regular acceptance suite and remains subject to every configured member, byte, ratio, disk, and CPU limit.",
             },
             "jobs": {
-                "endpoints": ["/api/import/jobs", "/api/import/jobs/{job_id}"],
+                "endpoints": ["/api/import/jobs", "/api/import/jobs/{job_id}", "/api/import/jobs/{job_id}/web-index/cancel"],
                 "job_id": "lowercase 32-character hexadecimal UUID; invalid syntax returns invalid_job_id and a valid unknown ID returns job_not_found",
                 "statuses": ["queued", "running", "succeeded", "failed", "postcheck_failed"],
-                "outcomes": ["queued", "import_running", "import_job_start_failed", "input_preflight_failed", "source_scan_failed", "source_read_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "succeeded"],
-                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index"],
+                "outcomes": ["queued", "import_running", "import_job_start_failed", "input_preflight_failed", "source_scan_failed", "source_read_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "web_index_cancelled", "succeeded"],
+                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index", "web_index_cancel_requested", "web_index_cancelled"],
                 "web_index_progress": ["status", "build_stage", "processed", "total", "complete", "batch_size"],
-                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "conversation_json_element_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
+                "web_index_cancellation": "the cancel endpoint is accepted only while the import job is in web-index or web-index-recovery; cancellation rolls back staging objects and keeps the previous optional index readable",
+                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "source_member_limit_exceeded", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "json_nesting_limit_exceeded", "json_scalar_limit_exceeded", "conversation_json_element_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_empty", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
                 "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"]},
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
             },
             "import_contract": {
-                "top_level": "conversation JSON must be one array; a single-pass incremental framer scans each element once, then decodes it once; one element is capped at 128 MiB of UTF-8 input and 128 Mi decoded characters",
+                "top_level": "conversation JSON must be one array; a single-pass incremental framer scans each element once, checks lexical nesting, then decodes it once; one element is capped at 32 MiB of UTF-8 input and 32 Mi decoded characters",
                 "max_element_utf8_bytes": MAX_JSON_ELEMENT_BYTES,
                 "max_element_decoded_chars": MAX_JSON_ELEMENT_CHARS,
                 "encoding": "UTF-8 only; exactly one file-leading UTF-8 BOM is removed; repeated or JSON-outside-string U+FEFF, UTF-16/32, mixed, and invalid encodings are rejected, while U+FEFF inside a JSON string is preserved",
                 "canonical_id_max_chars": MAX_CANONICAL_ID_LENGTH,
+                "max_source_total_members": MAX_SOURCE_TOTAL_MEMBERS,
+                "json_limits": {
+                    "max_nesting_depth": MAX_JSON_NESTING_DEPTH,
+                    "max_scalar_count": MAX_JSON_SCALAR_COUNT,
+                    "max_raw_preview_nodes": MAX_RAW_PREVIEW_NODES,
+                    "max_raw_preview_bytes": MAX_RAW_PREVIEW_BYTES,
+                    "max_sanitized_output_bytes": MAX_SANITIZED_OUTPUT_BYTES,
+                },
                 "id_fields": ["conversation_id", "exported_conversation_id", "mapping_node_key", "node_id", "message_id", "current_node", "parent", "children"],
                 "overlong_id": "the conversation element is skipped with canonical_id_too_long; IDs are never truncated",
                 "zip_source_read_codes": ["encrypted_zip_member_not_supported", "zip_member_not_found", "source_changed_during_read", "zip_member_crc_failed", "zip_member_read_failed"],
+                "zip64": {"runtime_supported": True, "small_forced_fixture_tested": True, "physical_over_4_gib_acceptance_tested": False},
             },
             "ui_state": {
                 "canonical_copy_url": ["match_mode", "layout", "show_internal", "sort", "path", "scope", "q", "role", "title", "exact", "exclude", "source", "after", "before", "selected conversation"],
@@ -835,15 +900,37 @@ def create_api_router(
                     "raw_flag_topology": ["raw_flag_cycles", "missing_parent_in_raw_flag_topology", "cross_conversation_parent_in_raw_flag_topology", "partial_raw_flag_topology"],
                     "aggregate": ["cycle_detected"],
                 },
-                "readiness_states": ["database_missing_or_uninitialized", "migration_required", "schema_newer", "schema_incompatible", "foreign_key_violation", "database_malformed", "database_locked", "database_readonly_or_io", "ready_empty", "ready_with_data"],
-                "errors": ["database_not_ready", "database_migration_required", "database_schema_newer", "database_schema_incompatible", "database_foreign_key_violation"],
+                "readiness_states": ["database_missing_or_uninitialized", "migration_required", "schema_newer", "schema_incompatible", "data_incompatible", "foreign_key_violation", "database_malformed", "database_locked", "database_readonly_or_io", "ready_empty", "ready_with_data"],
+                "errors": ["database_not_ready", "database_migration_required", "database_schema_unsupported_predecessor", "database_custom_objects_require_manual_migration", "database_schema_newer", "database_schema_incompatible", "database_data_incompatible", "database_foreign_key_violation"],
                 "optional_fts_fields": ["message_fts_available", "message_fts_rebuildable", "message_fts_error", "optional_message_fts_error", "optional_message_fts_recovery_hint"],
+            },
+            "request_validation": {
+                "http_status": 422,
+                "detail_code": "invalid_request",
+                "max_errors": 16,
+                "item_fields": ["location", "field", "code"],
+                "locations": ["query", "path", "body", "header", "cookie", "request"],
+                "codes": [
+                    "invalid_request",
+                    "invalid_integer",
+                    "numeric_parameter_out_of_range",
+                    "invalid_offset",
+                    "invalid_limit",
+                    "string_parameter_too_long",
+                    "invalid_identifier_token",
+                    "missing_parameter",
+                    "invalid_enum_value",
+                    "invalid_body",
+                    "invalid_upload_metadata",
+                ],
+                "privacy": "never returns submitted input, request bodies, raw query/path values, Pydantic reprs, paths, OS messages, or tracebacks",
             },
             "stable_error_codes": [
                 "database_not_ready", "database_migration_required", "database_schema_newer", "database_schema_incompatible", "database_foreign_key_violation", "invalid_job_id", "job_not_found",
                 "database_malformed", "database_locked", "database_readonly", "database_io_error", "database_runtime_failure",
                 "conversation_not_found", "message_not_found", "invalid_export_format", "invalid_display_cursor", "display_cursor_stale", "display_cursor_required",
                 "export_node_count_limit_exceeded", "export_node_input_limit_exceeded", "export_input_byte_limit_exceeded", "export_header_input_limit_exceeded", "export_output_byte_limit_exceeded", "effective_current_node_limit_exceeded", "effective_current_input_limit_exceeded",
+                "invalid_request", "invalid_integer", "numeric_parameter_out_of_range", "invalid_offset", "invalid_limit", "string_parameter_too_long", "invalid_identifier_token", "missing_parameter", "invalid_enum_value", "invalid_body", "invalid_upload_metadata",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
                 "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_preflight_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required", "upload_duplicate_origin_header", "upload_duplicate_content_length", "upload_duplicate_sec_fetch_site",
@@ -854,7 +941,7 @@ def create_api_router(
                 "upload_zip_uncompressed_too_large", "upload_zip_compression_ratio_too_high",
                 "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read",
                 "invalid_conversation_encoding", "json_integer_too_large", "conversation_json_element_too_large", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_invalid_unicode", "delete_input_changed",
-                "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed",
+                "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed", "web_index_cancelled", "web_index_not_cancellable",
             ],
             "provenance": {
                 "input_sha256": "computed only for ZIP imports unless --no-input-sha256 is used",
@@ -1030,6 +1117,17 @@ def create_api_router(
             raise HTTPException(status_code=404, detail="job_not_found")
         return job.snapshot()
 
+    @router.post("/import/jobs/{job_id}/web-index/cancel")
+    def cancel_import_web_index(job_id: str):
+        if JOB_ID_PATTERN.fullmatch(job_id) is None:
+            raise HTTPException(status_code=400, detail="invalid_job_id")
+        job, accepted = manager.request_web_index_cancel(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job_not_found")
+        if not accepted:
+            raise HTTPException(status_code=409, detail="web_index_not_cancellable")
+        return job.snapshot()
+
     @router.get("/conversations/{conversation_id}")
     def conversation_detail(conversation_id: Annotated[str, ApiPath(max_length=MAX_ID_PARAM_LENGTH)], conn=Depends(get_conn)):
         item = get_conversation(conn, conversation_id)
@@ -1116,22 +1214,30 @@ def create_api_router(
     ):
         max_bytes = max_chars * 4 + 4
         row = conn.execute(
-            """SELECT COALESCE(length(CAST(raw_message_json AS BLOB)), 0) AS raw_size_bytes,
-                      substr(CAST(COALESCE(raw_message_json, '') AS BLOB), 1, ?) AS raw_prefix
+            """SELECT rowid AS storage_rowid, raw_message_json IS NULL AS raw_is_null
                FROM conversation_nodes WHERE conversation_id = ? AND node_id = ?""",
-            (max_bytes, conversation_id, node_id),
+            (conversation_id, node_id),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="message_not_found")
-        raw_size_bytes = int(row["raw_size_bytes"] or 0)
+        if bool(row["raw_is_null"]):
+            raw_size_bytes = 0
+            prefix_bytes = b""
+        else:
+            with conn.blobopen(
+                "conversation_nodes", "raw_message_json", int(row["storage_rowid"]), readonly=True
+            ) as blob:
+                raw_size_bytes = len(blob)
+                prefix_bytes = blob.read(min(raw_size_bytes, max_bytes))
         if raw_size_bytes == 0:
             return {
                 "conversation_id": conversation_id, "node_id": node_id,
                 "raw_message": None, "raw_size": 0, "raw_size_exact": True,
-                "raw_size_bytes": 0, "truncated": False,
+                "raw_size_unit": "bytes",
+                "raw_size_chars": 0, "raw_size_chars_exact": True,
+                "raw_size_bytes": 0, "raw_size_bytes_exact": True,
+                "parsed": True, "incomplete": False, "truncated": False,
             }
-        prefix_value = row["raw_prefix"]
-        prefix_bytes = bytes(prefix_value) if prefix_value is not None else b""
         decoded = normalize_display_text(prefix_bytes.decode("utf-8", errors="replace"))
         truncated = raw_size_bytes > len(prefix_bytes) or len(decoded) > max_chars
         raw_text = decoded[:max_chars]
@@ -1142,19 +1248,49 @@ def create_api_router(
                 "raw_message": raw_text,
                 "raw_text": raw_text,
                 "raw_size": raw_size_bytes,
-                "raw_size_exact": False,
+                "raw_size_exact": True,
+                "raw_size_unit": "bytes",
+                "raw_size_chars": None,
+                "raw_size_chars_exact": False,
                 "raw_size_bytes": raw_size_bytes,
+                "raw_size_bytes_exact": True,
+                "parsed": False,
+                "incomplete": True,
                 "truncated": True,
             }
         try:
+            validate_json_lexical_limits(raw_text or "null")
             raw = _safe_json_scalars(json.loads(raw_text or "null"))
-        except json.JSONDecodeError:
+        except JsonSafetyLimitError as exc:
+            return {
+                "conversation_id": conversation_id,
+                "node_id": node_id,
+                "raw_message": raw_text[: min(max_chars, MAX_RAW_PREVIEW_BYTES)],
+                "raw_text": raw_text[: min(max_chars, MAX_RAW_PREVIEW_BYTES)],
+                "raw_size": raw_size_bytes,
+                "raw_size_exact": True,
+                "raw_size_unit": "bytes",
+                "raw_size_chars": len(raw_text),
+                "raw_size_chars_exact": True,
+                "raw_size_bytes": raw_size_bytes,
+                "raw_size_bytes_exact": True,
+                "parsed": False,
+                "incomplete": True,
+                "error_code": exc.code,
+                "limit": exc.limit,
+                "truncated": len(raw_text) > min(max_chars, MAX_RAW_PREVIEW_BYTES),
+            }
+        except (json.JSONDecodeError, RecursionError):
             raw = raw_text
         return {
             "conversation_id": conversation_id, "node_id": node_id,
             "raw_message": raw, "raw_text": raw_text,
-            "raw_size": len(raw_text), "raw_size_exact": True,
-            "raw_size_bytes": raw_size_bytes, "truncated": False,
+            "raw_size": raw_size_bytes, "raw_size_exact": True,
+            "raw_size_unit": "bytes",
+            "raw_size_chars": len(raw_text), "raw_size_chars_exact": True,
+            "raw_size_bytes": raw_size_bytes, "raw_size_bytes_exact": True,
+            "parsed": not isinstance(raw, str), "incomplete": False,
+            "truncated": False,
         }
 
     @router.get("/conversations/{conversation_id}/export")
@@ -1166,7 +1302,9 @@ def create_api_router(
         if not conv:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         try:
-            check_conversation_export_budget(conn, conversation_id)
+            validated_budget = validate_conversation_export_budget(
+                conn, conversation_id, path=path, include_internal=include_internal
+            )
         except ExportResourceLimitError as exc:
             raise HTTPException(status_code=413, detail=exc.code) from None
         media_type = "text/markdown; charset=utf-8" if format == "md" else "text/plain; charset=utf-8"
@@ -1176,6 +1314,7 @@ def create_api_router(
             conv,
             path=path,
             include_internal=include_internal,
+            validated_budget=validated_budget,
         )
         return StreamingResponse(
             iter_rendered_conversation(conv, nodes, format),
@@ -1190,7 +1329,9 @@ def create_api_router(
         if not conv:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         try:
-            check_conversation_export_budget(conn, conversation_id)
+            validated_budget = validate_conversation_export_budget(
+                conn, conversation_id, path=path, include_internal=include_internal
+            )
         except ExportResourceLimitError as exc:
             raise HTTPException(status_code=413, detail=exc.code) from None
         nodes = iter_conversation_export_nodes(
@@ -1198,6 +1339,7 @@ def create_api_router(
             conv,
             path=path,
             include_internal=include_internal,
+            validated_budget=validated_budget,
         )
         return StreamingResponse(iter_copy_conversation(nodes), media_type="text/plain; charset=utf-8")
 
@@ -1466,14 +1608,7 @@ def _empty_page(limit: int, offset: int, *, selected_id: str | None, db_ready: b
 
 def _safe_json_scalars(value):
     """Make a bounded raw preview safe for the API JSON encoder."""
-
-    if isinstance(value, str):
-        return normalize_display_text(value)
-    if isinstance(value, list):
-        return [_safe_json_scalars(item) for item in value]
-    if isinstance(value, dict):
-        return {normalize_display_text(str(key)): _safe_json_scalars(item) for key, item in value.items()}
-    return value
+    return sanitize_json_value(value)
 
 
 def _empty_message_search_page(limit: int, offset: int, *, db_ready: bool) -> dict[str, object]:
@@ -1496,6 +1631,7 @@ def _readiness_from_error_code(code: str | None) -> str:
         "database_migration_required": "migration_required",
         "database_schema_newer": "schema_newer",
         "database_schema_incompatible": "schema_incompatible",
+        "database_data_incompatible": "data_incompatible",
         "database_foreign_key_violation": "foreign_key_violation",
         "database_malformed": "database_malformed",
         "database_locked": "database_locked",

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -304,9 +307,132 @@ class DatabaseMigrationError(ValueError):
         return self.code
 
 
+@dataclass(frozen=True)
+class ReadRequestCapabilities:
+    database_identity: tuple[str, int, int] | tuple[str]
+    user_version: int
+    schema_version: int
+    data_version: int
+    generation_snapshot: tuple[int, int]
+    schema_status: dict[str, Any]
+    fts5_available: bool
+    trigram_available: bool
+
+
+_READ_CAPABILITY_CACHE: dict[
+    tuple[tuple[str, int, int] | tuple[str], int, int, int, tuple[int, int]],
+    tuple[dict[str, Any], bool, bool],
+] = {}
+_READ_CAPABILITY_CACHE_LOCK = threading.Lock()
+
+
+def _read_database_identity(conn: sqlite3.Connection) -> tuple[str, int, int] | tuple[str]:
+    row = conn.execute("PRAGMA database_list").fetchone()
+    path = str(row[2] if row is not None else "")
+    if not path:
+        return ("memory",)
+    try:
+        info = os.stat(path)
+    except OSError:
+        return (path,)
+    return (str(Path(path).resolve()), int(info.st_dev), int(info.st_ino))
+
+
+def read_request_capabilities(conn: sqlite3.Connection) -> ReadRequestCapabilities:
+    """Return a schema snapshot with full introspection cached by DB identity/version."""
+
+    identity = _read_database_identity(conn)
+    user_version = _database_user_version(conn)
+    row = conn.execute("PRAGMA schema_version").fetchone()
+    schema_version = int(row[0] if row is not None else -1)
+    row = conn.execute("PRAGMA data_version").fetchone()
+    data_version = int(row[0] if row is not None else -1)
+    try:
+        generations = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                "SELECT name, generation FROM archive_generations "
+                "WHERE name IN ('message', 'title')"
+            )
+        }
+    except sqlite3.Error:
+        generations = {}
+    generation_snapshot = (generations.get("message", -1), generations.get("title", -1))
+    key = (identity, user_version, schema_version, data_version, generation_snapshot)
+    with _READ_CAPABILITY_CACHE_LOCK:
+        cached = _READ_CAPABILITY_CACHE.get(key)
+    if cached is None:
+        schema_status = database_schema_status(conn)
+        if schema_status.get("schema_compatible"):
+            legacy_limit = 16 * 1024
+            incompatible = conn.execute(
+                """SELECT 1 FROM conversations
+                   WHERE length(conversation_id) > ? OR length(COALESCE(current_node, '')) > ?
+                   UNION ALL
+                   SELECT 1 FROM conversation_nodes
+                   WHERE length(conversation_id) > ? OR length(node_id) > ?
+                      OR length(COALESCE(parent_node_id, '')) > ?
+                   LIMIT 1""",
+                (legacy_limit, legacy_limit, legacy_limit, legacy_limit, legacy_limit),
+            ).fetchone() is not None
+            if incompatible:
+                schema_status = {
+                    **schema_status,
+                    "data_compatible": False,
+                    "data_error_code": "database_data_incompatible",
+                    "max_addressable_legacy_id_chars": legacy_limit,
+                    "repair_guidance": "use a trusted local SQLite backup and repair overlong legacy graph identifiers before serving",
+                }
+            else:
+                schema_status = {**schema_status, "data_compatible": True}
+        fts5_available = detect_fts5_runtime(conn)
+        trigram_available = _detect_trigram_runtime(conn)
+        cached = (schema_status, fts5_available, trigram_available)
+        with _READ_CAPABILITY_CACHE_LOCK:
+            if len(_READ_CAPABILITY_CACHE) >= 32:
+                _READ_CAPABILITY_CACHE.clear()
+            _READ_CAPABILITY_CACHE[key] = (dict(schema_status), fts5_available, trigram_available)
+    schema_status, fts5_available, trigram_available = cached
+    return ReadRequestCapabilities(
+        database_identity=identity,
+        user_version=user_version,
+        schema_version=schema_version,
+        data_version=data_version,
+        generation_snapshot=generation_snapshot,
+        schema_status=dict(schema_status),
+        fts5_available=fts5_available,
+        trigram_available=trigram_available,
+    )
+
+
+def _detect_trigram_runtime(conn: sqlite3.Connection) -> bool:
+    table_name = f"__archive_trigram_probe_{id(conn):x}"
+    try:
+        conn.execute(
+            f'CREATE VIRTUAL TABLE temp."{table_name}" USING fts5(value, tokenize="trigram")'
+        )
+        return True
+    except sqlite3.OperationalError as exc:
+        if is_fts5_capability_unavailable(exc):
+            return False
+        raise
+    finally:
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS temp."{table_name}"')
+        except sqlite3.Error:
+            pass
+
+
+def invalidate_read_capability_cache() -> None:
+    with _READ_CAPABILITY_CACHE_LOCK:
+        _READ_CAPABILITY_CACHE.clear()
+
+
 def database_schema_error_code(status: dict[str, Any]) -> str | None:
     """Map a schema status to the stable read/write dependency error code."""
 
+    if status.get("data_compatible") is False:
+        return str(status.get("data_error_code") or "database_data_incompatible")
     if status.get("database_schema_newer"):
         return "database_schema_newer"
     if status.get("migration_required"):
@@ -324,7 +450,7 @@ def require_current_database_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     makes an indexed lookup proportional to the entire archive.
     """
 
-    status = database_schema_status(conn)
+    status = read_request_capabilities(conn).schema_status
     code = database_schema_error_code(status)
     if code is not None:
         raise DatabaseMigrationError(code, detail=status)
@@ -475,7 +601,141 @@ def _base_schema_compatibility(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-_SUPPORTED_SCHEMA_PREDECESSORS = frozenset(range(DATABASE_SCHEMA_VERSION))
+# Every entry is a schema version that was actually shipped.  Keep this an
+# explicit graph: a lower integer is not, by itself, evidence that its table
+# shape is one we know how to migrate.
+MIGRATIONS = {
+    0: "rebuild_nullable_identity_v3",
+    1: "rebuild_nullable_identity_v3",
+    2: "rebuild_nullable_identity_v3",
+}
+_SUPPORTED_SCHEMA_PREDECESSORS = frozenset(MIGRATIONS)
+
+_MIGRATION_REBUILT_TABLES = frozenset({"conversations", "archive_generations"})
+_SAFE_SCHEMA_OBJECT_NAME_CHARS = 160
+
+
+def _bounded_schema_object_name(value: object) -> str:
+    text = str(value)
+    return text[:_SAFE_SCHEMA_OBJECT_NAME_CHARS]
+
+
+def _schema_sql_mentions(sql: str, identifier: str) -> bool:
+    """Conservatively recognize an identifier in user-authored schema SQL."""
+
+    escaped = re.escape(identifier)
+    return re.search(
+        rf"(?<![A-Za-z0-9_])(?:{escaped}|\"{escaped}\"|`{escaped}`|\[{escaped}\])(?![A-Za-z0-9_])",
+        sql,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _migration_custom_object_conflicts(
+    conn: sqlite3.Connection,
+    *,
+    status: dict[str, Any],
+    rebuilt_tables: frozenset[str],
+) -> list[dict[str, str]]:
+    """Inventory schema objects and return unsafe rebuild dependencies.
+
+    This intentionally chooses the refusal branch of the migration contract.
+    SQLite DDL can contain arbitrary trigger programs and view dependency
+    chains; replaying it safely would require a full SQLite parser.  Refusing
+    before the first DROP/rename preserves every user object verbatim.
+    """
+
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+        "WHERE type IN ('table', 'view', 'trigger', 'index') "
+        "ORDER BY type, name"
+    ).fetchall()
+    invalid_indexes = set(status.get("invalid_indexes") or {})
+    invalid_triggers = set(status.get("invalid_triggers") or {})
+    missing_indexes = set(status.get("missing_indexes") or ())
+    missing_triggers = set(status.get("missing_triggers") or ())
+
+    dependent_names = set(rebuilt_tables)
+    # Resolve view dependencies to a fixed point.  False positives are safe:
+    # they cause a manual-migration refusal before destructive DDL.
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            object_type, name, _table, raw_sql = map(lambda value: value, row)
+            if str(object_type) != "view" or str(name) in dependent_names:
+                continue
+            sql = raw_sql if isinstance(raw_sql, str) else ""
+            if any(_schema_sql_mentions(sql, dependency) for dependency in dependent_names):
+                dependent_names.add(str(name))
+                changed = True
+
+    conflicts: list[dict[str, str]] = []
+    for row in rows:
+        object_type = str(row[0])
+        name = str(row[1])
+        table = str(row[2])
+        raw_sql = row[3]
+        if object_type == "table":
+            continue
+        if name.startswith("sqlite_autoindex_") and raw_sql is None:
+            continue
+        if (
+            object_type == "index"
+            and name in REQUIRED_INDEX_DDL
+            and name not in invalid_indexes
+            and name not in missing_indexes
+        ):
+            continue
+        if (
+            object_type == "trigger"
+            and name in GENERATION_TRIGGER_DDL
+            and name not in invalid_triggers
+            and name not in missing_triggers
+        ):
+            continue
+
+        sql = raw_sql if isinstance(raw_sql, str) else ""
+        depends_on_rebuild = bool(
+            table in rebuilt_tables
+            or name in dependent_names
+            or any(_schema_sql_mentions(sql, dependency) for dependency in dependent_names)
+        )
+        # A project-owned name with a non-authoritative fingerprint is a name
+        # collision, not permission to delete a user object.
+        managed_name_collision = bool(rebuilt_tables) and (
+            name in REQUIRED_INDEX_DDL or name in GENERATION_TRIGGER_DDL
+        )
+        if depends_on_rebuild or managed_name_collision:
+            conflicts.append(
+                {
+                    "type": object_type[:32],
+                    "name": _bounded_schema_object_name(name),
+                }
+            )
+    return conflicts
+
+
+def _raise_for_migration_custom_objects(
+    conn: sqlite3.Connection,
+    *,
+    status: dict[str, Any],
+    rebuilt_tables: frozenset[str],
+) -> None:
+    conflicts = _migration_custom_object_conflicts(
+        conn,
+        status=status,
+        rebuilt_tables=rebuilt_tables,
+    )
+    if conflicts:
+        raise DatabaseMigrationError(
+            "database_custom_objects_require_manual_migration",
+            detail={
+                "object_count": len(conflicts),
+                "objects": conflicts[:32],
+                "manual_repair_required": True,
+            },
+        )
 
 
 def _nullable_identity_only(error: dict[str, Any] | None, column: str) -> bool:
@@ -626,6 +886,15 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             raise DatabaseMigrationError("database_not_ready")
         locked_status = database_schema_status(conn) if has_objects else None
         if locked_status is not None and current_version < DATABASE_SCHEMA_VERSION:
+            if current_version not in MIGRATIONS:
+                raise DatabaseMigrationError(
+                    "database_schema_unsupported_predecessor",
+                    detail={
+                        "current_database_schema_version": current_version,
+                        "required_database_schema_version": DATABASE_SCHEMA_VERSION,
+                        "manual_repair_required": True,
+                    },
+                )
             if not _supported_predecessor_schema(locked_status):
                 raise DatabaseMigrationError(
                     "database_schema_incompatible", detail=_base_schema_compatibility(conn)
@@ -638,10 +907,22 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             raise DatabaseMigrationError("database_foreign_key_violation")
         if locked_status is not None and locked_status["schema_compatible"] and not locked_status["migration_required"]:
             conn.commit()
+            invalidate_read_capability_cache()
             return {"changed": False, "initialized": False, **locked_status}
 
         initialized = not has_objects
         upgrading_identity_contract = bool(has_objects and current_version < DATABASE_SCHEMA_VERSION)
+        if locked_status is not None:
+            rebuilt_tables = (
+                _MIGRATION_REBUILT_TABLES
+                if upgrading_identity_contract
+                else frozenset()
+            )
+            _raise_for_migration_custom_objects(
+                conn,
+                status=locked_status,
+                rebuilt_tables=rebuilt_tables,
+            )
         if upgrading_identity_contract:
             _rebuild_nullable_identity_tables(
                 conn,
@@ -697,6 +978,7 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
         if not after["schema_compatible"] or after["migration_required"]:
             raise DatabaseMigrationError("database_migration_incomplete", detail=after)
         conn.commit()
+        invalidate_read_capability_cache()
     except DatabaseMigrationError:
         if conn.in_transaction:
             conn.rollback()
@@ -718,6 +1000,7 @@ def init_db(conn: sqlite3.Connection) -> bool:
     migrate_database(conn, allow_initialize=True)
     fts_enabled = ensure_fts(conn)
     conn.commit()
+    invalidate_read_capability_cache()
     return fts_enabled
 
 
@@ -835,6 +1118,7 @@ def finish_import_run(conn: sqlite3.Connection, run_id: int, status: str, summar
         (utc_now_iso(), status, compact_json(summary), run_id),
     )
     conn.commit()
+    invalidate_read_capability_cache()
 
 
 def update_import_run_summary(conn: sqlite3.Connection, run_id: int, summary: dict[str, Any]) -> None:
