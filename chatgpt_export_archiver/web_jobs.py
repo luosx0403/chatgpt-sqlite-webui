@@ -9,7 +9,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Protocol
 
 from .cli import ImportPipelineError, run_import_pipeline
 from .db import connect, get_stats, verify_database
@@ -18,6 +18,20 @@ from .utils import safe_filename_part
 from .web_db import WebIndexBuildCancelled, create_web_indexes
 
 LOGGER = get_logger("web_jobs")
+
+
+class WebIndexBuilder(Protocol):
+    """Keyword-only contract shared by the job runner and index builder."""
+
+    def __call__(
+        self,
+        db_path: Path,
+        *,
+        batch_size: int = ...,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = ...,
+        cancel_check: Callable[[], bool] | None = ...,
+    ) -> dict[str, Any]: ...
+
 
 _JOB_LEVELS = {"debug": 10, "info": 20, "warning": 30, "error": 40, "none": 100}
 DEFAULT_JOB_HISTORY_LIMIT = 50
@@ -239,12 +253,14 @@ class ImportJobManager:
         status: str,
         outcome: str,
         error_code: str | None = None,
+        error_type: str | None = None,
     ) -> None:
         with job._lock:
             job.status = status
             job.outcome = outcome
             job.error_code = error_code
             job.error = error_code
+            job.error_type = error_type
 
     def _run_job(self, job: ImportJob) -> None:
         """Protect the complete worker entry, including initial state/log setup."""
@@ -309,7 +325,13 @@ class ImportJobManager:
                 with job._lock:
                     job.verify = verify_result
             except Exception as exc:
-                self._set_outcome(job, status="postcheck_failed", outcome="verify_failed", error_code="verify_failed")
+                self._set_outcome(
+                    job,
+                    status="postcheck_failed",
+                    outcome="verify_failed",
+                    error_code="verify_failed",
+                    error_type=type(exc).__name__,
+                )
                 self._log(job, "error", f"verify_failed error_type={type(exc).__name__}")
                 self._set_stage(job, "verify_failed")
                 return
@@ -317,10 +339,11 @@ class ImportJobManager:
                 if job.verify.get("optional_web_index_error"):
                     self._set_stage(job, "web-index-recovery")
                     try:
-                        web_index_result = create_web_indexes(
+                        builder: WebIndexBuilder = create_web_indexes
+                        web_index_result = builder(
                             self.db_path,
                             progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
-                            cancel_callback=job._web_index_cancel_event.is_set,
+                            cancel_check=job._web_index_cancel_event.is_set,
                         )
                         web_index_result["recovered_optional_web_index"] = True
                         conn = connect(self.db_path)
@@ -335,7 +358,13 @@ class ImportJobManager:
                         self._web_index_cancelled(job, postcheck_failed=True)
                         return
                     except Exception as exc:
-                        self._set_outcome(job, status="postcheck_failed", outcome="web_index_failed", error_code="web_index_failed")
+                        self._set_outcome(
+                            job,
+                            status="postcheck_failed",
+                            outcome="web_index_failed",
+                            error_code="web_index_failed",
+                            error_type=type(exc).__name__,
+                        )
                         self._log(job, "error", f"web_index_failed error_type={type(exc).__name__}")
                         self._set_stage(job, "web_index_failed")
                         return
@@ -357,17 +386,24 @@ class ImportJobManager:
                 with job._lock:
                     job.stats = stats_result
             except Exception as exc:
-                self._set_outcome(job, status="postcheck_failed", outcome="stats_failed", error_code="stats_failed")
+                self._set_outcome(
+                    job,
+                    status="postcheck_failed",
+                    outcome="stats_failed",
+                    error_code="stats_failed",
+                    error_type=type(exc).__name__,
+                )
                 self._log(job, "error", f"stats_failed error_type={type(exc).__name__}")
                 self._set_stage(job, "stats_failed")
                 return
             self._set_stage(job, "web-index")
             if job.web_index is None:
                 try:
-                    web_index_result = create_web_indexes(
+                    builder: WebIndexBuilder = create_web_indexes
+                    web_index_result = builder(
                         self.db_path,
                         progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
-                        cancel_callback=job._web_index_cancel_event.is_set,
+                        cancel_check=job._web_index_cancel_event.is_set,
                     )
                     with job._lock:
                         job.web_index = web_index_result
@@ -375,7 +411,13 @@ class ImportJobManager:
                     self._web_index_cancelled(job, postcheck_failed=False)
                     return
                 except Exception as exc:
-                    self._set_outcome(job, status="postcheck_failed", outcome="web_index_failed", error_code="web_index_failed")
+                    self._set_outcome(
+                        job,
+                        status="postcheck_failed",
+                        outcome="web_index_failed",
+                        error_code="web_index_failed",
+                        error_type=type(exc).__name__,
+                    )
                     self._log(job, "error", f"web_index_failed error_type={type(exc).__name__}")
                     self._set_stage(job, "web_index_failed")
                     return
@@ -402,7 +444,13 @@ class ImportJobManager:
             self._set_stage(job, exc.stage)
             self._log(job, "error", f"import_failed code={exc.code} stage={exc.stage}")
         except Exception as exc:
-            self._set_outcome(job, status="failed", outcome="import_transaction_failed", error_code="import_transaction_failed")
+            self._set_outcome(
+                job,
+                status="failed",
+                outcome="import_transaction_failed",
+                error_code="import_transaction_failed",
+                error_type=type(exc).__name__,
+            )
             self._set_stage(job, "transaction")
             self._log(job, "error", f"import_failed error_type={type(exc).__name__}")
         finally:

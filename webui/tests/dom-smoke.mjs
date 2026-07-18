@@ -79,6 +79,8 @@ function assertStaticFrontendContracts() {
   assert.ok(clientSource.includes("reader.cancel()"), "over-limit or failed stream copy should cancel the response reader");
   assert.ok(clientSource.includes("structured.cleanup_warnings"), "ApiError should parse every structured cleanup warning");
   assert.ok(appSource.includes("cleanupWarningLabel"), "cleanup warning codes and path kinds should render as localized safe text");
+  assert.ok(appSource.includes('return t("importError_json_resource_limits")'), "JSON element resource failures must not be mislabeled as ZIP upload limits");
+  assert.ok(i18nSource.includes("importError_json_resource_limits"), "JSON element resource failures should have localized user-facing text");
   assert.ok(paneSource.includes("getConversationCopyText"), "reader full-copy must not accumulate reader page objects");
   assert.ok(paneSource.includes("countTotal: false"), "reader hit navigation should request fast message-hit pages without exact total counts");
   assert.equal(paneSource.includes("while (items.length < MAX_NAVIGABLE_HIT_MESSAGES)"), false, "reader hit navigation must not serially prefetch ten pages on initial load");
@@ -728,7 +730,7 @@ async function main() {
     let delayedFirstJobPoll = true;
     let allowTerminalJobPoll = false;
     let webIndexCancelCalls = 0;
-    await noDbPage.route("**/api/import/jobs/*", async (route) => {
+    await noDbPage.route("**/api/import/jobs/**", async (route) => {
       const requestUrl = new URL(route.request().url());
       if (route.request().method() === "POST" && requestUrl.pathname.endsWith("/web-index/cancel")) {
         webIndexCancelCalls += 1;
@@ -811,8 +813,13 @@ async function main() {
       throw new Error(`web-index progress did not render; active=${activeJobPolls} max=${maxActiveJobPolls} panel=${JSON.stringify(panelText)} cause=${error instanceof Error ? error.message : String(error)}`);
     }
     assert.ok((await noDbPage.getByTestId("web-index-progress").textContent())?.includes("Normalizing messages · 100/250"), "Web index progress should use a localized stage label and bounded counts");
+    const cancelResponse = noDbPage.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && new URL(response.url()).pathname.endsWith("/web-index/cancel")
+    ));
     await noDbPage.getByTestId("web-index-cancel-button").click();
     await noDbPage.waitForFunction(() => document.querySelector('[data-testid="web-index-cancel-button"]')?.textContent?.includes("Cancelling"), undefined, { timeout: 20_000 });
+    await cancelResponse;
     assert.equal(webIndexCancelCalls, 1, "Web index cancellation should issue exactly one POST request");
     assert.equal(await noDbPage.getByTestId("web-index-cancel-button").isDisabled(), true, "the cancellation button should disable after acknowledgement");
     allowTerminalJobPoll = true;
@@ -828,7 +835,7 @@ async function main() {
     assert.equal(await noDbPage.getByTestId("import-start-button").count(), 0, "successful job creation should clear selected file and start button");
     await noDbPage.waitForFunction(() => document.querySelectorAll(".conversation-item").length >= 1, undefined, { timeout: 20_000 });
     await noDbPage.unroute("**/api/import/upload");
-    await noDbPage.unroute("**/api/import/jobs/*");
+    await noDbPage.unroute("**/api/import/jobs/**");
     await noDbContext.close();
     if (noDbServer.exitCode === null && noDbServer.signalCode === null) {
       noDbServer.kill("SIGTERM");
@@ -844,7 +851,7 @@ async function main() {
     run([
       ...pythonCommand(),
       "-c",
-      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = CASE WHEN node_id = 'branch' THEN 1 ELSE 0 END WHERE conversation_id = 'dom-branch-override'\"); conn.execute(\"UPDATE conversation_nodes SET content_text = replace(hex(zeroblob(70000)), '00', 'L') || ' DOM-LONG-BODY-END', raw_message_json = NULL WHERE conversation_id = 'dom-long-body' AND node_id = 'long-body'\"); conn.commit(); conn.close()",
+      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = CASE WHEN node_id = 'branch' THEN 1 ELSE 0 END WHERE conversation_id = 'dom-branch-override'\"); conn.execute(\"UPDATE conversation_nodes SET content_text = replace(hex(zeroblob(1100000)), '00', 'L') || ' DOM-LONG-BODY-END', raw_message_json = NULL WHERE conversation_id = 'dom-long-body' AND node_id = 'long-body'\"); conn.commit(); conn.close()",
       db,
     ]);
     run([...pythonCommand(), "chatgpt_archive.py", "web-index", "--db", db]);
@@ -871,6 +878,13 @@ async function main() {
 
     const fallbackContext = await browser.newContext({ viewport: { width: 1000, height: 760 }, locale: "en-US" });
     const fallbackPage = await fallbackContext.newPage();
+    await fallbackPage.addInitScript(() => {
+      window.__fallbackCopiedText = "fallback-copy-sentinel";
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (text) => { window.__fallbackCopiedText = text; } },
+      });
+    });
     const fallbackRequests = [];
     fallbackPage.on("request", (request) => fallbackRequests.push(request.url()));
     await fallbackPage.goto(fallbackUrl, { waitUntil: "networkidle" });
@@ -885,6 +899,52 @@ async function main() {
       const href = await fallbackPage.getByRole("link", { name: label }).first().getAttribute("href");
       assert.equal(new URL(href, fallbackUrl).searchParams.get("conversation_id"), "fallback/id?hash%:漢字", `${label} must preserve the complete fallback conversation ID`);
     }
+    await fallbackPage.evaluate(() => {
+      window.__fallbackNativeFetch = window.fetch;
+      window.__fallbackCopyMode = "missing-length";
+      window.__fallbackStreamCancelled = false;
+      window.fetch = (input, init) => {
+        const url = new URL(typeof input === "string" ? input : input.url, location.href);
+        if (url.pathname !== "/api/by-id/copy") return window.__fallbackNativeFetch(input, init);
+        if (window.__fallbackCopyMode === "missing-length") return Promise.resolve(new Response("small synthetic copy", { status: 200 }));
+        if (window.__fallbackCopyMode === "oversized-length") return Promise.resolve(new Response("", { status: 200, headers: { "content-length": String(16 * 1024 * 1024 + 1) } }));
+        if (window.__fallbackCopyMode === "underdeclared-body") return Promise.resolve(new Response("x".repeat(8 * 1024 * 1024 + 1), { status: 200, headers: { "content-length": "1" } }));
+        if (window.__fallbackCopyMode === "stream-overflow") {
+          let chunks = 0;
+          return Promise.resolve(new Response(new ReadableStream({
+            pull(controller) {
+              chunks += 1;
+              controller.enqueue(new Uint8Array(1024 * 1024).fill(120));
+              if (chunks >= 32) controller.close();
+            },
+            cancel() { window.__fallbackStreamCancelled = true; },
+          }), { status: 200 }));
+        }
+        return Promise.resolve(new Response("small synthetic copy", { status: 200, headers: { "content-length": "20" } }));
+      };
+    });
+    const fallbackCopy = fallbackPage.getByRole("button", { name: "Copy visible current conversation" });
+    await fallbackCopy.click();
+    await fallbackPage.waitForFunction(() => window.__fallbackCopiedText === "small synthetic copy", undefined, { timeout: 20_000 });
+    for (const mode of ["oversized-length", "underdeclared-body", "stream-overflow"]) {
+      await fallbackPage.evaluate((nextMode) => {
+        window.__fallbackCopyMode = nextMode;
+        window.__fallbackCopiedText = "fallback-copy-sentinel";
+        window.__fallbackStreamCancelled = false;
+      }, mode);
+      await fallbackCopy.click();
+      await fallbackPage.getByText("Use Download instead", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+      assert.equal(await fallbackPage.evaluate(() => window.__fallbackCopiedText), "fallback-copy-sentinel", `${mode} must not mutate the clipboard`);
+      assert.equal(await fallbackPage.getByRole("link", { name: "Download visible MD" }).count(), 1, `${mode} must leave Download available`);
+      if (mode === "stream-overflow") assert.equal(await fallbackPage.evaluate(() => window.__fallbackStreamCancelled), true, "stream overflow must cancel the response reader before the unbounded tail is read");
+    }
+    await fallbackPage.evaluate(() => {
+      window.__fallbackCopyMode = "success";
+      window.__fallbackCopiedText = "";
+    });
+    await fallbackCopy.click();
+    await fallbackPage.waitForFunction(() => window.__fallbackCopiedText === "small synthetic copy", undefined, { timeout: 20_000 });
+    await fallbackPage.evaluate(() => { window.fetch = window.__fallbackNativeFetch; });
     await fallbackPage.getByRole("button", { name: "Open around message" }).click();
     await fallbackPage.waitForTimeout(300);
     assert.ok(fallbackRequests.some((url) => new URL(url).pathname === "/api/by-id/messages" && new URL(url).searchParams.has("around_node_id")), "fallback around navigation must use the by-id query route");
@@ -992,6 +1052,41 @@ async function main() {
     await page.keyboard.press("Escape");
     await page.getByRole("dialog", { name: "Search help" }).waitFor({ state: "hidden" });
     assert.equal(await helpOpener.evaluate((node) => node === document.activeElement), true, "closing help should restore opener focus");
+    await page.evaluate(() => {
+      window.__nativeRaf = window.requestAnimationFrame;
+      window.__nativeCancelRaf = window.cancelAnimationFrame;
+      window.__heldRafs = new Map();
+      window.__nextHeldRaf = 1;
+      window.__cancelledHeldRafs = 0;
+      window.requestAnimationFrame = (callback) => {
+        const id = window.__nextHeldRaf++;
+        window.__heldRafs.set(id, callback);
+        return id;
+      };
+      window.cancelAnimationFrame = (id) => {
+        if (window.__heldRafs.delete(id)) window.__cancelledHeldRafs += 1;
+      };
+    });
+    await helpOpener.click();
+    await page.getByRole("dialog", { name: "Search help" }).waitFor({ state: "visible" });
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog", { name: "Search help" }).waitFor({ state: "hidden" });
+    await helpOpener.click();
+    const reopenedHelp = page.getByRole("dialog", { name: "Search help" });
+    await reopenedHelp.waitFor({ state: "visible" });
+    await page.evaluate(() => {
+      const callbacks = [...window.__heldRafs.values()];
+      window.__heldRafs.clear();
+      callbacks.forEach((callback) => callback(performance.now()));
+    });
+    assert.ok(await page.evaluate(() => window.__cancelledHeldRafs > 0), "modal reopen must cancel the stale focus-restore rAF");
+    assert.equal(await reopenedHelp.evaluate((dialog) => dialog.contains(document.activeElement)), true, "stale close rAF must not move focus outside a reopened modal");
+    await page.keyboard.press("Escape");
+    await reopenedHelp.waitFor({ state: "hidden" });
+    await page.evaluate(() => {
+      window.requestAnimationFrame = window.__nativeRaf;
+      window.cancelAnimationFrame = window.__nativeCancelRaf;
+    });
 
     await page.evaluate(() => {
       window.__nativeFetch = window.fetch;
@@ -1021,6 +1116,44 @@ async function main() {
     assert.equal(await page.getByRole("heading", { name: "Fresh Race B" }).count(), 1, "late list response must not replace the newer selection");
     assert.equal(await page.getByRole("heading", { name: "Stale Race A" }).count(), 0, "stale selected metadata must be discarded");
     await page.evaluate(() => { window.fetch = window.__nativeFetch; });
+    await page.locator("#global-search").fill("");
+    await waitForCount(page, ".conversation-item", 20);
+
+    const partialDiagnosticsRoute = async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname !== "/api/conversations" || url.searchParams.get("q") !== "partial-dom") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [{
+            conversation_id: "dom-long",
+            title: "DOM Long Conversation",
+            create_time: 1,
+            update_time: 1,
+            current_node: "m379",
+            hit_count: 10001,
+            message_match: true,
+            enrichment_partial: true,
+          }],
+          total: 1,
+          limit: 60,
+          offset: 0,
+          has_more: false,
+          next_offset: null,
+          selected_in_results: true,
+          diagnostics: { partial: true, completion_state: "partial" },
+        }),
+      });
+    };
+    await page.route("**/api/conversations**", partialDiagnosticsRoute);
+    await page.locator("#global-search").fill("partial-dom");
+    await page.getByText("Search is incomplete", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.getByText("Hit details limited", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.unroute("**/api/conversations**", partialDiagnosticsRoute);
     await page.locator("#global-search").fill("");
     await waitForCount(page, ".conversation-item", 20);
 
@@ -1508,11 +1641,14 @@ async function main() {
     await page.waitForFunction(() => window.__copiedText?.includes("Synthetic message 120"), undefined, { timeout: 20_000 });
     assert.equal(await page.evaluate(() => window.__copiedText.includes("Synthetic system context for DOM test")), false, "copy visible should copy loaded reader-visible messages, not hidden internal messages");
     const copiedBeforeFailure = await page.evaluate(() => window.__copiedText || "");
+    await page.waitForTimeout(300);
     await page.evaluate(() => {
       Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
     });
     await page.getByRole("button", { name: "Copy visible" }).click();
     await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("Copy failed"), undefined, { timeout: 20_000 });
+    await page.waitForTimeout(1_200);
+    assert.ok((await page.locator(".hit-counter").textContent())?.includes("Copy failed"), "the first copy timeout must not clear the newer copy status");
     assert.equal(await page.evaluate(() => window.__copiedText || ""), copiedBeforeFailure, "missing Clipboard API must not be reported as a successful copy");
     await page.evaluate(() => {
       Object.defineProperty(navigator, "clipboard", {

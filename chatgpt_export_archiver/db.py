@@ -9,13 +9,23 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
-from .current_path import effective_current_metadata, ensure_effective_current_views
+from .current_path import (
+    EffectiveCurrentResourceLimitError,
+    effective_current_metadata,
+    ensure_effective_current_views,
+)
 
 from .parser import ParsedConversation, WarningRecord
 from .scanner import InputSource, SourceEntry
-from .schema_contract import DATABASE_SCHEMA_VERSION, parse_nonnegative_integer
+from .schema_contract import (
+    DATABASE_SCHEMA_VERSION,
+    DISPLAY_TEXT_RESOLVER_VERSION,
+    NORMALIZATION_INDEX_FORMAT_VERSION,
+    OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+    parse_nonnegative_integer,
+)
 from .sqlite_errors import (
     is_fts5_capability_unavailable,
     is_optional_search_capability_missing,
@@ -145,14 +155,83 @@ GENERATION_TRIGGER_DDL = {
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
         END""",
     "archive_message_generation_update": """CREATE TRIGGER IF NOT EXISTS archive_message_generation_update
-        AFTER UPDATE OF conversation_id, node_id, content_text, raw_message_json ON conversation_nodes BEGIN
+        AFTER UPDATE OF conversation_id, node_id, message_id, role, author_name, content_type, content_text, content_hash, raw_message_json ON conversation_nodes BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
         END""",
     "archive_message_generation_delete": """CREATE TRIGGER IF NOT EXISTS archive_message_generation_delete
         AFTER DELETE ON conversation_nodes BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
         END""",
+    "archive_address_generation_conversation_insert": """CREATE TRIGGER IF NOT EXISTS archive_address_generation_conversation_insert
+        AFTER INSERT ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    "archive_address_generation_conversation_update": """CREATE TRIGGER IF NOT EXISTS archive_address_generation_conversation_update
+        AFTER UPDATE OF conversation_id, exported_id, current_node ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    "archive_address_generation_conversation_delete": """CREATE TRIGGER IF NOT EXISTS archive_address_generation_conversation_delete
+        AFTER DELETE ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    "archive_address_generation_node_insert": """CREATE TRIGGER IF NOT EXISTS archive_address_generation_node_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    "archive_address_generation_node_update": """CREATE TRIGGER IF NOT EXISTS archive_address_generation_node_update
+        AFTER UPDATE OF conversation_id, node_id, parent_node_id, children_json, message_id ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    "archive_address_generation_node_delete": """CREATE TRIGGER IF NOT EXISTS archive_address_generation_node_delete
+        AFTER DELETE ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    "archive_graph_generation_conversation_insert": """CREATE TRIGGER IF NOT EXISTS archive_graph_generation_conversation_insert
+        AFTER INSERT ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'graph';
+        END""",
+    "archive_graph_generation_conversation_update": """CREATE TRIGGER IF NOT EXISTS archive_graph_generation_conversation_update
+        AFTER UPDATE OF conversation_id, current_node ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'graph';
+        END""",
+    "archive_graph_generation_conversation_delete": """CREATE TRIGGER IF NOT EXISTS archive_graph_generation_conversation_delete
+        AFTER DELETE ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'graph';
+        END""",
+    "archive_graph_generation_node_insert": """CREATE TRIGGER IF NOT EXISTS archive_graph_generation_node_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'graph';
+        END""",
+    "archive_graph_generation_node_update": """CREATE TRIGGER IF NOT EXISTS archive_graph_generation_node_update
+        AFTER UPDATE OF conversation_id, node_id, parent_node_id, children_json, is_on_current_path ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'graph';
+        END""",
+    "archive_graph_generation_node_delete": """CREATE TRIGGER IF NOT EXISTS archive_graph_generation_node_delete
+        AFTER DELETE ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'graph';
+        END""",
 }
+
+# Row-specific display revisions let long-body cursors ignore unrelated writes
+# without relying on a bounded content sample.  Keep these triggers active
+# during bulk generation aggregation: unlike the four global domains, a row
+# revision must advance for every affected canonical row.
+DISPLAY_REVISION_TRIGGER_DDL = {
+    "archive_display_revision_node_insert": """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            INSERT INTO archive_generations(name, generation)
+            VALUES ('display:' || NEW.rowid, 1)
+            ON CONFLICT(name) DO UPDATE SET generation = generation + 1;
+        END""",
+    "archive_display_revision_node_update": """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_update
+        AFTER UPDATE OF content_type, content_text, content_hash, raw_message_json ON conversation_nodes BEGIN
+            INSERT INTO archive_generations(name, generation)
+            VALUES ('display:' || NEW.rowid, 1)
+            ON CONFLICT(name) DO UPDATE SET generation = generation + 1;
+        END""",
+}
+
+CANONICAL_TRIGGER_DDL = {**GENERATION_TRIGGER_DDL, **DISPLAY_REVISION_TRIGGER_DDL}
 
 REQUIRED_INDEX_DDL = {
     "idx_nodes_conversation_path": """CREATE INDEX IF NOT EXISTS idx_nodes_conversation_path
@@ -283,16 +362,89 @@ GENERATION_TRIGGER_CONTRACT = {
         "conversation_nodes",
         "AFTER",
         "UPDATE",
-        ("conversation_id", "node_id", "content_text", "raw_message_json"),
+        ("conversation_id", "node_id", "message_id", "role", "author_name", "content_type", "content_text", "content_hash", "raw_message_json"),
         None,
         "message",
     ),
     "archive_message_generation_delete": (
         "conversation_nodes", "AFTER", "DELETE", (), None, "message"
     ),
+    "archive_address_generation_conversation_insert": ("conversations", "AFTER", "INSERT", (), None, "address"),
+    "archive_address_generation_conversation_update": ("conversations", "AFTER", "UPDATE", ("conversation_id", "exported_id", "current_node"), None, "address"),
+    "archive_address_generation_conversation_delete": ("conversations", "AFTER", "DELETE", (), None, "address"),
+    "archive_address_generation_node_insert": ("conversation_nodes", "AFTER", "INSERT", (), None, "address"),
+    "archive_address_generation_node_update": ("conversation_nodes", "AFTER", "UPDATE", ("conversation_id", "node_id", "parent_node_id", "children_json", "message_id"), None, "address"),
+    "archive_address_generation_node_delete": ("conversation_nodes", "AFTER", "DELETE", (), None, "address"),
+    "archive_graph_generation_conversation_insert": ("conversations", "AFTER", "INSERT", (), None, "graph"),
+    "archive_graph_generation_conversation_update": ("conversations", "AFTER", "UPDATE", ("conversation_id", "current_node"), None, "graph"),
+    "archive_graph_generation_conversation_delete": ("conversations", "AFTER", "DELETE", (), None, "graph"),
+    "archive_graph_generation_node_insert": ("conversation_nodes", "AFTER", "INSERT", (), None, "graph"),
+    "archive_graph_generation_node_update": ("conversation_nodes", "AFTER", "UPDATE", ("conversation_id", "node_id", "parent_node_id", "children_json", "is_on_current_path"), None, "graph"),
+    "archive_graph_generation_node_delete": ("conversation_nodes", "AFTER", "DELETE", (), None, "graph"),
+    "archive_display_revision_node_insert": (
+        "conversation_nodes", "AFTER", "INSERT", (), None, "display"
+    ),
+    "archive_display_revision_node_update": (
+        "conversation_nodes",
+        "AFTER",
+        "UPDATE",
+        ("content_type", "content_text", "content_hash", "raw_message_json"),
+        None,
+        "display",
+    ),
 }
 
-REQUIRED_GENERATION_ROWS = ("title", "message")
+REQUIRED_GENERATION_ROWS = ("title", "message", "address", "graph")
+
+
+def begin_bulk_generation_aggregation(conn: sqlite3.Connection) -> None:
+    """Suspend row triggers inside the caller's authoritative write transaction.
+
+    SQLite rolls transactional DDL back together with canonical writes.  The
+    caller must hold the write transaction until
+    :func:`finish_bulk_generation_aggregation` recreates the exact managed
+    triggers and advances each dirty domain once.  There is deliberately no
+    durable or connection-global suppression switch that an external writer
+    could inherit or leave enabled after a crash.
+    """
+
+    if not conn.in_transaction:
+        raise DatabaseMigrationError("bulk_generation_transaction_required")
+    if not generation_schema_contract_is_current(conn):
+        raise DatabaseMigrationError("bulk_generation_schema_incompatible")
+    for name in GENERATION_TRIGGER_DDL:
+        conn.execute(f'DROP TRIGGER "{name}"')
+
+
+def finish_bulk_generation_aggregation(
+    conn: sqlite3.Connection,
+    dirty_domains: Iterable[str],
+) -> None:
+    """Publish aggregated generations and restore triggers before commit."""
+
+    if not conn.in_transaction:
+        raise DatabaseMigrationError("bulk_generation_transaction_required")
+    domains = sorted(set(str(value) for value in dirty_domains))
+    if any(value not in REQUIRED_GENERATION_ROWS for value in domains):
+        raise DatabaseMigrationError("bulk_generation_domain_invalid")
+    existing = conn.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name IN ({})".format(
+            ",".join("?" for _ in GENERATION_TRIGGER_DDL)
+        ),
+        tuple(GENERATION_TRIGGER_DDL),
+    ).fetchall()
+    if existing:
+        raise DatabaseMigrationError("bulk_generation_trigger_collision")
+    if domains:
+        conn.execute(
+            "UPDATE archive_generations SET generation = generation + 1 "
+            "WHERE name IN ({})".format(",".join("?" for _ in domains)),
+            domains,
+        )
+    for statement in GENERATION_TRIGGER_DDL.values():
+        conn.execute(statement)
+    if not generation_schema_contract_is_current(conn):
+        raise DatabaseMigrationError("bulk_generation_restore_failed")
 
 
 class DatabaseMigrationError(ValueError):
@@ -312,15 +464,14 @@ class ReadRequestCapabilities:
     database_identity: tuple[str, int, int] | tuple[str]
     user_version: int
     schema_version: int
-    data_version: int
-    generation_snapshot: tuple[int, int]
+    generation_snapshot: tuple[int, int, int, int]
     schema_status: dict[str, Any]
     fts5_available: bool
     trigram_available: bool
 
 
 _READ_CAPABILITY_CACHE: dict[
-    tuple[tuple[str, int, int] | tuple[str], int, int, int, tuple[int, int]],
+    tuple[tuple[str, int, int] | tuple[str], int, int, tuple[int, int, int, int]],
     tuple[dict[str, Any], bool, bool],
 ] = {}
 _READ_CAPABILITY_CACHE_LOCK = threading.Lock()
@@ -345,35 +496,58 @@ def read_request_capabilities(conn: sqlite3.Connection) -> ReadRequestCapabiliti
     user_version = _database_user_version(conn)
     row = conn.execute("PRAGMA schema_version").fetchone()
     schema_version = int(row[0] if row is not None else -1)
-    row = conn.execute("PRAGMA data_version").fetchone()
-    data_version = int(row[0] if row is not None else -1)
     try:
         generations = {
             str(row[0]): int(row[1])
             for row in conn.execute(
                 "SELECT name, generation FROM archive_generations "
-                "WHERE name IN ('message', 'title')"
+                "WHERE name IN ('message', 'title', 'address', 'graph')"
             )
         }
     except sqlite3.Error:
         generations = {}
-    generation_snapshot = (generations.get("message", -1), generations.get("title", -1))
-    key = (identity, user_version, schema_version, data_version, generation_snapshot)
+    generation_snapshot = (
+        generations.get("message", -1),
+        generations.get("title", -1),
+        generations.get("address", -1),
+        generations.get("graph", -1),
+    )
+    # data_version is connection-relative and cannot identify commits across
+    # fresh request connections. Durable generation rows and schema_version do.
+    key = (identity, user_version, schema_version, generation_snapshot)
     with _READ_CAPABILITY_CACHE_LOCK:
         cached = _READ_CAPABILITY_CACHE.get(key)
     if cached is None:
         schema_status = database_schema_status(conn)
         if schema_status.get("schema_compatible"):
             legacy_limit = 16 * 1024
+            conn.create_function(
+                "archive_legacy_id_safe",
+                1,
+                lambda value: 1 if _legacy_graph_id_is_safe(value, legacy_limit) else 0,
+                deterministic=True,
+            )
             incompatible = conn.execute(
                 """SELECT 1 FROM conversations
-                   WHERE length(conversation_id) > ? OR length(COALESCE(current_node, '')) > ?
+                   WHERE archive_legacy_id_safe(conversation_id) = 0
+                      OR archive_legacy_id_safe(exported_id) = 0
+                      OR archive_legacy_id_safe(current_node) = 0
                    UNION ALL
                    SELECT 1 FROM conversation_nodes
-                   WHERE length(conversation_id) > ? OR length(node_id) > ?
-                      OR length(COALESCE(parent_node_id, '')) > ?
+                   WHERE archive_legacy_id_safe(conversation_id) = 0
+                      OR archive_legacy_id_safe(node_id) = 0
+                      OR archive_legacy_id_safe(parent_node_id) = 0
+                      OR archive_legacy_id_safe(message_id) = 0
+                      OR (children_json IS NOT NULL AND json_valid(children_json) = 0)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM json_each(
+                              CASE WHEN json_valid(children_json) THEN children_json ELSE '[]' END
+                          ) child
+                          WHERE child.type != 'text'
+                             OR archive_legacy_id_safe(child.value) = 0
+                      )
                    LIMIT 1""",
-                (legacy_limit, legacy_limit, legacy_limit, legacy_limit, legacy_limit),
             ).fetchone() is not None
             if incompatible:
                 schema_status = {
@@ -397,7 +571,6 @@ def read_request_capabilities(conn: sqlite3.Connection) -> ReadRequestCapabiliti
         database_identity=identity,
         user_version=user_version,
         schema_version=schema_version,
-        data_version=data_version,
         generation_snapshot=generation_snapshot,
         schema_status=dict(schema_status),
         fts5_available=fts5_available,
@@ -479,6 +652,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
+    register_archive_sql_functions(conn)
     return conn
 
 
@@ -492,6 +666,7 @@ def connect_existing_readonly(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
+    register_archive_sql_functions(conn)
     return conn
 
 
@@ -505,7 +680,45 @@ def connect_existing(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
+    register_archive_sql_functions(conn)
     return conn
+
+
+def register_archive_sql_functions(conn: sqlite3.Connection) -> None:
+    """Install the SQL functions used by every archive search/read entry point.
+
+    Keeping this registration beside the canonical connection helpers avoids
+    making optional-index SQL work only through the Web-specific connectors.
+    Imports are local to avoid coupling module initialization to the larger
+    search implementation.
+    """
+
+    from .parser import recover_message_display_text
+    from .search import normalize_search_text, search_fragment_match
+
+    conn.create_function("web_norm", 1, normalize_search_text, deterministic=True)
+    conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
+    conn.create_function("web_display_text", 2, recover_message_display_text)
+
+
+def _legacy_graph_id_is_safe(value: Any, limit: int = 16 * 1024) -> bool:
+    """Return whether a legacy identifier is JSON/URL/SQLite round-trip safe."""
+
+    if value is None:
+        return True
+    if not isinstance(value, str) or len(value) > limit:
+        return False
+    for character in value:
+        codepoint = ord(character)
+        if (
+            codepoint <= 0x1F
+            or codepoint == 0x7F
+            or 0xD800 <= codepoint <= 0xDFFF
+            or 0xFDD0 <= codepoint <= 0xFDEF
+            or codepoint & 0xFFFF in (0xFFFE, 0xFFFF)
+        ):
+            return False
+    return True
 
 
 @contextmanager
@@ -608,11 +821,30 @@ MIGRATIONS = {
     0: "rebuild_nullable_identity_v3",
     1: "rebuild_nullable_identity_v3",
     2: "rebuild_nullable_identity_v3",
+    3: "add_durable_revision_domains_v4",
 }
 _SUPPORTED_SCHEMA_PREDECESSORS = frozenset(MIGRATIONS)
 
 _MIGRATION_REBUILT_TABLES = frozenset({"conversations", "archive_generations"})
 _SAFE_SCHEMA_OBJECT_NAME_CHARS = 160
+_KNOWN_MANAGED_TRIGGER_PREDECESSORS = {
+    "archive_message_generation_update": (
+        """CREATE TRIGGER IF NOT EXISTS archive_message_generation_update
+        AFTER UPDATE OF conversation_id, node_id, content_text, raw_message_json ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
+        END""",
+    ),
+    "archive_address_generation_conversation_update": (
+        """CREATE TRIGGER IF NOT EXISTS archive_address_generation_conversation_update
+        AFTER UPDATE OF conversation_id, current_node ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    ),
+}
+_MANAGED_SCHEMA_NAMES = {
+    name.casefold(): name
+    for name in (*REQUIRED_INDEX_DDL, *CANONICAL_TRIGGER_DDL)
+}
 
 
 def _bounded_schema_object_name(value: object) -> str:
@@ -676,12 +908,12 @@ def _migration_custom_object_conflicts(
         name = str(row[1])
         table = str(row[2])
         raw_sql = row[3]
-        if object_type == "table":
-            continue
+        managed_canonical_name = _MANAGED_SCHEMA_NAMES.get(name.casefold())
         if name.startswith("sqlite_autoindex_") and raw_sql is None:
             continue
         if (
             object_type == "index"
+            and managed_canonical_name == name
             and name in REQUIRED_INDEX_DDL
             and name not in invalid_indexes
             and name not in missing_indexes
@@ -689,13 +921,42 @@ def _migration_custom_object_conflicts(
             continue
         if (
             object_type == "trigger"
-            and name in GENERATION_TRIGGER_DDL
+            and managed_canonical_name == name
+            and name in CANONICAL_TRIGGER_DDL
             and name not in invalid_triggers
             and name not in missing_triggers
         ):
             continue
 
         sql = raw_sql if isinstance(raw_sql, str) else ""
+        if (
+            object_type == "trigger"
+            and managed_canonical_name == name
+            and name in _KNOWN_MANAGED_TRIGGER_PREDECESSORS
+        ):
+            actual_definition = _trigger_definition(sql)
+            if any(
+                actual_definition == _trigger_definition(predecessor)
+                for predecessor in _KNOWN_MANAGED_TRIGGER_PREDECESSORS[name]
+            ):
+                continue
+
+        # SQLite object names are ASCII case-insensitive across types.  A
+        # differently-cased table/view/index/trigger can therefore block or be
+        # mistaken for a managed object and must be rejected explicitly.
+        if managed_canonical_name is not None:
+            conflicts.append(
+                {
+                    "type": object_type[:32],
+                    "name": _bounded_schema_object_name(name),
+                    "reason": "managed_name_collision",
+                    "target_table": _bounded_schema_object_name(table),
+                }
+            )
+            continue
+        if object_type == "table":
+            continue
+
         depends_on_rebuild = bool(
             table in rebuilt_tables
             or name in dependent_names
@@ -703,14 +964,13 @@ def _migration_custom_object_conflicts(
         )
         # A project-owned name with a non-authoritative fingerprint is a name
         # collision, not permission to delete a user object.
-        managed_name_collision = bool(rebuilt_tables) and (
-            name in REQUIRED_INDEX_DDL or name in GENERATION_TRIGGER_DDL
-        )
-        if depends_on_rebuild or managed_name_collision:
+        if depends_on_rebuild:
             conflicts.append(
                 {
                     "type": object_type[:32],
                     "name": _bounded_schema_object_name(name),
+                    "reason": "rebuild_dependency",
+                    "target_table": _bounded_schema_object_name(table),
                 }
             )
     return conflicts
@@ -728,6 +988,18 @@ def _raise_for_migration_custom_objects(
         rebuilt_tables=rebuilt_tables,
     )
     if conflicts:
+        managed_collisions = [
+            item for item in conflicts if item.get("reason") == "managed_name_collision"
+        ]
+        if managed_collisions:
+            raise DatabaseMigrationError(
+                "database_managed_object_name_collision",
+                detail={
+                    "collision_count": len(managed_collisions),
+                    "objects": managed_collisions[:32],
+                    "manual_repair_required": True,
+                },
+            )
         raise DatabaseMigrationError(
             "database_custom_objects_require_manual_migration",
             detail={
@@ -802,7 +1074,7 @@ def _rebuild_nullable_identity_tables(conn: sqlite3.Connection, *, has_generatio
             detail={"manual_repair_required": True, "null_identity": "archive_generations.name"},
         )
 
-    for name in GENERATION_TRIGGER_DDL:
+    for name in CANONICAL_TRIGGER_DDL:
         conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
     conn.execute(
         """CREATE TABLE conversations_v3 (
@@ -873,6 +1145,7 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("BEGIN IMMEDIATE")
         has_objects = _database_has_user_objects(conn)
+        validate_core_fts_ownership(conn)
         current_version = _database_user_version(conn)
         if current_version > DATABASE_SCHEMA_VERSION:
             raise DatabaseMigrationError(
@@ -885,6 +1158,17 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
         if not has_objects and not allow_initialize:
             raise DatabaseMigrationError("database_not_ready")
         locked_status = database_schema_status(conn) if has_objects else None
+        upgrading_identity_contract = bool(has_objects and current_version < 3)
+        if locked_status is not None:
+            _raise_for_migration_custom_objects(
+                conn,
+                status=locked_status,
+                rebuilt_tables=(
+                    _MIGRATION_REBUILT_TABLES
+                    if upgrading_identity_contract
+                    else frozenset()
+                ),
+            )
         if locked_status is not None and current_version < DATABASE_SCHEMA_VERSION:
             if current_version not in MIGRATIONS:
                 raise DatabaseMigrationError(
@@ -911,18 +1195,6 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             return {"changed": False, "initialized": False, **locked_status}
 
         initialized = not has_objects
-        upgrading_identity_contract = bool(has_objects and current_version < DATABASE_SCHEMA_VERSION)
-        if locked_status is not None:
-            rebuilt_tables = (
-                _MIGRATION_REBUILT_TABLES
-                if upgrading_identity_contract
-                else frozenset()
-            )
-            _raise_for_migration_custom_objects(
-                conn,
-                status=locked_status,
-                rebuilt_tables=rebuilt_tables,
-            )
         if upgrading_identity_contract:
             _rebuild_nullable_identity_tables(
                 conn,
@@ -931,17 +1203,29 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
         if not has_objects:
             for statement in CANONICAL_TABLE_DDL:
                 conn.execute(statement)
-        generation_infrastructure_changed = bool(
+        web_index_source_triggers = {
+            name for name, contract in GENERATION_TRIGGER_CONTRACT.items()
+            if contract[-1] in {"message", "title"}
+        }
+        missing_generation_rows = set(
+            (locked_status or {}).get("missing_generation_rows") or ()
+        )
+        invalid_generation_rows = set(
+            ((locked_status or {}).get("invalid_generation_rows") or {}).keys()
+        )
+        missing_triggers = set((locked_status or {}).get("missing_triggers") or ())
+        invalid_triggers = set(
+            ((locked_status or {}).get("invalid_triggers") or {}).keys()
+        )
+        web_index_source_infrastructure_changed = bool(
             upgrading_identity_contract
             or (locked_status and locked_status.get("missing_generation_table"))
-            or (locked_status and locked_status.get("missing_generation_rows"))
-            or (locked_status and locked_status.get("invalid_generation_rows"))
-            or (locked_status and locked_status.get("missing_triggers"))
-            or (locked_status and locked_status.get("invalid_triggers"))
-            or (locked_status and locked_status.get("missing_indexes"))
-            or (locked_status and locked_status.get("invalid_indexes"))
+            or missing_generation_rows.intersection({"message", "title"})
+            or invalid_generation_rows.intersection({"message", "title"})
+            or missing_triggers.intersection(web_index_source_triggers)
+            or invalid_triggers.intersection(web_index_source_triggers)
         )
-        if generation_infrastructure_changed and has_objects:
+        if web_index_source_infrastructure_changed and has_objects:
             failures = drop_optional_web_indexes(conn)
             if failures:
                 raise DatabaseMigrationError(
@@ -955,8 +1239,15 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
         )
         for name in (locked_status or {}).get("invalid_triggers", {}):
             conn.execute(f'DROP TRIGGER "{name}"')
-        for statement in GENERATION_TRIGGER_DDL.values():
+        for statement in CANONICAL_TRIGGER_DDL.values():
             conn.execute(statement)
+        # Existing v4 rows predate row-specific display revisions.  Tombstones
+        # are intentionally retained so a deleted/reinserted rowid cannot
+        # recycle an earlier cursor revision.
+        conn.execute(
+            "INSERT OR IGNORE INTO archive_generations(name, generation) "
+            "SELECT printf('display:%lld', rowid), 1 FROM conversation_nodes"
+        )
         for name in (locked_status or {}).get("invalid_indexes", {}):
             conn.execute(f'DROP INDEX "{name}"')
         for statement in REQUIRED_INDEX_DDL.values():
@@ -997,6 +1288,7 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
 
 
 def init_db(conn: sqlite3.Connection) -> bool:
+    validate_core_fts_ownership(conn)
     migrate_database(conn, allow_initialize=True)
     fts_enabled = ensure_fts(conn)
     conn.commit()
@@ -1008,6 +1300,286 @@ OPTIONAL_WEB_TRIGRAM_TABLES = ("web_message_trigram", "web_title_trigram")
 OPTIONAL_WEB_NORM_TABLES = ("web_message_norm", "web_title_norm")
 OPTIONAL_WEB_METADATA_TABLES = ("web_index_metadata", "web_index_oversized")
 OPTIONAL_WEB_INDEX_TABLES = OPTIONAL_WEB_TRIGRAM_TABLES + OPTIONAL_WEB_NORM_TABLES + OPTIONAL_WEB_METADATA_TABLES
+OPTIONAL_WEB_INDEX_OWNER = "chatgpt-sqlite-webui"
+OPTIONAL_WEB_INDEX_OWNER_KEY = "project_object_owner"
+
+
+def _schema_rows_for_names(
+    conn: sqlite3.Connection,
+    names: tuple[str, ...],
+) -> dict[str, list[sqlite3.Row | tuple[Any, ...]]]:
+    """Read all ASCII-case-insensitive collisions for authoritative names."""
+
+    if not names:
+        return {}
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE lower(name) IN ({})".format(
+            ",".join("lower(?)" for _ in names)
+        ),
+        names,
+    ).fetchall()
+    result: dict[str, list[sqlite3.Row | tuple[Any, ...]]] = {
+        name: [] for name in names
+    }
+    by_fold = {name.casefold(): name for name in names}
+    for row in rows:
+        name = str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+        canonical = by_fold.get(name.casefold())
+        if canonical is not None:
+            result[canonical].append(row)
+    return result
+
+
+def _row_value(row: sqlite3.Row | tuple[Any, ...], key: str, index: int) -> Any:
+    return row[key] if isinstance(row, sqlite3.Row) else row[index]
+
+
+def _raise_object_collision(
+    code: str,
+    rows: list[sqlite3.Row | tuple[Any, ...]],
+    *,
+    expected_type: str = "table",
+) -> None:
+    objects = [
+        {
+            "name": _bounded_schema_object_name(_row_value(row, "name", 1)),
+            "object_type": str(_row_value(row, "type", 0))[:32],
+            "expected_type": expected_type,
+        }
+        for row in rows[:32]
+    ]
+    raise DatabaseMigrationError(
+        code,
+        detail={"collision_count": max(1, len(rows)), "objects": objects},
+    )
+
+
+def _table_xinfo_contract(
+    conn: sqlite3.Connection,
+    name: str,
+) -> tuple[tuple[str, str, bool, str | None, int, bool], ...]:
+    return tuple(
+        (
+            str(row[1]),
+            str(row[2] or "").strip().upper(),
+            bool(row[3]),
+            _normalize_default(row[4]),
+            int(row[5]),
+            bool(row[6]),
+        )
+        for row in conn.execute(f'PRAGMA table_xinfo("{name}")')
+    )
+
+
+_OPTIONAL_TABLE_XINFO = {
+    "web_message_norm": (
+        ("conversation_id", "TEXT", True, None, 1, False),
+        ("node_id", "TEXT", True, None, 2, False),
+        ("content_norm", "TEXT", True, None, 0, False),
+    ),
+    "web_title_norm": (
+        ("conversation_id", "TEXT", True, None, 1, False),
+        ("title_norm", "TEXT", True, None, 0, False),
+    ),
+    "web_index_metadata": (
+        ("key", "TEXT", True, None, 1, False),
+        ("value", "TEXT", True, None, 0, False),
+    ),
+    "web_index_oversized": (
+        ("kind", "TEXT", True, None, 1, False),
+        ("source_rowid", "INTEGER", True, None, 2, False),
+        ("conversation_id", "TEXT", True, None, 0, False),
+        ("node_id", "TEXT", False, None, 0, False),
+        ("input_bytes", "INTEGER", True, None, 0, False),
+        ("reason", "TEXT", True, None, 0, False),
+    ),
+}
+
+
+def _normalized_fts5_arguments(sql: Any) -> str | None:
+    if not isinstance(sql, str):
+        return None
+    match = re.search(r"\bUSING\s+fts5\s*\((.*)\)\s*$", sql, re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    value = re.sub(r"\s+", " ", match.group(1).strip()).casefold()
+    value = re.sub(r"\s*,\s*", ",", value)
+    value = re.sub(r"\s*=\s*", "=", value)
+    value = value.replace('"', "'")
+    return value
+
+
+def _validate_fts5_family(
+    conn: sqlite3.Connection,
+    parent: str,
+    *,
+    visible_columns: tuple[str, ...],
+    arguments: str,
+    collision_code: str,
+    allow_absent: bool = True,
+    allow_missing_shadows: bool = False,
+) -> bool:
+    """Validate an exact project-created FTS5 parent and all known shadows."""
+
+    shadow_suffixes = ("_data", "_idx", "_config", "_docsize")
+    if "content=''" not in arguments:
+        shadow_suffixes = ("_content",) + shadow_suffixes
+    names = (parent,) + tuple(f"{parent}{suffix}" for suffix in shadow_suffixes)
+    rows_by_name = _schema_rows_for_names(conn, names)
+    present_rows = [row for rows in rows_by_name.values() for row in rows]
+    if not present_rows:
+        if allow_absent:
+            return False
+        _raise_object_collision(collision_code, [], expected_type="fts5")
+    for name in names:
+        rows = rows_by_name[name]
+        if name != parent and not rows and allow_missing_shadows:
+            continue
+        if len(rows) != 1:
+            _raise_object_collision(collision_code, present_rows, expected_type="fts5")
+        if name != parent:
+            suffix = name[len(parent):]
+            expected_shadow = {
+                "_data": (
+                    ("id", "INTEGER", False, None, 1, False),
+                    ("block", "BLOB", False, None, 0, False),
+                ),
+                "_idx": (
+                    ("segid", "", True, None, 1, False),
+                    ("term", "", True, None, 2, False),
+                    ("pgno", "", False, None, 0, False),
+                ),
+                "_config": (
+                    ("k", "", True, None, 1, False),
+                    ("v", "", False, None, 0, False),
+                ),
+                "_docsize": (
+                    ("id", "INTEGER", False, None, 1, False),
+                    ("sz", "BLOB", False, None, 0, False),
+                ),
+                "_content": tuple(
+                    [("id", "INTEGER", False, None, 1, False)]
+                    + [
+                        (f"c{index}", "", False, None, 0, False)
+                        for index in range(len(visible_columns))
+                    ]
+                ),
+            }[suffix]
+            if _table_xinfo_contract(conn, name) != expected_shadow:
+                _raise_object_collision(collision_code, present_rows, expected_type="fts5")
+        row = rows[0]
+        if (
+            str(_row_value(row, "name", 1)) != name
+            or str(_row_value(row, "type", 0)) != "table"
+            or str(_row_value(row, "tbl_name", 2)) != name
+        ):
+            _raise_object_collision(collision_code, present_rows, expected_type="fts5")
+    parent_row = rows_by_name[parent][0]
+    if _normalized_fts5_arguments(_row_value(parent_row, "sql", 3)) != arguments:
+        _raise_object_collision(collision_code, present_rows, expected_type="fts5")
+    xinfo = _table_xinfo_contract(conn, parent)
+    expected_names = visible_columns + (parent, "rank")
+    if tuple(item[0] for item in xinfo) != expected_names or any(
+        item[5] != (index >= len(visible_columns)) for index, item in enumerate(xinfo)
+    ):
+        _raise_object_collision(collision_code, present_rows, expected_type="fts5")
+    return True
+
+
+def validate_core_fts_ownership(conn: sqlite3.Connection, *, allow_absent: bool = True) -> bool:
+    return _validate_fts5_family(
+        conn,
+        "message_fts",
+        visible_columns=("conversation_id", "node_id", "role", "content_text"),
+        arguments="conversation_id unindexed,node_id unindexed,role unindexed,content_text",
+        collision_code="core_fts_name_collision",
+        allow_absent=allow_absent,
+    )
+
+
+def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
+    """Validate the complete live optional-index family before destructive DDL.
+
+    Current and exact predecessor objects are accepted.  A partial family or
+    any name/type/shape/shadow collision is refused as an unknown user object.
+    """
+
+    base_names = tuple(_OPTIONAL_TABLE_XINFO)
+    trigram_names = OPTIONAL_WEB_TRIGRAM_TABLES
+    all_names = base_names + trigram_names + tuple(
+        f"{name}{suffix}"
+        for name in trigram_names
+        for suffix in ("_data", "_idx", "_config", "_docsize")
+    )
+    rows_by_name = _schema_rows_for_names(conn, all_names)
+    present_rows = [row for rows in rows_by_name.values() for row in rows]
+    if not present_rows:
+        return False
+    base_present = [bool(rows_by_name[name]) for name in base_names]
+    if not all(base_present):
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    for name, expected in _OPTIONAL_TABLE_XINFO.items():
+        rows = rows_by_name[name]
+        if len(rows) != 1:
+            _raise_object_collision("optional_index_name_collision", present_rows)
+        row = rows[0]
+        if (
+            str(_row_value(row, "name", 1)) != name
+            or str(_row_value(row, "type", 0)) != "table"
+            or str(_row_value(row, "tbl_name", 2)) != name
+            or _table_xinfo_contract(conn, name) != expected
+        ):
+            _raise_object_collision("optional_index_name_collision", present_rows)
+    try:
+        metadata = {
+            str(row[0]): str(row[1])
+            for row in conn.execute("SELECT key, value FROM web_index_metadata")
+        }
+    except sqlite3.Error:
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    required_metadata = {
+        "web_index_format_version",
+        "display_text_resolver_version",
+        "normalization_index_format_version",
+        "message_generation",
+        "title_generation",
+    }
+    if not required_metadata.issubset(metadata) or any(
+        parse_nonnegative_integer(metadata.get(key)) is None
+        for key in ("message_generation", "title_generation")
+    ):
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    if (
+        metadata.get("web_index_format_version") != OPTIONAL_WEB_INDEX_FORMAT_VERSION
+        or metadata.get("display_text_resolver_version") != DISPLAY_TEXT_RESOLVER_VERSION
+        or metadata.get("normalization_index_format_version")
+        != NORMALIZATION_INDEX_FORMAT_VERSION
+    ):
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    owner = metadata.get(OPTIONAL_WEB_INDEX_OWNER_KEY)
+    if owner not in (None, OPTIONAL_WEB_INDEX_OWNER):
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    trigram_any = any(bool(rows_by_name[name]) for name in all_names if name not in base_names)
+    if trigram_any:
+        _validate_fts5_family(
+            conn,
+            "web_message_trigram",
+            visible_columns=("content_text",),
+            arguments="content_text,content='',tokenize='trigram'",
+            collision_code="optional_index_name_collision",
+            allow_absent=False,
+            allow_missing_shadows=owner == OPTIONAL_WEB_INDEX_OWNER,
+        )
+        _validate_fts5_family(
+            conn,
+            "web_title_trigram",
+            visible_columns=("title",),
+            arguments="title,content='',tokenize='trigram'",
+            collision_code="optional_index_name_collision",
+            allow_absent=False,
+            allow_missing_shadows=owner == OPTIONAL_WEB_INDEX_OWNER,
+        )
+    return True
 
 
 def _fts5_shadow_suffixes() -> list[str]:
@@ -1043,6 +1615,7 @@ def drop_optional_web_indexes(conn: sqlite3.Connection) -> list[dict[str, str]]:
     stale trigram candidates could create false-positive or false-negative
     search results after an incremental import.
     """
+    validate_optional_web_index_ownership(conn)
     failures: list[dict[str, str]] = []
     for table in OPTIONAL_WEB_TRIGRAM_TABLES:
         failures.extend(_drop_table_with_shadows(conn, table))
@@ -1061,13 +1634,20 @@ def drop_optional_web_indexes(conn: sqlite3.Connection) -> list[dict[str, str]]:
 
 def ensure_fts(conn: sqlite3.Connection) -> bool:
     try:
+        if validate_core_fts_ownership(conn):
+            return True
+    except sqlite3.OperationalError as exc:
+        if is_fts5_capability_unavailable(exc):
+            return False
+        raise
+    try:
         conn.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS message_fts
             USING fts5(conversation_id UNINDEXED, node_id UNINDEXED, role UNINDEXED, content_text)
             """
         )
-        return True
+        return validate_core_fts_ownership(conn, allow_absent=False)
     except sqlite3.OperationalError as exc:
         if is_fts5_capability_unavailable(exc):
             return False
@@ -1739,14 +2319,26 @@ def _trigger_definition(sql: str | None) -> dict[str, Any] | None:
         body_compact,
         re.IGNORECASE,
     )
+    display_match = re.fullmatch(
+        r"INSERT\s+INTO\s+archive_generations\s*\(\s*name\s*,\s*generation\s*\)\s*"
+        r"VALUES\s*\(\s*'display:'\s*\|\|\s*NEW\.rowid\s*,\s*1\s*\)\s*"
+        r"ON\s+CONFLICT\s*\(\s*name\s*\)\s+DO\s+UPDATE\s+SET\s+"
+        r"generation\s*=\s*generation\s*\+\s*1",
+        body_compact,
+        re.IGNORECASE,
+    )
     return {
         "table": _unquote_identifier(table),
         "timing": re.sub(r"\s+", " ", timing.upper()),
         "event": event.upper(),
         "update_of": columns,
         "when": None if when_token is None else "present",
-        "generation_name": body_match.group(1) if body_match else None,
-        "body_semantics": "increment_by_one" if body_match else "invalid",
+        "generation_name": body_match.group(1) if body_match else ("display" if display_match else None),
+        "body_semantics": (
+            "increment_by_one" if body_match else
+            "row_revision_upsert" if display_match else
+            "invalid"
+        ),
     }
 
 
@@ -1795,6 +2387,7 @@ def generation_schema_contract_is_current(conn: sqlite3.Connection) -> bool:
         item = found.get(name)
         if item is None or item[0] != "trigger":
             return False
+        is_display = expected_tuple[5] == "display"
         expected = {
             "table": expected_tuple[0],
             "timing": expected_tuple[1],
@@ -1802,7 +2395,7 @@ def generation_schema_contract_is_current(conn: sqlite3.Connection) -> bool:
             "update_of": expected_tuple[3],
             "when": expected_tuple[4],
             "generation_name": expected_tuple[5],
-            "body_semantics": "increment_by_one",
+            "body_semantics": "row_revision_upsert" if is_display else "increment_by_one",
         }
         if _trigger_definition(item[1]) != expected:
             return False
@@ -1928,6 +2521,7 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
             continue
         if item["type"] != "trigger":
             continue
+        is_display = expected_tuple[5] == "display"
         expected = {
             "table": expected_tuple[0],
             "timing": expected_tuple[1],
@@ -1935,7 +2529,7 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
             "update_of": expected_tuple[3],
             "when": expected_tuple[4],
             "generation_name": expected_tuple[5],
-            "body_semantics": "increment_by_one",
+            "body_semantics": "row_revision_upsert" if is_display else "increment_by_one",
         }
         actual = _trigger_definition(item["sql"])
         if actual != expected:
@@ -2174,6 +2768,10 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             "foreign_key_violation_samples": [],
             "non_finite_timestamps": 0,
             "effective_current_diagnostics": {},
+            "effective_current_checked": False,
+            "effective_current_exact": False,
+            "diagnostics_partial": True,
+            "resource_limit_code": None,
             "integrity_check": integrity,
             "optional_web_index_error": False,
             "optional_web_index_recovery_hint": "",
@@ -2259,7 +2857,18 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
             for value in row:
                 if isinstance(value, float) and not math.isfinite(value):
                     non_finite_timestamps += 1
-    effective_diagnostics = _effective_current_diagnostics(conn)
+    effective_current_checked = True
+    effective_current_exact = True
+    diagnostics_partial = False
+    resource_limit_code = None
+    try:
+        effective_diagnostics = _effective_current_diagnostics(conn)
+    except EffectiveCurrentResourceLimitError as exc:
+        effective_diagnostics = {}
+        effective_current_checked = False
+        effective_current_exact = False
+        diagnostics_partial = True
+        resource_limit_code = exc.code
     optional_web_index_error = False
     optional_web_index_recovery_hint = ""
     optional_message_fts_error = False
@@ -2292,6 +2901,10 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         **foreign_keys,
         "non_finite_timestamps": non_finite_timestamps,
         "effective_current_diagnostics": effective_diagnostics,
+        "effective_current_checked": effective_current_checked,
+        "effective_current_exact": effective_current_exact,
+        "diagnostics_partial": diagnostics_partial,
+        "resource_limit_code": resource_limit_code,
         "integrity_check": integrity,
         "optional_web_index_error": optional_web_index_error,
         "optional_web_index_recovery_hint": optional_web_index_recovery_hint,
@@ -2307,7 +2920,16 @@ def verify_database(conn: sqlite3.Connection) -> dict[str, Any]:
         "optional_message_fts_recovery_hint": optional_message_fts_recovery_hint,
         "warnings_by_type": warning_counts,
         "latest_warnings_by_type": latest_warning_counts,
-        "ok": missing_current == 0 and broken_parent == 0 and zero_node == 0 and cycle_nodes == 0 and foreign_keys["foreign_key_violations"] == 0 and non_finite_timestamps == 0 and integrity == "ok",
+        "ok": (
+            not diagnostics_partial
+            and missing_current == 0
+            and broken_parent == 0
+            and zero_node == 0
+            and cycle_nodes == 0
+            and foreign_keys["foreign_key_violations"] == 0
+            and non_finite_timestamps == 0
+            and integrity == "ok"
+        ),
     }
 
 

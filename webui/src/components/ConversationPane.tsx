@@ -37,6 +37,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hitItems, setHitItems] = useState<SearchMessageHit[]>([]);
+  const [hitExactTotal, setHitExactTotal] = useState<number | null>(null);
   const [hitLimitReached, setHitLimitReached] = useState(false);
   const [hitHasMore, setHitHasMore] = useState(false);
   const [hitNextOffset, setHitNextOffset] = useState<number | null>(null);
@@ -54,6 +55,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const hitAppendInFlightRef = useRef(false);
   const copyControllerRef = useRef<AbortController | null>(null);
   const copyRequestRef = useRef(0);
+  const copyStatusTimerRef = useRef<number | null>(null);
   const scrollRequestRef = useRef(0);
   const fallbackTargetsRef = useRef<Set<string>>(new Set());
   const replacementLoadRef = useRef(false);
@@ -111,6 +113,11 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     messageRequestRef.current += 1;
     hitRequestRef.current += 1;
     copyRequestRef.current += 1;
+    if (copyStatusTimerRef.current !== null) {
+      window.clearTimeout(copyStatusTimerRef.current);
+      copyStatusTimerRef.current = null;
+    }
+    setCopyStatus("");
     setMessages([]);
     setMessageTotal(0);
     setVisibleTotal(0);
@@ -120,6 +127,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     setNextOffset(null);
     setHasMore(false);
     setHitItems([]);
+    setHitExactTotal(null);
     setHitLimitReached(false);
     setHitHasMore(false);
     setHitNextOffset(null);
@@ -213,6 +221,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
 
   useEffect(() => {
     setHitItems([]);
+    setHitExactTotal(null);
     setHitLimitReached(false);
     setHitHasMore(false);
     setHitNextOffset(null);
@@ -227,12 +236,13 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     const controller = new AbortController();
     hitControllerRef.current?.abort();
     hitControllerRef.current = controller;
-    const loadHits = () => getMessageHits({ q: highlightQuery, conversationId: conversation.conversation_id, path: effectivePath, order: "display", limit: HIT_NAVIGATION_PAGE_SIZE, offset: 0, filters: effectiveFilters, matchMode, countTotal: false, signal: controller.signal });
+    const loadHits = () => getMessageHits({ q: highlightQuery, conversationId: conversation.conversation_id, path: effectivePath, order: "display", limit: HIT_NAVIGATION_PAGE_SIZE, offset: 0, filters: effectiveFilters, matchMode, countTotal: true, signal: controller.signal });
     loadHits()
       .then((page) => {
         if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
         if (!Array.isArray(page.items)) throw new Error("invalid_response");
         setHitItems(page.items);
+        setHitExactTotal(page.total_exact ? page.total : null);
         setHitNextOffset(page.next_offset);
         setHitHasMore(Boolean(page.has_more && page.next_offset !== null));
         setHitLimitReached(Boolean(page.has_more && page.items.length >= MAX_NAVIGABLE_HIT_MESSAGES));
@@ -272,9 +282,16 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   }, [rowVirtualizer]);
 
   useEffect(() => () => {
+    copyControllerRef.current?.abort();
+    copyControllerRef.current = null;
+    copyRequestRef.current += 1;
     if (measureFrameRef.current !== null) {
       window.cancelAnimationFrame(measureFrameRef.current);
       measureFrameRef.current = null;
+    }
+    if (copyStatusTimerRef.current !== null) {
+      window.clearTimeout(copyStatusTimerRef.current);
+      copyStatusTimerRef.current = null;
     }
   }, []);
 
@@ -367,7 +384,8 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     titleOnlyContext || conversation?.title_match || conversation?.has_title_hits || conversation?.reasons?.includes("title match")
   ));
   const hiddenSnippetInternal = Boolean(!showInternal && (conversation?.has_internal_hits || conversation?.snippets?.some((snippet) => snippet.is_internal)));
-  const activeNode = currentViewHits[hitIndex]?.node_id || null;
+  const activeHit = currentViewHits[hitIndex] ?? null;
+  const activeNode = activeHit?.node_id || null;
   const activeIndex = useMemo(() => visibleMessages.findIndex((msg) => msg.node_id === activeNode), [visibleMessages, activeNode]);
 
   useEffect(() => {
@@ -474,18 +492,27 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   }, [activeNode, activeIndex, loading, loadMessages]);
 
   const copyText = async (text: string, expectedContextKey?: string, requestId?: number): Promise<boolean> => {
+    const clearCopyStatusLater = (delay: number) => {
+      if (copyStatusTimerRef.current !== null) window.clearTimeout(copyStatusTimerRef.current);
+      const contextKey = readerDataContextRef.current;
+      const generation = copyRequestRef.current;
+      copyStatusTimerRef.current = window.setTimeout(() => {
+        copyStatusTimerRef.current = null;
+        if (readerDataContextRef.current === contextKey && copyRequestRef.current === generation) setCopyStatus("");
+      }, delay);
+    };
     try {
       assertBrowserCopyLimit(text);
       if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(text);
       if (expectedContextKey && (readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current)) return false;
       setCopyStatus(t("copied"));
-      window.setTimeout(() => setCopyStatus(""), 1400);
+      clearCopyStatusLater(1400);
       return true;
     } catch {
       if (expectedContextKey && (readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current)) return false;
       setCopyStatus(t("copyFailed"));
-      window.setTimeout(() => setCopyStatus(""), 1800);
+      clearCopyStatusLater(1800);
       return false;
     }
   };
@@ -498,7 +525,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     let complete = "";
     let completeBytes = 0;
     for (;;) {
-      const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 65536, signal, cursor);
+      const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 1048576, signal, cursor);
       if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
         throw new IncompleteDisplayRecoveryError();
       }
@@ -555,7 +582,13 @@ export default function ConversationPane({ conversation, query, filters, matchMo
               ? t("copyConversationFailed")
               : t("copyFailed"),
       );
-      window.setTimeout(() => setCopyStatus(""), 1800);
+      if (copyStatusTimerRef.current !== null) window.clearTimeout(copyStatusTimerRef.current);
+      const contextKey = readerDataContextRef.current;
+      const generation = copyRequestRef.current;
+      copyStatusTimerRef.current = window.setTimeout(() => {
+        copyStatusTimerRef.current = null;
+        if (readerDataContextRef.current === contextKey && copyRequestRef.current === generation) setCopyStatus("");
+      }, 1800);
     } finally {
       if (readerDataContextRef.current === requestedContextKey && requestId === copyRequestRef.current) setCopyBusy(null);
     }
@@ -621,7 +654,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     ? filterOnlyMatch
       ? t("filterOnlyMatchNotice")
       : currentViewHits.length
-      ? `${hitIndex + 1} / ${currentViewHits.length} ${t("visibleHits")}${totalHitCount !== currentViewHits.length ? ` · ${totalHitCount} ${t("totalHits")}` : ""}`
+      ? `${hitIndex + 1} / ${currentViewHits.length} ${t("visibleHits")} · ${t("showing")} ${totalHitCount}${hitExactTotal !== null ? ` ${t("of")} ${hitExactTotal}` : ""} ${t("totalHits")}`
       : titleOnlyMatch
         ? t("titleOnlyHitNotice")
         : totalHitCount || hiddenInternalCount
@@ -704,6 +737,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
                     conversationId={conversation.conversation_id}
                     stateContextKey={messageStateContextKey}
                     active={message.node_id === activeNode}
+                    activeTargetOffset={message.node_id === activeNode ? activeHit?.match_char_offset : null}
+                    activeMatchLength={message.node_id === activeNode ? activeHit?.match_length : null}
+                    activeRevision={message.node_id === activeNode ? activeHit?.display_anchor_revision : null}
                     layout={settings.messageLayout}
                     showRawDefault={settings.showRawDefault}
                     t={t}

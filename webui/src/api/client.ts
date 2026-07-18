@@ -273,11 +273,12 @@ export function getMessageDisplayChunk(
   conversationId: string,
   nodeId: string,
   offset = 0,
-  limit = 65536,
+  limit = 1048576,
   signal?: AbortSignal,
   cursor?: string | null,
+  anchorCharOffset?: number | null,
 ): Promise<DisplayTextChunk> {
-  const query = params({ conversation_id: conversationId, node_id: nodeId, offset, limit, cursor });
+  const query = params({ conversation_id: conversationId, node_id: nodeId, offset, limit, cursor, anchor_char_offset: anchorCharOffset });
   return request<DisplayTextChunk>(`/api/by-id/display?${query}`, signal);
 }
 

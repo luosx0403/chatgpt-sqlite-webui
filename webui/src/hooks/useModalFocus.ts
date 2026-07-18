@@ -12,11 +12,20 @@ const FOCUSABLE = [
 export function useModalFocus(open: boolean, onClose: () => void) {
   const dialogRef = useRef<HTMLElement | null>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
+  const restoreFrameRef = useRef<number | null>(null);
+  const generationRef = useRef(0);
+  const mountedRef = useRef(true);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
+    generationRef.current += 1;
+    const generation = generationRef.current;
+    if (restoreFrameRef.current !== null) {
+      window.cancelAnimationFrame(restoreFrameRef.current);
+      restoreFrameRef.current = null;
+    }
     restoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
     const focusable = dialog ? Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE)) : [];
@@ -48,9 +57,23 @@ export function useModalFocus(open: boolean, onClose: () => void) {
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
-      window.requestAnimationFrame(() => restoreRef.current?.focus());
+      restoreFrameRef.current = window.requestAnimationFrame(() => {
+        restoreFrameRef.current = null;
+        const target = restoreRef.current;
+        if (mountedRef.current && generationRef.current === generation && target?.isConnected) target.focus();
+      });
     };
   }, [open]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      if (restoreFrameRef.current !== null) window.cancelAnimationFrame(restoreFrameRef.current);
+      restoreFrameRef.current = null;
+    };
+  }, []);
 
   return dialogRef;
 }

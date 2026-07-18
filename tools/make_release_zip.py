@@ -149,8 +149,10 @@ def _dist_assets(root: Path) -> set[str]:
     return parser.assets
 
 
-def _collect_payload(root: Path) -> dict[str, bytes]:
+def _collect_payload_test_only(root: Path) -> dict[str, bytes]:
+    """Materializing helper for small synthetic tests; never use in release builds."""
     payload: dict[str, bytes] = {}
+    total = 0
     for include in INCLUDE_PATHS:
         source = root / include
         paths = [source] if source.is_file() else sorted(source.rglob("*"))
@@ -160,7 +162,11 @@ def _collect_payload(root: Path) -> dict[str, bytes]:
             relative = path.relative_to(root).as_posix()
             if _matches_any(relative):
                 continue
-            payload[relative] = path.read_bytes()
+            data = path.read_bytes()
+            total += len(data)
+            if total > 8 * 1024 * 1024:
+                raise ValueError("test_payload_materialization_limit")
+            payload[relative] = data
     return dict(sorted(payload.items()))
 
 
@@ -261,14 +267,10 @@ def _manifest_bytes(
     return (json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def _write_archive(
-    path: Path,
-    payload: dict[str, bytes] | tuple[list[tuple[str, Path]], list[dict[str, object]]],
-) -> None:
-    if isinstance(payload, tuple):
-        paths, manifest = payload
-        _write_archive_paths(path, paths, manifest)
-        return
+def _write_archive_test_only(path: Path, payload: dict[str, bytes]) -> None:
+    """Write at most 8 MiB of synthetic in-memory payload for unit tests."""
+    if sum(len(data) for data in payload.values()) > 8 * 1024 * 1024:
+        raise ValueError("test_payload_materialization_limit")
     def write_member(archive: zipfile.ZipFile, relative: str, data: bytes) -> None:
         info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
         info.create_system = 3
@@ -288,7 +290,7 @@ def _write_archive(
         os.fsync(handle.fileno())
 
 
-def _verify_archive(path: Path, payload: dict[str, bytes]) -> list[dict[str, object]]:
+def _verify_archive_test_only(path: Path, payload: dict[str, bytes]) -> list[dict[str, object]]:
     expected_manifest = _manifest(payload)
     expected_names = set(payload) | {MANIFEST_NAME}
     with zipfile.ZipFile(path) as archive:
@@ -348,7 +350,7 @@ def build_release(root: Path, output: Path, *, check: bool = True) -> tuple[list
     temporary = Path(temporary_name)
     try:
         manifest = _file_manifest(payload)
-        _write_archive(temporary, (payload, manifest))
+        _write_archive_paths(temporary, payload, manifest)
         manifest = _verify_archive_paths(temporary, manifest)
         if check:
             _delivery_check(root, temporary)

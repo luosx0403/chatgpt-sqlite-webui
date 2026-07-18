@@ -9,10 +9,11 @@ import stat
 import zipfile
 import codecs
 import secrets
+import struct
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterable, Iterator
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 from .json_safety import (
     JsonSafetyLimitError,
@@ -31,6 +32,15 @@ JSON_STREAM_CHUNK_BYTES = 64 * 1024
 MAX_JSON_ELEMENT_BYTES = 32 * 1024 * 1024
 MAX_JSON_ELEMENT_CHARS = 32 * 1024 * 1024
 MAX_SOURCE_TOTAL_MEMBERS = 100_000
+MAX_SOURCE_DIRECTORY_DEPTH = 256
+MAX_SOURCE_RELATIVE_PATH_BYTES = 32 * 1024
+_ZIP_EOCD_SEARCH_BYTES = 22 + 65_535
+DELETE_INPUT_RECOVERY_FORMAT_VERSION = 1
+DELETE_INPUT_RECOVERY_PREFIX = ".chatgpt-archive-delete-recovery-"
+DELETE_INPUT_RECOVERY_MAX_BYTES = 64 * 1024
+_DELETE_DIR_FD_SUPPORTED = all(
+    function in os.supports_dir_fd for function in (os.open, os.stat, os.rename, os.unlink)
+)
 
 
 class NonFiniteJsonNumberError(ValueError):
@@ -55,6 +65,79 @@ class ZipMemberNotFoundError(ValueError):
 
 class SourceChangedDuringReadError(ValueError):
     pass
+
+
+class DeleteInputRecoveryRequired(ValueError):
+    """A private staged entry could not be safely restored or removed."""
+
+
+def delete_input_secure_identity_supported() -> bool:
+    """Return whether descriptor-relative identity/delete primitives are usable."""
+
+    if os.name == "nt":
+        return False
+    return _DELETE_DIR_FD_SUPPORTED
+
+
+def _delete_identity_record(identity: FileIdentity) -> dict[str, Any]:
+    return {
+        "file_type": identity.file_type,
+        "device": identity.device,
+        "inode": identity.inode,
+        "size": identity.size,
+        "mtime_ns": identity.mtime_ns,
+        "ctime_ns": identity.ctime_ns,
+        "nlink": identity.nlink,
+        "is_symlink": identity.is_symlink,
+        "is_reparse_point": identity.is_reparse_point,
+        "link_target_hash": identity.link_target_hash,
+    }
+
+
+def _write_delete_recovery_record(
+    parent_fd: int,
+    journal_name: str,
+    record: dict[str, Any],
+) -> None:
+    payload = json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    if len(payload) > DELETE_INPUT_RECOVERY_MAX_BYTES:
+        raise DeleteInputRecoveryRequired("delete_input_recovery_record_too_large")
+    temporary = f"{journal_name}.tmp-{secrets.token_hex(8)}"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short recovery record write")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.rename(temporary, journal_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _remove_delete_recovery_record(parent_fd: int, journal_name: str) -> None:
+    try:
+        os.unlink(journal_name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+    os.fsync(parent_fd)
 
 
 class ZipMemberCrcError(ValueError):
@@ -163,6 +246,53 @@ class InputSource:
             object.__setattr__(self, "delete_parent_identity", _entry_identity(self.delete_target.parent, follow_symlinks=True))
 
 
+@dataclass(frozen=True)
+class DeleteInputStage:
+    original_path: Path
+    staged_path: Path
+    source: InputSource
+
+
+def _stable_delete_identity(identity: FileIdentity) -> tuple[Any, ...]:
+    # rename changes ctime on common filesystems, so content continuity is
+    # instead re-established by parsing the staged InputSource through its new
+    # descriptor-bound identity.  Every other captured entry attribute stays
+    # part of the staging barrier.
+    return (
+        identity.file_type,
+        identity.device,
+        identity.inode,
+        identity.size,
+        identity.mtime_ns,
+        identity.nlink,
+        identity.is_symlink,
+        identity.is_reparse_point,
+        identity.link_target_hash,
+    )
+
+
+def stage_input_for_delete(input_source: InputSource) -> DeleteInputStage:
+    """Reject the retired pre-commit rename design.
+
+    Production keeps the original directory entry present through canonical
+    commit and uses :func:`delete_input_if_unchanged` afterwards with a durable
+    recovery record.  Retaining this callable as an explicit refusal keeps old
+    integrations from silently reintroducing crash-unsafe staging.
+    """
+
+    raise DeleteInputRecoveryRequired("delete_input_precommit_staging_disabled")
+
+
+def restore_staged_input(stage: DeleteInputStage) -> None:
+    """Atomically restore without overwriting a replacement directory entry."""
+
+    try:
+        os.link(stage.staged_path, stage.original_path, follow_symlinks=False)
+        os.unlink(stage.staged_path)
+    except OSError as exc:
+        raise DeleteInputRecoveryRequired("delete_input_recovery_required") from exc
+
+
 def _file_identity(path: Path) -> tuple[int, int, int, int, int]:
     info = path.stat()
     return (
@@ -248,6 +378,8 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
     ``False`` means continuity could not be proven and nothing was deleted.
     """
 
+    if not delete_input_secure_identity_supported():
+        raise DeleteInputRecoveryRequired("delete_input_secure_identity_unsupported")
     path = input_source.delete_target
     expected_entry = input_source.delete_entry_identity
     expected_target = input_source.delete_target_identity
@@ -256,10 +388,19 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
         return False
     if expected_entry.nlink != 1 or expected_target.nlink != 1:
         return False
+    if not delete_input_identity_is_current(input_source):
+        return False
+    try:
+        source_digest = sha256_input_source(input_source)
+    except SourceChangedDuringReadError:
+        return False
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     parent_fd = os.open(path.parent, directory_flags)
-    staged_name = f".chatgpt-archive-delete-{os.getpid()}-{secrets.token_hex(16)}"
+    recovery_token = secrets.token_hex(16)
+    staged_name = f".chatgpt-archive-delete-{recovery_token}"
+    journal_name = f"{DELETE_INPUT_RECOVERY_PREFIX}{recovery_token}.json"
     staged = False
+    journal_written = False
     try:
         parent_info = os.fstat(parent_fd)
         if (
@@ -268,25 +409,74 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
             return False
         if not delete_input_identity_is_current(input_source):
             return False
+        record = {
+            "format_version": DELETE_INPUT_RECOVERY_FORMAT_VERSION,
+            "owner_token": recovery_token,
+            "state": "prepared",
+            "original_name": path.name,
+            "staged_name": staged_name,
+            "source_sha256": source_digest,
+            "entry_identity": _delete_identity_record(expected_entry),
+            "target_identity": _delete_identity_record(expected_target),
+            "parent_identity": _delete_identity_record(expected_parent),
+        }
+        _write_delete_recovery_record(parent_fd, journal_name, record)
+        journal_written = True
         os.rename(path.name, staged_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         staged = True
+        record["state"] = "staged"
+        _write_delete_recovery_record(parent_fd, journal_name, record)
         staged_info = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
+        staged_attributes = int(getattr(staged_info, "st_file_attributes", 0))
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        staged_is_symlink = stat.S_ISLNK(staged_info.st_mode)
+        staged_link_hash = None
+        if staged_is_symlink:
+            staged_link_hash = hashlib.sha256(
+                os.fsencode(os.readlink(staged_name, dir_fd=parent_fd))
+            ).hexdigest()
         staged_identity = (
             stat.S_IFMT(staged_info.st_mode), int(staged_info.st_dev), int(staged_info.st_ino),
             int(staged_info.st_size), int(staged_info.st_mtime_ns),
-            int(staged_info.st_nlink), stat.S_ISLNK(staged_info.st_mode),
+            int(staged_info.st_nlink), staged_is_symlink,
+            bool(staged_attributes & reparse_flag), staged_link_hash,
         )
         expected_identity = (
             expected_entry.file_type, expected_entry.device, expected_entry.inode,
             expected_entry.size, expected_entry.mtime_ns,
             expected_entry.nlink, expected_entry.is_symlink,
+            expected_entry.is_reparse_point, expected_entry.link_target_hash,
         )
-        if staged_identity != expected_identity:
+        target_matches = True
+        try:
+            staged_target = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=True)
+            target_matches = (
+                stat.S_IFMT(staged_target.st_mode),
+                int(staged_target.st_dev),
+                int(staged_target.st_ino),
+                int(staged_target.st_size),
+                int(staged_target.st_mtime_ns),
+                int(staged_target.st_nlink),
+            ) == (
+                expected_target.file_type,
+                expected_target.device,
+                expected_target.inode,
+                expected_target.size,
+                expected_target.mtime_ns,
+                expected_target.nlink,
+            )
+        except OSError:
+            target_matches = False
+        if staged_identity != expected_identity or not target_matches:
             try:
                 os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 os.rename(staged_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 staged = False
+                _remove_delete_recovery_record(parent_fd, journal_name)
+                journal_written = False
+            else:
+                raise DeleteInputRecoveryRequired("delete_input_recovery_required")
             return False
         try:
             os.unlink(staged_name, dir_fd=parent_fd)
@@ -300,12 +490,135 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
             except FileNotFoundError:
                 os.rename(staged_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 staged = False
+                _remove_delete_recovery_record(parent_fd, journal_name)
+                journal_written = False
+            else:
+                raise DeleteInputRecoveryRequired("delete_input_recovery_required")
             raise
         staged = False
+        _remove_delete_recovery_record(parent_fd, journal_name)
+        journal_written = False
         return True
+    except NotImplementedError as exc:
+        raise DeleteInputRecoveryRequired(
+            "delete_input_secure_identity_unsupported"
+        ) from exc
     finally:
         # Never delete an unverified staged entry.  A failure is intentionally
         # visible to the caller for a safe cleanup warning.
+        if journal_written and not staged:
+            try:
+                _remove_delete_recovery_record(parent_fd, journal_name)
+            except OSError:
+                pass
+        os.close(parent_fd)
+
+
+def recover_delete_input(directory: Path, owner_token: str) -> str:
+    """Restore a crash-left staged input using its durable recovery token."""
+
+    if not delete_input_secure_identity_supported() or os.link not in os.supports_dir_fd:
+        raise DeleteInputRecoveryRequired("delete_input_secure_identity_unsupported")
+    if len(owner_token) != 32 or any(ch not in "0123456789abcdef" for ch in owner_token):
+        raise DeleteInputRecoveryRequired("delete_input_recovery_token_invalid")
+    journal_name = f"{DELETE_INPUT_RECOVERY_PREFIX}{owner_token}.json"
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(directory, flags)
+    try:
+        record_fd = os.open(
+            journal_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            info = os.fstat(record_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > DELETE_INPUT_RECOVERY_MAX_BYTES:
+                raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+            payload = os.read(record_fd, DELETE_INPUT_RECOVERY_MAX_BYTES + 1)
+        finally:
+            os.close(record_fd)
+        try:
+            record = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid") from None
+        required = {
+            "format_version",
+            "owner_token",
+            "state",
+            "original_name",
+            "staged_name",
+            "source_sha256",
+            "entry_identity",
+            "target_identity",
+            "parent_identity",
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != required
+            or record["format_version"] != DELETE_INPUT_RECOVERY_FORMAT_VERSION
+            or not secrets.compare_digest(str(record["owner_token"]), owner_token)
+            or record["state"] not in {"prepared", "staged"}
+        ):
+            raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+        original_name = str(record["original_name"])
+        staged_name = str(record["staged_name"])
+        expected_staged = f".chatgpt-archive-delete-{owner_token}"
+        if (
+            not original_name
+            or original_name in {".", ".."}
+            or "/" in original_name
+            or os.sep in original_name
+            or staged_name != expected_staged
+        ):
+            raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+
+        def exists(name: str) -> bool:
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                return True
+            except FileNotFoundError:
+                return False
+
+        original_exists = exists(original_name)
+        staged_exists = exists(staged_name)
+        if original_exists and staged_exists:
+            raise DeleteInputRecoveryRequired("delete_input_recovery_original_occupied")
+        if staged_exists:
+            staged_info = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
+            expected = record["entry_identity"]
+            if not isinstance(expected, dict) or (
+                stat.S_IFMT(staged_info.st_mode),
+                int(staged_info.st_dev),
+                int(staged_info.st_ino),
+                int(staged_info.st_size),
+                int(staged_info.st_mtime_ns),
+            ) != (
+                expected.get("file_type"),
+                expected.get("device"),
+                expected.get("inode"),
+                expected.get("size"),
+                expected.get("mtime_ns"),
+            ):
+                raise DeleteInputRecoveryRequired("delete_input_recovery_identity_mismatch")
+            os.link(
+                staged_name,
+                original_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(staged_name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            _remove_delete_recovery_record(parent_fd, journal_name)
+            return "restored"
+        if original_exists:
+            _remove_delete_recovery_record(parent_fd, journal_name)
+            return "already_restored"
+        _remove_delete_recovery_record(parent_fd, journal_name)
+        return "already_deleted"
+    except (FileNotFoundError, NotImplementedError) as exc:
+        raise DeleteInputRecoveryRequired("delete_input_recovery_record_not_found") from exc
+    finally:
         os.close(parent_fd)
 
 
@@ -394,22 +707,105 @@ def is_metadata_path(path: str) -> bool:
     return name == ".DS_Store" or name.startswith("._")
 
 
+def preflight_zip_central_directory(stream: BinaryIO, *, max_members: int) -> int:
+    """Bound central-directory object creation before ``zipfile.ZipFile``.
+
+    This metadata check complements rather than replaces the stdlib parser and
+    its structural/CRC checks.
+    """
+
+    stream.seek(0, os.SEEK_END)
+    archive_size = stream.tell()
+    tail_size = min(archive_size, _ZIP_EOCD_SEARCH_BYTES)
+    stream.seek(archive_size - tail_size)
+    tail = stream.read(tail_size)
+    marker = tail.rfind(b"PK\x05\x06")
+    while marker >= 0:
+        if len(tail) - marker >= 22:
+            candidate_comment_length = struct.unpack_from("<H", tail, marker + 20)[0]
+            if marker + 22 + candidate_comment_length == len(tail):
+                break
+        marker = tail.rfind(b"PK\x05\x06", 0, marker)
+    if marker < 0:
+        raise ValueError("source_zip_eocd_invalid")
+    eocd_offset = archive_size - tail_size + marker
+    (
+        _signature,
+        disk_number,
+        central_disk,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_length,
+    ) = struct.unpack_from("<4s4H2LH", tail, marker)
+    # The matching-candidate scan above intentionally tolerates the EOCD
+    # signature bytes inside an otherwise valid ZIP comment.
+    if disk_number != 0 or central_disk != 0 or entries_on_disk != total_entries:
+        raise ValueError("source_zip_multidisk_not_supported")
+    if total_entries == 0xFFFF or central_size == 0xFFFFFFFF or central_offset == 0xFFFFFFFF:
+        locator_offset = eocd_offset - 20
+        if locator_offset < 0:
+            raise ValueError("source_zip64_eocd_invalid")
+        stream.seek(locator_offset)
+        locator = stream.read(20)
+        if len(locator) != 20 or locator[:4] != b"PK\x06\x07":
+            raise ValueError("source_zip64_eocd_invalid")
+        _loc_signature, zip64_disk, zip64_offset, disk_count = struct.unpack("<4sLQL", locator)
+        if zip64_disk != 0 or disk_count != 1:
+            raise ValueError("source_zip_multidisk_not_supported")
+        if zip64_offset < 0 or zip64_offset + 56 > locator_offset:
+            raise ValueError("source_zip64_eocd_invalid")
+        stream.seek(zip64_offset)
+        record = stream.read(56)
+        if len(record) != 56 or record[:4] != b"PK\x06\x06":
+            raise ValueError("source_zip64_eocd_invalid")
+        (
+            _signature64,
+            record_size,
+            _made_by,
+            _needed,
+            disk_number64,
+            central_disk64,
+            entries_on_disk64,
+            total_entries64,
+            central_size64,
+            central_offset64,
+        ) = struct.unpack("<4sQ2H2L4Q", record)
+        if record_size < 44 or disk_number64 != 0 or central_disk64 != 0 or entries_on_disk64 != total_entries64:
+            raise ValueError("source_zip64_eocd_invalid")
+        total_entries = total_entries64
+        central_size = central_size64
+        central_offset = central_offset64
+    if total_entries > max_members:
+        raise ValueError("source_member_limit_exceeded")
+    if central_offset > archive_size or central_size > archive_size or central_offset + central_size > eocd_offset:
+        raise ValueError("source_zip_central_directory_invalid")
+    stream.seek(0)
+    return int(total_entries)
+
+
 def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
     if input_source.kind == "zip":
-        with _open_verified_input_file(input_source) as archive_stream, zipfile.ZipFile(archive_stream) as zf:
-            if len(zf.filelist) > MAX_SOURCE_TOTAL_MEMBERS:
-                raise ValueError("source_member_limit_exceeded")
-            entries = [
-                SourceEntry(
-                    source_path=info.filename,
-                    file_type=classify_file(_logical_zip_path(info.filename)),
-                    size=info.file_size,
-                    extension=Path(_logical_zip_path(info.filename)).suffix.lower(),
-                    is_conversation_json=is_conversation_json_source(info.filename),
-                )
-                for info in zf.infolist()
-                if not info.is_dir() and not is_metadata_path(info.filename)
-            ]
+        with _open_verified_input_file(input_source) as archive_stream:
+            preflight_zip_central_directory(archive_stream, max_members=MAX_SOURCE_TOTAL_MEMBERS)
+            zf = zipfile.ZipFile(archive_stream)
+            try:
+                if len(zf.filelist) > MAX_SOURCE_TOTAL_MEMBERS:
+                    raise ValueError("source_member_limit_exceeded")
+                entries = [
+                    SourceEntry(
+                        source_path=info.filename,
+                        file_type=classify_file(_logical_zip_path(info.filename)),
+                        size=info.file_size,
+                        extension=Path(_logical_zip_path(info.filename)).suffix.lower(),
+                        is_conversation_json=is_conversation_json_source(info.filename),
+                    )
+                    for info in zf.infolist()
+                    if not info.is_dir() and not is_metadata_path(info.filename)
+                ]
+            finally:
+                zf.close()
     elif input_source.kind == "json":
         name = input_source.path.name
         with _open_verified_input_file(input_source) as source_stream:
@@ -505,6 +901,63 @@ def iter_json_array_from_source(input_source: InputSource, source_path: str) -> 
 
     with _open_source_binary(input_source, source_path) as stream:
         yield from _iter_json_array(_iter_utf8_chunks(stream))
+
+
+@contextmanager
+def open_source_read_session(
+    input_source: InputSource,
+) -> Iterator[Callable[[str], Iterator[Any]]]:
+    """Reuse one verified archive and one ZipFile across every selected shard."""
+
+    if input_source.kind != "zip":
+        yield lambda source_path: iter_json_array_from_source(input_source, source_path)
+        return
+    with _open_verified_input_file(input_source) as archive_stream:
+        preflight_zip_central_directory(archive_stream, max_members=MAX_SOURCE_TOTAL_MEMBERS)
+        try:
+            zf = zipfile.ZipFile(archive_stream)
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise SourceChangedDuringReadError("source_changed_during_read") from exc
+
+        def iterate(source_path: str) -> Iterator[Any]:
+            try:
+                info = zf.getinfo(source_path)
+            except KeyError as exc:
+                raise ZipMemberNotFoundError("zip_member_not_found") from exc
+            if info.flag_bits & 0x1:
+                raise EncryptedZipMemberError("encrypted_zip_member_not_supported")
+            try:
+                member = zf.open(info, "r")
+            except RuntimeError as exc:
+                raise EncryptedZipMemberError("encrypted_zip_member_not_supported") from exc
+            except KeyError as exc:
+                raise ZipMemberNotFoundError("zip_member_not_found") from exc
+            try:
+                yield from _iter_json_array(_iter_utf8_chunks(member))
+            except zipfile.BadZipFile as exc:
+                if "CRC" in str(exc).upper():
+                    raise ZipMemberCrcError("zip_member_crc_failed") from exc
+                raise ZipMemberReadError("zip_member_read_failed") from exc
+            except (OSError, RuntimeError) as exc:
+                raise ZipMemberReadError("zip_member_read_failed") from exc
+            finally:
+                member.close()
+
+        try:
+            yield iterate
+        finally:
+            zf.close()
+
+
+def iter_source_array_sessions(
+    input_source: InputSource,
+    entries: Iterable[SourceEntry],
+) -> Iterator[tuple[int, SourceEntry, Iterator[Any]]]:
+    """Yield shard iterators while keeping their shared ZIP session alive."""
+
+    with open_source_read_session(input_source) as iterate:
+        for index, entry in enumerate(entries):
+            yield index, entry, iter(iterate(entry.source_path))
 
 
 @contextmanager
@@ -651,10 +1104,6 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
     for chunk in chunks:
         i = 0
         while i < len(chunk):
-            if phase == "nonlist":
-                append_part(chunk[i:])
-                i = len(chunk)
-                continue
             if phase != "element":
                 while i < len(chunk) and chunk[i] in " \t\r\n":
                     i += 1
@@ -665,10 +1114,14 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
                     raise InvalidConversationEncodingError("invalid_conversation_encoding")
                 if phase == "start":
                     if char != "[":
-                        phase = "nonlist"
-                        append_part(chunk[i:])
-                        i = len(chunk)
-                        continue
+                        top_level_type = {
+                            "{": "dict",
+                            '"': "str",
+                            "t": "bool",
+                            "f": "bool",
+                            "n": "NoneType",
+                        }.get(char, "number")
+                        raise ConversationJsonTopLevelError(top_level_type)
                     phase = "between"
                     i += 1
                     continue
@@ -760,9 +1213,6 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
                 i = completed_at
             # Scalar delimiter is reprocessed by the surrounding-array state.
 
-    if phase == "nonlist":
-        scalar = decoder.decode("".join(parts))
-        raise ConversationJsonTopLevelError(type(scalar).__name__)
     if phase != "done":
         raise json.JSONDecodeError("Expecting value", "", 0)
 
@@ -784,34 +1234,42 @@ def _walk_directory_without_links(
 ) -> list[tuple[str, int, tuple[int, int, int, int, int]]]:
     results: list[tuple[str, int, tuple[int, int, int, int, int]]] = []
     member_count = 0
-
-    def visit(directory: Path) -> None:
-        nonlocal member_count
+    pending: list[tuple[Path, int]] = [(base, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        if depth > MAX_SOURCE_DIRECTORY_DEPTH:
+            raise ValueError("source_directory_depth_limit_exceeded")
         try:
-            children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            iterator_context = os.scandir(directory)
         except OSError as exc:
             raise ValueError("input_source_scan_failed") from exc
-        for entry in children:
-            member_count += 1
-            if member_count > MAX_SOURCE_TOTAL_MEMBERS:
-                raise ValueError("source_member_limit_exceeded")
-            path = Path(entry.path)
-            if _is_link_or_reparse(path):
-                raise ValueError("input_symlink_not_allowed")
-            try:
-                info = entry.stat(follow_symlinks=False)
-            except OSError as exc:
-                raise ValueError("input_source_scan_failed") from exc
-            if stat.S_ISDIR(info.st_mode):
-                visit(path)
-            elif stat.S_ISREG(info.st_mode):
-                results.append((
-                    path.relative_to(base).as_posix(),
-                    int(info.st_size),
-                    _fstat_identity(info),
-                ))
-
-    visit(base)
+        try:
+            with iterator_context as iterator:
+                for entry in iterator:
+                    member_count += 1
+                    if member_count > MAX_SOURCE_TOTAL_MEMBERS:
+                        raise ValueError("source_member_limit_exceeded")
+                    path = Path(entry.path)
+                    if _is_link_or_reparse(path):
+                        raise ValueError("input_symlink_not_allowed")
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise ValueError("input_source_scan_failed") from exc
+                    relative = path.relative_to(base).as_posix()
+                    if len(relative.encode("utf-8", errors="surrogatepass")) > MAX_SOURCE_RELATIVE_PATH_BYTES:
+                        raise ValueError("source_path_length_limit_exceeded")
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append((path, depth + 1))
+                    elif stat.S_ISREG(info.st_mode):
+                        results.append((
+                            relative,
+                            int(info.st_size),
+                            _fstat_identity(info),
+                        ))
+        except OSError as exc:
+            raise ValueError("input_source_scan_failed") from exc
+    results.sort(key=lambda item: item[0])
     return results
 
 

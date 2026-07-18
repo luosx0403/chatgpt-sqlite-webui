@@ -52,6 +52,7 @@ export interface ConversationSummary {
   has_title_hits?: boolean;
   has_internal_hits?: boolean;
   has_branch_hits?: boolean;
+  enrichment_partial?: boolean;
 }
 
 export interface SearchSnippet {
@@ -123,6 +124,9 @@ export interface SearchMessageHit {
   display_text_total_chars?: number;
   display_text_total_chars_exact?: boolean;
   snippet: string;
+  match_char_offset?: number | null;
+  match_length?: number | null;
+  display_anchor_revision?: string | null;
   is_on_current_path: boolean;
   current_path_fallback_to_all?: boolean;
   effective_visible_in_current_view?: boolean;
@@ -210,6 +214,8 @@ export interface DisplayTextChunk {
   max_chunk_chars: number;
   resolver_input_truncated: boolean;
   source: "canonical" | "raw_fallback" | "canonical_placeholder" | UnknownApiEnum;
+  anchor_char_offset?: number | null;
+  anchor_offset_in_chunk?: number | null;
 }
 
 export interface SearchMessagePage extends BasePage<SearchMessageHit> {
@@ -241,7 +247,22 @@ export interface SearchDiagnostics {
   response_estimated_bytes?: number;
   response_estimated_bytes_limit?: number;
   partial_due_to_oversized_input?: boolean;
+  partial?: boolean;
+  partial_reason?: string | null;
+  verified_chars_per_candidate?: number;
+  verified_bytes_per_candidate?: number;
+  request_verified_bytes?: number;
+  request_verified_chars?: number;
+  request_verify_bytes_limit?: number;
+  request_verify_chars_limit?: number;
+  raw_fallback_bytes_per_row?: number;
+  raw_fallback_chars_per_row?: number;
+  verify_chunk_bytes?: number;
+  oversized_candidates_seen?: number;
+  oversized_candidates_verified?: number;
   continuation_available?: boolean;
+  continuation_token?: string | null;
+  completion_state?: "complete" | "partial" | UnknownApiEnum;
 }
 
 export interface Stats {
@@ -266,6 +287,7 @@ export interface Health {
     | "schema_incompatible"
     | "data_incompatible"
     | "foreign_key_violation"
+    | "resource_contract_exceeded"
     | "database_malformed"
     | "database_locked"
     | "database_readonly_or_io"
@@ -311,9 +333,16 @@ export interface Health {
   foreign_key_violations?: number;
   foreign_key_violations_exact?: boolean;
   foreign_key_check_complete?: boolean;
+  foreign_key_check_last_completed_at?: string | null;
+  foreign_key_check_connection_data_version?: number | null;
+  result_stale?: boolean;
   foreign_key_violation_sample_limit?: number;
   foreign_key_violations_by_table?: Array<{ table: string; count: number }>;
   foreign_key_violation_samples?: Array<{ table: string; rowid: number | null; parent_table: string; constraint_index: number }>;
+  reader_resource_contract_checked?: boolean;
+  reader_resource_contract_exact?: boolean;
+  reader_resource_contract_violations?: number;
+  reader_resource_contract_limit_nodes_per_conversation?: number;
 }
 
 export interface CleanupWarning {

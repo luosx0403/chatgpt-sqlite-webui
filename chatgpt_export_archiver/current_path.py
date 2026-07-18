@@ -420,24 +420,90 @@ def ensure_effective_current_views(
     without a growing visited-path string.
     """
 
-    ids = None if conversation_ids is None else sorted({str(value) for value in conversation_ids})
-    if _scope_is_current(conn, ids):
+    global_scope = conversation_ids is None
+    if _scope_is_current(conn, None):
         return
     for statement in _EFFECTIVE_CURRENT_TABLES_SQL:
         conn.execute(statement)
+    finite_scope_current = False
+    if not global_scope:
+        try:
+            state = conn.execute(
+                "SELECT scope_mode, total_changes, data_version FROM effective_current_cache_state"
+            ).fetchone()
+            finite_scope_current = bool(
+                state
+                and state[0] == "ids"
+                and int(state[1]) == conn.total_changes
+                and int(state[2]) == _data_version(conn)
+            )
+        except sqlite3.Error:
+            finite_scope_current = False
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS effective_current_requested_scope("
+            "conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        conn.execute("DELETE FROM effective_current_requested_scope")
+        pending_ids: list[tuple[str]] = []
+        requested_id_bytes = 0
+        for value in conversation_ids:
+            identifier = str(value)
+            requested_id_bytes += len(identifier.encode("utf-8", errors="surrogatepass"))
+            if requested_id_bytes > MAX_EFFECTIVE_CURRENT_SCOPE_INPUT_BYTES:
+                raise EffectiveCurrentResourceLimitError("effective_current_scope_too_large")
+            pending_ids.append((identifier,))
+            if len(pending_ids) >= 400:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO effective_current_requested_scope VALUES (?)",
+                    pending_ids,
+                )
+                pending_ids.clear()
+        if pending_ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO effective_current_requested_scope VALUES (?)",
+                pending_ids,
+            )
+        requested_count = int(
+            conn.execute("SELECT COUNT(*) FROM effective_current_requested_scope").fetchone()[0]
+        )
+        if requested_count > MAX_EFFECTIVE_CURRENT_CONVERSATIONS:
+            raise EffectiveCurrentResourceLimitError("effective_current_scope_too_large")
+        temp_page_size = int(conn.execute("PRAGMA temp.page_size").fetchone()[0])
+        temp_page_count = int(conn.execute("PRAGMA temp.page_count").fetchone()[0])
+        if temp_page_size * temp_page_count > MAX_EFFECTIVE_CURRENT_TEMP_BYTES:
+            raise EffectiveCurrentResourceLimitError("effective_current_scope_too_large")
+        if finite_scope_current:
+            # A materialized superset is valid for a smaller page/enrichment
+            # request.  Retaining it is essential for selected-item checks
+            # that run after page metadata has been added.  Compare actual IDs
+            # (not cardinality) so equal-sized but different scopes still
+            # rebuild correctly.
+            missing = conn.execute(
+                """SELECT 1 FROM (
+                       SELECT conversation_id FROM effective_current_requested_scope
+                       EXCEPT SELECT conversation_id FROM effective_current_scope
+                   )
+                   LIMIT 1"""
+            ).fetchone()
+            if missing is None:
+                conn.execute(
+                    "UPDATE effective_current_cache_state SET total_changes = ?",
+                    (conn.total_changes + 1,),
+                )
+                return
     conn.execute("DELETE FROM effective_current_cache_state")
     conn.execute("DELETE FROM effective_current_meta")
     conn.execute("DELETE FROM effective_current_nodes")
     conn.execute("DELETE FROM effective_current_scope")
-    if ids is None:
+    if global_scope:
         conn.execute("INSERT INTO effective_current_scope SELECT conversation_id FROM conversations")
-    elif ids:
-        conn.executemany(
-            "INSERT INTO effective_current_scope(conversation_id) VALUES (?)",
-            ((value,) for value in ids),
+    else:
+        conn.execute(
+            "INSERT INTO effective_current_scope "
+            "SELECT conversation_id FROM effective_current_requested_scope"
         )
 
-    if ids is None:
+    if global_scope:
         scope_totals = conn.execute(
             """SELECT COUNT(DISTINCT scope.conversation_id), COUNT(n.node_id),
                       COALESCE(SUM(
@@ -460,6 +526,37 @@ def ensure_effective_current_views(
         ):
             raise EffectiveCurrentResourceLimitError("effective_current_scope_too_large")
         _materialize_global_effective_current(conn)
+        return
+
+    scope_totals = conn.execute(
+        """SELECT COUNT(DISTINCT scope.conversation_id), COUNT(n.node_id),
+                  COALESCE(SUM(
+                      length(CAST(COALESCE(n.node_id, '') AS BLOB)) +
+                      length(CAST(COALESCE(n.parent_node_id, '') AS BLOB))
+                  ), 0)
+           FROM effective_current_scope scope
+           LEFT JOIN conversation_nodes n
+             ON n.conversation_id = scope.conversation_id"""
+    ).fetchone()
+    scope_conversations = int(scope_totals[0] or 0)
+    scope_nodes = int(scope_totals[1] or 0)
+    scope_bytes = int(scope_totals[2] or 0)
+    if (
+        scope_conversations > MAX_EFFECTIVE_CURRENT_CONVERSATIONS
+        or scope_nodes > MAX_EFFECTIVE_CURRENT_SCOPE_NODES
+        or scope_bytes > MAX_EFFECTIVE_CURRENT_SCOPE_INPUT_BYTES
+        or scope_bytes + scope_nodes * 96 > MAX_EFFECTIVE_CURRENT_TEMP_BYTES
+    ):
+        raise EffectiveCurrentResourceLimitError("effective_current_scope_too_large")
+    if (
+        scope_conversations > 1
+        and (
+            scope_conversations > EFFECTIVE_CURRENT_SCOPE_BATCH_ROWS
+            or scope_nodes > EFFECTIVE_CURRENT_SCOPE_BATCH_NODES
+            or scope_bytes > EFFECTIVE_CURRENT_SCOPE_BATCH_INPUT_BYTES
+        )
+    ):
+        _materialize_finite_effective_current_in_batches(conn)
         return
 
     oversized = conn.execute(
@@ -701,7 +798,7 @@ def ensure_effective_current_views(
         )
     conn.execute(
         "INSERT INTO effective_current_cache_state VALUES (?, ?, ?)",
-        ("all" if ids is None else "ids", conn.total_changes + 1, _data_version(conn)),
+        ("all" if global_scope else "ids", conn.total_changes + 1, _data_version(conn)),
     )
 
 
@@ -799,6 +896,93 @@ def _materialize_global_effective_current(conn: sqlite3.Connection) -> None:
     finally:
         conn.execute(f"DROP TABLE IF EXISTS temp.{aggregate_nodes}")
         conn.execute(f"DROP TABLE IF EXISTS temp.{aggregate_meta}")
+
+
+def _materialize_finite_effective_current_in_batches(conn: sqlite3.Connection) -> None:
+    """Materialize a large finite request without a full-scope Python graph."""
+
+    outer_scope = "effective_current_outer_scope"
+    aggregate_nodes = "effective_current_nodes_finite_build"
+    aggregate_meta = "effective_current_meta_finite_build"
+    for name in (outer_scope, aggregate_nodes, aggregate_meta):
+        conn.execute(f"DROP TABLE IF EXISTS temp.{name}")
+    conn.execute(
+        f"CREATE TEMP TABLE {outer_scope}(conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
+    )
+    conn.execute(
+        f"INSERT INTO {outer_scope} SELECT conversation_id FROM effective_current_scope"
+    )
+    conn.execute(
+        f"CREATE TEMP TABLE {aggregate_nodes} AS SELECT * FROM effective_current_nodes WHERE 0"
+    )
+    conn.execute(
+        f"CREATE TEMP TABLE {aggregate_meta} AS SELECT * FROM effective_current_meta WHERE 0"
+    )
+
+    def materialize(batch: list[str]) -> None:
+        if not batch:
+            return
+        ensure_effective_current_views(conn, batch)
+        conn.execute(f"INSERT INTO {aggregate_nodes} SELECT * FROM effective_current_nodes")
+        conn.execute(f"INSERT INTO {aggregate_meta} SELECT * FROM effective_current_meta")
+
+    try:
+        last_id = ""
+        batch: list[str] = []
+        batch_nodes = 0
+        batch_bytes = 0
+        while True:
+            rows = conn.execute(
+                f"""SELECT scope.conversation_id, COUNT(n.node_id),
+                           COALESCE(SUM(
+                               COALESCE(length(CAST(n.node_id AS BLOB)), 0) +
+                               COALESCE(length(CAST(n.parent_node_id AS BLOB)), 0)
+                           ), 0)
+                    FROM {outer_scope} scope
+                    LEFT JOIN conversation_nodes n
+                      ON n.conversation_id = scope.conversation_id
+                    WHERE scope.conversation_id > ?
+                    GROUP BY scope.conversation_id
+                    ORDER BY scope.conversation_id
+                    LIMIT ?""",
+                (last_id, EFFECTIVE_CURRENT_SCOPE_BATCH_ROWS),
+            ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                conversation_id = str(row[0])
+                node_count = int(row[1] or 0)
+                graph_bytes = int(row[2] or 0)
+                if batch and (
+                    len(batch) >= EFFECTIVE_CURRENT_SCOPE_BATCH_ROWS
+                    or batch_nodes + node_count > EFFECTIVE_CURRENT_SCOPE_BATCH_NODES
+                    or batch_bytes + graph_bytes > EFFECTIVE_CURRENT_SCOPE_BATCH_INPUT_BYTES
+                ):
+                    materialize(batch)
+                    batch = []
+                    batch_nodes = 0
+                    batch_bytes = 0
+                batch.append(conversation_id)
+                batch_nodes += node_count
+                batch_bytes += graph_bytes
+                last_id = conversation_id
+            if len(rows) < EFFECTIVE_CURRENT_SCOPE_BATCH_ROWS:
+                break
+        materialize(batch)
+        conn.execute("DELETE FROM effective_current_cache_state")
+        conn.execute("DELETE FROM effective_current_meta")
+        conn.execute("DELETE FROM effective_current_nodes")
+        conn.execute("DELETE FROM effective_current_scope")
+        conn.execute(f"INSERT INTO effective_current_scope SELECT * FROM {outer_scope}")
+        conn.execute(f"INSERT INTO effective_current_nodes SELECT * FROM {aggregate_nodes}")
+        conn.execute(f"INSERT INTO effective_current_meta SELECT * FROM {aggregate_meta}")
+        conn.execute(
+            "INSERT INTO effective_current_cache_state VALUES (?, ?, ?)",
+            ("ids", conn.total_changes + 1, _data_version(conn)),
+        )
+    finally:
+        for name in (outer_scope, aggregate_nodes, aggregate_meta):
+            conn.execute(f"DROP TABLE IF EXISTS temp.{name}")
 
 
 def effective_current_metadata(conn: sqlite3.Connection, conversation_ids: Iterable[str]) -> dict[str, dict[str, Any]]:

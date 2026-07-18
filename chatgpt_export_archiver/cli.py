@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -12,6 +13,7 @@ from typing import Any, Callable
 
 from .db import (
     DatabaseMigrationError,
+    begin_bulk_generation_aggregation,
     begin_import_run,
     configure_import_connection,
     connect,
@@ -21,6 +23,7 @@ from .db import (
     drop_optional_web_indexes,
     drop_import_rebuildable_indexes,
     finish_import_run,
+    finish_bulk_generation_aggregation,
     get_stats,
     init_db,
     migrate_database,
@@ -34,6 +37,7 @@ from .db import (
     rebuild_message_fts,
     update_import_run_summary,
     upsert_conversations_batch,
+    validate_optional_web_index_ownership,
     verify_database,
 )
 from .exporter import export_conversations
@@ -43,6 +47,7 @@ from .parser import WarningRecord, conversation_id_from_value, parse_conversatio
 from .scanner import (
     ConversationJsonTopLevelError,
     ConversationJsonElementTooLargeError,
+    DeleteInputRecoveryRequired,
     EncryptedZipMemberError,
     InputSource,
     InvalidConversationEncodingError,
@@ -53,10 +58,13 @@ from .scanner import (
     ZipMemberNotFoundError,
     ZipMemberReadError,
     delete_input_if_unchanged,
+    delete_input_identity_is_current,
+    delete_input_secure_identity_supported,
     is_legacy_conversations_source,
     is_shard_conversation_source,
-    iter_json_array_from_source,
+    iter_source_array_sessions,
     list_source_entries,
+    recover_delete_input,
     resolve_input,
     select_conversation_sources,
     sha256_input_source,
@@ -66,6 +74,7 @@ from .utils import compact_json, epoch_to_display, sha256_text
 from .web_db import create_web_indexes
 
 LOGGER = get_logger("cli")
+REQUIRED_IMPORT_GENERATION_DOMAINS = ("title", "message", "address", "graph")
 
 
 class ImportPipelineError(ValueError):
@@ -281,6 +290,16 @@ def build_parser() -> argparse.ArgumentParser:
     web_index_p.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
     web_index_p.set_defaults(func=cmd_web_index)
     _add_log_args(web_index_p)
+
+    recover_delete_p = sub.add_parser(
+        "recover-delete-input",
+        help="Restore a crash-left delete-input staging entry using its recovery token.",
+    )
+    recover_delete_p.add_argument("--db", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    recover_delete_p.add_argument("--directory", required=True, help="Directory containing the recovery record.")
+    recover_delete_p.add_argument("--token", required=True, help="32-character recovery token.")
+    recover_delete_p.set_defaults(func=cmd_recover_delete_input)
+    _add_log_args(recover_delete_p)
     return parser
 
 
@@ -290,6 +309,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     conn.close()
     print("initialized_db true")
     print(f"fts5_available {str(fts).lower()}")
+    return 0
+
+
+def cmd_recover_delete_input(args: argparse.Namespace) -> int:
+    status = recover_delete_input(Path(args.directory), args.token)
+    print(f"delete_input_recovery_status {status}")
     return 0
 
 
@@ -369,11 +394,11 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     invalid_locations: list[tuple[str, int, str]] = []
     valid_count = 0
     top_level_bad = 0
-    for entry in selected:
+    for _source_index, entry, source_items in iter_source_array_sessions(source, selected):
         source_valid = 0
         source_invalid = 0
         try:
-            for idx, item in enumerate(iter_json_array_from_source(source, entry.source_path)):
+            for idx, item in enumerate(source_items):
                 warning = validate_conversation_element(item, entry.source_path, idx)
                 if warning:
                     source_invalid += 1
@@ -468,6 +493,8 @@ def cmd_import(args: argparse.Namespace) -> int:
         elif result.get("delete_input_failed"):
             print(f"delete_input_failed {result['delete_input_failed']}")
             print(f"delete_input_error_type {result['delete_input_error_type']}")
+            if result.get("delete_input_recovery_required"):
+                print("delete_input_recovery_required true")
     return 0
 
 
@@ -485,19 +512,27 @@ def run_import_pipeline(
 ) -> dict[str, Any]:
     """Import a ZIP/directory and return structural summary without printing chat content."""
     import_started = time.perf_counter()
+    if optimize_fts_after_import and not rebuild_fts:
+        raise ValueError("--optimize-fts-after-import requires --rebuild-fts")
     source = resolve_input(input_value, cwd)
     if delete_input_on_success and source.kind != "zip":
         raise ValueError("--delete-input-on-success is only supported for ZIP inputs")
-    if optimize_fts_after_import and not rebuild_fts:
-        raise ValueError("--optimize-fts-after-import requires --rebuild-fts")
+    if delete_input_on_success and not delete_input_secure_identity_supported():
+        raise ValueError("delete_input_secure_identity_unsupported")
+    if delete_input_on_success and not delete_input_identity_is_current(source):
+        raise SourceChangedDuringReadError("source_changed_during_read")
+    reported_source = source
     LOGGER.info("import_start input_kind=%s input_size=%s", source.kind, source.size)
     conn: sqlite3.Connection | None = None
     try:
         conn = connect(db_path)
         configure_import_connection(conn)
         init_db(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        validate_optional_web_index_ownership(conn)
+        conn.commit()
         input_sha = None if no_input_sha256 or source.kind != "zip" else sha256_input_source(source)
-        run_id = begin_import_run(conn, source, input_sha)
+        run_id = begin_import_run(conn, reported_source, input_sha)
     except Exception:
         if conn is not None:
             try:
@@ -540,6 +575,7 @@ def run_import_pipeline(
         "deleted_input": None,
         "delete_input_changed": None,
         "delete_input_failed": None,
+        "delete_input_recovery_required": None,
         "delete_input_error_type": None,
         "summary_update_after_commit_failed": None,
         "import_connection_close_failed": None,
@@ -549,10 +585,6 @@ def run_import_pipeline(
     def notify(stage: str) -> None:
         if progress_callback:
             progress_callback(stage, dict(summary))
-
-    seen_conversation_ids: set[str] = set()
-    final_node_counts: dict[str, int] = {}
-    final_status_by_id: dict[str, str] = {}
 
     def record_duplicate_warning(parsed: Any) -> None:
         record_warning(
@@ -569,7 +601,16 @@ def run_import_pipeline(
         summary["warnings"] += 1
 
     try:
+        conn.execute("PRAGMA temp_store = FILE")
         conn.execute("BEGIN")
+        begin_bulk_generation_aggregation(conn)
+        conn.execute(
+            """CREATE TEMP TABLE import_run_state(
+                   conversation_id TEXT NOT NULL PRIMARY KEY,
+                   node_count INTEGER NOT NULL,
+                   final_status TEXT
+               ) WITHOUT ROWID"""
+        )
         optional_drop_failures = drop_optional_web_indexes(conn)
         if optional_drop_failures:
             summary["optional_web_index_drop_failures"] = len(optional_drop_failures)
@@ -622,31 +663,45 @@ def run_import_pipeline(
             summary["attempted_updated_conversations"] += statuses["updated"]
             summary["attempted_inserted_conversations"] += statuses["inserted"]
             for conversation_id, status in statuses.get("outcomes", {}).items():
-                previous = final_status_by_id.get(conversation_id)
-                if previous == "inserted":
-                    final_status_by_id[conversation_id] = "inserted"
-                elif previous == "updated":
-                    final_status_by_id[conversation_id] = "updated"
-                elif previous == "unchanged" and status != "unchanged":
-                    final_status_by_id[conversation_id] = "updated"
-                else:
-                    final_status_by_id[conversation_id] = status
+                conn.execute(
+                    """UPDATE import_run_state
+                       SET final_status = CASE
+                           WHEN final_status = 'inserted' THEN 'inserted'
+                           WHEN final_status = 'updated' THEN 'updated'
+                           WHEN final_status = 'unchanged' AND ? <> 'unchanged' THEN 'updated'
+                           ELSE ?
+                       END
+                       WHERE conversation_id = ?""",
+                    (status, status, conversation_id),
+                )
             batch.clear()
 
         parse_started = time.perf_counter()
-        for source_index, entry in enumerate(selected):
-            parsed_conversations = []
+        def classified_source_sessions():
             try:
-                source_items = iter(iter_json_array_from_source(source, entry.source_path))
-            except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, InvalidConversationEncodingError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                yield from iter_source_array_sessions(source, selected)
+            except ImportPipelineError:
+                raise
+            except (
+                json.JSONDecodeError,
+                NonFiniteJsonNumberError,
+                JsonIntegerTooLargeError,
+                InvalidConversationEncodingError,
+                OSError,
+                ValueError,
+                zipfile.BadZipFile,
+            ) as exc:
                 code, stage = _classify_source_load_error(exc)
                 summary["failure_code"] = code
                 raise ImportPipelineError(
                     code,
                     stage=stage,
-                    source_identifier=f"selected_source_{source_index}",
+                    source_identifier="selected_source_session",
                     run_id=run_id,
                 ) from exc
+
+        for source_index, entry, source_items in classified_source_sessions():
+            parsed_conversations = []
             idx = 0
             while True:
                 try:
@@ -681,13 +736,18 @@ def run_import_pipeline(
                 parsed = parse_conversation(item, entry.source_path, idx)
                 record_warnings(conn, run_id, parsed.warnings)
                 summary["warnings"] += len(parsed.warnings)
-                if parsed.conversation_id in seen_conversation_ids:
+                inserted_state = conn.execute(
+                    "INSERT OR IGNORE INTO import_run_state(conversation_id, node_count) VALUES (?, ?)",
+                    (parsed.conversation_id, len(parsed.nodes)),
+                ).rowcount
+                if not inserted_state:
                     record_duplicate_warning(parsed)
-                else:
-                    seen_conversation_ids.add(parsed.conversation_id)
+                    conn.execute(
+                        "UPDATE import_run_state SET node_count = ? WHERE conversation_id = ?",
+                        (len(parsed.nodes), parsed.conversation_id),
+                    )
                 summary["attempted_valid_conversations"] += 1
                 summary["attempted_nodes"] += len(parsed.nodes)
-                final_node_counts[parsed.conversation_id] = len(parsed.nodes)
                 parsed_conversations.append(parsed)
                 if len(parsed_conversations) >= 100:
                     flush_batch(parsed_conversations)
@@ -711,22 +771,29 @@ def run_import_pipeline(
             summary["pragma_optimize_seconds"] = _elapsed(pragma_started)
             notify("pragma_optimize_complete")
         summary["valid_conversations"] = summary["attempted_valid_conversations"]
-        summary["committed_conversations"] = len(final_node_counts)
-        summary["committed_nodes"] = sum(final_node_counts.values())
+        state_totals = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(node_count), 0) FROM import_run_state"
+        ).fetchone()
+        summary["committed_conversations"] = int(state_totals[0])
+        summary["committed_nodes"] = int(state_totals[1])
         summary["nodes"] = summary["committed_nodes"]
-        summary["inserted_conversations"] = sum(
-            status == "inserted" for status in final_status_by_id.values()
-        )
-        summary["updated_conversations"] = sum(
-            status == "updated" for status in final_status_by_id.values()
-        )
-        summary["unchanged_conversations"] = sum(
-            status == "unchanged" for status in final_status_by_id.values()
-        )
+        final_counts = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                "SELECT final_status, COUNT(*) FROM import_run_state GROUP BY final_status"
+            )
+        }
+        summary["inserted_conversations"] = final_counts.get("inserted", 0)
+        summary["updated_conversations"] = final_counts.get("updated", 0)
+        summary["unchanged_conversations"] = final_counts.get("unchanged", 0)
         summary["legacy_pre_commit_seconds"] = _elapsed(import_started)
         summary["wall_total_seconds"] = summary["legacy_pre_commit_seconds"]
         summary["total_import_seconds"] = summary["wall_total_seconds"]
         commit_started = time.perf_counter()
+        finish_bulk_generation_aggregation(
+            conn,
+            REQUIRED_IMPORT_GENERATION_DOMAINS if summary["attempted_valid_conversations"] else (),
+        )
         finish_import_run(conn, run_id, "finished", summary)
         summary["finalize_commit_seconds"] = _elapsed(commit_started)
         summary["wall_total_seconds"] = _elapsed(import_started)
@@ -818,12 +885,14 @@ def run_import_pipeline(
     if not import_succeeded:
         raise RuntimeError("import did not complete")
     if delete_input_on_success:
+        recovery_required = False
         try:
             delete_succeeded = delete_input_if_unchanged(source)
-            delete_error: OSError | None = None
-        except OSError as exc:
+            delete_error: BaseException | None = None
+        except (OSError, DeleteInputRecoveryRequired) as exc:
             delete_succeeded = False
             delete_error = exc
+            recovery_required = isinstance(exc, DeleteInputRecoveryRequired)
         if not delete_succeeded and delete_error is None:
             result["delete_input_changed"] = True
             summary["delete_input_changed"] = True
@@ -838,13 +907,21 @@ def run_import_pipeline(
             error_type = type(delete_error).__name__
             result["delete_input_failed"] = True
             result["delete_input_error_type"] = error_type
+            result["delete_input_recovery_required"] = recovery_required
             summary["delete_input_failed"] = True
             summary["delete_input_error_type"] = error_type
+            summary["delete_input_recovery_required"] = recovery_required
             summary["warnings"] += 1
             _record_post_import_warning(
                 db_path,
                 run_id,
-                WarningRecord("input", None, "delete_input_failed", compact_json({"error_type": error_type}), None),
+                WarningRecord(
+                    "input",
+                    None,
+                    "delete_input_recovery_required" if recovery_required else "delete_input_failed",
+                    compact_json({"error_type": error_type}),
+                    None,
+                ),
                 summary,
             )
         else:
@@ -1038,6 +1115,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"parent_table={item['parent_table']} constraint_index={item['constraint_index']}"
         )
     print(f"non_finite_timestamps {result.get('non_finite_timestamps', 0)}")
+    print(f"effective_current_checked {str(bool(result.get('effective_current_checked'))).lower()}")
+    print(f"effective_current_exact {str(bool(result.get('effective_current_exact'))).lower()}")
+    print(f"diagnostics_partial {str(bool(result.get('diagnostics_partial'))).lower()}")
+    if result.get("resource_limit_code"):
+        print(f"resource_limit_code {result['resource_limit_code']}")
     for key, value in sorted(result.get("effective_current_diagnostics", {}).items()):
         print(f"effective_current_{key} {value}")
     if result.get("optional_web_index_error"):

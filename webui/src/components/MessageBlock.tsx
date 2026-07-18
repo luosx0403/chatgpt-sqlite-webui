@@ -9,6 +9,9 @@ interface Props {
   conversationId: string;
   stateContextKey: string;
   active: boolean;
+  activeTargetOffset?: number | null;
+  activeMatchLength?: number | null;
+  activeRevision?: string | null;
   layout: MessageLayout;
   showRawDefault: boolean;
   t: (key: string) => string;
@@ -108,7 +111,7 @@ function looksLikeTechnicalPayload(message: MessageItem, text: string): boolean 
   return false;
 }
 
-export default function MessageBlock({ message, conversationId, stateContextKey, active, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
+export default function MessageBlock({ message, conversationId, stateContextKey, active, activeTargetOffset = null, activeMatchLength = null, activeRevision = null, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
   const messageIdentity = JSON.stringify([conversationId, message.node_id, message.message_id || "", message.content_hash || ""]);
   const preservedStateKey = JSON.stringify([stateContextKey, messageIdentity, showRawDefault ? "raw" : "plain"]);
   const savedState = preservedMessageStates.get(preservedStateKey);
@@ -130,9 +133,11 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
   );
   const [displayLoading, setDisplayLoading] = useState(false);
   const [displayError, setDisplayError] = useState("");
+  const [activeWindowRange, setActiveWindowRange] = useState<HighlightRange | null>(null);
   const FULL_RAW_MAX_CHARS = 50000;
   const mountedRef = useRef(true);
   const measureFrameRef = useRef<number | null>(null);
+  const focusFrameRef = useRef<number | null>(null);
   const rawControllerRef = useRef<AbortController | null>(null);
   const displayControllerRef = useRef<AbortController | null>(null);
   const rawRequestIdRef = useRef(0);
@@ -171,13 +176,14 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     const requestIdentity = messageIdentity;
     setDisplayLoading(true);
     setDisplayError("");
+    setActiveWindowRange(null);
     try {
       let offset = 0;
       let cursor: string | null = null;
       let complete = "";
       let completeBytes = 0;
       while (true) {
-        const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal, cursor);
+        const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 1048576, controller.signal, cursor);
         if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
         if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
           setDisplayRecoveryIncomplete(true);
@@ -237,6 +243,10 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
         window.cancelAnimationFrame(measureFrameRef.current);
         measureFrameRef.current = null;
       }
+      if (focusFrameRef.current !== null) {
+        window.cancelAnimationFrame(focusFrameRef.current);
+        focusFrameRef.current = null;
+      }
     };
   }, [preservedStateKey]);
   useEffect(() => {
@@ -270,6 +280,51 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
       notifySizeMayChange();
     }
   }, [active, shouldCollapseDetails]);
+  useEffect(() => {
+    if (!active || activeTargetOffset === null || activeTargetOffset < previewText.length) {
+      setActiveWindowRange(null);
+      return;
+    }
+    const controller = new AbortController();
+    const requestIdentity = messageIdentity;
+    const requestId = ++displayRequestIdRef.current;
+    displayControllerRef.current?.abort();
+    displayControllerRef.current = controller;
+    setDisplayLoading(true);
+    void getMessageDisplayChunk(
+      conversationId,
+      message.node_id,
+      0,
+      1048576,
+      controller.signal,
+      null,
+      activeTargetOffset,
+    ).then((chunk) => {
+      if (controller.signal.aborted || requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
+      if (activeRevision && chunk.content_revision !== activeRevision) {
+        setDisplayError(t("displayTextFailed"));
+        return;
+      }
+      const codePointStart = Math.max(0, chunk.anchor_offset_in_chunk ?? 0);
+      const codePointLength = Math.max(1, activeMatchLength ?? 1);
+      const start = Array.from(chunk.display_text).slice(0, codePointStart).join("").length;
+      const end = start + Array.from(chunk.display_text).slice(codePointStart, codePointStart + codePointLength).join("").length;
+      setExpandedText(chunk.display_text);
+      setDisplayNextOffset(null);
+      setDisplayNextCursor(null);
+      setActiveWindowRange({ start, end });
+      requestAnimationFrame(() => bodyRef.current?.querySelector("mark.search-highlight-active")?.scrollIntoView({ block: "center" }));
+    }).catch((error: unknown) => {
+      if (!(error instanceof Error && error.name === "AbortError")) setDisplayError(t("displayTextFailed"));
+    }).finally(() => {
+      if (requestId === displayRequestIdRef.current) {
+        setDisplayLoading(false);
+        displayControllerRef.current = null;
+        notifySizeMayChange();
+      }
+    });
+    return () => controller.abort();
+  }, [active, activeMatchLength, activeRevision, activeTargetOffset, conversationId, message.node_id, messageIdentity, previewText.length, t]);
   const openFullRaw = async () => {
     if (fullRaw) {
       rawRequestIdRef.current += 1;
@@ -343,14 +398,25 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     setDisplayLoading(true);
     setDisplayError("");
     try {
-      const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 65536, controller.signal, displayNextCursor);
+      const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 1048576, controller.signal, displayNextCursor);
       if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
       const incomplete = chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact);
       if (incomplete) setDisplayRecoveryIncomplete(true);
       setExpandedText((current) => offset === 0 ? chunk.display_text : `${current ?? ""}${chunk.display_text}`);
       setDisplayNextOffset(chunk.next_offset);
       setDisplayNextCursor(chunk.next_cursor);
-      if (!chunk.has_more) window.requestAnimationFrame(() => bodyRef.current?.focus());
+      if (!chunk.has_more) {
+        if (focusFrameRef.current !== null) window.cancelAnimationFrame(focusFrameRef.current);
+        focusFrameRef.current = window.requestAnimationFrame(() => {
+          focusFrameRef.current = null;
+          if (
+            mountedRef.current &&
+            requestId === displayRequestIdRef.current &&
+            requestIdentity === messageIdentityRef.current &&
+            bodyRef.current?.isConnected
+          ) bodyRef.current.focus();
+        });
+      }
     } catch (error) {
       if (
         mountedRef.current &&
@@ -387,7 +453,8 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
       <pre ref={bodyRef} tabIndex={-1} className="message-text">
         {(() => {
           let markIndex = 0;
-          return pieces(text || placeholder, message.highlight_ranges).map((part, index) => {
+          const ranges = active && activeWindowRange ? [activeWindowRange] : message.highlight_ranges;
+          return pieces(text || placeholder, ranges).map((part, index) => {
             if (typeof part === "string") return part;
             const isActiveMark = active && markIndex === 0;
             markIndex += 1;

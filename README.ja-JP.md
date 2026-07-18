@@ -200,7 +200,7 @@ CLI と Web のエクスポートは、有効な現在パスと表示メッセ�
 python chatgpt_archive.py web-index --db archive/chatgpt_archive.db
 ```
 
-`web-index` は、メッセージの走査と正規化、タイトル正規化、対応時の message/title trigram 構築、generation metadata 書き込み、commit を明示的で観測可能な段階として実行します。各段階は上限付き keyset batch と byte budget を使い、各メッセージを一度だけ解決します。再構築は単一の atomic SQLite transaction 内で行われ、commit までは reader が以前の current 任意インデックスを参照します。generation/metadata failure、SQLite interrupt、disk error、または cancel は置換オブジェクト全体を rollback します。構築全体で `BEGIN IMMEDIATE` と writer slot を保持し、一時 disk を使う場合があります。Web import job JSON は stage と processed/total を公開し、import job の index stage 中は React UI または `POST /api/import/jobs/{job_id}/web-index/cancel` で取消を要求できます。これは独立した Web index build job ではありません。budget 超過行は記録して canonical verifier で走査するため、index 構築によって recall は低下しません。
+`web-index` は明示的な段階で message/title を正規化し、対応時に trigram index を構築します。build ごとに予測不能な staging 名と永続 owner-token lease を使い、2 個目の build は `web_index_build_in_progress` で拒否され、stale cleanup も厳密な所有権を検証します。全段階は上限付き keyset と個別の input/normalized/derived/FTS-bind byte budget を使い、実測 peak を報告します。writer lock は batch 間で解放され、最後の短い `BEGIN IMMEDIATE` transaction で canonical generation、object ownership、metadata を再確認して atomic publish します。それまでは reader が旧 index を参照します。generation change、interrupt、disk error、cancel は旧 index を維持し、その lease が所有する object だけを cleanup します。`POST /api/import/jobs/{job_id}/web-index/cancel` は import job の index stage にのみ適用されます。
 
 Web UI を起動します。
 
@@ -472,9 +472,23 @@ tools/                             Delivery and support scripts
 
 メインデータベースは conversations、mapping nodes、import runs、warnings を保存します。message object だけが raw message JSON object を保持し、conversation と mapping-node object は正規化され、byte-for-byte 保存ではありません。入力 ZIP SHA-256 は任意で、`source_files`/`file_index` の entry SHA 列は予約済みですが現在は未設定です。CLI FTS テーブルは `message_fts` です。任意 Web 検索用の補助テーブルには `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram` と SQLite FTS5 shadow tables が含まれます。
 
-canonical DB は `PRAGMA user_version` で version 3 として管理されます。version 3 は canonical TEXT identity に明示的な `NOT NULL` を追加します。migration は判断と再構築を同じ write-lock transaction 内で行い、NULL identity を推測せず、データベースを変更しないまま拒否します。readonly CLI と Web request は migration DDL を実行せず、古い compatible DB は migration まで `database_migration_required` で gate されます。外部 backup を作成・検証してから `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db` を実行してください。
+canonical DB は `PRAGMA user_version` の version 4 です。version 3 は canonical TEXT identity に `NOT NULL` を追加し、version 4 は field-scoped durable address/graph revision を追加して fresh reader の stale compatibility/effective-current cache を防ぎます。Migration は同じ write-lock transaction で revision row と managed trigger を導入し、必要な optional index を invalidate します。readonly path は migration DDL を実行せず、旧 compatible DB は `database_migration_required` を返します。外部 backup を検証してから migrate command を実行してください。
 
 Health と `verify` は任意の `message_fts` の欠落と破損を区別します。破損時は `optional_message_fts_error` と `--rebuild-fts` の復旧ヒントを返します。一般的な malformed、locked、readonly、I/O、SQL runtime failure は能力欠落として扱わず、`database_malformed`、`database_locked`、`database_readonly`、`database_io_error`、`database_runtime_failure` を使います。
+
+## Round 9 のリソース・所有権・復旧契約
+
+managed FTS、任意 Web index、staging、metadata、generation、shadow object は、type、target table、SQL、fingerprint の所有権が完全一致した場合だけ破壊的 DDL の対象になります。衝突は `core_fts_name_collision`、`optional_index_name_collision`、`staging_name_collision` で拒否し、名前が似ている user object を削除しません。任意 Web index format は 4 です。build ごとに予測不能な staging 名と永続 owner-token lease を使い、同時 build は `web_index_build_in_progress` になります。stale recovery も owner、database identity、schema、generation、format、全 object 名を検証します。input、normalized、derived、FTS bind は別々の batch budget と実測 current/peak byte を持ち、256 文字を超える prefix でも完全 streaming placeholder 判定を回避できません。
+
+長い display cursor は `archive_generations` の内部 `display:<rowid>` key に保存される durable な行別 revision に結び付けられます。managed insert/update trigger は表示に影響するすべての write で revision を進めるため、直接の外部 SQLite writer が `content_hash` を更新しなくても stale cursor を検出し、無関係な行の write は cursor を無効化しません。これらの trigger がない既存 version-4 database は migration-required gate となり、明示的 writer migration が revision を backfill します。rowid 再利用で旧 cursor が復活しないよう、削除行の revision tombstone は保持します。
+
+exact message search は canonical BLOB を 64 KiB overlap chunk で incremental read します。通常の 1 row 上限は decoded 32 MiB characters と UTF-8 32 MiB、trusted local opt-in は 100 MiB characters、raw-only fallback は別に 1 MiB/800,000 characters、1 request は 128 MiB bytes/characters aggregate です。超過時は完全な HTTP 413 を返し、partial page と continuation token は提供しません。最初の hit request は exact total を取得し、後続 page は loaded 数を分けて表示できます。late hit は row revision に結び付く character anchor を持ち、reader は数 MiB の page を再生せず直接 seek します。
+
+新規 import の 1 conversation element は UTF-8 32 MiB、decoded 32 MiB characters、250,000 scalar、5,000 mapping node の独立上限を持ちます。node 超過は `conversation_node_limit_exceeded` で内容を保存せず skip します。reader/effective-current/export の 100,000-node 上限は legacy または外部書込み DB の互換用で、import の約束ではありません。選択した ZIP shard は 1 read session を共有し、directory discovery は incremental budget を使います。空 `parent` は legacy root/missing-parent 互換です。legacy ID readiness は全 address/graph field の長さと危険な Unicode を検査し、永続 field revision で cache を無効化します。通常 read は `PRAGMA data_version` を polling しません。
+
+project bulk import は同じ write-lock transaction 内で完全一致する project-owned generation trigger を一時置換し、dirty field domain ごとに 1 回だけ generation を進めて trigger を復元・検証します。rollback/crash は旧 DDL/data を復元し、external writer は通常の statement trigger を使います。finite effective-current scope は bounded SQLite TEMP batch で正確に比較します。archive export は plan と node を temporary SQLite に spool し、conversation/node を keyset stream するため、archive 全体の Python node graph を保持しません。
+
+`--delete-input-on-success` では canonical commit 成功まで user の元 pathname が存在します。commit 後は identity-bound recovery journal を durable write/fsync してから rename します。中断時の token は `python chatgpt_archive.py recover-delete-input --directory <dir> --token <token>` で明示復元でき、replacement を上書きしません。Windows または descriptor-relative no-follow identity 機能がない platform では secure delete を拒否します。Web Python constraints は resolved version を固定しますが cross-platform hash lock ではないため、信頼できる package index を使用してください。
 
 ## 既知の制限
 
@@ -492,9 +506,9 @@ Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
 
-単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、UTF-8 入力と decode 後文字数は各 32 MiB、nesting は 256、scalar は 100,000 に制限されます。legacy raw の iterative sanitizer は traversal 100,000 nodes、raw preview 80,000 bytes、sanitized API payload 全体 4 MiB を上限にします。ZIP central directory と directory の全 entry は 100,000 member 上限に数えます。先頭 BOM は 1 個だけ除去し、他の不正 encoding は拒否します。新 canonical ID は 512 文字上限で切り詰めず、query-based `/api/by-id/*` は legacy ID を 16 Ki 文字まで扱います。それ以上の旧 ID は readiness を `database_data_incompatible` にします。
+単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、UTF-8 入力と decode 後文字数は各 32 MiB、nesting は 256、scalar は 250,000 に制限されます。legacy raw の iterative sanitizer は traversal 100,000 nodes、raw preview 80,000 bytes、sanitized API payload 全体 4 MiB を上限にします。ZIP central directory と directory の全 entry は 100,000 member 上限に数えます。先頭 BOM は 1 個だけ除去し、他の不正 encoding は拒否します。新 canonical ID は 512 文字上限で切り詰めず、query-based `/api/by-id/*` は legacy ID を 16 Ki 文字まで扱います。それ以上の旧 ID は readiness を `database_data_incompatible` にします。
 
-descriptor-bound stat/hash/read で file identity を検証し、directory child は open 時に再検証します。`--delete-input-on-success` は atomic staged rename と最終 identity barrier を使い、変更された target を削除しません。migration は明示 predecessor だけを受け入れ、DDL 前に dependent custom view/trigger/index を inventory し、安全でない rebuild は `database_custom_objects_require_manual_migration` で拒否します。
+descriptor-bound stat/hash/read で file identity を検証します。`--delete-input-on-success` は atomic staging rename と最終 identity barrier を使い、復旧できない occupied-name race は `delete_input_recovery_required` を記録します。Migration は定義が完全一致する既知 predecessor のみ受け入れ、managed trigger/index 名を誤った type/target/definition で占有する object は DDL 前に `database_managed_object_name_collision` で拒否します。
 
 非標準 JSON `NaN` / `Infinity`（`1e9999` のような overflow する標準数値を含む）は拒否され、無効な timestamp は内容を含まない warning とともに `NULL` になります。既定 message API は reader budget で制限された `display_text` を一つだけ返し、truncation/total-exactness metadata で完全復元の可否を示し、`content_text`/`render_text` を重複しません。通常の CLI/Web read と既定 `/api/health` は bounded schema gate を使い、`foreign_key_check` を実行しません。`verify` と `/api/health?deep=true` は完全で正確な検査と freshness fields を返します。複数 statement の CLI/Web logical read は schema/capability probe 前に一つの SQLite read snapshot を開始し、stream の完了・失敗時に解放します。Effective-current、pagination、around-node の意味は維持されます。
 
@@ -516,10 +530,12 @@ message search page は常に `total_exact` を返します。empty DB または
 
 filter-only/exclude-only は conversation を絞れますが、message hit、reader highlight、hit navigation には正の message text term が必要です。Copy URL は同じ applied search/list/selection context を使い、debounce 前の入力を古い selection と混ぜません。日本語とスペイン語 UI は partial translation と明示表示されます。release は collector とは独立した authoritative required-file list を先に検証し、必要な source/config/doc が欠ければ旧 ZIP を置換せず失敗します。
 
-request validation response は最大 16 件の安全な item のみで、allowlist 済み `location`、`field`、stable public `code` だけを含み、body/path/query 値や framework validation type を echo しません。Raw API は exact UTF-8 byte と character 単位を分離します。message-search verifier、snippet、enrichment、response size は bounded で、oversized input は partial diagnostics を明示します。SQLite rowid BLOB prefix は unbounded text materialization を避け、Web index は実際に read/normalize した byte を計測します。Release payload は whole-file buffer ではなく chunk stream で hash/write/verify します。
+request validation response は最大 16 件の安全な item のみで、allowlist 済み `location`、`field`、stable public `code` だけを含みます。message-search candidate exact verifier、late snippet、enrichment、serialized response は bounded です。import 範囲内は incremental BLOB read で exact verify し、それより大きい legacy candidate は false-exact ではなく stable 413 を返します。Web index は read/normalize/FTS bind の byte を計測し、release payload は chunk stream で hash/write/verify します。
 
 Python `zipfile` と本プロジェクトの import pipeline は ZIP64 構造をサポートし、小さな forced-ZIP64 member の回帰テストがあります。ただし通常の acceptance suite では物理サイズ 4 GiB 超の ZIP は生成していません。member、byte、compression ratio、disk、CPU の全上限は引き続き適用されます。
 
 長時間の CLI/Web streaming export は、完了、失敗、または client disconnect まで一つの SQLite read snapshot を保持します。WAL mode では長い reader が checkpoint を遅らせ、concurrent writer により WAL が増える場合があります。duration、CPU/VM work、WAL、temporary disk は選択データ量に比例し、snapshot consistency を壊して早期 checkpoint してはいけません。
 
 `npm run build` は `webui/scripts/build.mjs` を使い、typecheck 後に同階層の staging directory へ build し、staged `index.html` が参照する全 asset を検証して、asset を先に公開し、最後に `dist/index.html` を atomic replace します。failure injection self-test は失敗時にも旧 entry point とその asset が使用可能なことを確認します。
+
+Search candidate は import element の独立した 32 Mi-character と 32 MiB UTF-8 上限内で incremental BLOB read により exact verify されます。trusted local test は `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` で最大 100 Mi characters まで opt in でき、この明示的 opt-in は対応する有効な UTF-8 byte capacity も許可します。さらに大きい legacy candidate は false-exact な空結果ではなく HTTP 413 `search_candidate_exact_verify_limit` を返します。long display cursor は target row revision に結び付きます。

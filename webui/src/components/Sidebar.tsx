@@ -149,6 +149,7 @@ export default function Sidebar(props: Props) {
             (item.has_title_hits || item.title_match || item.reasons?.includes("title match")) ? props.t("titleHitBadge") : "",
             (item.has_internal_hits || item.snippets?.some((snippet) => snippet.is_internal)) ? props.t("internalHitBadge") : "",
             (!pathFallback && (item.has_branch_hits || hasSnippetBranch)) ? props.t("branchHitBadge") : "",
+            item.enrichment_partial ? props.t("enrichmentPartialBadge") : "",
           ].filter(Boolean);
           return (
             <button
@@ -231,6 +232,7 @@ function SearchLoadingProgress({ label }: { label: string }) {
 }
 
 function diagnosticsLabel(t: (key: string) => string, diag: SearchDiagnostics): string | null {
+  if (diag.partial || diag.completion_state === "partial") return t("searchDiagnosticsPartial");
   if (diag.web_index_missing && diag.short_query) return t("searchDiagnosticsMissingShort");
   if (diag.web_index_missing) return t("searchDiagnosticsMissing");
   if (diag.legacy_trigram_index || diag.actual_fallback_note || diag.estimated_backend_note) return t("searchDiagnosticsLegacy");

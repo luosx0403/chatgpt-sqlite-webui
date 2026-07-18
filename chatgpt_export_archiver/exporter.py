@@ -10,11 +10,11 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
-from .current_path import resolve_effective_current_collection
+from .current_path import ensure_effective_current_views, resolve_effective_current_collection
 from .db import record_export
 from .parser import recover_message_display_text
 from .search import _is_internal_message
-from .utils import epoch_to_date_part, epoch_to_display, finite_float_or_none, parse_date_boundary, safe_filename_part, sha256_text, truncate_utf8, write_bytes_if_changed, write_chunks_if_changed
+from .utils import epoch_to_date_part, epoch_to_display, finite_float_or_none, parse_date_boundary, safe_filename_part, sha256_text, truncate_utf8, write_chunks_if_changed
 
 
 MAX_EXPORT_BASENAME_BYTES = 240
@@ -257,8 +257,8 @@ def export_conversations(
                 bounded_batches.append(bounded_batch)
 
             for conversation_batch in bounded_batches:
-                nodes_by_conversation = _nodes_for_conversation_batch(conn, conversation_batch)
                 ids = [str(conv["conversation_id"]) for conv in conversation_batch]
+                _spool_export_nodes_for_batch(conn, plan, ids, path=path)
                 placeholders = ",".join("?" for _ in ids)
                 filename_rows = plan.execute(
                     f"SELECT conversation_id, format, output_path FROM requests WHERE conversation_id IN ({placeholders})",
@@ -270,14 +270,13 @@ def export_conversations(
                 }
                 for conv in conversation_batch:
                     conversation_id = str(conv["conversation_id"])
-                    nodes = prepare_export_nodes(
-                        conv,
-                        nodes_by_conversation.get(conversation_id, []),
-                        path=path,
-                        include_internal=include_internal,
-                    )
                     for fmt in formats:
                         rel_path = filenames[(conversation_id, fmt)]
+                        nodes = _iter_spooled_export_nodes(
+                            plan,
+                            conversation_id,
+                            include_internal=include_internal,
+                        )
                         changed, output_hash, _output_bytes = write_chunks_if_changed(
                             out_dir / rel_path,
                             iter_rendered_conversation(conv, nodes, fmt),
@@ -293,7 +292,7 @@ def export_conversations(
                 plan.commit()
 
         _validate_archive_export_outputs(plan, out_dir, conversation_count, formats)
-        _write_manifest_from_plan(
+        manifest_cleanup_warnings = _write_manifest_from_plan(
             plan,
             out_dir,
             path=path,
@@ -316,6 +315,7 @@ def export_conversations(
             "formats": formats,
             "written": written,
             "skipped_unchanged": skipped,
+            "cleanup_warnings": manifest_cleanup_warnings,
         }
     finally:
         if plan is not None:
@@ -353,6 +353,19 @@ def _create_archive_export_plan(plan: sqlite3.Connection) -> None:
         CREATE INDEX requests_natural_key ON requests(collision_key, format, conversation_id);
         CREATE UNIQUE INDEX requests_output_key ON requests(output_collision_key)
             WHERE output_collision_key IS NOT NULL;
+        CREATE TABLE export_nodes (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            role TEXT,
+            content_type TEXT,
+            content_text TEXT,
+            raw_message_json TEXT,
+            create_time REAL,
+            update_time REAL
+        );
+        CREATE INDEX export_nodes_conversation_sequence
+            ON export_nodes(conversation_id, sequence);
         CREATE TABLE natural_counts (
             collision_key TEXT PRIMARY KEY,
             request_count INTEGER NOT NULL,
@@ -634,6 +647,13 @@ def _files_equal(left: Path, right: Path, chunk_size: int = 1024 * 1024) -> bool
         return False
 
 
+class ManifestPairRecoveryError(RuntimeError):
+    def __init__(self, code: str, diagnostics: list[dict[str, str]]) -> None:
+        super().__init__(code)
+        self.code = code
+        self.diagnostics = diagnostics
+
+
 def _write_manifest_from_plan(
     plan: sqlite3.Connection,
     out_dir: Path,
@@ -641,10 +661,17 @@ def _write_manifest_from_plan(
     path: str,
     include_internal: bool,
     force: bool,
-) -> None:
+) -> list[dict[str, str]]:
     candidates: dict[Path, Path] = {}
     backups: dict[Path, Path] = {}
-    published: set[Path] = set()
+    published: list[Path] = []
+    pair_committed = False
+    recovery_incomplete = False
+    cleanup_warnings: list[dict[str, str]] = []
+
+    def diagnostic(operation: str, exc: BaseException) -> dict[str, str]:
+        return {"operation": operation, "error_type": type(exc).__name__}
+
     try:
         for target, chunks in (
             (out_dir / "manifest.jsonl", _iter_jsonl_manifest(plan, path=path, include_internal=include_internal)),
@@ -666,7 +693,10 @@ def _write_manifest_from_plan(
             target for target, candidate in candidates.items()
             if force or not _files_equal(target, candidate)
         }
-        for target in changed:
+        ordered_targets = tuple(candidates)
+        for target in ordered_targets:
+            if target not in changed:
+                continue
             if target.exists():
                 backup_fd, backup_name = tempfile.mkstemp(
                     prefix=f".{target.name}.backup-", suffix=".tmp", dir=out_dir
@@ -676,40 +706,65 @@ def _write_manifest_from_plan(
                 backup = Path(backup_name)
                 os.replace(target, backup)
                 backups[target] = backup
-        for target in changed:
+        for target in ordered_targets:
+            if target not in changed:
+                continue
             os.replace(candidates[target], target)
-            published.add(target)
+            published.append(target)
+        pair_committed = True
         for backup in backups.values():
             try:
                 os.unlink(backup)
-            except OSError:
-                # Publication is already complete. A stale private backup is
-                # preferable to rolling back only part of the manifest pair.
-                pass
+            except OSError as exc:
+                cleanup_warnings.append(diagnostic("backup_cleanup_pending", exc))
         for target, candidate in candidates.items():
             if target not in changed:
-                os.unlink(candidate)
-    except BaseException:
+                try:
+                    os.unlink(candidate)
+                except OSError as exc:
+                    cleanup_warnings.append(diagnostic("candidate_cleanup_pending", exc))
+        return cleanup_warnings
+    except BaseException as primary:
+        recovery_errors: list[dict[str, str]] = []
+        unlink_errors: dict[Path, dict[str, str]] = {}
         for target in published:
             try:
                 os.unlink(target)
             except FileNotFoundError:
-                pass
+                continue
+            except OSError as exc:
+                unlink_errors[target] = diagnostic("rollback_target_unlink_failed", exc)
         for target, backup in backups.items():
             if backup.exists():
-                os.replace(backup, target)
+                try:
+                    # os.replace also overwrites a published target whose
+                    # explicit unlink failed, so that earlier cleanup error is
+                    # not itself evidence of partial recovery.
+                    os.replace(backup, target)
+                    unlink_errors.pop(target, None)
+                except OSError as exc:
+                    recovery_errors.append(diagnostic("rollback_restore_failed", exc))
+        # A newly created target has no backup that can overwrite it. Failure
+        # to remove that target therefore leaves the pair potentially mixed.
+        recovery_errors.extend(unlink_errors.values())
+        if recovery_errors:
+            recovery_incomplete = True
+            raise ManifestPairRecoveryError(
+                "manifest_pair_partial_recovery", recovery_errors
+            ) from primary
         raise
     finally:
         for candidate in candidates.values():
             try:
                 os.unlink(candidate)
-            except FileNotFoundError:
+            except OSError:
                 pass
-        for backup in backups.values():
-            try:
-                os.unlink(backup)
-            except FileNotFoundError:
-                pass
+        if not pair_committed and not recovery_incomplete:
+            for backup in backups.values():
+                try:
+                    os.unlink(backup)
+                except OSError:
+                    pass
 
 
 def _record_archive_exports(
@@ -937,22 +992,83 @@ def prepare_export_nodes(
     return prepared
 
 
-def _nodes_for_conversation_batch(
+def _spool_export_nodes_for_batch(
     conn: sqlite3.Connection,
-    conversations: Sequence[Mapping[str, Any]],
-) -> dict[str, list[sqlite3.Row]]:
-    ids = [str(conv["conversation_id"]) for conv in conversations]
+    plan: sqlite3.Connection,
+    ids: Sequence[str],
+    *,
+    path: str,
+) -> None:
+    """Copy one bounded node batch to the disk-backed export plan in order."""
+
+    plan.execute("DELETE FROM export_nodes")
     if not ids:
-        return {}
+        return
     placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT * FROM conversation_nodes WHERE conversation_id IN ({placeholders})",
-        ids,
-    ).fetchall()
-    grouped: dict[str, list[sqlite3.Row]] = {conversation_id: [] for conversation_id in ids}
+    missing_expr = "CASE WHEN n.create_time IS NULL THEN 1 ELSE 0 END"
+    time_expr = (
+        "CASE WHEN n.create_time IS NOT NULL THEN n.create_time "
+        "WHEN n.update_time IS NOT NULL THEN n.update_time ELSE 0 END"
+    )
+    if path == "current":
+        ensure_effective_current_views(conn, ids)
+        rows = conn.execute(
+            f"""SELECT n.conversation_id, n.node_id, n.role, n.content_type,
+                       n.content_text, n.raw_message_json, n.create_time, n.update_time
+                FROM effective_current_nodes e
+                JOIN conversation_nodes n
+                  ON n.conversation_id = e.conversation_id AND n.node_id = e.node_id
+                WHERE e.conversation_id IN ({placeholders})
+                ORDER BY n.conversation_id,
+                         CASE WHEN e.source = 'fallback_all' THEN {missing_expr} ELSE 0 END,
+                         CASE WHEN e.source = 'fallback_all' THEN {time_expr} ELSE -COALESCE(e.depth, 0) END,
+                         n.node_id""",
+            list(ids),
+        )
+    else:
+        rows = conn.execute(
+            f"""SELECT n.conversation_id, n.node_id, n.role, n.content_type,
+                       n.content_text, n.raw_message_json, n.create_time, n.update_time
+                FROM conversation_nodes n
+                WHERE n.conversation_id IN ({placeholders})
+                ORDER BY n.conversation_id, {missing_expr}, {time_expr}, n.node_id""",
+            list(ids),
+        )
+    pending: list[tuple[Any, ...]] = []
     for row in rows:
-        grouped[str(row["conversation_id"])].append(row)
-    return grouped
+        pending.append(tuple(row))
+        if len(pending) >= 128:
+            plan.executemany(
+                """INSERT INTO export_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       raw_message_json, create_time, update_time
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                pending,
+            )
+            pending.clear()
+    if pending:
+        plan.executemany(
+            """INSERT INTO export_nodes(
+                   conversation_id, node_id, role, content_type, content_text,
+                   raw_message_json, create_time, update_time
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            pending,
+        )
+
+
+def _iter_spooled_export_nodes(
+    plan: sqlite3.Connection,
+    conversation_id: str,
+    *,
+    include_internal: bool,
+) -> Iterator[dict[str, Any]]:
+    for row in plan.execute(
+        "SELECT * FROM export_nodes WHERE conversation_id = ? ORDER BY sequence",
+        (conversation_id,),
+    ):
+        resolved = _resolved_export_node(row, include_internal=include_internal)
+        if resolved is not None:
+            yield resolved
 
 
 def iter_conversation_export_nodes(
@@ -996,29 +1112,64 @@ def iter_conversation_export_nodes(
             batch_size=batch_size,
         )
         return
-    skeletons = conn.execute(
-        """SELECT node_id, parent_node_id, is_on_current_path,
-                  create_time, update_time
-           FROM conversation_nodes
-           WHERE conversation_id = ?""",
-        (conv["conversation_id"],),
-    ).fetchall()
-    ordered_ids = [str(row["node_id"]) for row in order_export_path(conv, skeletons, path)]
-    for offset in range(0, len(ordered_ids), batch_size):
-        ids = ordered_ids[offset : offset + batch_size]
-        placeholders = ",".join("?" for _ in ids)
+    ensure_effective_current_views(conn, [conversation_id])
+    source_row = conn.execute(
+        "SELECT source FROM effective_current_nodes WHERE conversation_id = ? LIMIT 1",
+        (conversation_id,),
+    ).fetchone()
+    if source_row is None:
+        return
+    if str(source_row[0]) == "fallback_all":
+        yield from _iter_all_export_nodes_keyset(
+            conn,
+            conversation_id,
+            include_internal=include_internal,
+            batch_size=batch_size,
+        )
+        return
+    yield from _iter_current_export_nodes_keyset(
+        conn,
+        conversation_id,
+        include_internal=include_internal,
+        batch_size=batch_size,
+    )
+
+
+def _iter_current_export_nodes_keyset(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    *,
+    include_internal: bool,
+    batch_size: int,
+) -> Iterator[dict[str, Any]]:
+    """Stream the disk-backed effective chain from root toward its leaf."""
+
+    last_key: tuple[int, str] | None = None
+    while True:
+        predicate = ""
+        params: list[Any] = [conversation_id]
+        if last_key is not None:
+            predicate = "AND (e.depth < ? OR (e.depth = ? AND e.node_id > ?))"
+            params.extend((last_key[0], last_key[0], last_key[1]))
+        params.append(batch_size)
         rows = conn.execute(
-            f"SELECT * FROM conversation_nodes WHERE conversation_id = ? AND node_id IN ({placeholders})",
-            [conv["conversation_id"], *ids],
+            f"""SELECT n.*, e.depth AS export_depth
+                FROM effective_current_nodes e
+                JOIN conversation_nodes n
+                  ON n.conversation_id = e.conversation_id AND n.node_id = e.node_id
+                WHERE e.conversation_id = ? AND e.depth IS NOT NULL {predicate}
+                ORDER BY e.depth DESC, e.node_id
+                LIMIT ?""",
+            params,
         ).fetchall()
-        by_id = {str(row["node_id"]): row for row in rows}
-        for node_id in ids:
-            node = by_id.get(node_id)
-            if node is None:
-                continue
-            resolved = _resolved_export_node(node, include_internal=include_internal)
+        if not rows:
+            return
+        for row in rows:
+            resolved = _resolved_export_node(row, include_internal=include_internal)
             if resolved is not None:
                 yield resolved
+        tail = rows[-1]
+        last_key = (int(tail["export_depth"]), str(tail["node_id"]))
 
 
 def _iter_all_export_nodes_keyset(
@@ -1175,57 +1326,3 @@ def iter_copy_conversation(nodes: Iterable[Mapping[str, Any]]) -> Iterator[str]:
             yield "\n\n"
         first = False
         yield f"{node['role'] or 'message'}:\n{content_text}"
-
-
-def manifest_row(
-    conv: Mapping[str, Any],
-    fmt: str,
-    relative_path: Path,
-    output_hash: str,
-    *,
-    path: str = "current",
-    include_internal: bool = False,
-) -> dict[str, Any]:
-    return {
-        "aggregate_hash": conv["aggregate_hash"],
-        "conversation_id": conv["conversation_id"],
-        "create_time": finite_float_or_none(conv["create_time"]),
-        "current_node": conv["current_node"],
-        "format": fmt,
-        "include_internal": include_internal,
-        "output_hash": output_hash,
-        "output_path": relative_path.as_posix(),
-        "path": path,
-        "source_file": conv["source_file"],
-        "title": conv["title"],
-        "update_time": finite_float_or_none(conv["update_time"]),
-    }
-
-
-def write_manifest(out_dir: Path, rows: list[dict[str, Any]], force: bool = False) -> None:
-    rows = sorted(rows, key=lambda row: (row["output_path"], row["conversation_id"], row["format"]))
-    jsonl = out_dir / "manifest.jsonl"
-    jsonl_text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n" for row in rows)
-    write_bytes_if_changed(jsonl, jsonl_text.encode("utf-8"), force=force)
-    csv_path = out_dir / "manifest.csv"
-    fieldnames = [
-        "aggregate_hash",
-        "conversation_id",
-        "create_time",
-        "current_node",
-        "format",
-        "include_internal",
-        "output_hash",
-        "output_path",
-        "path",
-        "source_file",
-        "title",
-        "update_time",
-    ]
-    from io import StringIO
-
-    buffer = StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames, lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(rows)
-    write_bytes_if_changed(csv_path, buffer.getvalue().encode("utf-8"), force=force)

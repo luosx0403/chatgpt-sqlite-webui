@@ -21,6 +21,31 @@ const DEFAULT_FILTERS: SearchFilters = {
 };
 const MATCH_MODE_KEY = "chatgptArchiveWeb.searchMatchMode.v1";
 
+const TERMINAL_IMPORT_JOB_STATUSES = new Set<ImportJob["status"]>(["succeeded", "failed", "postcheck_failed"]);
+
+function mergeImportJobSnapshot(current: ImportJob | null, incoming: ImportJob): ImportJob {
+  if (!current || current.job_id !== incoming.job_id) return incoming;
+  if (TERMINAL_IMPORT_JOB_STATUSES.has(current.status) && !TERMINAL_IMPORT_JOB_STATUSES.has(incoming.status)) {
+    return current;
+  }
+  if (
+    current.status === "running"
+    && incoming.status === "running"
+    && (current.web_index_cancel_requested || current.web_index?.status === "cancelling")
+    && !incoming.web_index_cancelled
+    && incoming.web_index?.status !== "cancelled"
+  ) {
+    return {
+      ...incoming,
+      web_index_cancel_requested: true,
+      web_index: incoming.web_index
+        ? { ...incoming.web_index, status: "cancelling", cancel_requested: true }
+        : current.web_index,
+    };
+  }
+  return incoming;
+}
+
 function mergeConversationSearchMeta(detail: ConversationSummary, meta?: ConversationSummary | null): ConversationSummary {
   if (!meta || meta.conversation_id !== detail.conversation_id) return detail;
   return {
@@ -34,6 +59,7 @@ function mergeConversationSearchMeta(detail: ConversationSummary, meta?: Convers
     has_title_hits: meta.has_title_hits,
     has_internal_hits: meta.has_internal_hits,
     has_branch_hits: meta.has_branch_hits,
+    enrichment_partial: meta.enrichment_partial,
   };
 }
 
@@ -48,6 +74,7 @@ function clearConversationSearchMeta(item: ConversationSummary): ConversationSum
     has_title_hits,
     has_internal_hits,
     has_branch_hits,
+    enrichment_partial,
     ...detail
   } = item;
   void hit_count;
@@ -59,6 +86,7 @@ function clearConversationSearchMeta(item: ConversationSummary): ConversationSum
   void has_title_hits;
   void has_internal_hits;
   void has_branch_hits;
+  void enrichment_partial;
   return detail;
 }
 
@@ -311,12 +339,13 @@ function importErrorLabel(t: (key: string) => string, code: string | null | unde
     "upload_duplicate_sec_fetch_site",
   ]);
   if (code && direct.has(code)) return t(`importError_${code}`);
+  if (code === "source_member_limit_exceeded") return t("importError_upload_limits");
   if (code && new Set([
-    "source_member_limit_exceeded",
     "json_nesting_limit_exceeded",
     "json_scalar_limit_exceeded",
     "conversation_json_element_too_large",
-  ]).has(code)) return t("importError_upload_limits");
+    "conversation_node_limit_exceeded",
+  ]).has(code)) return t("importError_json_resource_limits");
   if (code === "canonical_id_empty") return t("importError_invalid_conversation_json");
   if (code === "upload_content_length_required") return t("importError_upload_content_length_required");
   if (code && (code.includes("too_large") || code.includes("too_many") || code.includes("compression_ratio"))) return t("importError_upload_limits");
@@ -332,6 +361,7 @@ function archiveReadinessLabel(t: (key: string) => string, health: Health): stri
     case "schema_incompatible": return t("archiveSchemaIncompatible");
     case "data_incompatible": return t("archiveDataIncompatible");
     case "foreign_key_violation": return t("archiveForeignKeyViolation");
+    case "resource_contract_exceeded": return t("archiveResourceContractExceeded");
     case "database_malformed": return t("archiveMalformed");
     case "database_locked": return t("archiveLocked");
     case "database_readonly_or_io": return t("archiveIoError");
@@ -474,7 +504,7 @@ export default function App() {
         else if (helpOpen) setHelpOpen(false);
         else if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
       }
-      if ((!interactive && !event.metaKey && !event.ctrlKey && !event.altKey && event.key === "/") || ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k")) {
+      if (!interactive && ((!event.metaKey && !event.ctrlKey && !event.altKey && event.key === "/") || ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k"))) {
         event.preventDefault();
         document.getElementById("global-search")?.focus();
       }
@@ -601,7 +631,7 @@ export default function App() {
       try {
         const job = await getImportJob(jobId, controller.signal);
         if (controller.signal.aborted || generation !== importPollGenerationRef.current) return;
-        setImportJob(job);
+        setImportJob((current) => mergeImportJobSnapshot(current, job));
         if (job.status === "succeeded" || job.status === "postcheck_failed" || job.status === "failed") {
           if (job.canonical_commit_succeeded && importRefreshDoneRef.current !== jobId) {
             importRefreshDoneRef.current = jobId;
@@ -683,15 +713,34 @@ export default function App() {
 
   const cancelImportWebIndex = () => {
     if (!importJob || importJob.status !== "running" || !["building", "cancelling"].includes(String(importJob.web_index?.status || ""))) return;
+    const jobId = importJob.job_id;
+    setImportJob((current) => {
+      if (!current || current.job_id !== jobId || current.status !== "running" || !current.web_index) return current;
+      return {
+        ...current,
+        web_index_cancel_requested: true,
+        web_index: { ...current.web_index, status: "cancelling", cancel_requested: true },
+      };
+    });
     webIndexCancelControllerRef.current?.abort();
     const controller = new AbortController();
     webIndexCancelControllerRef.current = controller;
-    cancelWebIndex(importJob.job_id, controller.signal)
+    cancelWebIndex(jobId, controller.signal)
       .then((job) => {
-        if (!controller.signal.aborted) setImportJob(job);
+        if (!controller.signal.aborted) setImportJob((current) => mergeImportJobSnapshot(current, job));
       })
       .catch((err: unknown) => {
-        if (!controller.signal.aborted) setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null));
+        if (!controller.signal.aborted) {
+          setImportJob((current) => {
+            if (!current || current.job_id !== jobId || current.status !== "running" || !current.web_index) return current;
+            return {
+              ...current,
+              web_index_cancel_requested: false,
+              web_index: { ...current.web_index, status: "building", cancel_requested: false },
+            };
+          });
+          setImportError(importErrorLabel(t, err instanceof ApiError ? err.code : null));
+        }
       })
       .finally(() => {
         if (webIndexCancelControllerRef.current === controller) webIndexCancelControllerRef.current = null;

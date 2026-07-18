@@ -11,6 +11,7 @@ from .utils import canonical_json, compact_json, sha256_text
 
 
 RAW_MESSAGE_NOT_PARSED = object()
+MAX_IMPORT_NODES_PER_CONVERSATION = 5_000
 
 
 def is_generated_non_text_placeholder(value: str | None) -> bool:
@@ -123,6 +124,14 @@ def validate_conversation_element(value: Any, source_file: str, array_index: int
             keys_json=keys_json,
             raw_json=None,
         )
+    if len(value["mapping"]) > MAX_IMPORT_NODES_PER_CONVERSATION:
+        return WarningRecord(
+            source_file=source_file,
+            array_index=array_index,
+            warning_type="conversation_node_limit_exceeded",
+            keys_json=compact_json({"limit": MAX_IMPORT_NODES_PER_CONVERSATION}),
+            raw_json=None,
+        )
     id_warning = _canonical_graph_id_warning(value, source_file, array_index)
     if id_warning is not None:
         return id_warning
@@ -186,7 +195,7 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
             ParsedNode(
                 node_id=node_key,
                 conversation_id=conversation_id,
-                parent_node_id=canonical_id_text(node.get("parent")),
+                parent_node_id=canonical_id_text(node.get("parent")) or None,
                 children_json=compact_json(children_value),
                 message_id=message_id,
                 role=role,
@@ -295,6 +304,11 @@ def _canonical_graph_id_warning(
     for field, candidate, strip in candidates:
         length = canonical_id_length(candidate, strip=strip)
         if candidate is not None and length == 0:
+            # Historical exports may encode a root's missing parent as "".
+            # The parser and effective-current resolver already normalize it
+            # to no parent; keep that field-specific compatibility contract.
+            if field == "parent":
+                continue
             return WarningRecord(
                 source_file=source_file,
                 array_index=array_index,
@@ -406,6 +420,8 @@ def _compute_current_path(
         if parent is None:
             break
         parent_id = canonical_id_text(parent)
+        if parent_id == "":
+            break
         if parent_id is None:
             warnings.append(WarningRecord(source_file, array_index, "parent_invalid", compact_json([node_id]), None))
             break
