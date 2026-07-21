@@ -506,6 +506,8 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bi
 
 匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。
 
+上傳、canonical import 與可選 Web index rebuild 都會預檢檔案系統容量，並保留 256 MiB 緊急空間。這是保守估算而非保證；quota、並行寫入、WAL、暫存頁與實際 SQLite 放大仍可能耗盡空間。執行期間檢查與 ENOSPC 分別回傳 `upload_disk_space_insufficient`、`import_disk_space_insufficient` 或 `web_index_disk_space_insufficient`；失敗會清理部分上傳、回滾 canonical import，並讓舊的已發布 Web 索引維持可讀。
+
 獨立 JSON、目錄成員與 ZIP 成員使用同一個單遍、逐頂層陣列元素的解碼器，並位於同一匯入交易；每個元素只掃描和解碼一次，UTF-8 輸入與解碼後字元數各限制為 32 MiB，巢狀最多 256 層、lexical scalar 最多 1,000,000 個。legacy raw 的迭代 sanitizer 另限 250,000 scalar、遍歷最多 100,000 個 node、raw preview 最多 80,000 bytes、完整 sanitized API payload 最多 4 MiB。ZIP 中央目錄全部 entry 與目錄全部 entry 都計入 100,000 member 上限。只移除檔案開頭的一個 UTF-8 BOM；JSON 字串內的 U+FEFF 會保留，重複開頭 BOM、字串外的中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。新 canonical ID 上限為 512 字元且不截斷；主要 query-based `/api/by-id/*` 最多接受 16 Ki 字元 legacy ID，更長舊 ID 會使 readiness 回報 `database_data_incompatible`。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
 
 檔案身分透過 descriptor-bound stat/hash/read 驗證；`--delete-input-on-success` 使用原子 staging rename 與最終身分屏障，無法復原的佔名競態會產生 `delete_input_recovery_required`。Migration 僅接受定義完全相符的已知 predecessor；任何使用錯誤型別、目標或定義佔用 managed trigger/index 名稱的物件，都會在 DDL 前以 `database_managed_object_name_collision` 拒絕。

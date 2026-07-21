@@ -47,6 +47,13 @@ from .db import (
     read_request_capabilities,
     require_current_database_schema,
 )
+from .disk_resources import (
+    DiskSpaceGuard,
+    DiskSpaceInsufficientError,
+    is_disk_full_error,
+    require_free_space,
+    upload_required_bytes,
+)
 from .logging_utils import get_logger
 from .identifiers import MAX_CANONICAL_ID_LENGTH
 from .json_safety import (
@@ -917,9 +924,16 @@ def create_api_router(
                 "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index", "web_index_cancel_requested", "web_index_cancelled"],
                 "web_index_progress": ["status", "build_stage", "processed", "total", "complete", "batch_size", "processed_input_bytes", "processed_normalized_bytes", "current_batch_input_bytes", "current_batch_normalized_bytes", "current_batch_derived_bytes", "peak_batch_input_bytes", "peak_batch_normalized_bytes", "peak_batch_derived_bytes", "oversized_rows"],
                 "web_index_cancellation": "the cancel endpoint is accepted only while the import job is in web-index or web-index-recovery; cancellation rolls back staging objects and keeps the previous optional index readable",
-                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "source_member_limit_exceeded", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "json_nesting_limit_exceeded", "json_scalar_limit_exceeded", "conversation_json_element_too_large", "conversation_node_limit_exceeded", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_empty", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
+                "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "upload_disk_space_insufficient", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "source_member_limit_exceeded", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "json_nesting_limit_exceeded", "json_scalar_limit_exceeded", "conversation_json_element_too_large", "conversation_node_limit_exceeded", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_empty", "import_disk_space_insufficient", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_disk_space_insufficient", "web_index_failed"],
                 "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete", "web_index_staging_cleanup_failed"]},
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
+            },
+            "disk_capacity": {
+                "preflight_stages": ["upload", "canonical_import", "optional_web_index"],
+                "runtime_checks": True,
+                "reserve_bytes": 268435456,
+                "error_codes": ["upload_disk_space_insufficient", "import_disk_space_insufficient", "web_index_disk_space_insufficient"],
+                "contract": "capacity estimates include an emergency reserve but are not guarantees; filesystem quotas, concurrent writers, WAL, temporary pages, and actual SQLite amplification may still exhaust space, in which case the active transaction or private index build is rolled back",
             },
             "import_contract": {
                 "top_level": "conversation JSON must be one array; a single-pass incremental framer scans each element once, checks lexical nesting, then decodes it once; one element is capped at 32 MiB of UTF-8 input and 32 Mi decoded characters",
@@ -993,7 +1007,7 @@ def create_api_router(
                 "invalid_request", "invalid_integer", "numeric_parameter_out_of_range", "invalid_offset", "invalid_limit", "string_parameter_too_long", "invalid_identifier_token", "missing_parameter", "invalid_enum_value", "invalid_body", "invalid_upload_metadata",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
-                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_preflight_failed", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required", "upload_duplicate_origin_header", "upload_duplicate_content_length", "upload_duplicate_sec_fetch_site",
+                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "upload_preflight_failed", "upload_disk_space_insufficient", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required", "upload_duplicate_origin_header", "upload_duplicate_content_length", "upload_duplicate_sec_fetch_site",
                 "upload_invalid_content_length", "upload_multipart_body_too_large", "upload_too_large",
                 "uploaded_file_not_zip", "uploaded_file_invalid_zip", "upload_zip_no_conversation_sources",
                 "upload_zip_ambiguous_conversation_sources", "upload_zip_too_many_members",
@@ -1001,7 +1015,7 @@ def create_api_router(
                 "upload_zip_uncompressed_too_large", "upload_zip_compression_ratio_too_high",
                 "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read",
                 "invalid_conversation_encoding", "json_integer_too_large", "conversation_json_element_too_large", "conversation_node_limit_exceeded", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_invalid_unicode", "delete_input_changed",
-                "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed", "web_index_cancelled", "web_index_not_cancellable",
+                "import_disk_space_insufficient", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_disk_space_insufficient", "web_index_failed", "web_index_cancelled", "web_index_not_cancellable",
             ],
             "provenance": {
                 "input_sha256": "computed only for ZIP imports unless --no-input-sha256 is used",
@@ -1065,6 +1079,13 @@ def create_api_router(
             if not filename.lower().endswith(".zip"):
                 raise HTTPException(status_code=400, detail="uploaded_file_not_zip")
             upload_dir, upload_path = make_upload_path()
+            announced_length = int(request.headers.get("content-length", "0"))
+            require_free_space(
+                upload_dir,
+                upload_required_bytes(announced_length),
+                "upload_disk_space_insufficient",
+            )
+            disk_guard = DiskSpaceGuard(upload_dir, "upload_disk_space_insufficient")
             size = 0
             with upload_path.open("wb") as out:
                 while True:
@@ -1077,6 +1098,7 @@ def create_api_router(
                     written = out.write(chunk)
                     if written != len(chunk):
                         raise OSError("short upload write")
+                    disk_guard.check(advanced_bytes=written)
             await file.close()
             upload_file_closed = True
             if not zipfile.is_zipfile(upload_path):
@@ -1098,7 +1120,16 @@ def create_api_router(
         except HTTPException as exc:
             primary_http_error = exc
             raise
+        except DiskSpaceInsufficientError as exc:
+            primary_http_error = HTTPException(status_code=507, detail=exc.code)
+            raise primary_http_error from exc
         except Exception as exc:
+            if is_disk_full_error(exc):
+                primary_http_error = HTTPException(
+                    status_code=507,
+                    detail="upload_disk_space_insufficient",
+                )
+                raise primary_http_error from exc
             primary_http_error = HTTPException(
                 status_code=500,
                 detail={"code": "upload_preflight_failed", "error_type": type(exc).__name__},

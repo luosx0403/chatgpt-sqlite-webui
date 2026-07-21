@@ -506,6 +506,8 @@ Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
 
+upload、canonical import、optional Web index rebuild は filesystem capacity を事前確認し、256 MiB の emergency reserve を残します。これは保守的な見積もりであり保証ではありません。quota、同時 writer、WAL、temporary page、実際の SQLite amplification により容量を使い切る場合があります。runtime check と ENOSPC は `upload_disk_space_insufficient`、`import_disk_space_insufficient`、`web_index_disk_space_insufficient` を返し、部分 upload の cleanup、canonical import の rollback、以前の公開済み Web index の保持を行います。
+
 単独 JSON、ディレクトリ内ファイル、ZIP メンバーは、同じ single-pass のトップレベル配列 framer と単一のインポートトランザクションを使用します。各要素は 1 回だけ走査・decode され、UTF-8 入力と decode 後文字数は各 32 MiB、nesting は 256、lexical scalar は 1,000,000 に制限されます。legacy raw の iterative sanitizer は別に scalar 250,000、traversal 100,000 nodes、raw preview 80,000 bytes、sanitized API payload 全体 4 MiB を上限にします。ZIP central directory と directory の全 entry は 100,000 member 上限に数えます。先頭 BOM は 1 個だけ除去し、他の不正 encoding は拒否します。新 canonical ID は 512 文字上限で切り詰めず、query-based `/api/by-id/*` は legacy ID を 16 Ki 文字まで扱います。それ以上の旧 ID は readiness を `database_data_incompatible` にします。
 
 descriptor-bound stat/hash/read で file identity を検証します。`--delete-input-on-success` は atomic staging rename と最終 identity barrier を使い、復旧できない occupied-name race は `delete_input_recovery_required` を記録します。Migration は定義が完全一致する既知 predecessor のみ受け入れ、managed trigger/index 名を誤った type/target/definition で占有する object は DDL 前に `database_managed_object_name_collision` で拒否します。

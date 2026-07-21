@@ -3965,6 +3965,7 @@ class ArchiverTests(unittest.TestCase):
             cases.extend([
                 ("no-source", no_source, None, "no_conversation_sources", "input_preflight"),
                 ("ambiguous", ambiguous, None, "ambiguous_conversation_sources", "source_scan"),
+                ("disk-full", valid, sqlite3.OperationalError("database or disk is full"), "import_disk_space_insufficient", "transaction"),
                 ("sqlite", valid, sqlite3.OperationalError("synthetic"), "import_transaction_failed", "transaction"),
                 ("unknown", valid, RuntimeError("synthetic"), "import_transaction_failed", "transaction"),
             ])
@@ -3994,6 +3995,63 @@ class ArchiverTests(unittest.TestCase):
                     self.assertEqual(summary["failure_stage"], stage)
                     self.assertEqual([row["warning_type"] for row in warning_rows], [code])
                     self.assertEqual(summary["warnings"], 1)
+
+    def test_disk_capacity_helpers_and_import_preflight_are_content_free(self):
+        from chatgpt_export_archiver import cli as cli_module
+        from chatgpt_export_archiver.disk_resources import (
+            DISK_RESERVE_BYTES,
+            DiskSpaceInsufficientError,
+            import_required_bytes,
+            require_free_space,
+            upload_required_bytes,
+            web_index_required_bytes,
+        )
+
+        self.assertEqual(upload_required_bytes(123), DISK_RESERVE_BYTES + 123)
+        self.assertGreaterEqual(import_required_bytes(1), DISK_RESERVE_BYTES + 512 * 1024 * 1024)
+        self.assertGreaterEqual(web_index_required_bytes(1), DISK_RESERVE_BYTES + 512 * 1024 * 1024)
+        with mock.patch(
+            "chatgpt_export_archiver.disk_resources.shutil.disk_usage",
+            return_value=mock.Mock(free=99),
+        ):
+            with self.assertRaises(DiskSpaceInsufficientError) as caught:
+                require_free_space(Path("/"), 100, "synthetic_disk_space_insufficient")
+        self.assertEqual(caught.exception.code, "synthetic_disk_space_insufficient")
+        self.assertEqual(caught.exception.required_bytes, 100)
+        self.assertEqual(caught.exception.free_bytes, 99)
+        self.assertNotIn(str(Path.home()), str(caught.exception))
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "valid.zip"
+            write_zip(source, {"conversations.json": [conversation("disk-preflight")]})
+            db = base / "archive.db"
+            injected = DiskSpaceInsufficientError(
+                "import_disk_space_insufficient",
+                required_bytes=900,
+                free_bytes=100,
+            )
+            with mock.patch.object(cli_module, "require_free_space", side_effect=injected):
+                code, output = run_cli([
+                    "--db", str(db), "import", "--input", str(source), "--no-input-sha256",
+                ])
+            self.assertEqual(code, 2, output)
+            self.assertIn("import_disk_space_insufficient", output)
+            self.assertNotIn(str(base), output)
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            try:
+                run = conn.execute(
+                    "SELECT status, summary_json FROM import_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                summary = json.loads(run["summary_json"])
+                self.assertEqual(run["status"], "failed")
+                self.assertEqual(summary["failure_code"], "import_disk_space_insufficient")
+                self.assertEqual(summary["failure_stage"], "input_preflight")
+                self.assertEqual(summary["warnings"], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+            finally:
+                conn.close()
 
     def test_mixed_shard_rollback_separates_attempted_and_committed_counts(self):
         from chatgpt_export_archiver.cli import ImportPipelineError, run_import_pipeline

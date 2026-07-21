@@ -43,6 +43,13 @@ from .db import (
     verify_database,
 )
 from .exporter import export_conversations
+from .disk_resources import (
+    DiskSpaceGuard,
+    DiskSpaceInsufficientError,
+    import_required_bytes,
+    is_disk_full_error,
+    require_free_space,
+)
 from .logging_utils import configure_logging, get_logger
 from .json_safety import JsonSafetyLimitError
 from .parser import WarningRecord, conversation_id_from_value, parse_conversation, validate_conversation_element
@@ -723,23 +730,6 @@ def _run_import_pipeline_locked(
                    final_status TEXT
                ) WITHOUT ROWID"""
         )
-        optional_drop_failures = drop_optional_web_indexes(conn)
-        if optional_drop_failures:
-            summary["optional_web_index_drop_failures"] = len(optional_drop_failures)
-            for failure in optional_drop_failures:
-                record_warning(
-                    conn,
-                    run_id,
-                    WarningRecord(
-                        "optional_web_index",
-                        None,
-                        "optional_web_index_drop_failed",
-                        compact_json({"table": failure["table"], "error_type": failure["error_type"]}),
-                        None,
-                    ),
-            )
-            summary["warnings"] += len(optional_drop_failures)
-        drop_import_rebuildable_indexes(conn)
         source_scan_started = time.perf_counter()
         try:
             entries = list_source_entries(source)
@@ -765,6 +755,44 @@ def _run_import_pipeline_locked(
             raise ImportPipelineError("no_conversation_sources", stage="input_preflight", run_id=run_id)
         record_source_entries(conn, run_id, entries)
         summary["source_scan_seconds"] = _elapsed(source_scan_started)
+        selected_json_bytes = sum(max(0, int(entry.size)) for entry in selected)
+        try:
+            capacity = require_free_space(
+                db_path,
+                import_required_bytes(selected_json_bytes),
+                "import_disk_space_insufficient",
+            )
+        except DiskSpaceInsufficientError as exc:
+            summary["failure_code"] = exc.code
+            raise ImportPipelineError(
+                exc.code,
+                stage="input_preflight",
+                run_id=run_id,
+                detail={
+                    "required_bytes": exc.required_bytes,
+                    "free_bytes": exc.free_bytes,
+                },
+            ) from exc
+        summary["disk_preflight_required_bytes"] = capacity["required_bytes"]
+        summary["disk_preflight_free_bytes"] = capacity["free_bytes"]
+        disk_guard = DiskSpaceGuard(db_path, "import_disk_space_insufficient")
+        optional_drop_failures = drop_optional_web_indexes(conn)
+        if optional_drop_failures:
+            summary["optional_web_index_drop_failures"] = len(optional_drop_failures)
+            for failure in optional_drop_failures:
+                record_warning(
+                    conn,
+                    run_id,
+                    WarningRecord(
+                        "optional_web_index",
+                        None,
+                        "optional_web_index_drop_failed",
+                        compact_json({"table": failure["table"], "error_type": failure["error_type"]}),
+                        None,
+                    ),
+            )
+            summary["warnings"] += len(optional_drop_failures)
+        drop_import_rebuildable_indexes(conn)
         notify("source_scan_complete")
 
         batch_usage = {
@@ -957,6 +985,7 @@ def _run_import_pipeline_locked(
                 summary["attempted_valid_conversations"] += 1
                 summary["attempted_nodes"] += len(parsed.nodes)
                 metrics = parsed_resource_metrics(item, parsed)
+                disk_guard.check(advanced_bytes=metrics["input_bytes"])
                 if parsed_conversations and any(
                     batch_usage[name] + metrics[name] > limit
                     for name, limit in batch_limits.items()
@@ -1060,11 +1089,20 @@ def _run_import_pipeline_locked(
                 conn.rollback()
             except Exception:
                 pass
-        pipeline_error = exc if isinstance(exc, ImportPipelineError) else ImportPipelineError(
-            "import_transaction_failed",
-            stage="transaction",
-            run_id=run_id,
-        )
+        if isinstance(exc, ImportPipelineError):
+            pipeline_error = exc
+        elif is_disk_full_error(exc):
+            pipeline_error = ImportPipelineError(
+                "import_disk_space_insufficient",
+                stage="transaction",
+                run_id=run_id,
+            )
+        else:
+            pipeline_error = ImportPipelineError(
+                "import_transaction_failed",
+                stage="transaction",
+                run_id=run_id,
+            )
         summary["failure_code"] = pipeline_error.code
         summary["failure_stage"] = pipeline_error.stage
         summary["original_failure_code"] = pipeline_error.code

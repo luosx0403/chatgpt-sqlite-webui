@@ -3702,6 +3702,30 @@ class WebApiTests(unittest.TestCase):
                 self.assertEqual(job.error_code, expected)
                 self.assertTrue(job.canonical_commit_succeeded)
 
+    def test_web_job_preserves_specific_web_index_capacity_code(self):
+        from chatgpt_export_archiver.web_db import WebIndexBuildError
+        from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            upload = base / "upload.zip"
+            upload.write_bytes(b"synthetic")
+            manager = ImportJobManager(base / "archive.db")
+            job = ImportJob("job", base / "archive.db", upload, "synthetic.zip", upload.stat().st_size)
+            with mock.patch("chatgpt_export_archiver.web_jobs.run_import_pipeline", return_value={"summary": {"import_run_id": 1}}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.connect"), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.verify_database", return_value={"ok": True}), \
+                 mock.patch("chatgpt_export_archiver.web_jobs.get_stats", return_value={"conversations": 1}), \
+                 mock.patch(
+                     "chatgpt_export_archiver.web_jobs.create_web_indexes",
+                     side_effect=WebIndexBuildError("web_index_disk_space_insufficient"),
+                 ):
+                manager._run_job(job)
+            self.assertEqual(job.status, "postcheck_failed")
+            self.assertEqual(job.outcome, "web_index_failed")
+            self.assertEqual(job.error_code, "web_index_disk_space_insufficient")
+            self.assertTrue(job.canonical_commit_succeeded)
+
     def test_web_job_preserves_postcommit_cleanup_warning_on_success(self):
         from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 
@@ -4645,10 +4669,20 @@ class WebApiTests(unittest.TestCase):
             "database_not_ready", "conversation_not_found", "message_not_found",
             "invalid_query", "invalid_sort", "invalid_message_order",
             "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed",
+            "upload_disk_space_insufficient", "import_disk_space_insufficient",
+            "web_index_disk_space_insufficient",
             "upload_duplicate_origin_header", "upload_duplicate_content_length",
             "upload_duplicate_sec_fetch_site",
         ):
             self.assertIn(code, schema["stable_error_codes"])
+        self.assertEqual(
+            schema["disk_capacity"]["error_codes"],
+            [
+                "upload_disk_space_insufficient",
+                "import_disk_space_insufficient",
+                "web_index_disk_space_insufficient",
+            ],
+        )
 
     def test_schema_effective_upload_policy_matches_bound_host_policy(self):
         from chatgpt_export_archiver.web_api import _get_upload_policy
@@ -4950,6 +4984,49 @@ class WebApiTests(unittest.TestCase):
                 self.assertNotIn("private", response.text)
                 self.assertFalse(manager.has_running_job())
                 client.close()
+
+    def test_upload_disk_capacity_failure_is_507_and_cleans_temporary_copy(self):
+        from fastapi import FastAPI
+        from chatgpt_export_archiver.disk_resources import DiskSpaceInsufficientError
+        from chatgpt_export_archiver.web_api import create_api_router
+        from chatgpt_export_archiver.web_jobs import ImportJobManager
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        upload_dir = base / "upload-temp"
+        upload_path = upload_dir / "upload.zip"
+        manager = ImportJobManager(base / "archive.db")
+        app = FastAPI()
+        app.include_router(create_api_router(base / "archive.db", manager))
+        client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(client.close)
+
+        def make_known_upload_path():
+            upload_dir.mkdir()
+            return upload_dir, upload_path
+
+        failure = DiskSpaceInsufficientError(
+            "upload_disk_space_insufficient",
+            required_bytes=900,
+            free_bytes=100,
+        )
+        with mock.patch(
+            "chatgpt_export_archiver.web_api.make_upload_path",
+            side_effect=make_known_upload_path,
+        ), mock.patch(
+            "chatgpt_export_archiver.web_api.require_free_space",
+            side_effect=failure,
+        ):
+            response = client.post(
+                "/api/import/upload",
+                files={"file": ("synthetic.zip", b"synthetic", "application/zip")},
+            )
+        self.assertEqual(response.status_code, 507, response.text)
+        self.assertEqual(response.json()["detail"], "upload_disk_space_insufficient")
+        self.assertNotIn(str(base), response.text)
+        self.assertFalse(upload_dir.exists())
+        self.assertFalse(manager.has_running_job())
 
     def test_upload_policy_remote_opt_in_for_all_limits(self):
         from chatgpt_export_archiver.web_api import _get_upload_policy, REMOTE_DEFAULT_MAX_UPLOAD_BYTES, REMOTE_DEFAULT_TOTAL_UNCOMPRESSED
@@ -5995,6 +6072,53 @@ class WebApiTests(unittest.TestCase):
             status = web_index_status(conn)
             conn.close()
             self.assertTrue(status["web_normalized_indexed"])
+
+    def test_web_index_disk_preflight_preserves_published_index(self):
+        from chatgpt_export_archiver.disk_resources import DiskSpaceInsufficientError
+        from chatgpt_export_archiver.web_db import (
+            WebIndexBuildError,
+            create_web_indexes,
+            web_index_status,
+        )
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        self.addCleanup(client.close)
+        create_web_indexes(db)
+        conn = sqlite3.connect(db)
+        before_schema = conn.execute(
+            "SELECT name, type, sql FROM sqlite_master WHERE name LIKE 'web_%' ORDER BY name"
+        ).fetchall()
+        before_rows = conn.execute("SELECT COUNT(*) FROM web_message_norm").fetchone()[0]
+        conn.close()
+        failure = DiskSpaceInsufficientError(
+            "web_index_disk_space_insufficient",
+            required_bytes=900,
+            free_bytes=100,
+        )
+        with mock.patch(
+            "chatgpt_export_archiver.web_db.require_free_space",
+            side_effect=failure,
+        ):
+            with self.assertRaises(WebIndexBuildError) as caught:
+                create_web_indexes(db)
+        self.assertEqual(caught.exception.code, "web_index_disk_space_insufficient")
+        conn = connect_readonly(db)
+        try:
+            self.assertTrue(web_index_status(conn)["web_normalized_indexed"])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM web_message_norm").fetchone()[0], before_rows)
+            self.assertEqual(
+                [tuple(row) for row in conn.execute(
+                    "SELECT name, type, sql FROM sqlite_master WHERE name LIKE 'web_%' ORDER BY name"
+                ).fetchall()],
+                before_schema,
+            )
+            private_names = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'wai_%'"
+            ).fetchall()
+            self.assertEqual(private_names, [])
+        finally:
+            conn.close()
 
     def test_missing_required_index_is_migration_required_not_operational_error(self):
         from chatgpt_export_archiver.db import connect, migrate_database

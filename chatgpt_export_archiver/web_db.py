@@ -29,6 +29,13 @@ from .db import (
     register_archive_sql_functions,
     validate_optional_web_index_ownership,
 )
+from .disk_resources import (
+    DiskSpaceGuard,
+    DiskSpaceInsufficientError,
+    is_disk_full_error,
+    require_free_space,
+    web_index_required_bytes,
+)
 from .parser import is_generated_non_text_placeholder, recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
@@ -754,6 +761,8 @@ def create_web_indexes(
         title_trigram_build,
     ) = build_names
     cancelled = False
+    disk_guard: DiskSpaceGuard | None = None
+    disk_accounted_bytes = 0
     resource_progress = {
         "input_materialized_bytes": 0,
         "normalized_materialized_bytes": 0,
@@ -780,6 +789,13 @@ def create_web_indexes(
         return 0
 
     def report(stage: str, processed: int, total: int) -> None:
+        nonlocal disk_accounted_bytes
+        if disk_guard is not None:
+            current_bytes = int(resource_progress["input_materialized_bytes"]) + int(
+                resource_progress["normalized_materialized_bytes"]
+            )
+            disk_guard.check(advanced_bytes=max(0, current_bytes - disk_accounted_bytes))
+            disk_accounted_bytes = current_bytes
         if progress_callback is not None:
             progress_callback(stage, {
                 "build_stage": stage,
@@ -809,6 +825,19 @@ def create_web_indexes(
         if not schema["ok"]:
             code = "database_migration_required" if schema["migration_required"] else "database_schema_incompatible"
             raise DatabaseMigrationError(code, detail=schema)
+        database_bytes = sum(
+            path.stat().st_size
+            for path in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm"))
+            if path.exists()
+        )
+        capacity = require_free_space(
+            db_path,
+            web_index_required_bytes(database_bytes),
+            "web_index_disk_space_insufficient",
+        )
+        resource_progress["disk_preflight_required_bytes"] = capacity["required_bytes"]
+        resource_progress["disk_preflight_free_bytes"] = capacity["free_bytes"]
+        disk_guard = DiskSpaceGuard(db_path, "web_index_disk_space_insufficient")
         configure_bulk_write_connection(conn)
         trigram_available = detect_trigram(conn)
         conn.set_progress_handler(progress_handler, WEB_INDEX_PROGRESS_VM_STEPS)
@@ -1358,6 +1387,8 @@ def create_web_indexes(
             "peak_batch_input_bytes": resource_progress["peak_batch_input_bytes"],
             "peak_batch_normalized_bytes": resource_progress["peak_batch_normalized_bytes"],
             "peak_batch_derived_bytes": resource_progress["peak_batch_derived_bytes"],
+            "disk_preflight_required_bytes": resource_progress["disk_preflight_required_bytes"],
+            "disk_preflight_free_bytes": resource_progress["disk_preflight_free_bytes"],
             "max_input_bytes": WEB_INDEX_MAX_INPUT_BYTES,
             "max_normalized_bytes": WEB_INDEX_MAX_NORMALIZED_BYTES,
             "max_derived_bytes": WEB_INDEX_MAX_DERIVED_BYTES,
@@ -1385,7 +1416,24 @@ def create_web_indexes(
             cancelled_error = WebIndexBuildCancelled()
             setattr(cancelled_error, "cleanup_warnings", cleanup_warnings)
             raise cancelled_error from None
+        if is_disk_full_error(exc):
+            disk_error = WebIndexBuildError(
+                "web_index_disk_space_insufficient",
+                cleanup_warnings=cleanup_warnings,
+            )
+            raise disk_error from exc
         raise
+    except DiskSpaceInsufficientError as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.set_progress_handler(None, 0)
+        cleanup_warnings = _cleanup_web_index_staging(
+            conn, build_names, build_id=build_id, owner_token=owner_token
+        )
+        raise WebIndexBuildError(
+            exc.code,
+            cleanup_warnings=cleanup_warnings,
+        ) from exc
     except Exception as exc:
         if conn.in_transaction:
             conn.rollback()

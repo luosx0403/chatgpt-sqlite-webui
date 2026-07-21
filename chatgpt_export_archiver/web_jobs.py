@@ -15,7 +15,7 @@ from .cli import ImportPipelineError, run_import_pipeline
 from .db import connect, get_stats, verify_database
 from .logging_utils import get_logger, parse_log_level
 from .utils import safe_filename_part
-from .web_db import WebIndexBuildCancelled, create_web_indexes
+from .web_db import WebIndexBuildCancelled, WebIndexBuildError, create_web_indexes
 
 LOGGER = get_logger("web_jobs")
 
@@ -372,11 +372,16 @@ class ImportJobManager:
                         return
                     except Exception as exc:
                         _add_exception_cleanup_warnings(job, exc)
+                        error_code = (
+                            exc.code
+                            if isinstance(exc, WebIndexBuildError)
+                            else "web_index_failed"
+                        )
                         self._set_outcome(
                             job,
                             status="postcheck_failed",
                             outcome="web_index_failed",
-                            error_code="web_index_failed",
+                            error_code=error_code,
                             error_type=type(exc).__name__,
                         )
                         self._log(job, "error", f"web_index_failed error_type={type(exc).__name__}")
@@ -427,11 +432,16 @@ class ImportJobManager:
                     return
                 except Exception as exc:
                     _add_exception_cleanup_warnings(job, exc)
+                    error_code = (
+                        exc.code
+                        if isinstance(exc, WebIndexBuildError)
+                        else "web_index_failed"
+                    )
                     self._set_outcome(
                         job,
                         status="postcheck_failed",
                         outcome="web_index_failed",
-                        error_code="web_index_failed",
+                        error_code=error_code,
                         error_type=type(exc).__name__,
                     )
                     self._log(job, "error", f"web_index_failed error_type={type(exc).__name__}")
