@@ -171,6 +171,7 @@ export function getMessageHits(args: {
   filters?: SearchFilters;
   matchMode?: MatchMode;
   countTotal?: boolean;
+  continuation?: string | null;
   signal?: AbortSignal;
 }): Promise<SearchMessagePage> {
   const query = params({
@@ -189,7 +190,8 @@ export function getMessageHits(args: {
     before: args.filters?.before,
     source: args.filters?.source,
     match_mode: args.matchMode,
-    count_total: args.countTotal === false ? "false" : undefined
+    count_total: args.countTotal === false ? "false" : undefined,
+    continuation: args.continuation
   });
   return request<SearchMessagePage>(`/api/search/messages?${query}`, args.signal);
 }

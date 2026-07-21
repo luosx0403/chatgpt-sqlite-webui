@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
     create_app = None
 
 from chatgpt_export_archiver.cli import main
+from chatgpt_export_archiver.db import migrate_database
 from chatgpt_export_archiver.web_db import connect_readonly
 from chatgpt_export_archiver.search import _message_display_fields, _message_visibility_counts, _message_visibility_counts_for_path, _is_internal_message
 
@@ -98,6 +99,16 @@ def write_zip_members(path: Path, members: dict[str, object], *, compression=zip
 def js_slice(text: str, start: int, end: int) -> str:
     data = text.encode("utf-16-le")
     return data[start * 2 : end * 2].decode("utf-16-le")
+
+
+def refresh_test_database_compatibility(db: Path) -> None:
+    """Publish compatibility after a fixture intentionally writes SQLite directly."""
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        migrate_database(conn, refresh_compatibility=True)
+    finally:
+        conn.close()
 
 
 @unittest.skipIf(TestClient is None, "fastapi test client is not installed")
@@ -1270,6 +1281,7 @@ class WebApiTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+        refresh_test_database_compatibility(db)
 
         page = client.get("/api/conversations/web-3/messages?path=all&limit=20").json()
         self.assertEqual(page["empty_hidden_count"], 1)
@@ -1680,6 +1692,9 @@ class WebApiTests(unittest.TestCase):
             conn.execute("UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'missing-current'")
             conn.execute("UPDATE conversations SET current_node = NULL WHERE conversation_id = 'missing-current'")
             conn.commit()
+            from chatgpt_export_archiver.db import migrate_database
+            migrate_database(conn, refresh_compatibility=True)
+            conn.commit()
         finally:
             conn.close()
         client = TestClient(create_app(db))
@@ -1731,6 +1746,7 @@ class WebApiTests(unittest.TestCase):
             writer.commit()
         finally:
             writer.close()
+        refresh_test_database_compatibility(db)
 
         from chatgpt_export_archiver.db import connect, verify_database
         verify_conn = connect(db)
@@ -1776,6 +1792,7 @@ class WebApiTests(unittest.TestCase):
             writer.commit()
         finally:
             writer.close()
+        refresh_test_database_compatibility(db)
         stray_flag_reader = client.get("/api/conversations/zero-flags-valid-current/messages?path=current&include_internal=true&limit=20").json()
         self.assertEqual(stray_flag_reader["current_collection_source"], "current_node")
         self.assertEqual({item["node_id"] for item in stray_flag_reader["items"]}, {"root", "u", "a"})
@@ -1791,6 +1808,7 @@ class WebApiTests(unittest.TestCase):
             writer.commit()
         finally:
             writer.close()
+        refresh_test_database_compatibility(db)
         flag_reader = client.get("/api/conversations/zero-flags-valid-current/messages?path=current&include_internal=true&limit=20").json()
         self.assertFalse(flag_reader["current_node_exists"])
         self.assertEqual(flag_reader["current_collection_source"], "raw_flags")
@@ -1817,6 +1835,9 @@ class WebApiTests(unittest.TestCase):
         try:
             writer.execute("UPDATE conversation_nodes SET parent_node_id = 'a', is_on_current_path = 0 WHERE conversation_id = 'cycle-current' AND node_id = 'u'")
             writer.execute("UPDATE conversation_nodes SET parent_node_id = 'u', is_on_current_path = 0 WHERE conversation_id = 'cycle-current' AND node_id = 'a'")
+            writer.commit()
+            from chatgpt_export_archiver.db import migrate_database
+            migrate_database(writer, refresh_compatibility=True)
             writer.commit()
         finally:
             writer.close()
@@ -1946,6 +1967,9 @@ class WebApiTests(unittest.TestCase):
                 "INSERT INTO conversation_nodes(conversation_id, node_id, message_id, role, content_text, raw_message_json) VALUES ('budget', 'raw-large', 'raw-message', 'assistant', '', ?)",
                 ("{" + ("x" * 1_048_576) + "}",),
             )
+            conn.commit()
+            from chatgpt_export_archiver.db import migrate_database
+            migrate_database(conn, refresh_compatibility=True)
             conn.commit()
             response_sizes: dict[int, int] = {}
             peak_bytes: dict[int, int] = {}
@@ -2350,23 +2374,15 @@ class WebApiTests(unittest.TestCase):
             conn.close()
 
     def test_message_search_api_count_total_false_uses_fast_page_probe(self):
-        from chatgpt_export_archiver import search as search_module
-
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
-        original = search_module._message_search_page_rows
-        calls: list[bool] = []
-
-        def wrapped(conn, parsed, conversation_id, limit, offset, order, *, use_trigram=True, count_total=True):
-            calls.append(count_total)
-            return original(conn, parsed, conversation_id, limit, offset, order, use_trigram=use_trigram, count_total=count_total)
-
-        with mock.patch.object(search_module, "_message_search_page_rows", side_effect=wrapped):
-            payload = client.get("/api/search/messages?q=python&limit=1&count_total=false").json()
-        self.assertIn(False, calls)
+        payload = client.get("/api/search/messages?q=python&limit=1&count_total=false").json()
         self.assertEqual(len(payload["items"]), 1)
         self.assertTrue(payload["has_more"])
         self.assertLessEqual(payload["total"], 2)
+        self.assertFalse(payload["total_exact"])
+        self.assertLessEqual(payload["diagnostics"]["candidate_count"], 5)
+        self.assertEqual(payload["diagnostics"]["partial_reason"], "page_result_limit")
 
     def test_trigram_partial_candidates_keep_safe_and_terms_without_full_scan(self):
         from chatgpt_export_archiver import search as search_module
@@ -2768,6 +2784,145 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(client.get("/api/conversations?q=image_asset_pointer&path=all").json()["total"], 0)
         reader = client.get("/api/conversations/placeholder/messages?q=image_asset_pointer&path=all").json()
         self.assertFalse(any(item["highlight_ranges"] for item in reader["items"]))
+
+    def test_long_generated_placeholder_recovers_raw_text_before_and_after_web_index(self):
+        from chatgpt_export_archiver.db import init_db
+        from chatgpt_export_archiver.search import parse_query, search_messages
+        from chatgpt_export_archiver.web_db import create_web_indexes, connect_readonly
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "long-placeholder.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            placeholder = "[non-text content: " + ("legacy-kind-" * 40) + "]"
+            raw = json.dumps(
+                {"content": {"content_type": "text", "parts": ["recovered-index-needle"]}},
+                separators=(",", ":"),
+            )
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) "
+                "VALUES ('c', 'Synthetic', 'n', 'h')"
+            )
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       raw_message_json, content_hash, is_on_current_path
+                   ) VALUES ('c', 'n', 'assistant', 'text', ?, ?, 'r1', 1)""",
+                (placeholder, raw),
+            )
+            conn.commit()
+            before = search_messages(
+                conn, parse_query("recovered-index-needle"), conversation_id="c"
+            )
+            self.assertEqual([item["node_id"] for item in before["items"]], ["n"])
+            conn.close()
+
+            result = create_web_indexes(db)
+            self.assertEqual(result["indexed_messages"], 1)
+            reader = connect_readonly(db)
+            after = search_messages(
+                reader, parse_query("recovered-index-needle"), conversation_id="c"
+            )
+            self.assertEqual([item["node_id"] for item in after["items"]], ["n"])
+            indexed = reader.execute(
+                "SELECT content_norm FROM web_message_norm WHERE conversation_id='c' AND node_id='n'"
+            ).fetchone()[0]
+            self.assertIn("recovered-index-needle", indexed)
+            self.assertNotIn("legacy-kind", indexed)
+            reader.close()
+
+    def test_web_index_canonical_path_does_not_materialize_unrelated_raw_blob(self):
+        from chatgpt_export_archiver.db import init_db
+        from chatgpt_export_archiver.web_db import create_web_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "canonical-raw.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.execute(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) "
+                "VALUES ('c', 'Synthetic', 'n', 'h')"
+            )
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       raw_message_json, content_hash, is_on_current_path
+                   ) VALUES ('c', 'n', 'assistant', 'text', 'canonical-index-needle', ?, 'r1', 1)""",
+                ("x" * (5 * 1024 * 1024),),
+            )
+            conn.commit()
+            conn.close()
+
+            result = create_web_indexes(db)
+            self.assertEqual(result["indexed_messages"], 1)
+            self.assertEqual(
+                result["input_materialized_bytes"],
+                len("canonical-index-needle") + len("Synthetic"),
+            )
+            self.assertLess(result["peak_batch_input_bytes"], 1024)
+
+    def test_unrelated_oversized_raw_returns_confirmed_hits_as_partial_not_413(self):
+        from chatgpt_export_archiver.db import init_db, migrate_database
+        from chatgpt_export_archiver.web_db import create_web_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "oversized-search.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) "
+                "VALUES (?, 'Synthetic', 'n', ?)",
+                (("confirmed", "h1"), ("oversized", "h2")),
+            )
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       content_hash, is_on_current_path
+                   ) VALUES ('confirmed', 'n', 'assistant', 'text',
+                             'needle wanted', 'r1', 1)"""
+            )
+            raw = json.dumps(
+                {"content": {"content_type": "text", "parts": ["x" * (5 * 1024 * 1024)]}},
+                separators=(",", ":"),
+            )
+            conn.execute(
+                """INSERT INTO conversation_nodes(
+                       conversation_id, node_id, role, content_type, content_text,
+                       raw_message_json, content_hash, is_on_current_path
+                   ) VALUES ('oversized', 'n', 'assistant', 'text',
+                             '[non-text content: legacy]', ?, 'r2', 1)""",
+                (raw,),
+            )
+            conn.commit()
+            migrate_database(conn, refresh_compatibility=True)
+            conn.close()
+
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            self.addCleanup(client.close)
+
+            def assert_partial() -> None:
+                response = client.get(
+                    "/api/search/messages",
+                    params={"q": "needle wanted", "path": "all", "count_total": "true"},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertEqual(
+                    [(item["conversation_id"], item["node_id"]) for item in payload["items"]],
+                    [("confirmed", "n")],
+                )
+                self.assertFalse(payload["total_exact"])
+                self.assertTrue(payload["diagnostics"]["partial"])
+                self.assertEqual(payload["diagnostics"]["completion_state"], "partial")
+                self.assertGreaterEqual(payload["diagnostics"]["oversized_candidates_pending"], 1)
+
+            assert_partial()
+            create_web_indexes(db)
+            assert_partial()
 
     def test_export_path_validation_and_advanced_search_endpoint_defaults(self):
         td, client, _db = self.make_client()
@@ -3884,6 +4039,9 @@ class WebApiTests(unittest.TestCase):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
         schema = client.get("/api/schema").json()
+        self.assertEqual(schema["version"], 6)
+        self.assertEqual(schema["versions"]["required_database_schema_version"], 5)
+        self.assertEqual(schema["versions"]["optional_web_index_format_version"], "5")
         self.assertIn("include_internal", json.dumps(schema))
         self.assertIn("hidden_counts", json.dumps(schema))
         self.assertIn("match_mode", json.dumps(schema))
@@ -3896,7 +4054,14 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(schema["id_addressing"]["new_import_id_max_chars"], 512)
         self.assertEqual(schema["import_contract"]["max_element_utf8_bytes"], 32 * 1024 * 1024)
         self.assertEqual(schema["import_contract"]["max_element_decoded_chars"], 32 * 1024 * 1024)
-        self.assertEqual(schema["import_contract"]["json_limits"]["max_scalar_count"], 250_000)
+        self.assertEqual(
+            schema["import_contract"]["json_limits"]["max_conversation_element_scalar_count"],
+            1_000_000,
+        )
+        self.assertEqual(
+            schema["import_contract"]["json_limits"]["max_legacy_sanitizer_scalar_count"],
+            250_000,
+        )
         self.assertEqual(schema["request_validation"]["detail_code"], "invalid_request")
         self.assertEqual(schema["request_validation"]["item_fields"], ["location", "field", "code"])
         self.assertEqual(schema["raw"]["units"].split(";")[0], "raw_size is always exact UTF-8 bytes for compatibility")
@@ -3944,6 +4109,25 @@ class WebApiTests(unittest.TestCase):
             schema["search"]["message_resource_contract"]["raw_fallback_bytes_per_row"],
             1024 * 1024,
         )
+        self.assertIn("continuation", schema["search"]["parameters"])
+        self.assertIn("signed opaque candidate cursor", schema["search"]["message_resource_contract"]["continuation"])
+        self.assertIn("direct UTF-8 byte seek", schema["messages"]["display_cursor"])
+        for field in (
+            "candidate_count",
+            "candidate_limit",
+            "resolver_calls",
+            "blob_reads",
+            "candidate_blob_bytes",
+            "raw_blob_bytes",
+            "decoded_chars",
+            "normalization_units",
+            "sqlite_vm_steps",
+            "wall_seconds",
+            "continuation_available",
+            "continuation_token",
+            "completion_state",
+        ):
+            self.assertIn(field, schema["search"]["diagnostics"]["fields"])
         self.assertIn("foreign_key_check_complete", schema["database_compatibility"]["health_fields"])
         self.assertEqual(
             schema["database_compatibility"]["effective_current_verify_counters"]["unit"],
@@ -5672,6 +5856,9 @@ class WebApiTests(unittest.TestCase):
             writer.execute("UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'rank-b'")
             writer.execute("UPDATE conversation_nodes SET is_on_current_path = 1 WHERE conversation_id = 'rank-b' AND node_id = 'branch'")
             writer.commit()
+            from chatgpt_export_archiver.db import migrate_database
+            migrate_database(writer, refresh_compatibility=True)
+            writer.commit()
         finally:
             writer.close()
         client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
@@ -5924,6 +6111,7 @@ class WebApiTests(unittest.TestCase):
                     )
             conn.set_trace_callback(None)
             conn.close()
+            refresh_test_database_compatibility(db)
 
             client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
             self.addCleanup(client.close)
@@ -6101,6 +6289,9 @@ class WebApiTests(unittest.TestCase):
                 (conversation_id, node_id, raw),
             )
             conn.commit()
+            from chatgpt_export_archiver.db import migrate_database
+            migrate_database(conn, refresh_compatibility=True)
+            conn.commit()
             conn.close()
             client = TestClient(create_app(db))
             self.addCleanup(client.close)
@@ -6222,6 +6413,7 @@ class WebApiTests(unittest.TestCase):
         )
         conn.commit()
         conn.close()
+        refresh_test_database_compatibility(db)
         listing = client.get("/api/conversations", params={"limit": 1}).json()["items"][0]
         detail = client.get(
             "/api/by-id/conversation", params={"conversation_id": "huge-scalar"}
@@ -6344,6 +6536,7 @@ class WebApiTests(unittest.TestCase):
         )
         conn.commit()
         conn.close()
+        refresh_test_database_compatibility(db)
         reader = client.get("/api/by-id/messages", params={"conversation_id": conversation_id})
         self.assertEqual(reader.status_code, 413)
         self.assertEqual(reader.json()["detail"], "effective_current_node_limit_exceeded")
@@ -6582,6 +6775,37 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(page.status_code, 409)
         self.assertNotIn(legacy_id[:256], page.text)
 
+    def test_round10_invalid_utf8_legacy_ids_are_blob_safe_and_incompatible(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO conversations(conversation_id, title, aggregate_hash) "
+            "VALUES (CAST(X'80' AS TEXT), 'synthetic', 'bad-id')"
+        )
+        conn.execute(
+            "UPDATE conversations SET exported_id=CAST(X'81' AS TEXT), "
+            "current_node=CAST(X'82' AS TEXT) WHERE conversation_id='web-1'"
+        )
+        conn.execute(
+            "INSERT INTO conversation_nodes(conversation_id, node_id, content_text) "
+            "VALUES ('web-1', CAST(X'83' AS TEXT), 'synthetic')"
+        )
+        conn.execute(
+            "UPDATE conversation_nodes SET parent_node_id=CAST(X'84' AS TEXT), "
+            "message_id=CAST(X'85' AS TEXT) "
+            "WHERE conversation_id='web-1' AND node_id='a1'"
+        )
+        conn.commit()
+        conn.close()
+        health = client.get("/api/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertFalse(health.json()["db_ready"])
+        self.assertEqual(health.json()["database_error_code"], "database_data_incompatible")
+        listing = client.get("/api/conversations")
+        self.assertEqual(listing.status_code, 409)
+        self.assertEqual(listing.json()["detail"]["code"], "database_data_incompatible")
+
     def test_round7_deep_legacy_raw_is_bounded_and_reports_incomplete(self):
         td, client, db = self.make_client()
         self.addCleanup(td.cleanup)
@@ -6732,7 +6956,258 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(body["total_exact"])
         self.assertEqual(body["diagnostics"]["completion_state"], "complete")
         self.assertEqual(body["diagnostics"]["oversized_candidates_seen"], 1)
-        self.assertEqual(body["items"][0]["match_char_offset"], 210_001)
+        hit = body["items"][0]
+        self.assertEqual(hit["match_char_offset"], 210_001)
+        self.assertIsInstance(hit["display_anchor_cursor"], str)
+        anchored = client.get(
+            "/api/by-id/display",
+            params={
+                "conversation_id": hit["conversation_id"],
+                "node_id": hit["node_id"],
+                "offset": hit["match_char_offset"],
+                "limit": 1024,
+                "cursor": hit["display_anchor_cursor"],
+            },
+        )
+        self.assertEqual(anchored.status_code, 200, anchored.text)
+        self.assertEqual(anchored.json()["offset"], 210_001)
+        self.assertTrue(anchored.json()["display_text"].startswith("round8-late-needle"))
+
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE conversation_nodes SET content_text=content_text || ' changed' "
+            "WHERE conversation_id='web-1' AND node_id='a1'"
+        )
+        conn.commit()
+        conn.close()
+        stale = client.get(
+            "/api/by-id/display",
+            params={
+                "conversation_id": hit["conversation_id"],
+                "node_id": hit["node_id"],
+                "offset": hit["match_char_offset"],
+                "limit": 1024,
+                "cursor": hit["display_anchor_cursor"],
+            },
+        )
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["detail"], "display_cursor_stale")
+
+    def test_round10_selected_long_hit_reuses_verifier_and_anchor_seeks_directly(self):
+        from chatgpt_export_archiver.search import (
+            get_message_display_chunk,
+            parse_query,
+            search_messages,
+        )
+
+        class CountingBlob:
+            def __init__(self, inner, counters, key):
+                self.inner = inner
+                self.counters = counters
+                self.key = key
+
+            def __len__(self):
+                return len(self.inner)
+
+            def read(self, length=-1):
+                value = self.inner.read(length)
+                self.counters["bytes"] += len(value)
+                return value
+
+            def seek(self, offset, origin=0):
+                self.counters["seeks"].append((self.key, offset, origin))
+                return self.inner.seek(offset, origin)
+
+            def close(self):
+                return self.inner.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.close()
+                return False
+
+        counters = {"opens": {}, "bytes": 0, "seeks": []}
+
+        class CountingConnection(sqlite3.Connection):
+            def blobopen(self, table, column, rowid, *, readonly=False, name="main"):
+                key = (int(rowid), str(column))
+                counters["opens"][key] = counters["opens"].get(key, 0) + 1
+                inner = super().blobopen(
+                    table, column, rowid, readonly=readonly, name=name
+                )
+                return CountingBlob(inner, counters, key)
+
+        td, _client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        needle = "round10-direct-anchor"
+        writer = sqlite3.connect(db)
+        writer.execute(
+            "UPDATE conversation_nodes SET content_text=?, raw_message_json=NULL "
+            "WHERE conversation_id='web-1' AND node_id='a1'",
+            ("x" * (2 * 1024 * 1024) + needle,),
+        )
+        writer.commit()
+        rowid = int(writer.execute(
+            "SELECT rowid FROM conversation_nodes "
+            "WHERE conversation_id='web-1' AND node_id='a1'"
+        ).fetchone()[0])
+        writer.close()
+
+        conn = sqlite3.connect(
+            f"file:{quote(str(db))}?mode=ro",
+            uri=True,
+            factory=CountingConnection,
+        )
+        conn.row_factory = sqlite3.Row
+        page = search_messages(
+            conn,
+            parse_query(needle, path_default="all"),
+            limit=10,
+            count_total=True,
+        )
+        hit = next(item for item in page["items"] if item["node_id"] == "a1")
+        self.assertEqual(counters["opens"].get((rowid, "content_text")), 1)
+        self.assertEqual(
+            page["diagnostics"]["blob_reads"],
+            page["diagnostics"]["resolver_calls"],
+        )
+        target_bytes = 2 * 1024 * 1024 + len(needle)
+        self.assertGreaterEqual(page["diagnostics"]["candidate_blob_bytes"], target_bytes)
+        self.assertLess(page["diagnostics"]["candidate_blob_bytes"], target_bytes + 10_000)
+
+        before_anchor_bytes = counters["bytes"]
+        chunk = get_message_display_chunk(
+            conn,
+            "web-1",
+            "a1",
+            offset=hit["match_char_offset"],
+            limit=1024,
+            cursor=hit["display_anchor_cursor"],
+        )
+        self.assertIsNotNone(chunk)
+        self.assertTrue(chunk["display_text"].startswith(needle))
+        self.assertLess(counters["bytes"] - before_anchor_bytes, 8_000)
+        self.assertTrue(any(
+            key == (rowid, "content_text") and offset == hit["match_char_offset"]
+            for key, offset, _origin in counters["seeks"]
+        ))
+        conn.close()
+
+    def test_round10_search_hit_reports_actual_source_span(self):
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE conversation_nodes SET content_text=? "
+            "WHERE conversation_id='web-1' AND node_id='a1'",
+            ("longneedle and a",),
+        )
+        conn.commit()
+        response = client.get(
+            "/api/search/messages",
+            params={"q": "a longneedle", "path": "all"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        hit = next(
+            item for item in response.json()["items"] if item["node_id"] == "a1"
+        )
+        self.assertEqual(hit["match_char_offset"], 0)
+        self.assertEqual(hit["match_length"], len("longneedle"))
+        self.assertEqual(hit["matched_term"], "longneedle")
+
+        conn.execute(
+            "UPDATE conversation_nodes SET content_text='ﬁ' "
+            "WHERE conversation_id='web-1' AND node_id='a1'"
+        )
+        conn.commit()
+        conn.close()
+        response = client.get(
+            "/api/search/messages",
+            params={"q": "fi", "path": "all"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        hit = next(
+            item for item in response.json()["items"] if item["node_id"] == "a1"
+        )
+        self.assertEqual(hit["match_char_offset"], 0)
+        self.assertEqual(hit["match_length"], 1)
+        self.assertEqual(hit["matched_term"], "fi")
+
+    def test_round10_message_search_continuation_is_query_and_generation_bound(self):
+        import chatgpt_export_archiver.search as search_module
+
+        td, client, db = self.make_client()
+        self.addCleanup(td.cleanup)
+        params = {"q": "assistant", "path": "all", "limit": 100}
+        complete = client.get("/api/search/messages", params=params)
+        self.assertEqual(complete.status_code, 200, complete.text)
+        expected = {
+            (item["conversation_id"], item["node_id"])
+            for item in complete.json()["items"]
+        }
+
+        seen: set[tuple[str, str]] = set()
+        continuation = None
+        with mock.patch.object(search_module, "SEARCH_CANDIDATE_LIMIT", 2):
+            for _page in range(20):
+                request_params = dict(params)
+                if continuation is not None:
+                    request_params["continuation"] = continuation
+                response = client.get("/api/search/messages", params=request_params)
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                seen.update(
+                    (item["conversation_id"], item["node_id"])
+                    for item in payload["items"]
+                )
+                diagnostics = payload["diagnostics"]
+                self.assertLessEqual(diagnostics["candidate_count"], 3)
+                self.assertGreaterEqual(diagnostics["resolver_calls"], 0)
+                self.assertGreaterEqual(diagnostics["sqlite_vm_steps"], 0)
+                if diagnostics["completion_state"] == "complete":
+                    self.assertFalse(diagnostics["continuation_available"])
+                    self.assertIsNone(diagnostics["continuation_token"])
+                    break
+                self.assertTrue(diagnostics["partial"])
+                self.assertFalse(payload["total_exact"])
+                self.assertTrue(diagnostics["continuation_available"])
+                continuation = diagnostics["continuation_token"]
+            else:
+                self.fail("message-search continuation did not finish")
+        self.assertEqual(seen, expected)
+
+        with mock.patch.object(search_module, "SEARCH_CANDIDATE_LIMIT", 1):
+            first = client.get("/api/search/messages", params=params).json()
+            stale_token = first["diagnostics"]["continuation_token"]
+            self.assertIsInstance(stale_token, str)
+            changed_query = client.get(
+                "/api/search/messages",
+                params={**params, "q": "visible", "continuation": stale_token},
+            )
+            self.assertEqual(changed_query.status_code, 409)
+            self.assertEqual(changed_query.json()["detail"], "search_continuation_stale")
+
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "UPDATE conversation_nodes SET content_text=content_text || ' generation-change' "
+                "WHERE conversation_id='web-1' AND node_id='a1'"
+            )
+            conn.commit()
+            conn.close()
+            stale_generation = client.get(
+                "/api/search/messages",
+                params={**params, "continuation": stale_token},
+            )
+            self.assertEqual(stale_generation.status_code, 409)
+            self.assertEqual(stale_generation.json()["detail"], "search_continuation_stale")
+
+        invalid = client.get(
+            "/api/search/messages", params={**params, "continuation": "not-a-token"}
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(invalid.json()["detail"], "invalid_search_continuation")
 
     def test_round8_exact_search_boundary_matrix_and_raw_only_fallback(self):
         td, client, db = self.make_client()
@@ -6778,7 +7253,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(raw_payload["total"], 1)
         self.assertEqual(raw_payload["items"][0]["match_char_offset"], 210_001)
 
-    def test_round8_exact_verify_limit_is_413_and_trusted_opt_in_completes(self):
+    def test_round10_exact_verify_limit_preserves_confirmed_results_and_opt_in_completes(self):
         import chatgpt_export_archiver.search as search_module
 
         td, client, db = self.make_client()
@@ -6800,8 +7275,14 @@ class WebApiTests(unittest.TestCase):
             limited = client.get(
                 "/api/search/messages", params={"q": needle, "path": "all"}
             )
-            self.assertEqual(limited.status_code, 413)
-            self.assertEqual(limited.json()["detail"], "search_candidate_exact_verify_limit")
+            self.assertEqual(limited.status_code, 200)
+            limited_payload = limited.json()
+            self.assertEqual(limited_payload["total"], 0)
+            self.assertFalse(limited_payload["total_exact"])
+            self.assertEqual(limited_payload["diagnostics"]["completion_state"], "partial")
+            self.assertEqual(limited_payload["diagnostics"]["oversized_candidates_pending"], 1)
+            self.assertFalse(limited_payload["diagnostics"]["continuation_available"])
+            self.assertIsNone(limited_payload["diagnostics"]["continuation_token"])
             with mock.patch.dict(
                 os.environ,
                 {search_module.SEARCH_EXACT_VERIFY_ENV: "220000"},
@@ -6812,6 +7293,7 @@ class WebApiTests(unittest.TestCase):
                 )
                 self.assertEqual(completed.status_code, 200)
                 self.assertEqual(completed.json()["total"], 1)
+                self.assertTrue(completed.json()["total_exact"])
 
     def test_round8_search_business_budget_returns_non_2xx_before_render(self):
         import chatgpt_export_archiver.search as search_module
@@ -6825,7 +7307,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 413)
         self.assertEqual(response.json()["detail"], "search_response_resource_limit_exceeded")
 
-    def test_round8_exact_search_enforces_utf8_bytes_independently_from_characters(self):
+    def test_round10_exact_search_tracks_utf8_byte_limited_candidate_as_pending(self):
         import chatgpt_export_archiver.search as search_module
 
         td, client, db = self.make_client()
@@ -6847,8 +7329,12 @@ class WebApiTests(unittest.TestCase):
                 "/api/search/messages",
                 params={"q": "byte-boundary-needle", "path": "all"},
             )
-        self.assertEqual(response.status_code, 413)
-        self.assertEqual(response.json()["detail"], "search_candidate_exact_verify_limit")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["total_exact"])
+        self.assertEqual(payload["diagnostics"]["completion_state"], "partial")
+        self.assertEqual(payload["diagnostics"]["partial_reason"], "candidate_row_limit")
+        self.assertEqual(payload["diagnostics"]["oversized_candidates_pending"], 1)
 
     def test_round8_conversation_enrichment_marks_every_item_partial_at_global_cap(self):
         import chatgpt_export_archiver.search as search_module
@@ -6865,6 +7351,7 @@ class WebApiTests(unittest.TestCase):
             )
         conn.commit()
         conn.close()
+        refresh_test_database_compatibility(db)
         with mock.patch.object(search_module, "SEARCH_ENRICHMENT_MATCH_LIMIT", 2):
             response = client.get(
                 "/api/conversations",
@@ -7010,7 +7497,7 @@ class WebApiTests(unittest.TestCase):
         self.assertLess(raw_bytes_read, len(raw.encode("utf-8")))
         self.assertLessEqual(raw_bytes_read, 2 * 800_004)
 
-    def test_round9_raw_only_exact_search_over_one_mib_returns_413(self):
+    def test_round10_raw_only_exact_search_over_one_mib_isolated_as_pending(self):
         td, client, db = self.make_client()
         self.addCleanup(td.cleanup)
         needle = "round9-raw-limit-needle"
@@ -7033,10 +7520,14 @@ class WebApiTests(unittest.TestCase):
         response = client.get(
             "/api/search/messages", params={"q": needle, "path": "all"}
         )
-        self.assertEqual(response.status_code, 413)
-        self.assertEqual(response.json(), {"detail": "search_candidate_exact_verify_limit"})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["total_exact"])
+        self.assertEqual(payload["diagnostics"]["completion_state"], "partial")
+        self.assertEqual(payload["diagnostics"]["partial_reason"], "raw_fallback_limit")
+        self.assertEqual(payload["diagnostics"]["oversized_candidates_pending"], 1)
 
-    def test_round9_long_placeholder_uses_raw_recall_in_format_four_index(self):
+    def test_round10_long_placeholder_uses_raw_recall_in_format_five_index(self):
         from chatgpt_export_archiver.web_db import WEB_INDEX_FORMAT_VERSION, create_web_indexes
 
         td, client, db = self.make_client()
@@ -7058,7 +7549,7 @@ class WebApiTests(unittest.TestCase):
         finally:
             conn.close()
         result = create_web_indexes(db)
-        self.assertEqual(WEB_INDEX_FORMAT_VERSION, "4")
+        self.assertEqual(WEB_INDEX_FORMAT_VERSION, "5")
         self.assertGreater(result["peak_batch_derived_bytes"], 0)
         response = client.get(
             "/api/search/messages", params={"q": needle, "path": "all"}

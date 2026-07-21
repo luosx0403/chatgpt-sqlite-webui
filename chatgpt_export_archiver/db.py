@@ -4,8 +4,10 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import threading
+from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +15,6 @@ from typing import Any, Iterable, Iterator
 
 from .current_path import (
     EffectiveCurrentResourceLimitError,
-    effective_current_metadata,
     ensure_effective_current_views,
 )
 
@@ -24,6 +25,7 @@ from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
     OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+    OPTIONAL_WEB_INDEX_PREDECESSOR_FORMAT_VERSIONS,
     parse_nonnegative_integer,
 )
 from .sqlite_errors import (
@@ -104,6 +106,7 @@ CANONICAL_TABLE_DDL = (
         is_on_current_path INTEGER NOT NULL DEFAULT 0,
         raw_message_json TEXT,
         last_import_run_id INTEGER,
+        display_revision TEXT NOT NULL DEFAULT '',
         PRIMARY KEY(conversation_id, node_id),
         FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
         FOREIGN KEY(last_import_run_id) REFERENCES import_runs(id)
@@ -130,7 +133,18 @@ CANONICAL_TABLE_DDL = (
         related_message_id TEXT,
         FOREIGN KEY(import_run_id) REFERENCES import_runs(id)
     )""",
+    """CREATE TABLE IF NOT EXISTS archive_compatibility_state (
+        domain TEXT NOT NULL PRIMARY KEY,
+        checked_generation INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        incompatible_count INTEGER NOT NULL DEFAULT 0,
+        CHECK(domain IN ('address', 'graph')),
+        CHECK(status IN ('compatible', 'incompatible')),
+        CHECK(checked_generation >= 0),
+        CHECK(incompatible_count >= 0)
+    )""",
 )
+COMPATIBILITY_STATE_DDL = CANONICAL_TABLE_DDL[-1]
 
 GENERATION_TABLE_DDL = """CREATE TABLE IF NOT EXISTS archive_generations (
     name TEXT NOT NULL PRIMARY KEY,
@@ -213,21 +227,21 @@ GENERATION_TRIGGER_DDL = {
 }
 
 # Row-specific display revisions let long-body cursors ignore unrelated writes
-# without relying on a bounded content sample.  Keep these triggers active
-# during bulk generation aggregation: unlike the four global domains, a row
-# revision must advance for every affected canonical row.
+# without relying on rowid or an ever-growing tombstone table. Keep these
+# triggers active during bulk generation aggregation: unlike the four global
+# domains, a row revision must change for every affected canonical row.
 DISPLAY_REVISION_TRIGGER_DDL = {
     "archive_display_revision_node_insert": """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_insert
         AFTER INSERT ON conversation_nodes BEGIN
-            INSERT INTO archive_generations(name, generation)
-            VALUES ('display:' || NEW.rowid, 1)
-            ON CONFLICT(name) DO UPDATE SET generation = generation + 1;
+            UPDATE conversation_nodes
+            SET display_revision = lower(hex(randomblob(16)))
+            WHERE conversation_id = NEW.conversation_id AND node_id = NEW.node_id;
         END""",
     "archive_display_revision_node_update": """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_update
         AFTER UPDATE OF content_type, content_text, content_hash, raw_message_json ON conversation_nodes BEGIN
-            INSERT INTO archive_generations(name, generation)
-            VALUES ('display:' || NEW.rowid, 1)
-            ON CONFLICT(name) DO UPDATE SET generation = generation + 1;
+            UPDATE conversation_nodes
+            SET display_revision = lower(hex(randomblob(16)))
+            WHERE conversation_id = NEW.conversation_id AND node_id = NEW.node_id;
         END""",
 }
 
@@ -300,6 +314,7 @@ CANONICAL_TABLE_CONTRACT = {
             "conversation_id": ("TEXT", True, None),
             "node_id": ("TEXT", True, None),
             "is_on_current_path": ("INTEGER", True, "0"),
+            "display_revision": ("TEXT", True, "''"),
         },
     },
     "exports": {
@@ -328,6 +343,15 @@ CANONICAL_TABLE_CONTRACT = {
         "columns": {
             "name": ("TEXT", True, None),
             "generation": ("INTEGER", True, "0"),
+        },
+    },
+    "archive_compatibility_state": {
+        "primary_key": ("domain",),
+        "columns": {
+            "domain": ("TEXT", True, None),
+            "checked_generation": ("INTEGER", True, None),
+            "status": ("TEXT", True, None),
+            "incompatible_count": ("INTEGER", True, "0"),
         },
     },
 }
@@ -520,45 +544,26 @@ def read_request_capabilities(conn: sqlite3.Connection) -> ReadRequestCapabiliti
     if cached is None:
         schema_status = database_schema_status(conn)
         if schema_status.get("schema_compatible"):
-            legacy_limit = 16 * 1024
-            conn.create_function(
-                "archive_legacy_id_safe",
-                1,
-                lambda value: 1 if _legacy_graph_id_is_safe(value, legacy_limit) else 0,
-                deterministic=True,
-            )
-            incompatible = conn.execute(
-                """SELECT 1 FROM conversations
-                   WHERE archive_legacy_id_safe(conversation_id) = 0
-                      OR archive_legacy_id_safe(exported_id) = 0
-                      OR archive_legacy_id_safe(current_node) = 0
-                   UNION ALL
-                   SELECT 1 FROM conversation_nodes
-                   WHERE archive_legacy_id_safe(conversation_id) = 0
-                      OR archive_legacy_id_safe(node_id) = 0
-                      OR archive_legacy_id_safe(parent_node_id) = 0
-                      OR archive_legacy_id_safe(message_id) = 0
-                      OR (children_json IS NOT NULL AND json_valid(children_json) = 0)
-                      OR EXISTS (
-                          SELECT 1
-                          FROM json_each(
-                              CASE WHEN json_valid(children_json) THEN children_json ELSE '[]' END
-                          ) child
-                          WHERE child.type != 'text'
-                             OR archive_legacy_id_safe(child.value) = 0
-                      )
-                   LIMIT 1""",
-            ).fetchone() is not None
-            if incompatible:
+            compatibility = legacy_compatibility_state(conn)
+            if compatibility["state"] != "compatible":
                 schema_status = {
                     **schema_status,
                     "data_compatible": False,
                     "data_error_code": "database_data_incompatible",
-                    "max_addressable_legacy_id_chars": legacy_limit,
-                    "repair_guidance": "use a trusted local SQLite backup and repair overlong legacy graph identifiers before serving",
+                    "data_compatibility_state": compatibility["state"],
+                    "data_compatibility_exact": compatibility["exact"],
+                    "data_incompatible_count": compatibility["incompatible_count"],
+                    "max_addressable_legacy_id_chars": 16 * 1024,
+                    "repair_guidance": "run explicit migrate after an external backup to refresh exact legacy compatibility state",
                 }
             else:
-                schema_status = {**schema_status, "data_compatible": True}
+                schema_status = {
+                    **schema_status,
+                    "data_compatible": True,
+                    "data_compatibility_state": "compatible",
+                    "data_compatibility_exact": True,
+                    "data_incompatible_count": 0,
+                }
         fts5_available = detect_fts5_runtime(conn)
         trigram_available = _detect_trigram_runtime(conn)
         cached = (schema_status, fts5_available, trigram_available)
@@ -706,6 +711,13 @@ def _legacy_graph_id_is_safe(value: Any, limit: int = 16 * 1024) -> bool:
 
     if value is None:
         return True
+    if isinstance(value, bytes):
+        if len(value) > limit * 4:
+            return False
+        try:
+            value = value.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
     if not isinstance(value, str) or len(value) > limit:
         return False
     for character in value:
@@ -719,6 +731,121 @@ def _legacy_graph_id_is_safe(value: Any, limit: int = 16 * 1024) -> bool:
         ):
             return False
     return True
+
+
+def _legacy_compatibility_generations(conn: sqlite3.Connection) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT name, generation, typeof(generation) FROM archive_generations "
+        "WHERE name IN ('address', 'graph')"
+    ).fetchall()
+    values: dict[str, int] = {}
+    for row in rows:
+        if _strict_nonnegative_integer(row[1], str(row[2])):
+            values[str(row[0])] = int(row[1])
+    if set(values) != {"address", "graph"}:
+        raise DatabaseMigrationError("database_schema_incompatible")
+    return values
+
+
+def refresh_legacy_compatibility_state(conn: sqlite3.Connection) -> dict[str, int]:
+    """Deep-scan legacy address/graph data and bind exact results to generations."""
+
+    legacy_limit = 16 * 1024
+    conn.create_function(
+        "archive_legacy_id_safe",
+        1,
+        lambda value: 1 if _legacy_graph_id_is_safe(value, legacy_limit) else 0,
+        deterministic=True,
+    )
+    address_count = int(conn.execute(
+        """SELECT COUNT(*) FROM (
+               SELECT 1 FROM conversations
+               WHERE archive_legacy_id_safe(CAST(conversation_id AS BLOB)) = 0
+                  OR archive_legacy_id_safe(CAST(exported_id AS BLOB)) = 0
+                  OR archive_legacy_id_safe(CAST(current_node AS BLOB)) = 0
+               UNION ALL
+               SELECT 1 FROM conversation_nodes
+               WHERE archive_legacy_id_safe(CAST(conversation_id AS BLOB)) = 0
+                  OR archive_legacy_id_safe(CAST(node_id AS BLOB)) = 0
+                  OR archive_legacy_id_safe(CAST(parent_node_id AS BLOB)) = 0
+                  OR archive_legacy_id_safe(CAST(message_id AS BLOB)) = 0
+                  OR EXISTS (
+                      SELECT 1 FROM json_each(
+                          CASE WHEN json_valid(children_json) THEN children_json ELSE '[]' END
+                      ) child
+                      WHERE archive_legacy_id_safe(CAST(child.value AS BLOB)) = 0
+                  )
+           )"""
+    ).fetchone()[0])
+    graph_count = int(conn.execute(
+        """SELECT COUNT(*) FROM conversation_nodes
+           WHERE (children_json IS NOT NULL AND json_valid(children_json) = 0)
+              OR EXISTS (
+                  SELECT 1 FROM json_each(
+                      CASE WHEN json_valid(children_json) THEN children_json ELSE '[]' END
+                  ) child
+                  WHERE child.type != 'text'
+              )"""
+    ).fetchone()[0])
+    generations = _legacy_compatibility_generations(conn)
+    conn.executemany(
+        """INSERT INTO archive_compatibility_state(
+               domain, checked_generation, status, incompatible_count
+           ) VALUES (?, ?, ?, ?)
+           ON CONFLICT(domain) DO UPDATE SET
+               checked_generation=excluded.checked_generation,
+               status=excluded.status,
+               incompatible_count=excluded.incompatible_count""",
+        (
+            ("address", generations["address"], "compatible" if address_count == 0 else "incompatible", address_count),
+            ("graph", generations["graph"], "compatible" if graph_count == 0 else "incompatible", graph_count),
+        ),
+    )
+    return {"address": address_count, "graph": graph_count}
+
+
+def legacy_compatibility_state(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Read constant-size generation-bound compatibility state."""
+
+    generations = _legacy_compatibility_generations(conn)
+    rows = conn.execute(
+        "SELECT domain, checked_generation, status, incompatible_count "
+        "FROM archive_compatibility_state WHERE domain IN ('address', 'graph')"
+    ).fetchall()
+    state = {str(row[0]): row for row in rows}
+    if set(state) != {"address", "graph"}:
+        return {"state": "dirty", "exact": False, "incompatible_count": 0}
+    dirty = any(
+        int(state[domain][1]) != generations[domain]
+        for domain in ("address", "graph")
+    )
+    if dirty:
+        return {"state": "dirty", "exact": False, "incompatible_count": 0}
+    incompatible_count = sum(int(state[domain][3]) for domain in ("address", "graph"))
+    incompatible = incompatible_count > 0 or any(
+        str(state[domain][2]) != "compatible" for domain in ("address", "graph")
+    )
+    return {
+        "state": "incompatible" if incompatible else "compatible",
+        "exact": True,
+        "incompatible_count": incompatible_count,
+    }
+
+
+def mark_legacy_compatibility_current(conn: sqlite3.Connection) -> None:
+    """Bind a previously exact-compatible state to trusted canonical writes."""
+
+    generations = _legacy_compatibility_generations(conn)
+    changed = conn.executemany(
+        "UPDATE archive_compatibility_state SET checked_generation=?, "
+        "status='compatible', incompatible_count=0 WHERE domain=?",
+        (
+            (generations["address"], "address"),
+            (generations["graph"], "graph"),
+        ),
+    )
+    if changed.rowcount not in (-1, 2):
+        raise DatabaseMigrationError("database_schema_incompatible")
 
 
 @contextmanager
@@ -822,6 +949,7 @@ MIGRATIONS = {
     1: "rebuild_nullable_identity_v3",
     2: "rebuild_nullable_identity_v3",
     3: "add_durable_revision_domains_v4",
+    4: "add_row_local_display_revision_v5",
 }
 _SUPPORTED_SCHEMA_PREDECESSORS = frozenset(MIGRATIONS)
 
@@ -838,6 +966,22 @@ _KNOWN_MANAGED_TRIGGER_PREDECESSORS = {
         """CREATE TRIGGER IF NOT EXISTS archive_address_generation_conversation_update
         AFTER UPDATE OF conversation_id, current_node ON conversations BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+    ),
+    "archive_display_revision_node_insert": (
+        """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            INSERT INTO archive_generations(name, generation)
+            VALUES ('display:' || NEW.rowid, 1)
+            ON CONFLICT(name) DO UPDATE SET generation = generation + 1;
+        END""",
+    ),
+    "archive_display_revision_node_update": (
+        """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_update
+        AFTER UPDATE OF content_type, content_text, content_hash, raw_message_json ON conversation_nodes BEGIN
+            INSERT INTO archive_generations(name, generation)
+            VALUES ('display:' || NEW.rowid, 1)
+            ON CONFLICT(name) DO UPDATE SET generation = generation + 1;
         END""",
     ),
 }
@@ -1033,20 +1177,27 @@ def _supported_predecessor_schema(status: dict[str, Any]) -> bool:
         return False
     if status.get("base_schema_compatible"):
         return True
+    missing_columns = {
+        str(table): set(columns)
+        for table, columns in (status.get("missing_columns") or {}).items()
+    }
+    node_missing = missing_columns.get("conversation_nodes", set())
+    if node_missing == {"display_revision"}:
+        missing_columns.pop("conversation_nodes", None)
     if (
         status.get("database_schema_newer")
-        or status.get("missing_columns")
+        or missing_columns
         or status.get("object_type_mismatches")
         or status.get("missing_foreign_keys")
         or status.get("invalid_generation_rows")
     ):
         return False
     missing_tables = set(status.get("missing_tables") or ())
-    if missing_tables - {"archive_generations"}:
+    if missing_tables - {"archive_generations", "archive_compatibility_state"}:
         return False
     invalid = dict(status.get("invalid_tables") or {})
     conversations = invalid.pop("conversations", None)
-    if not _nullable_identity_only(conversations, "conversation_id"):
+    if conversations is not None and not _nullable_identity_only(conversations, "conversation_id"):
         return False
     generations = invalid.pop("archive_generations", None)
     if generations is not None and not _nullable_identity_only(generations, "name"):
@@ -1122,7 +1273,12 @@ def _rebuild_nullable_identity_tables(conn: sqlite3.Connection, *, has_generatio
         conn.execute("ALTER TABLE archive_generations_v3 RENAME TO archive_generations")
 
 
-def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False) -> dict[str, Any]:
+def migrate_database(
+    conn: sqlite3.Connection,
+    *,
+    allow_initialize: bool = False,
+    refresh_compatibility: bool = False,
+) -> dict[str, Any]:
     """Initialize or migrate the canonical schema in one protected transaction.
 
     Read-only callers never invoke this function.  The schema version is
@@ -1159,6 +1315,7 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             raise DatabaseMigrationError("database_not_ready")
         locked_status = database_schema_status(conn) if has_objects else None
         upgrading_identity_contract = bool(has_objects and current_version < 3)
+        upgrading_display_contract = bool(has_objects and current_version < 5)
         if locked_status is not None:
             _raise_for_migration_custom_objects(
                 conn,
@@ -1190,9 +1347,18 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
         if has_objects and conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise DatabaseMigrationError("database_foreign_key_violation")
         if locked_status is not None and locked_status["schema_compatible"] and not locked_status["migration_required"]:
+            compatibility_refreshed = False
+            if refresh_compatibility:
+                refresh_legacy_compatibility_state(conn)
+                compatibility_refreshed = True
             conn.commit()
             invalidate_read_capability_cache()
-            return {"changed": False, "initialized": False, **locked_status}
+            return {
+                "changed": compatibility_refreshed,
+                "initialized": False,
+                "compatibility_refreshed": compatibility_refreshed,
+                **locked_status,
+            }
 
         initialized = not has_objects
         if upgrading_identity_contract:
@@ -1203,6 +1369,23 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
         if not has_objects:
             for statement in CANONICAL_TABLE_DDL:
                 conn.execute(statement)
+        elif upgrading_display_contract:
+            node_columns = {
+                str(row[1]) for row in conn.execute('PRAGMA table_xinfo("conversation_nodes")')
+            }
+            if "display_revision" not in node_columns:
+                conn.execute(
+                    "ALTER TABLE conversation_nodes ADD COLUMN "
+                    "display_revision TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                "UPDATE conversation_nodes "
+                "SET display_revision = lower(hex(randomblob(16)))"
+            )
+        if has_objects and "archive_compatibility_state" in set(
+            (locked_status or {}).get("missing_tables") or ()
+        ):
+            conn.execute(COMPATIBILITY_STATE_DDL)
         web_index_source_triggers = {
             name for name, contract in GENERATION_TRIGGER_CONTRACT.items()
             if contract[-1] in {"message", "title"}
@@ -1237,21 +1420,17 @@ def migrate_database(conn: sqlite3.Connection, *, allow_initialize: bool = False
             "INSERT OR IGNORE INTO archive_generations(name, generation) VALUES (?, 0)",
             ((name,) for name in REQUIRED_GENERATION_ROWS),
         )
+        if upgrading_display_contract:
+            conn.execute("DELETE FROM archive_generations WHERE name GLOB 'display:*'")
         for name in (locked_status or {}).get("invalid_triggers", {}):
             conn.execute(f'DROP TRIGGER "{name}"')
         for statement in CANONICAL_TRIGGER_DDL.values():
             conn.execute(statement)
-        # Existing v4 rows predate row-specific display revisions.  Tombstones
-        # are intentionally retained so a deleted/reinserted rowid cannot
-        # recycle an earlier cursor revision.
-        conn.execute(
-            "INSERT OR IGNORE INTO archive_generations(name, generation) "
-            "SELECT printf('display:%lld', rowid), 1 FROM conversation_nodes"
-        )
         for name in (locked_status or {}).get("invalid_indexes", {}):
             conn.execute(f'DROP INDEX "{name}"')
         for statement in REQUIRED_INDEX_DDL.values():
             conn.execute(statement)
+        refresh_legacy_compatibility_state(conn)
         pre_version = database_schema_status(conn)
         if (
             not pre_version["base_schema_compatible"]
@@ -1302,6 +1481,22 @@ OPTIONAL_WEB_METADATA_TABLES = ("web_index_metadata", "web_index_oversized")
 OPTIONAL_WEB_INDEX_TABLES = OPTIONAL_WEB_TRIGRAM_TABLES + OPTIONAL_WEB_NORM_TABLES + OPTIONAL_WEB_METADATA_TABLES
 OPTIONAL_WEB_INDEX_OWNER = "chatgpt-sqlite-webui"
 OPTIONAL_WEB_INDEX_OWNER_KEY = "project_object_owner"
+
+_OPTIONAL_WEB_INDEX_FIXED_METADATA = {
+    "message_norm_text": "normalized",
+    "title_norm_text": "normalized",
+    "display_text_resolver_version": DISPLAY_TEXT_RESOLVER_VERSION,
+    "normalization_index_format_version": NORMALIZATION_INDEX_FORMAT_VERSION,
+    "oversized_fallback": "required",
+    "max_input_bytes": "4194304",
+    "max_normalized_bytes": "2097152",
+    "max_derived_bytes": "8388608",
+}
+_OPTIONAL_WEB_INDEX_BATCH_METADATA = {
+    "batch_input_bytes": "16777216",
+    "batch_normalized_bytes": "16777216",
+    "batch_derived_bytes": "33554432",
+}
 
 
 def _schema_rows_for_names(
@@ -1537,29 +1732,36 @@ def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
         }
     except sqlite3.Error:
         _raise_object_collision("optional_index_name_collision", present_rows)
-    required_metadata = {
-        "web_index_format_version",
-        "display_text_resolver_version",
-        "normalization_index_format_version",
-        "message_generation",
-        "title_generation",
-    }
-    if not required_metadata.issubset(metadata) or any(
+    if any(
         parse_nonnegative_integer(metadata.get(key)) is None
         for key in ("message_generation", "title_generation")
     ):
         _raise_object_collision("optional_index_name_collision", present_rows)
-    if (
-        metadata.get("web_index_format_version") != OPTIONAL_WEB_INDEX_FORMAT_VERSION
-        or metadata.get("display_text_resolver_version") != DISPLAY_TEXT_RESOLVER_VERSION
-        or metadata.get("normalization_index_format_version")
-        != NORMALIZATION_INDEX_FORMAT_VERSION
-    ):
+    trigram_any = any(bool(rows_by_name[name]) for name in all_names if name not in base_names)
+    format_version = metadata.get("web_index_format_version")
+    supported_formats = {
+        OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+        *OPTIONAL_WEB_INDEX_PREDECESSOR_FORMAT_VERSIONS,
+    }
+    if format_version not in supported_formats:
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    expected_metadata = {
+        **_OPTIONAL_WEB_INDEX_FIXED_METADATA,
+        "web_index_format_version": str(format_version),
+        "message_generation": metadata.get("message_generation", ""),
+        "title_generation": metadata.get("title_generation", ""),
+    }
+    if format_version != "3":
+        expected_metadata.update(_OPTIONAL_WEB_INDEX_BATCH_METADATA)
+        expected_metadata[OPTIONAL_WEB_INDEX_OWNER_KEY] = OPTIONAL_WEB_INDEX_OWNER
+    if trigram_any:
+        expected_metadata.update({
+            "message_trigram_text": "normalized",
+            "title_trigram_text": "normalized",
+        })
+    if metadata != expected_metadata:
         _raise_object_collision("optional_index_name_collision", present_rows)
     owner = metadata.get(OPTIONAL_WEB_INDEX_OWNER_KEY)
-    if owner not in (None, OPTIONAL_WEB_INDEX_OWNER):
-        _raise_object_collision("optional_index_name_collision", present_rows)
-    trigram_any = any(bool(rows_by_name[name]) for name in all_names if name not in base_names)
     if trigram_any:
         _validate_fts5_family(
             conn,
@@ -1568,7 +1770,10 @@ def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
             arguments="content_text,content='',tokenize='trigram'",
             collision_code="optional_index_name_collision",
             allow_absent=False,
-            allow_missing_shadows=owner == OPTIONAL_WEB_INDEX_OWNER,
+            allow_missing_shadows=(
+                format_version == OPTIONAL_WEB_INDEX_FORMAT_VERSION
+                and owner == OPTIONAL_WEB_INDEX_OWNER
+            ),
         )
         _validate_fts5_family(
             conn,
@@ -1577,7 +1782,10 @@ def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
             arguments="title,content='',tokenize='trigram'",
             collision_code="optional_index_name_collision",
             allow_absent=False,
-            allow_missing_shadows=owner == OPTIONAL_WEB_INDEX_OWNER,
+            allow_missing_shadows=(
+                format_version == OPTIONAL_WEB_INDEX_FORMAT_VERSION
+                and owner == OPTIONAL_WEB_INDEX_OWNER
+            ),
         )
     return True
 
@@ -2200,6 +2408,7 @@ CORE_SCHEMA_TABLES = frozenset({
     "conversation_nodes",
     "exports",
     "archive_generations",
+    "archive_compatibility_state",
 })
 
 CORE_SCHEMA_COLUMNS = {
@@ -2226,6 +2435,7 @@ CORE_SCHEMA_COLUMNS = {
         "message_id", "role", "author_name", "create_time", "update_time",
         "content_type", "content_text", "content_hash", "metadata_json",
         "is_on_current_path", "raw_message_json", "last_import_run_id",
+        "display_revision",
     }),
     "exports": frozenset({
         "id", "conversation_id", "format", "output_path", "output_hash",
@@ -2236,6 +2446,9 @@ CORE_SCHEMA_COLUMNS = {
         "sha256", "related_conversation_id", "related_message_id",
     }),
     "archive_generations": frozenset({"name", "generation"}),
+    "archive_compatibility_state": frozenset({
+        "domain", "checked_generation", "status", "incompatible_count",
+    }),
 }
 
 
@@ -2319,11 +2532,19 @@ def _trigger_definition(sql: str | None) -> dict[str, Any] | None:
         body_compact,
         re.IGNORECASE,
     )
-    display_match = re.fullmatch(
+    legacy_display_match = re.fullmatch(
         r"INSERT\s+INTO\s+archive_generations\s*\(\s*name\s*,\s*generation\s*\)\s*"
         r"VALUES\s*\(\s*'display:'\s*\|\|\s*NEW\.rowid\s*,\s*1\s*\)\s*"
         r"ON\s+CONFLICT\s*\(\s*name\s*\)\s+DO\s+UPDATE\s+SET\s+"
         r"generation\s*=\s*generation\s*\+\s*1",
+        body_compact,
+        re.IGNORECASE,
+    )
+    row_display_match = re.fullmatch(
+        r"UPDATE\s+conversation_nodes\s+SET\s+display_revision\s*=\s*"
+        r"lower\s*\(\s*hex\s*\(\s*randomblob\s*\(\s*16\s*\)\s*\)\s*\)\s+"
+        r"WHERE\s+conversation_id\s*=\s*NEW\.conversation_id\s+AND\s+"
+        r"node_id\s*=\s*NEW\.node_id",
         body_compact,
         re.IGNORECASE,
     )
@@ -2333,10 +2554,13 @@ def _trigger_definition(sql: str | None) -> dict[str, Any] | None:
         "event": event.upper(),
         "update_of": columns,
         "when": None if when_token is None else "present",
-        "generation_name": body_match.group(1) if body_match else ("display" if display_match else None),
+        "generation_name": body_match.group(1) if body_match else (
+            "display" if legacy_display_match or row_display_match else None
+        ),
         "body_semantics": (
             "increment_by_one" if body_match else
-            "row_revision_upsert" if display_match else
+            "legacy_row_revision_upsert" if legacy_display_match else
+            "row_revision_randomize" if row_display_match else
             "invalid"
         ),
     }
@@ -2395,7 +2619,7 @@ def generation_schema_contract_is_current(conn: sqlite3.Connection) -> bool:
             "update_of": expected_tuple[3],
             "when": expected_tuple[4],
             "generation_name": expected_tuple[5],
-            "body_semantics": "row_revision_upsert" if is_display else "increment_by_one",
+            "body_semantics": "row_revision_randomize" if is_display else "increment_by_one",
         }
         if _trigger_definition(item[1]) != expected:
             return False
@@ -2529,7 +2753,7 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
             "update_of": expected_tuple[3],
             "when": expected_tuple[4],
             "generation_name": expected_tuple[5],
-            "body_semantics": "row_revision_upsert" if is_display else "increment_by_one",
+            "body_semantics": "row_revision_randomize" if is_display else "increment_by_one",
         }
         actual = _trigger_definition(item["sql"])
         if actual != expected:
@@ -2543,7 +2767,8 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
     if "archive_generations" in tables and "archive_generations" not in missing_columns:
         try:
             for row in conn.execute(
-                "SELECT name, generation, typeof(generation) FROM archive_generations"
+                "SELECT name, generation, typeof(generation) FROM archive_generations "
+                "WHERE name IN ('title', 'message', 'address', 'graph')"
             ):
                 name = str(row[0])
                 generation_rows.add(name)
@@ -2599,19 +2824,33 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
         or "archive_generations" in missing_columns
         or ("archive_generations" in tables and "archive_generations" in invalid_tables)
     )
+    predecessor_missing_columns = {
+        table: set(columns) for table, columns in base_missing_columns.items()
+    }
+    predecessor_missing_tables = set(base_missing_tables)
+    if current_version in _SUPPORTED_SCHEMA_PREDECESSORS:
+        predecessor_missing_tables.discard("archive_compatibility_state")
+    if predecessor_missing_columns.get("conversation_nodes") == {"display_revision"}:
+        predecessor_missing_columns.pop("conversation_nodes", None)
+    predecessor_invalid_tables = dict(invalid_tables)
+    predecessor_conversations = predecessor_invalid_tables.pop("conversations", None)
+    predecessor_generations = predecessor_invalid_tables.pop("archive_generations", None)
     legacy_identity_compatible = bool(
         current_version in _SUPPORTED_SCHEMA_PREDECESSORS
-        and not base_missing_tables
-        and not base_missing_columns
+        and not predecessor_missing_tables
+        and not predecessor_missing_columns
         and not missing_foreign_keys
         and not base_object_mismatches
         and not invalid_generation_rows
-        and _nullable_identity_only(invalid_tables.get("conversations"), "conversation_id")
         and (
-            "archive_generations" not in tables
-            or _nullable_identity_only(invalid_tables.get("archive_generations"), "name")
+            predecessor_conversations is None
+            or _nullable_identity_only(predecessor_conversations, "conversation_id")
         )
-        and not (set(invalid_tables) - {"conversations", "archive_generations"})
+        and (
+            predecessor_generations is None
+            or _nullable_identity_only(predecessor_generations, "name")
+        )
+        and not predecessor_invalid_tables
     )
     migration_base_compatible = base_compatible or legacy_identity_compatible
     managed_missing = bool(
@@ -2967,80 +3206,62 @@ def foreign_key_diagnostics(conn: sqlite3.Connection, *, sample_limit: int = 20)
 
 
 def _effective_current_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
-    conversation_rows = conn.execute(
-        "SELECT conversation_id, current_node FROM conversations ORDER BY conversation_id"
-    ).fetchall()
-    conversation_ids = [str(row["conversation_id"]) for row in conversation_rows]
     ensure_effective_current_views(conn, None)
-    metadata = effective_current_metadata(conn, conversation_ids)
-    current_chains_with_unflagged_nodes = {
-        str(row[0])
-        for row in conn.execute(
-            """SELECT DISTINCT ec.conversation_id
-               FROM effective_current_nodes ec
-               JOIN effective_current_meta em
-                 ON em.conversation_id = ec.conversation_id
-               JOIN conversation_nodes n
-                 ON n.conversation_id = ec.conversation_id AND n.node_id = ec.node_id
-               WHERE em.current_collection_source = 'current_node'
-                 AND n.is_on_current_path = 0"""
-        )
-    }
-    counts = {
-        "selected_current_node": 0,
-        "selected_raw_flags": 0,
-        "selected_fallback_all": 0,
-        "valid_current_node_zero_flags": 0,
-        "flags_missing_current_chain_nodes": 0,
-        "multiple_flag_leaves": 0,
-        "invalid_current_node_flags_used": 0,
-        "cycle_detected": 0,
-        "selected_chain_cycles": 0,
-        "raw_flag_cycles": 0,
-        "missing_parent_in_selected_chain": 0,
-        "cross_conversation_parent_in_selected_chain": 0,
-        "partial_selected_chain": 0,
-        "missing_parent_in_raw_flag_topology": 0,
-        "cross_conversation_parent_in_raw_flag_topology": 0,
-        "partial_raw_flag_topology": 0,
-    }
-    for conversation in conversation_rows:
-        conversation_id = str(conversation["conversation_id"])
-        item = metadata.get(conversation_id, {})
-        source = str(item.get("current_collection_source", "fallback_all"))
-        counts[f"selected_{source}"] += 1
-        if source == "current_node" and int(item.get("current_path_nodes") or 0) == 0:
-            counts["valid_current_node_zero_flags"] += 1
-        if conversation_id in current_chains_with_unflagged_nodes:
-            counts["flags_missing_current_chain_nodes"] += 1
-        if int(item.get("raw_flag_leaf_count") or 0) > 1:
-            counts["multiple_flag_leaves"] += 1
-        if source == "raw_flags" and conversation["current_node"]:
-            counts["invalid_current_node_flags_used"] += 1
-        if item.get("cycle_detected"):
-            counts["cycle_detected"] += 1
-        if item.get("selected_chain_cycle_detected"):
-            counts["selected_chain_cycles"] += 1
-        if item.get("raw_flag_cycle_detected"):
-            counts["raw_flag_cycles"] += 1
-        selected_missing = bool(item.get("selected_chain_missing_parent"))
-        selected_cross = bool(item.get("selected_chain_cross_conversation_parent"))
-        selected_cycle = bool(item.get("selected_chain_cycle_detected"))
-        raw_missing = bool(item.get("raw_flag_missing_parent"))
-        raw_cross = bool(item.get("raw_flag_cross_conversation_parent"))
-        raw_cycle = bool(item.get("raw_flag_cycle_detected"))
-        if selected_missing:
-            counts["missing_parent_in_selected_chain"] += 1
-        if selected_cross:
-            counts["cross_conversation_parent_in_selected_chain"] += 1
-        if selected_cycle or selected_missing or selected_cross:
-            counts["partial_selected_chain"] += 1
-        if raw_missing:
-            counts["missing_parent_in_raw_flag_topology"] += 1
-        if raw_cross:
-            counts["cross_conversation_parent_in_raw_flag_topology"] += 1
-        if raw_cycle or raw_missing or raw_cross:
-            counts["partial_raw_flag_topology"] += 1
+    row = conn.execute(
+        """SELECT
+               COALESCE(SUM(current_collection_source = 'current_node'), 0),
+               COALESCE(SUM(current_collection_source = 'raw_flags'), 0),
+               COALESCE(SUM(current_collection_source = 'fallback_all'), 0),
+               COALESCE(SUM(current_collection_source = 'current_node' AND raw_flag_count = 0), 0),
+               COALESCE(SUM(raw_flag_leaf_count > 1), 0),
+               COALESCE(SUM(current_collection_source = 'raw_flags' AND
+                            EXISTS (SELECT 1 FROM conversations c
+                                    WHERE c.conversation_id = effective_current_meta.conversation_id
+                                      AND c.current_node IS NOT NULL AND c.current_node <> '')), 0),
+               COALESCE(SUM(cycle_detected <> 0), 0),
+               COALESCE(SUM(selected_chain_cycle_detected <> 0), 0),
+               COALESCE(SUM(raw_flag_cycle_detected <> 0), 0),
+               COALESCE(SUM(selected_chain_missing_parent <> 0), 0),
+               COALESCE(SUM(selected_chain_cross_conversation_parent <> 0), 0),
+               COALESCE(SUM(selected_chain_cycle_detected <> 0 OR
+                            selected_chain_missing_parent <> 0 OR
+                            selected_chain_cross_conversation_parent <> 0), 0),
+               COALESCE(SUM(raw_flag_missing_parent <> 0), 0),
+               COALESCE(SUM(raw_flag_cross_conversation_parent <> 0), 0),
+               COALESCE(SUM(raw_flag_cycle_detected <> 0 OR
+                            raw_flag_missing_parent <> 0 OR
+                            raw_flag_cross_conversation_parent <> 0), 0)
+           FROM effective_current_meta"""
+    ).fetchone()
+    flags_missing = int(conn.execute(
+        """SELECT COUNT(DISTINCT ec.conversation_id)
+           FROM effective_current_nodes ec
+           JOIN effective_current_meta em
+             ON em.conversation_id = ec.conversation_id
+           JOIN conversation_nodes n
+             ON n.conversation_id = ec.conversation_id AND n.node_id = ec.node_id
+           WHERE em.current_collection_source = 'current_node'
+             AND n.is_on_current_path = 0"""
+    ).fetchone()[0])
+    names = (
+        "selected_current_node",
+        "selected_raw_flags",
+        "selected_fallback_all",
+        "valid_current_node_zero_flags",
+        "multiple_flag_leaves",
+        "invalid_current_node_flags_used",
+        "cycle_detected",
+        "selected_chain_cycles",
+        "raw_flag_cycles",
+        "missing_parent_in_selected_chain",
+        "cross_conversation_parent_in_selected_chain",
+        "partial_selected_chain",
+        "missing_parent_in_raw_flag_topology",
+        "cross_conversation_parent_in_raw_flag_topology",
+        "partial_raw_flag_topology",
+    )
+    counts = {name: int(row[index] or 0) for index, name in enumerate(names)}
+    counts["flags_missing_current_chain_nodes"] = flags_missing
     return counts
 
 
@@ -3051,33 +3272,63 @@ def count_parent_cycles(conn: sqlite3.Connection) -> int:
 
 
 def parent_cycle_diagnostics(conn: sqlite3.Connection) -> dict[str, int]:
-    rows = conn.execute(
-        "SELECT conversation_id, node_id, parent_node_id FROM conversation_nodes WHERE parent_node_id IS NOT NULL"
-    ).fetchall()
-    parents = {(row["conversation_id"], row["node_id"]): row["parent_node_id"] for row in rows}
-    cycle_nodes: set[tuple[str, str]] = set()
-    cycle_components = 0
-    checked: set[tuple[str, str]] = set()
-    for start in parents:
-        if start in checked:
-            continue
-        path: list[tuple[str, str]] = []
-        seen_at: dict[tuple[str, str], int] = {}
-        current: tuple[str, str] | None = start
-        while current is not None and current not in checked:
-            if current in seen_at:
-                cycle_nodes.update(path[seen_at[current] :])
+    # Spool string identity to TEMP SQLite and retain only compact integer
+    # arrays in Python. Exact O(nodes) traversal no longer builds archive-sized
+    # dict/set copies of conversation and node IDs.
+    table = f"parent_cycle_work_{secrets.token_hex(8)}"
+    conn.execute(
+        f'CREATE TEMP TABLE "{table}" ('
+        "seq INTEGER PRIMARY KEY, node_rowid INTEGER NOT NULL UNIQUE, parent_seq INTEGER)"
+    )
+    try:
+        conn.execute(
+            f'INSERT INTO "{table}"(seq, node_rowid) '
+            "SELECT row_number() OVER (ORDER BY n.rowid), n.rowid "
+            "FROM conversation_nodes n WHERE n.parent_node_id IS NOT NULL"
+        )
+        conn.execute(
+            f'UPDATE "{table}" AS work SET parent_seq = ('
+            f'  SELECT parent_work.seq FROM conversation_nodes child '
+            "  JOIN conversation_nodes parent "
+            "    ON parent.conversation_id = child.conversation_id "
+            "   AND parent.node_id = child.parent_node_id "
+            f'  JOIN "{table}" parent_work ON parent_work.node_rowid = parent.rowid '
+            "  WHERE child.rowid = work.node_rowid"
+            ")"
+        )
+        count = int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        parents = array("q", [0])
+        parents.extend(
+            int(row[0] or 0)
+            for row in conn.execute(f'SELECT parent_seq FROM "{table}" ORDER BY seq')
+        )
+        states = bytearray(count + 1)
+        cycle_nodes = 0
+        cycle_components = 0
+        for start in range(1, count + 1):
+            if states[start] != 0:
+                continue
+            path = array("q")
+            current = start
+            while current and states[current] == 0:
+                states[current] = 1
+                path.append(current)
+                current = parents[current]
+            if current and states[current] == 1:
                 cycle_components += 1
-                break
-            seen_at[current] = len(path)
-            path.append(current)
-            parent = parents.get(current)
-            current = (current[0], parent) if parent is not None else None
-        checked.update(path)
-    return {
-        "parent_cycle_nodes": len(cycle_nodes),
-        "parent_cycle_components": cycle_components,
-    }
+                cycle_nodes += 1
+                cursor = parents[current]
+                while cursor != current:
+                    cycle_nodes += 1
+                    cursor = parents[cursor]
+            for node in path:
+                states[node] = 2
+        return {
+            "parent_cycle_nodes": cycle_nodes,
+            "parent_cycle_components": cycle_components,
+        }
+    finally:
+        conn.execute(f'DROP TABLE "{table}"')
 
 
 def export_query(conn: sqlite3.Connection, start_ts: float | None, end_ts: float | None) -> list[sqlite3.Row]:

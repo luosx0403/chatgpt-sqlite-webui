@@ -126,7 +126,9 @@ export interface SearchMessageHit {
   snippet: string;
   match_char_offset?: number | null;
   match_length?: number | null;
+  matched_term?: string | null;
   display_anchor_revision?: string | null;
+  display_anchor_cursor?: string | null;
   is_on_current_path: boolean;
   current_path_fallback_to_all?: boolean;
   effective_visible_in_current_view?: boolean;
@@ -260,6 +262,17 @@ export interface SearchDiagnostics {
   verify_chunk_bytes?: number;
   oversized_candidates_seen?: number;
   oversized_candidates_verified?: number;
+  oversized_candidates_pending?: number;
+  candidate_count?: number;
+  candidate_limit?: number;
+  resolver_calls?: number;
+  blob_reads?: number;
+  candidate_blob_bytes?: number;
+  raw_blob_bytes?: number;
+  decoded_chars?: number;
+  normalization_units?: number;
+  sqlite_vm_steps?: number;
+  wall_seconds?: number;
   continuation_available?: boolean;
   continuation_token?: string | null;
   completion_state?: "complete" | "partial" | UnknownApiEnum;

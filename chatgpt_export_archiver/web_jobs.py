@@ -139,6 +139,18 @@ def _add_cleanup_warning(
             job.cleanup_warning = code
 
 
+def _add_exception_cleanup_warnings(job: ImportJob, exc: BaseException) -> None:
+    for item in getattr(exc, "cleanup_warnings", []):
+        if not isinstance(item, dict):
+            continue
+        _add_cleanup_warning(
+            job,
+            str(item.get("code") or "web_index_staging_cleanup_failed"),
+            error_type=str(item.get("error_type") or "UnknownError"),
+            path_kind=str(item.get("path_kind") or "web_index_staging"),
+        )
+
+
 class ImportJobManager:
     def __init__(self, db_path: Path, *, log_level: str = "warning", history_limit: int | None = None, history_ttl_seconds: int | None = None) -> None:
         self.db_path = db_path
@@ -354,10 +366,12 @@ class ImportJobManager:
                         with job._lock:
                             job.web_index = web_index_result
                             job.verify = verify_result
-                    except WebIndexBuildCancelled:
+                    except WebIndexBuildCancelled as exc:
+                        _add_exception_cleanup_warnings(job, exc)
                         self._web_index_cancelled(job, postcheck_failed=True)
                         return
                     except Exception as exc:
+                        _add_exception_cleanup_warnings(job, exc)
                         self._set_outcome(
                             job,
                             status="postcheck_failed",
@@ -407,10 +421,12 @@ class ImportJobManager:
                     )
                     with job._lock:
                         job.web_index = web_index_result
-                except WebIndexBuildCancelled:
+                except WebIndexBuildCancelled as exc:
+                    _add_exception_cleanup_warnings(job, exc)
                     self._web_index_cancelled(job, postcheck_failed=False)
                     return
                 except Exception as exc:
+                    _add_exception_cleanup_warnings(job, exc)
                     self._set_outcome(
                         job,
                         status="postcheck_failed",

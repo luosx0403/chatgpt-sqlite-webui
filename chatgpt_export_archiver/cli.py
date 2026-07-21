@@ -26,6 +26,8 @@ from .db import (
     finish_bulk_generation_aggregation,
     get_stats,
     init_db,
+    legacy_compatibility_state,
+    mark_legacy_compatibility_current,
     migrate_database,
     optimize_after_import,
     read_snapshot,
@@ -71,10 +73,18 @@ from .scanner import (
 )
 from .sqlite_errors import sqlite_runtime_error_code
 from .utils import compact_json, epoch_to_display, sha256_text
-from .web_db import create_web_indexes
+from .web_db import WebIndexBuildError, acquire_web_index_process_lock, create_web_indexes
 
 LOGGER = get_logger("cli")
 REQUIRED_IMPORT_GENERATION_DOMAINS = ("title", "message", "address", "graph")
+IMPORT_BATCH_MAX_CONVERSATIONS = 100
+IMPORT_BATCH_MAX_NODES = 20_000
+IMPORT_BATCH_MAX_INPUT_BYTES = 32 * 1024 * 1024
+IMPORT_BATCH_MAX_DECODED_CHARS = 32 * 1024 * 1024
+IMPORT_BATCH_MAX_RAW_BYTES = 24 * 1024 * 1024
+IMPORT_BATCH_MAX_METADATA_BYTES = 16 * 1024 * 1024
+IMPORT_BATCH_MAX_ESTIMATED_HEAP_BYTES = 96 * 1024 * 1024
+IMPORT_BATCH_MAX_SQLITE_BIND_BYTES = 48 * 1024 * 1024
 
 
 class ImportPipelineError(ValueError):
@@ -163,6 +173,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except sqlite3.Error as exc:
         print(f"ERROR: {sqlite_runtime_error_code(exc)} error_type={type(exc).__name__}", file=sys.stderr)
+        return 2
+    except WebIndexBuildError as exc:
+        print(f"ERROR: {exc.code}", file=sys.stderr)
+        for warning in exc.cleanup_warnings:
+            print(
+                "cleanup_warning "
+                f"code={warning['code']} error_type={warning['error_type']} "
+                f"path_kind={warning['path_kind']}",
+                file=sys.stderr,
+            )
         return 2
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -324,7 +344,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     try:
         before = database_schema_status(conn)
         print("WARNING: create and verify an external database backup before migration.", file=sys.stderr)
-        result = migrate_database(conn)
+        result = migrate_database(conn, refresh_compatibility=True)
     finally:
         conn.close()
     print(f"current_database_schema_version {before['current_database_schema_version']}")
@@ -390,48 +410,87 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if shard_count and legacy_count:
         print("legacy_conversations_json_ignored true")
 
-    ids: list[str] = []
+    # Keep exact duplicate detection on disk instead of retaining every ID as a
+    # Python string.  An empty SQLite pathname creates a private temporary
+    # database that is removed when the connection closes.
+    inspect_ids = sqlite3.connect("")
+    inspect_ids.execute("PRAGMA journal_mode = OFF")
+    inspect_ids.execute("PRAGMA synchronous = OFF")
+    inspect_ids.execute("PRAGMA cache_size = -2048")
+    inspect_ids.execute(
+        "CREATE TABLE inspect_conversation_ids (conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
+    )
     invalid_locations: list[tuple[str, int, str]] = []
+    invalid_count = 0
+    id_count = 0
     valid_count = 0
     top_level_bad = 0
-    for _source_index, entry, source_items in iter_source_array_sessions(source, selected):
-        source_valid = 0
-        source_invalid = 0
-        try:
-            for idx, item in enumerate(source_items):
-                warning = validate_conversation_element(item, entry.source_path, idx)
-                if warning:
-                    source_invalid += 1
-                    invalid_locations.append((Path(entry.source_path).name, idx, warning.warning_type))
-                    continue
-                source_valid += 1
-                conversation_id = conversation_id_from_value(item)
-                if conversation_id is not None:
-                    ids.append(conversation_id)
-        except ConversationJsonTopLevelError as exc:
-            top_level_bad += 1
-            print(f"source {Path(entry.source_path).name} top_level {exc.top_level_type} valid 0 invalid 0")
-            continue
-        except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, InvalidConversationEncodingError, OSError, ValueError) as exc:
-            top_level_bad += 1
-            code, stage = _classify_source_load_error(exc)
-            print(
-                f"source {Path(entry.source_path).name} top_level invalid_json "
-                f"valid 0 invalid 0 error_code {code} stage {stage}"
-            )
-            continue
-        valid_count += source_valid
-        print(f"source {Path(entry.source_path).name} top_level list valid {source_valid} invalid {source_invalid}")
-    duplicate_count = len(ids) - len(set(ids))
+    try:
+        for source_index, entry, source_items in iter_source_array_sessions(source, selected):
+            source_valid = 0
+            source_invalid = 0
+            source_id_count = 0
+            source_invalid_locations: list[tuple[str, int, str]] = []
+            savepoint = f"inspect_source_{source_index}"
+            inspect_ids.execute(f"SAVEPOINT {savepoint}")
+            try:
+                for idx, item in enumerate(source_items):
+                    warning = validate_conversation_element(item, entry.source_path, idx)
+                    if warning:
+                        source_invalid += 1
+                        if len(source_invalid_locations) < 50:
+                            source_invalid_locations.append(
+                                (Path(entry.source_path).name, idx, warning.warning_type)
+                            )
+                        continue
+                    source_valid += 1
+                    conversation_id = conversation_id_from_value(item)
+                    if conversation_id is not None:
+                        source_id_count += 1
+                        inspect_ids.execute(
+                            "INSERT OR IGNORE INTO inspect_conversation_ids(conversation_id) VALUES (?)",
+                            (conversation_id,),
+                        )
+            except ConversationJsonTopLevelError as exc:
+                inspect_ids.execute(f"ROLLBACK TO {savepoint}")
+                inspect_ids.execute(f"RELEASE {savepoint}")
+                top_level_bad += 1
+                print(f"source {Path(entry.source_path).name} top_level {exc.top_level_type} valid 0 invalid 0")
+                continue
+            except (json.JSONDecodeError, NonFiniteJsonNumberError, JsonIntegerTooLargeError, InvalidConversationEncodingError, OSError, ValueError) as exc:
+                inspect_ids.execute(f"ROLLBACK TO {savepoint}")
+                inspect_ids.execute(f"RELEASE {savepoint}")
+                top_level_bad += 1
+                code, stage = _classify_source_load_error(exc)
+                print(
+                    f"source {Path(entry.source_path).name} top_level invalid_json "
+                    f"valid 0 invalid 0 error_code {code} stage {stage}"
+                )
+                continue
+            inspect_ids.execute(f"RELEASE {savepoint}")
+            valid_count += source_valid
+            id_count += source_id_count
+            invalid_count += source_invalid
+            if len(invalid_locations) < 50:
+                invalid_locations.extend(
+                    source_invalid_locations[: 50 - len(invalid_locations)]
+                )
+            print(f"source {Path(entry.source_path).name} top_level list valid {source_valid} invalid {source_invalid}")
+        unique_id_count = int(
+            inspect_ids.execute("SELECT COUNT(*) FROM inspect_conversation_ids").fetchone()[0]
+        )
+    finally:
+        inspect_ids.close()
+    duplicate_count = id_count - unique_id_count
     print(f"valid_conversations {valid_count}")
-    print(f"invalid_elements {len(invalid_locations)}")
-    for filename, idx, warning_type in invalid_locations[:50]:
+    print(f"invalid_elements {invalid_count}")
+    for filename, idx, warning_type in invalid_locations:
         print(f"invalid_element source_file={filename} index={idx} warning_type={warning_type}")
-    if len(invalid_locations) > 50:
-        print(f"invalid_element_more {len(invalid_locations) - 50}")
+    if invalid_count > 50:
+        print(f"invalid_element_more {invalid_count - 50}")
     print(f"duplicate_conversation_ids {duplicate_count}")
     print(f"bad_top_level_files {top_level_bad}")
-    return 0
+    return 2 if top_level_bad else 0
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -510,6 +569,40 @@ def run_import_pipeline(
     delete_input_on_success: bool = False,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    """Serialize canonical import against optional Web-index builders."""
+
+    try:
+        writer_lock = acquire_web_index_process_lock(db_path)
+    except WebIndexBuildError as exc:
+        raise ImportPipelineError(exc.code, stage="input_preflight") from None
+    try:
+        return _run_import_pipeline_locked(
+            db_path,
+            input_value,
+            cwd=cwd,
+            no_input_sha256=no_input_sha256,
+            rebuild_fts=rebuild_fts,
+            optimize_after_import_flag=optimize_after_import_flag,
+            optimize_fts_after_import=optimize_fts_after_import,
+            delete_input_on_success=delete_input_on_success,
+            progress_callback=progress_callback,
+        )
+    finally:
+        writer_lock.close()
+
+
+def _run_import_pipeline_locked(
+    db_path: Path,
+    input_value: str | None,
+    *,
+    cwd: Path,
+    no_input_sha256: bool = False,
+    rebuild_fts: bool = False,
+    optimize_after_import_flag: bool = False,
+    optimize_fts_after_import: bool = False,
+    delete_input_on_success: bool = False,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Import a ZIP/directory and return structural summary without printing chat content."""
     import_started = time.perf_counter()
     if optimize_fts_after_import and not rebuild_fts:
@@ -524,14 +617,24 @@ def run_import_pipeline(
     reported_source = source
     LOGGER.info("import_start input_kind=%s input_size=%s", source.kind, source.size)
     conn: sqlite3.Connection | None = None
+    bound_source_sha256: str | None = None
     try:
         conn = connect(db_path)
         configure_import_connection(conn)
         init_db(conn)
+        compatibility = legacy_compatibility_state(conn)
+        if compatibility["state"] != "compatible":
+            raise ImportPipelineError(
+                "database_data_incompatible",
+                stage="input_preflight",
+                detail={"compatibility_state": compatibility["state"]},
+            )
         conn.execute("BEGIN IMMEDIATE")
         validate_optional_web_index_ownership(conn)
         conn.commit()
-        input_sha = None if no_input_sha256 or source.kind != "zip" else sha256_input_source(source)
+        if source.kind == "zip" and (not no_input_sha256 or delete_input_on_success):
+            bound_source_sha256 = sha256_input_source(source)
+        input_sha = None if no_input_sha256 else bound_source_sha256
         run_id = begin_import_run(conn, reported_source, input_sha)
     except Exception:
         if conn is not None:
@@ -567,6 +670,15 @@ def run_import_pipeline(
         "legacy_pre_commit_seconds": 0.0,
         "wall_total_seconds": 0.0,
         "total_import_seconds": 0.0,
+        "import_batch_count": 0,
+        "import_batch_total_input_bytes": 0,
+        "import_batch_peak_input_bytes": 0,
+        "import_batch_peak_decoded_chars": 0,
+        "import_batch_peak_nodes": 0,
+        "import_batch_peak_raw_bytes": 0,
+        "import_batch_peak_metadata_bytes": 0,
+        "import_batch_peak_estimated_heap_bytes": 0,
+        "import_batch_peak_sqlite_bind_bytes": 0,
     }
     import_succeeded = False
     result: dict[str, Any] = {
@@ -655,6 +767,86 @@ def run_import_pipeline(
         summary["source_scan_seconds"] = _elapsed(source_scan_started)
         notify("source_scan_complete")
 
+        batch_usage = {
+            "conversations": 0,
+            "nodes": 0,
+            "input_bytes": 0,
+            "decoded_chars": 0,
+            "raw_bytes": 0,
+            "metadata_bytes": 0,
+            "estimated_heap_bytes": 0,
+            "sqlite_bind_bytes": 0,
+        }
+        batch_limits = {
+            "conversations": IMPORT_BATCH_MAX_CONVERSATIONS,
+            "nodes": IMPORT_BATCH_MAX_NODES,
+            "input_bytes": IMPORT_BATCH_MAX_INPUT_BYTES,
+            "decoded_chars": IMPORT_BATCH_MAX_DECODED_CHARS,
+            "raw_bytes": IMPORT_BATCH_MAX_RAW_BYTES,
+            "metadata_bytes": IMPORT_BATCH_MAX_METADATA_BYTES,
+            "estimated_heap_bytes": IMPORT_BATCH_MAX_ESTIMATED_HEAP_BYTES,
+            "sqlite_bind_bytes": IMPORT_BATCH_MAX_SQLITE_BIND_BYTES,
+        }
+
+        def parsed_resource_metrics(item: Any, parsed: Any) -> dict[str, int]:
+            input_bytes = getattr(item, "input_utf8_bytes", None)
+            decoded_chars = getattr(item, "decoded_chars", None)
+            if input_bytes is None or decoded_chars is None:
+                serialized = compact_json(item)
+                input_bytes = len(serialized.encode("utf-8"))
+                decoded_chars = len(serialized)
+
+            def byte_size(value: Any) -> int:
+                return len(value.encode("utf-8")) if isinstance(value, str) else 0
+
+            conversation_values = (
+                parsed.conversation_id,
+                parsed.exported_id,
+                parsed.title,
+                parsed.current_node,
+                parsed.source_file,
+                parsed.aggregate_hash,
+                parsed.default_model_slug,
+                parsed.metadata_json,
+            )
+            sqlite_bind_bytes = sum(byte_size(value) for value in conversation_values)
+            raw_bytes = 0
+            metadata_bytes = byte_size(parsed.metadata_json)
+            for node_value in parsed.nodes:
+                node_fields = (
+                    node_value.node_id,
+                    node_value.conversation_id,
+                    node_value.parent_node_id,
+                    node_value.children_json,
+                    node_value.message_id,
+                    node_value.role,
+                    node_value.author_name,
+                    node_value.content_type,
+                    node_value.content_text,
+                    node_value.content_hash,
+                    node_value.metadata_json,
+                    node_value.raw_message_json,
+                )
+                sqlite_bind_bytes += sum(byte_size(value) for value in node_fields)
+                raw_bytes += byte_size(node_value.raw_message_json)
+                metadata_bytes += byte_size(node_value.children_json) + byte_size(node_value.metadata_json)
+            estimated_heap = (
+                int(input_bytes)
+                + sqlite_bind_bytes
+                + len(parsed.nodes) * 512
+                + len(parsed.warnings) * 256
+            )
+            return {
+                "conversations": 1,
+                "nodes": len(parsed.nodes),
+                "input_bytes": int(input_bytes),
+                "decoded_chars": int(decoded_chars),
+                "raw_bytes": raw_bytes,
+                "metadata_bytes": metadata_bytes,
+                "estimated_heap_bytes": estimated_heap,
+                "sqlite_bind_bytes": sqlite_bind_bytes,
+            }
+
         def flush_batch(batch: list[Any]) -> None:
             if not batch:
                 return
@@ -674,7 +866,23 @@ def run_import_pipeline(
                        WHERE conversation_id = ?""",
                     (status, status, conversation_id),
                 )
+            summary["import_batch_count"] += 1
+            summary["import_batch_total_input_bytes"] += batch_usage["input_bytes"]
+            for name in (
+                "input_bytes",
+                "decoded_chars",
+                "nodes",
+                "raw_bytes",
+                "metadata_bytes",
+                "estimated_heap_bytes",
+                "sqlite_bind_bytes",
+            ):
+                summary[f"import_batch_peak_{name}"] = max(
+                    summary[f"import_batch_peak_{name}"], batch_usage[name]
+                )
             batch.clear()
+            for name in batch_usage:
+                batch_usage[name] = 0
 
         parse_started = time.perf_counter()
         def classified_source_sessions():
@@ -748,13 +956,29 @@ def run_import_pipeline(
                     )
                 summary["attempted_valid_conversations"] += 1
                 summary["attempted_nodes"] += len(parsed.nodes)
+                metrics = parsed_resource_metrics(item, parsed)
+                if parsed_conversations and any(
+                    batch_usage[name] + metrics[name] > limit
+                    for name, limit in batch_limits.items()
+                ):
+                    flush_batch(parsed_conversations)
                 parsed_conversations.append(parsed)
-                if len(parsed_conversations) >= 100:
+                for name, value in metrics.items():
+                    batch_usage[name] += value
+                if any(
+                    batch_usage[name] >= limit
+                    for name, limit in batch_limits.items()
+                ):
                     flush_batch(parsed_conversations)
                 idx += 1
             flush_batch(parsed_conversations)
             notify("shard_complete")
         summary["parse_and_upsert_seconds"] = _elapsed(parse_started)
+        summary["import_batch_average_input_bytes"] = (
+            summary["import_batch_total_input_bytes"] // summary["import_batch_count"]
+            if summary["import_batch_count"]
+            else 0
+        )
         if rebuild_fts:
             fts_started = time.perf_counter()
             summary["rebuild_fts"] = rebuild_message_fts(conn, optimize=optimize_fts_after_import)
@@ -794,6 +1018,7 @@ def run_import_pipeline(
             conn,
             REQUIRED_IMPORT_GENERATION_DOMAINS if summary["attempted_valid_conversations"] else (),
         )
+        mark_legacy_compatibility_current(conn)
         finish_import_run(conn, run_id, "finished", summary)
         summary["finalize_commit_seconds"] = _elapsed(commit_started)
         summary["wall_total_seconds"] = _elapsed(import_started)
@@ -887,7 +1112,10 @@ def run_import_pipeline(
     if delete_input_on_success:
         recovery_required = False
         try:
-            delete_succeeded = delete_input_if_unchanged(source)
+            delete_succeeded = delete_input_if_unchanged(
+                source,
+                expected_source_sha256=bound_source_sha256,
+            )
             delete_error: BaseException | None = None
         except (OSError, DeleteInputRecoveryRequired) as exc:
             delete_succeeded = False

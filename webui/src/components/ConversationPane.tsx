@@ -41,7 +41,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const [hitLimitReached, setHitLimitReached] = useState(false);
   const [hitHasMore, setHitHasMore] = useState(false);
   const [hitNextOffset, setHitNextOffset] = useState<number | null>(null);
+  const [hitContinuation, setHitContinuation] = useState<string | null>(null);
   const [hitLoadingMore, setHitLoadingMore] = useState(false);
+  const [hitSearchPartial, setHitSearchPartial] = useState(false);
   const [hitIndex, setHitIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [copyStatus, setCopyStatus] = useState("");
@@ -131,7 +133,9 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     setHitLimitReached(false);
     setHitHasMore(false);
     setHitNextOffset(null);
+    setHitContinuation(null);
     setHitLoadingMore(false);
+    setHitSearchPartial(false);
     hitAppendInFlightRef.current = false;
     setHitIndex(0);
     setCopyBusy(null);
@@ -236,7 +240,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     const controller = new AbortController();
     hitControllerRef.current?.abort();
     hitControllerRef.current = controller;
-    const loadHits = () => getMessageHits({ q: highlightQuery, conversationId: conversation.conversation_id, path: effectivePath, order: "display", limit: HIT_NAVIGATION_PAGE_SIZE, offset: 0, filters: effectiveFilters, matchMode, countTotal: true, signal: controller.signal });
+    const loadHits = () => getMessageHits({ q: highlightQuery, conversationId: conversation.conversation_id, path: effectivePath, order: "display", limit: HIT_NAVIGATION_PAGE_SIZE, offset: 0, filters: effectiveFilters, matchMode, countTotal: false, signal: controller.signal });
     loadHits()
       .then((page) => {
         if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
@@ -244,7 +248,11 @@ export default function ConversationPane({ conversation, query, filters, matchMo
         setHitItems(page.items);
         setHitExactTotal(page.total_exact ? page.total : null);
         setHitNextOffset(page.next_offset);
-        setHitHasMore(Boolean(page.has_more && page.next_offset !== null));
+        setHitContinuation(page.diagnostics?.continuation_token ?? null);
+        setHitSearchPartial(Boolean(page.diagnostics?.partial));
+        setHitHasMore(Boolean(
+          page.diagnostics?.continuation_available || (page.has_more && page.next_offset !== null)
+        ));
         setHitLimitReached(Boolean(page.has_more && page.items.length >= MAX_NAVIGABLE_HIT_MESSAGES));
         setHitIndex(0);
       })
@@ -332,7 +340,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   );
   const loadMoreHits = useCallback(() => {
     if (
-      !conversation || !searchActive || !hitHasMore || hitNextOffset === null ||
+      !conversation || !searchActive || !hitHasMore || (hitNextOffset === null && !hitContinuation) ||
       hitAppendInFlightRef.current || hitItems.length >= MAX_NAVIGABLE_HIT_MESSAGES
     ) return;
     hitAppendInFlightRef.current = true;
@@ -348,21 +356,34 @@ export default function ConversationPane({ conversation, query, filters, matchMo
       conversationId: conversation.conversation_id,
       path: effectivePath,
       order: "display",
-      limit: Math.min(HIT_NAVIGATION_PAGE_SIZE, remaining),
-      offset: hitNextOffset,
+      limit: hitContinuation ? HIT_NAVIGATION_PAGE_SIZE : Math.min(HIT_NAVIGATION_PAGE_SIZE, remaining),
+      offset: hitContinuation ? 0 : (hitNextOffset ?? 0),
       filters: effectiveFilters,
       matchMode,
       countTotal: false,
+      continuation: hitContinuation,
       signal: controller.signal,
     })
       .then((page) => {
         if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
         if (!Array.isArray(page.items)) throw new Error("invalid_response");
         const loadedCount = Math.min(MAX_NAVIGABLE_HIT_MESSAGES, hitItems.length + page.items.length);
-        setHitItems((current) => [...current, ...page.items].slice(0, MAX_NAVIGABLE_HIT_MESSAGES));
+        setHitItems((current) => {
+          const merged = new Map(
+            current.map((item) => [`${item.conversation_id}\u0000${item.node_id}`, item] as const),
+          );
+          page.items.forEach((item) => merged.set(`${item.conversation_id}\u0000${item.node_id}`, item));
+          return Array.from(merged.values()).slice(0, MAX_NAVIGABLE_HIT_MESSAGES);
+        });
         setHitNextOffset(page.next_offset);
-        setHitHasMore(Boolean(page.has_more && page.next_offset !== null && loadedCount < MAX_NAVIGABLE_HIT_MESSAGES));
-        setHitLimitReached(Boolean(page.has_more && loadedCount >= MAX_NAVIGABLE_HIT_MESSAGES));
+        setHitContinuation(page.diagnostics?.continuation_token ?? null);
+        setHitSearchPartial(Boolean(page.diagnostics?.partial));
+        const more = Boolean(
+          page.diagnostics?.continuation_available || (page.has_more && page.next_offset !== null)
+        );
+        setHitHasMore(Boolean(more && loadedCount < MAX_NAVIGABLE_HIT_MESSAGES));
+        setHitLimitReached(Boolean(more && loadedCount >= MAX_NAVIGABLE_HIT_MESSAGES));
+        if (page.total_exact) setHitExactTotal(page.total);
       })
       .catch((err: Error) => {
         if (err.name !== "AbortError" && requestId === hitRequestRef.current && readerDataContextRef.current === requestedContextKey) {
@@ -375,7 +396,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
           setHitLoadingMore(false);
         }
       });
-  }, [conversation?.conversation_id, effectiveFiltersKey, effectivePath, highlightQuery, hitHasMore, hitItems.length, hitNextOffset, matchMode, readerDataContextKey, searchActive]);
+  }, [conversation?.conversation_id, effectiveFiltersKey, effectivePath, highlightQuery, hitContinuation, hitHasMore, hitItems.length, hitNextOffset, matchMode, readerDataContextKey, searchActive]);
   const titleOnlyContext = Boolean(
     filters.title ||
     (effectiveScope === "title" && (querySyntax.hasBodyText || querySyntax.hasTitleText || filters.exact)),
@@ -654,12 +675,14 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     ? filterOnlyMatch
       ? t("filterOnlyMatchNotice")
       : currentViewHits.length
-      ? `${hitIndex + 1} / ${currentViewHits.length} ${t("visibleHits")} · ${t("showing")} ${totalHitCount}${hitExactTotal !== null ? ` ${t("of")} ${hitExactTotal}` : ""} ${t("totalHits")}`
+      ? `${hitIndex + 1} / ${currentViewHits.length} ${t("visibleHits")} · ${t("showing")} ${totalHitCount}${hitExactTotal !== null ? ` ${t("of")} ${hitExactTotal}` : ""} ${t("totalHits")}${hitSearchPartial ? ` · ${t("searchDiagnosticsPartial")}` : ""}`
       : titleOnlyMatch
         ? t("titleOnlyHitNotice")
         : totalHitCount || hiddenInternalCount
           ? t("hiddenHitsOnlyNotice")
-          : t("noHits")
+          : hitSearchPartial
+            ? t("searchDiagnosticsPartial")
+            : t("noHits")
     : "";
 
   return (
@@ -740,6 +763,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
                     activeTargetOffset={message.node_id === activeNode ? activeHit?.match_char_offset : null}
                     activeMatchLength={message.node_id === activeNode ? activeHit?.match_length : null}
                     activeRevision={message.node_id === activeNode ? activeHit?.display_anchor_revision : null}
+                    activeAnchorCursor={message.node_id === activeNode ? activeHit?.display_anchor_cursor : null}
                     layout={settings.messageLayout}
                     showRawDefault={settings.showRawDefault}
                     t={t}

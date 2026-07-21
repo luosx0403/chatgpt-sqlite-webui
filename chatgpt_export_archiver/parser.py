@@ -227,6 +227,13 @@ def parse_conversation(value: dict[str, Any], source_file: str, array_index: int
         )
 
     aggregate_hash = compute_aggregate_hash(current_node, nodes)
+    # The canonical strings and aggregate hash are now authoritative. Drop
+    # the original nested JSON references so import batching does not retain
+    # both decoded objects and serialized DB bind values.
+    for parsed_node in nodes:
+        parsed_node.children_for_hash = None
+        parsed_node.metadata_for_hash = None
+        parsed_node.raw_message_for_hash = None
     metadata_keys = [
         "async_status",
         "atlas_mode_enabled",

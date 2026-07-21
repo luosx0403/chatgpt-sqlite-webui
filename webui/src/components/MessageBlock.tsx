@@ -12,6 +12,7 @@ interface Props {
   activeTargetOffset?: number | null;
   activeMatchLength?: number | null;
   activeRevision?: string | null;
+  activeAnchorCursor?: string | null;
   layout: MessageLayout;
   showRawDefault: boolean;
   t: (key: string) => string;
@@ -111,7 +112,7 @@ function looksLikeTechnicalPayload(message: MessageItem, text: string): boolean 
   return false;
 }
 
-export default function MessageBlock({ message, conversationId, stateContextKey, active, activeTargetOffset = null, activeMatchLength = null, activeRevision = null, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
+export default function MessageBlock({ message, conversationId, stateContextKey, active, activeTargetOffset = null, activeMatchLength = null, activeRevision = null, activeAnchorCursor = null, layout, showRawDefault, t, onCopy, onSizeMayChange, currentPathFallbackToAll = false }: Props) {
   const messageIdentity = JSON.stringify([conversationId, message.node_id, message.message_id || "", message.content_hash || ""]);
   const preservedStateKey = JSON.stringify([stateContextKey, messageIdentity, showRawDefault ? "raw" : "plain"]);
   const savedState = preservedMessageStates.get(preservedStateKey);
@@ -146,6 +147,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
   const bodyRef = useRef<HTMLPreElement | null>(null);
   const role = roleLabel(message.role, t);
   const previewText = message.display_text || "";
+  const previewCodePointLength = message.display_text_returned_chars ?? Array.from(previewText).length;
   const text = expandedText ?? previewText;
   const placeholder = `[non-text content: ${message.content_type || "empty"}]`;
   const timestamp = formatDate(message.create_time ?? message.update_time);
@@ -281,7 +283,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     }
   }, [active, shouldCollapseDetails]);
   useEffect(() => {
-    if (!active || activeTargetOffset === null || activeTargetOffset < previewText.length) {
+    if (!active || activeTargetOffset === null || activeTargetOffset < previewCodePointLength) {
       setActiveWindowRange(null);
       return;
     }
@@ -294,11 +296,11 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     void getMessageDisplayChunk(
       conversationId,
       message.node_id,
-      0,
+      activeAnchorCursor ? activeTargetOffset : 0,
       1048576,
       controller.signal,
-      null,
-      activeTargetOffset,
+      activeAnchorCursor,
+      activeAnchorCursor ? null : activeTargetOffset,
     ).then((chunk) => {
       if (controller.signal.aborted || requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
       if (activeRevision && chunk.content_revision !== activeRevision) {
@@ -324,7 +326,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
       }
     });
     return () => controller.abort();
-  }, [active, activeMatchLength, activeRevision, activeTargetOffset, conversationId, message.node_id, messageIdentity, previewText.length, t]);
+  }, [active, activeAnchorCursor, activeMatchLength, activeRevision, activeTargetOffset, conversationId, message.node_id, messageIdentity, previewCodePointLength, t]);
   const openFullRaw = async () => {
     if (fullRaw) {
       rawRequestIdRef.current += 1;

@@ -61,6 +61,7 @@ from .json_safety import (
 )
 from .parser import MAX_IMPORT_NODES_PER_CONVERSATION, normalize_display_text
 from .scanner import (
+    MAX_CONVERSATION_JSON_SCALARS,
     MAX_JSON_ELEMENT_BYTES,
     MAX_JSON_ELEMENT_CHARS,
     MAX_SOURCE_TOTAL_MEMBERS,
@@ -72,7 +73,7 @@ from .scanner import (
 )
 from .schema_contract import API_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
 from .sqlite_errors import sqlite_runtime_error_code
-from .search import DisplayCursorError, SearchResourceLimitError, SEARCH_CANDIDATE_SCAN_CHARS, SEARCH_EXACT_VERIFY_ENV, SEARCH_EXACT_VERIFY_MAX_OPT_IN_CHARS, SEARCH_HIT_PREVIEW_CHARS, SEARCH_PAGE_ESTIMATED_BYTES, SEARCH_RAW_EXACT_MAX_BYTES, SEARCH_RAW_EXACT_MAX_CHARS, SEARCH_REQUEST_VERIFY_BYTES, SEARCH_REQUEST_VERIFY_CHARS, SEARCH_SNIPPET_SCAN_CHARS, SEARCH_STREAM_CHUNK_BYTES, _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_exact_verify_limits, search_messages
+from .search import DisplayCursorError, SearchContinuationError, SearchResourceLimitError, SEARCH_CANDIDATE_LIMIT, SEARCH_CANDIDATE_SCAN_CHARS, SEARCH_EXACT_VERIFY_ENV, SEARCH_EXACT_VERIFY_MAX_OPT_IN_CHARS, SEARCH_HIT_PREVIEW_CHARS, SEARCH_PAGE_ESTIMATED_BYTES, SEARCH_RAW_EXACT_MAX_BYTES, SEARCH_RAW_EXACT_MAX_CHARS, SEARCH_REQUEST_VERIFY_BYTES, SEARCH_REQUEST_VERIFY_CHARS, SEARCH_SNIPPET_SCAN_CHARS, SEARCH_STREAM_CHUNK_BYTES, SEARCH_WALL_DEADLINE_SECONDS, _READER_BUDGET_ENV, _has_normalized_title_norm, get_conversation, get_message_display_chunk, get_messages, list_conversations, normalize_search_text, parse_query, reader_budget, search_conversations, search_exact_verify_limits, search_messages
 from .utils import finite_float_or_none, safe_filename_part, utc_now_iso
 from .web_db import (
     DISPLAY_TEXT_RESOLVER_VERSION,
@@ -748,7 +749,7 @@ def create_api_router(
                 },
                 "page_budget_fields": ["page_text_budget_exhausted", "page_preview_budget_exhausted", "page_highlight_budget_exhausted", "response_budget_estimated", "response_budget_limit", "response_budget_estimate_exhausted"],
                 "display_endpoint": "/api/by-id/display?conversation_id=...&node_id=...&offset=0&limit=65536",
-                "display_cursor": "next_cursor is a revision-bound opaque sequential cursor; stale revisions return display_cursor_stale (409); numeric offset is a compatibility scan capped at 1048576 characters and larger values return display_cursor_required (409)",
+                "display_cursor": "next_cursor is a revision-bound opaque sequential cursor. Search hits may also return display_anchor_cursor, bound to the canonical source field, row identity, row revision, source code-point position, and direct UTF-8 byte seek; stale revisions return display_cursor_stale (409). Numeric offset is a compatibility scan capped at 1048576 characters and larger values return display_cursor_required (409)",
                 "hidden_counts": {
                     "fields": ["visible_total", "empty_hidden_count", "internal_hidden_count", "technical_hidden_count"],
                     "contract": "internal_hidden_count is the one canonical non-empty internal-node count; technical_hidden_count is a deprecated exact alias retained for compatibility",
@@ -812,7 +813,7 @@ def create_api_router(
             },
             "search": {
                 "endpoints": ["/api/conversations", "/api/search/messages"],
-                "parameters": ["q", "title", "exact", "exclude", "role", "source", "after", "before", "scope", "path", "match_mode", "order", "conversation_id", "count_total"],
+                "parameters": ["q", "title", "exact", "exclude", "role", "source", "after", "before", "scope", "path", "match_mode", "order", "conversation_id", "count_total", "continuation"],
                 "exact_verify": {"effective_chars": search_exact_verify_limits()[0], "effective_utf8_bytes": search_exact_verify_limits()[1], "opt_in_env": SEARCH_EXACT_VERIFY_ENV, "max_opt_in_chars": SEARCH_EXACT_VERIFY_MAX_OPT_IN_CHARS},
                 "message_order": ["relevance", "display"],
                 "count_total": "boolean; false disables the exact count and returns total_exact=false with a known lower-bound total",
@@ -826,8 +827,11 @@ def create_api_router(
                     "request_verify_chars": SEARCH_REQUEST_VERIFY_CHARS,
                     "raw_fallback_bytes_per_row": SEARCH_RAW_EXACT_MAX_BYTES,
                     "raw_fallback_chars_per_row": SEARCH_RAW_EXACT_MAX_CHARS,
-                    "exact_verifier": "candidate rows are verified through bounded incremental BLOB reads with independent decoded-character, UTF-8 byte, raw-fallback, and request-aggregate ceilings; an over-limit request returns HTTP 413 rather than a partial or false-exact page, and no continuation token is promised",
-                    "resource_error_codes": ["search_candidate_exact_verify_limit", "search_page_exact_materialization_limit", "search_response_resource_limit_exceeded"],
+                    "candidate_limit": SEARCH_CANDIDATE_LIMIT,
+                    "wall_deadline_seconds": SEARCH_WALL_DEADLINE_SECONDS,
+                    "exact_verifier": "candidate rows are verified once into a connection-local TEMP result artifact through bounded incremental BLOB reads; count, page, payload, snippet, source span, and byte anchor reuse that artifact. Candidate, decoded-character, UTF-8 byte, raw-fallback, request-aggregate, SQLite VM, wall, and response ceilings produce an explicit partial page rather than erasing confirmed hits",
+                    "continuation": "a signed opaque candidate cursor binds database identity, schema and optional-index format, durable generations, the full query/filter/path/scope/match/order/page contract, cumulative confirmed/pending counts, and the budget-contract version; query or database changes return search_continuation_stale",
+                    "resource_error_codes": ["search_page_exact_materialization_limit", "search_response_resource_limit_exceeded", "invalid_search_continuation", "search_continuation_stale"],
                 },
                 "filter_only": "filter-only and exclude-only queries may filter conversation results; message hits and reader highlights require a positive message-text term, and role/source/date filters alone do not create hit navigation",
                 "raw_query_override": "path: and scope: modifiers in q override sidebar path/scope selectors",
@@ -851,6 +855,17 @@ def create_api_router(
                         "verified_bytes_per_candidate",
                         "oversized_candidates_seen",
                         "oversized_candidates_verified",
+                        "oversized_candidates_pending",
+                        "candidate_count",
+                        "candidate_limit",
+                        "resolver_calls",
+                        "blob_reads",
+                        "candidate_blob_bytes",
+                        "raw_blob_bytes",
+                        "decoded_chars",
+                        "normalization_units",
+                        "sqlite_vm_steps",
+                        "wall_seconds",
                         "continuation_available",
                         "continuation_token",
                         "completion_state",
@@ -903,7 +918,7 @@ def create_api_router(
                 "web_index_progress": ["status", "build_stage", "processed", "total", "complete", "batch_size", "processed_input_bytes", "processed_normalized_bytes", "current_batch_input_bytes", "current_batch_normalized_bytes", "current_batch_derived_bytes", "peak_batch_input_bytes", "peak_batch_normalized_bytes", "peak_batch_derived_bytes", "oversized_rows"],
                 "web_index_cancellation": "the cancel endpoint is accepted only while the import job is in web-index or web-index-recovery; cancellation rolls back staging objects and keeps the previous optional index readable",
                 "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "source_member_limit_exceeded", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "json_nesting_limit_exceeded", "json_scalar_limit_exceeded", "conversation_json_element_too_large", "conversation_node_limit_exceeded", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_empty", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_failed"],
-                "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete"]},
+                "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete", "web_index_staging_cleanup_failed"]},
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
             },
             "import_contract": {
@@ -918,7 +933,8 @@ def create_api_router(
                 "max_source_total_members": MAX_SOURCE_TOTAL_MEMBERS,
                 "json_limits": {
                     "max_nesting_depth": MAX_JSON_NESTING_DEPTH,
-                    "max_scalar_count": MAX_JSON_SCALAR_COUNT,
+                    "max_conversation_element_scalar_count": MAX_CONVERSATION_JSON_SCALARS,
+                    "max_legacy_sanitizer_scalar_count": MAX_JSON_SCALAR_COUNT,
                     "max_raw_preview_nodes": MAX_RAW_PREVIEW_NODES,
                     "max_raw_preview_bytes": MAX_RAW_PREVIEW_BYTES,
                     "max_sanitized_output_bytes": MAX_SANITIZED_OUTPUT_BYTES,
@@ -1513,6 +1529,7 @@ def create_api_router(
         source: Annotated[str | None, Query(max_length=200)] = None,
         match_mode: str = "contains",
         count_total: bool = True,
+        continuation: Annotated[str | None, Query(max_length=4096)] = None,
         conn=Depends(get_optional_conn),
     ):
         _validate_common(role=role, path=path, scope=scope, match_mode=match_mode)
@@ -1523,7 +1540,10 @@ def create_api_router(
         if conn is None:
             return _empty_message_search_page(limit, offset, db_ready=False)
         try:
-            return search_messages(conn, parsed, limit=limit, offset=offset, conversation_id=conversation_id, order=order, count_total=count_total)
+            return search_messages(conn, parsed, limit=limit, offset=offset, conversation_id=conversation_id, order=order, count_total=count_total, continuation=continuation)
+        except SearchContinuationError as exc:
+            status = 409 if exc.code == "search_continuation_stale" else 400
+            raise HTTPException(status_code=status, detail=exc.code) from exc
         except SearchResourceLimitError as exc:
             raise HTTPException(status_code=413, detail=exc.code) from exc
 

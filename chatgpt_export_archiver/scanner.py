@@ -18,7 +18,6 @@ from typing import Any, BinaryIO, Callable, Iterable, Iterator
 from .json_safety import (
     JsonSafetyLimitError,
     MAX_JSON_NESTING_DEPTH,
-    MAX_JSON_SCALAR_COUNT,
 )
 from .utils import classify_file
 
@@ -26,6 +25,10 @@ from .utils import classify_file
 SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
 MAX_JSON_INTEGER_DIGITS = 1000
 JSON_STREAM_CHUNK_BYTES = 64 * 1024
+MAX_CONVERSATION_JSON_SCALARS = 1_000_000
+_JSON_OUTSIDE_SPECIAL_RE = re.compile(r'["\[\]{},:\s\ufeff]')
+_JSON_STRING_SPECIAL_RE = re.compile(r'["\\]')
+_JSON_SCALAR_END_RE = re.compile(r'[,\]]')
 # Both limits are intentional.  The byte limit is the externally documented
 # resource contract; the character limit independently bounds the Python
 # decoded representation for ASCII-heavy input.
@@ -35,7 +38,8 @@ MAX_SOURCE_TOTAL_MEMBERS = 100_000
 MAX_SOURCE_DIRECTORY_DEPTH = 256
 MAX_SOURCE_RELATIVE_PATH_BYTES = 32 * 1024
 _ZIP_EOCD_SEARCH_BYTES = 22 + 65_535
-DELETE_INPUT_RECOVERY_FORMAT_VERSION = 1
+DELETE_INPUT_RECOVERY_FORMAT_VERSION = 2
+DELETE_INPUT_RECOVERY_PREDECESSOR_VERSIONS = (1,)
 DELETE_INPUT_RECOVERY_PREFIX = ".chatgpt-archive-delete-recovery-"
 DELETE_INPUT_RECOVERY_MAX_BYTES = 64 * 1024
 _DELETE_DIR_FD_SUPPORTED = all(
@@ -53,6 +57,13 @@ class JsonIntegerTooLargeError(ValueError):
 
 class InvalidConversationEncodingError(ValueError):
     """Raised for invalid UTF-8 or a BOM outside the single allowed prefix."""
+
+
+class ConversationJsonObject(dict[str, Any]):
+    """Top-level object carrying framer resource metrics without hidden JSON keys."""
+
+    input_utf8_bytes: int
+    decoded_chars: int
 
 
 class EncryptedZipMemberError(ValueError):
@@ -138,6 +149,129 @@ def _remove_delete_recovery_record(parent_fd: int, journal_name: str) -> None:
     except FileNotFoundError:
         return
     os.fsync(parent_fd)
+
+
+def _identity_from_record(value: Any) -> FileIdentity:
+    required = {
+        "file_type", "device", "inode", "size", "mtime_ns", "ctime_ns",
+        "nlink", "is_symlink", "is_reparse_point", "link_target_hash",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+    integer_fields = ("file_type", "device", "inode", "size", "mtime_ns", "ctime_ns", "nlink")
+    if any(not isinstance(value[name], int) or isinstance(value[name], bool) for name in integer_fields):
+        raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+    if not isinstance(value["is_symlink"], bool) or not isinstance(value["is_reparse_point"], bool):
+        raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+    link_hash = value["link_target_hash"]
+    if link_hash is not None and (
+        not isinstance(link_hash, str)
+        or len(link_hash) != 64
+        or any(ch not in "0123456789abcdef" for ch in link_hash)
+    ):
+        raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+    return FileIdentity(**value)
+
+
+def _stable_entry_identity_at(parent_fd: int, name: str) -> FileIdentity:
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    is_symlink = stat.S_ISLNK(info.st_mode)
+    link_target_hash = None
+    if is_symlink:
+        link_target_hash = hashlib.sha256(
+            os.fsencode(os.readlink(name, dir_fd=parent_fd))
+        ).hexdigest()
+    return FileIdentity(
+        file_type=stat.S_IFMT(info.st_mode),
+        device=int(info.st_dev),
+        inode=int(info.st_ino),
+        size=int(info.st_size),
+        mtime_ns=int(info.st_mtime_ns),
+        ctime_ns=int(info.st_ctime_ns),
+        nlink=int(info.st_nlink),
+        is_symlink=is_symlink,
+        is_reparse_point=bool(attributes & reparse_flag),
+        link_target_hash=link_target_hash,
+    )
+
+
+def _entry_matches_stable(actual: FileIdentity, expected: FileIdentity, *, allow_link_pair: bool = False) -> bool:
+    expected_nlink = expected.nlink + 1 if allow_link_pair else expected.nlink
+    return _stable_delete_identity(actual) == (
+        expected.file_type,
+        expected.device,
+        expected.inode,
+        expected.size,
+        expected.mtime_ns,
+        expected_nlink,
+        expected.is_symlink,
+        expected.is_reparse_point,
+        expected.link_target_hash,
+    )
+
+
+def _parent_matches_descriptor(parent_fd: int, expected: FileIdentity) -> bool:
+    info = os.fstat(parent_fd)
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return (
+        stat.S_IFMT(info.st_mode),
+        int(info.st_dev),
+        int(info.st_ino),
+        bool(attributes & reparse_flag),
+    ) == (
+        expected.file_type,
+        expected.device,
+        expected.inode,
+        expected.is_reparse_point,
+    )
+
+
+def _sha256_verified_dir_entry(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_entry: FileIdentity,
+    expected_target: FileIdentity,
+    allow_link_pair: bool = False,
+) -> str:
+    actual_entry = _stable_entry_identity_at(parent_fd, name)
+    if not _entry_matches_stable(actual_entry, expected_entry, allow_link_pair=allow_link_pair):
+        raise SourceChangedDuringReadError("source_changed_during_read")
+    flags = os.O_RDONLY
+    if not expected_entry.is_symlink:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        before = os.fstat(descriptor)
+        before_identity = (
+            stat.S_IFMT(before.st_mode), int(before.st_dev), int(before.st_ino),
+            int(before.st_size), int(before.st_mtime_ns), int(before.st_nlink),
+        )
+        expected_nlink = expected_target.nlink + 1 if allow_link_pair and not expected_entry.is_symlink else expected_target.nlink
+        if before_identity != (
+            expected_target.file_type, expected_target.device, expected_target.inode,
+            expected_target.size, expected_target.mtime_ns, expected_nlink,
+        ):
+            raise SourceChangedDuringReadError("source_changed_during_read")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        after_identity = (
+            stat.S_IFMT(after.st_mode), int(after.st_dev), int(after.st_ino),
+            int(after.st_size), int(after.st_mtime_ns), int(after.st_nlink),
+        )
+        if after_identity != before_identity:
+            raise SourceChangedDuringReadError("source_changed_during_read")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 class ZipMemberCrcError(ValueError):
@@ -370,7 +504,11 @@ def delete_input_identity_is_current(input_source: InputSource) -> bool:
     return same_parent and current_entry == expected_entry and current_target == expected_target
 
 
-def delete_input_if_unchanged(input_source: InputSource) -> bool:
+def delete_input_if_unchanged(
+    input_source: InputSource,
+    *,
+    expected_source_sha256: str | None = None,
+) -> bool:
     """Atomically stage, revalidate, and delete only the captured entry.
 
     The rename closes the check-to-unlink window: a replacement racing before
@@ -390,10 +528,18 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
         return False
     if not delete_input_identity_is_current(input_source):
         return False
-    try:
-        source_digest = sha256_input_source(input_source)
-    except SourceChangedDuringReadError:
-        return False
+    if expected_source_sha256 is None:
+        try:
+            source_digest = sha256_input_source(input_source)
+        except SourceChangedDuringReadError:
+            return False
+    else:
+        if (
+            len(expected_source_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in expected_source_sha256)
+        ):
+            raise ValueError("delete_input_source_sha256_invalid")
+        source_digest = expected_source_sha256
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     parent_fd = os.open(path.parent, directory_flags)
     recovery_token = secrets.token_hex(16)
@@ -401,11 +547,37 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
     journal_name = f"{DELETE_INPUT_RECOVERY_PREFIX}{recovery_token}.json"
     staged = False
     journal_written = False
+    record: dict[str, Any] | None = None
+
+    def write_state(state: str) -> None:
+        if record is None:
+            raise RuntimeError("delete recovery record not initialized")
+        record["state"] = state
+        _write_delete_recovery_record(parent_fd, journal_name, record)
+
+    def original_exists() -> bool:
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def restore_staged() -> None:
+        nonlocal staged
+        write_state("restore_pending")
+        os.link(
+            staged_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(staged_name, dir_fd=parent_fd)
+        staged = False
+        os.fsync(parent_fd)
+        write_state("restored")
     try:
-        parent_info = os.fstat(parent_fd)
-        if (
-            stat.S_IFMT(parent_info.st_mode), int(parent_info.st_dev), int(parent_info.st_ino)
-        ) != (expected_parent.file_type, expected_parent.device, expected_parent.inode):
+        if not _parent_matches_descriptor(parent_fd, expected_parent):
             return False
         if not delete_input_identity_is_current(input_source):
             return False
@@ -422,62 +594,28 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
         }
         _write_delete_recovery_record(parent_fd, journal_name, record)
         journal_written = True
+        write_state("rename_pending")
         os.rename(path.name, staged_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         staged = True
-        record["state"] = "staged"
-        _write_delete_recovery_record(parent_fd, journal_name, record)
-        staged_info = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
-        staged_attributes = int(getattr(staged_info, "st_file_attributes", 0))
-        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-        staged_is_symlink = stat.S_ISLNK(staged_info.st_mode)
-        staged_link_hash = None
-        if staged_is_symlink:
-            staged_link_hash = hashlib.sha256(
-                os.fsencode(os.readlink(staged_name, dir_fd=parent_fd))
-            ).hexdigest()
-        staged_identity = (
-            stat.S_IFMT(staged_info.st_mode), int(staged_info.st_dev), int(staged_info.st_ino),
-            int(staged_info.st_size), int(staged_info.st_mtime_ns),
-            int(staged_info.st_nlink), staged_is_symlink,
-            bool(staged_attributes & reparse_flag), staged_link_hash,
-        )
-        expected_identity = (
-            expected_entry.file_type, expected_entry.device, expected_entry.inode,
-            expected_entry.size, expected_entry.mtime_ns,
-            expected_entry.nlink, expected_entry.is_symlink,
-            expected_entry.is_reparse_point, expected_entry.link_target_hash,
-        )
-        target_matches = True
+        os.fsync(parent_fd)
+        write_state("staged")
         try:
-            staged_target = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=True)
-            target_matches = (
-                stat.S_IFMT(staged_target.st_mode),
-                int(staged_target.st_dev),
-                int(staged_target.st_ino),
-                int(staged_target.st_size),
-                int(staged_target.st_mtime_ns),
-                int(staged_target.st_nlink),
-            ) == (
-                expected_target.file_type,
-                expected_target.device,
-                expected_target.inode,
-                expected_target.size,
-                expected_target.mtime_ns,
-                expected_target.nlink,
+            staged_digest = _sha256_verified_dir_entry(
+                parent_fd,
+                staged_name,
+                expected_entry=expected_entry,
+                expected_target=expected_target,
             )
-        except OSError:
-            target_matches = False
-        if staged_identity != expected_identity or not target_matches:
-            try:
-                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                os.rename(staged_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                staged = False
-                _remove_delete_recovery_record(parent_fd, journal_name)
-                journal_written = False
-            else:
+        except (OSError, SourceChangedDuringReadError):
+            staged_digest = None
+        if staged_digest is None or not secrets.compare_digest(staged_digest, source_digest):
+            if original_exists():
                 raise DeleteInputRecoveryRequired("delete_input_recovery_required")
+            restore_staged()
+            _remove_delete_recovery_record(parent_fd, journal_name)
+            journal_written = False
             return False
+        write_state("delete_pending")
         try:
             os.unlink(staged_name, dir_fd=parent_fd)
         except OSError:
@@ -485,17 +623,15 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
             # our private staging name.  Restore only when no racer has
             # created a new entry at the original name; never overwrite a
             # replacement merely to hide the cleanup failure.
-            try:
-                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                os.rename(staged_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                staged = False
-                _remove_delete_recovery_record(parent_fd, journal_name)
-                journal_written = False
-            else:
+            if original_exists():
                 raise DeleteInputRecoveryRequired("delete_input_recovery_required")
+            restore_staged()
+            _remove_delete_recovery_record(parent_fd, journal_name)
+            journal_written = False
             raise
         staged = False
+        os.fsync(parent_fd)
+        write_state("deleted")
         _remove_delete_recovery_record(parent_fd, journal_name)
         journal_written = False
         return True
@@ -504,13 +640,8 @@ def delete_input_if_unchanged(input_source: InputSource) -> bool:
             "delete_input_secure_identity_unsupported"
         ) from exc
     finally:
-        # Never delete an unverified staged entry.  A failure is intentionally
-        # visible to the caller for a safe cleanup warning.
-        if journal_written and not staged:
-            try:
-                _remove_delete_recovery_record(parent_fd, journal_name)
-            except OSError:
-                pass
+        # A durable record is intentionally retained for every interrupted or
+        # ambiguous transition.  Only an explicitly completed path removes it.
         os.close(parent_fd)
 
 
@@ -555,10 +686,18 @@ def recover_delete_input(directory: Path, owner_token: str) -> str:
         if (
             not isinstance(record, dict)
             or set(record) != required
-            or record["format_version"] != DELETE_INPUT_RECOVERY_FORMAT_VERSION
+            or record["format_version"] not in (
+                *DELETE_INPUT_RECOVERY_PREDECESSOR_VERSIONS,
+                DELETE_INPUT_RECOVERY_FORMAT_VERSION,
+            )
             or not secrets.compare_digest(str(record["owner_token"]), owner_token)
-            or record["state"] not in {"prepared", "staged"}
+            or record["state"] not in {
+                "prepared", "rename_pending", "staged", "delete_pending",
+                "deleted", "restore_pending", "restored",
+            }
         ):
+            raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+        if record["format_version"] == 1 and record["state"] not in {"prepared", "staged"}:
             raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
         original_name = str(record["original_name"])
         staged_name = str(record["staged_name"])
@@ -571,6 +710,43 @@ def recover_delete_input(directory: Path, owner_token: str) -> str:
             or staged_name != expected_staged
         ):
             raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+        source_sha256 = record["source_sha256"]
+        if (
+            not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in source_sha256)
+        ):
+            raise DeleteInputRecoveryRequired("delete_input_recovery_record_invalid")
+        expected_entry = _identity_from_record(record["entry_identity"])
+        expected_target = _identity_from_record(record["target_identity"])
+        expected_parent = _identity_from_record(record["parent_identity"])
+        if (
+            expected_entry.nlink != 1
+            or expected_target.nlink != 1
+            or not _parent_matches_descriptor(parent_fd, expected_parent)
+        ):
+            raise DeleteInputRecoveryRequired("delete_input_recovery_identity_mismatch")
+
+        def write_state(state: str) -> None:
+            record["format_version"] = DELETE_INPUT_RECOVERY_FORMAT_VERSION
+            record["state"] = state
+            _write_delete_recovery_record(parent_fd, journal_name, record)
+
+        def verify_entry(name: str, *, allow_link_pair: bool = False) -> None:
+            try:
+                digest = _sha256_verified_dir_entry(
+                    parent_fd,
+                    name,
+                    expected_entry=expected_entry,
+                    expected_target=expected_target,
+                    allow_link_pair=allow_link_pair,
+                )
+            except (OSError, SourceChangedDuringReadError) as exc:
+                raise DeleteInputRecoveryRequired(
+                    "delete_input_recovery_identity_mismatch"
+                ) from exc
+            if not secrets.compare_digest(digest, source_sha256):
+                raise DeleteInputRecoveryRequired("delete_input_recovery_identity_mismatch")
 
         def exists(name: str) -> bool:
             try:
@@ -582,24 +758,26 @@ def recover_delete_input(directory: Path, owner_token: str) -> str:
         original_exists = exists(original_name)
         staged_exists = exists(staged_name)
         if original_exists and staged_exists:
-            raise DeleteInputRecoveryRequired("delete_input_recovery_original_occupied")
-        if staged_exists:
-            staged_info = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
-            expected = record["entry_identity"]
-            if not isinstance(expected, dict) or (
-                stat.S_IFMT(staged_info.st_mode),
-                int(staged_info.st_dev),
-                int(staged_info.st_ino),
-                int(staged_info.st_size),
-                int(staged_info.st_mtime_ns),
-            ) != (
-                expected.get("file_type"),
-                expected.get("device"),
-                expected.get("inode"),
-                expected.get("size"),
-                expected.get("mtime_ns"),
+            if record["state"] != "restore_pending":
+                raise DeleteInputRecoveryRequired("delete_input_recovery_original_occupied")
+            original_info = _stable_entry_identity_at(parent_fd, original_name)
+            staged_info = _stable_entry_identity_at(parent_fd, staged_name)
+            if (
+                original_info.device != staged_info.device
+                or original_info.inode != staged_info.inode
             ):
+                raise DeleteInputRecoveryRequired("delete_input_recovery_original_occupied")
+            verify_entry(original_name, allow_link_pair=True)
+            os.unlink(staged_name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            write_state("restored")
+            _remove_delete_recovery_record(parent_fd, journal_name)
+            return "restored"
+        if staged_exists:
+            if record["state"] in {"deleted", "restored"}:
                 raise DeleteInputRecoveryRequired("delete_input_recovery_identity_mismatch")
+            verify_entry(staged_name)
+            write_state("restore_pending")
             os.link(
                 staged_name,
                 original_name,
@@ -609,11 +787,19 @@ def recover_delete_input(directory: Path, owner_token: str) -> str:
             )
             os.unlink(staged_name, dir_fd=parent_fd)
             os.fsync(parent_fd)
+            write_state("restored")
             _remove_delete_recovery_record(parent_fd, journal_name)
             return "restored"
         if original_exists:
+            if record["state"] == "deleted":
+                raise DeleteInputRecoveryRequired("delete_input_recovery_identity_mismatch")
+            verify_entry(original_name)
+            write_state("restored")
             _remove_delete_recovery_record(parent_fd, journal_name)
             return "already_restored"
+        if record["state"] not in {"delete_pending", "deleted"}:
+            raise DeleteInputRecoveryRequired("delete_input_recovery_identity_mismatch")
+        write_state("deleted")
         _remove_delete_recovery_record(parent_fd, journal_name)
         return "already_deleted"
     except (FileNotFoundError, NotImplementedError) as exc:
@@ -1075,6 +1261,11 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
     def finish_element() -> Any:
         nonlocal parts, element_chars, element_bytes, scalar_count, scalar_token
         value = decoder.decode("".join(parts))
+        if isinstance(value, dict):
+            measured = ConversationJsonObject(value)
+            measured.input_utf8_bytes = element_bytes
+            measured.decoded_chars = element_chars
+            value = measured
         parts = []
         element_chars = 0
         element_bytes = 0
@@ -1088,17 +1279,17 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
             return
         scalar_count += 1
         scalar_token = False
-        if scalar_count > MAX_JSON_SCALAR_COUNT:
+        if scalar_count > MAX_CONVERSATION_JSON_SCALARS:
             raise JsonSafetyLimitError(
-                "json_scalar_limit_exceeded", limit=MAX_JSON_SCALAR_COUNT
+                "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
             )
 
     def count_string_scalar() -> None:
         nonlocal scalar_count
         scalar_count += 1
-        if scalar_count > MAX_JSON_SCALAR_COUNT:
+        if scalar_count > MAX_CONVERSATION_JSON_SCALARS:
             raise JsonSafetyLimitError(
-                "json_scalar_limit_exceeded", limit=MAX_JSON_SCALAR_COUNT
+                "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
             )
 
     for chunk in chunks:
@@ -1156,51 +1347,76 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
             completed_at: int | None = None
             scalar_delimiter = False
             while i < len(chunk):
-                char = chunk[i]
-                if char == "\ufeff" and not in_string:
-                    raise InvalidConversationEncodingError("invalid_conversation_encoding")
                 if kind == "scalar":
-                    if char in ",]":
-                        scalar_token = True
-                        finish_scalar_token()
-                        completed_at = i
-                        scalar_delimiter = True
+                    match = _JSON_SCALAR_END_RE.search(chunk, i)
+                    if match is None:
+                        if i < len(chunk):
+                            scalar_token = True
+                        i = len(chunk)
                         break
-                elif in_string:
+                    i = match.start()
+                    scalar_token = True
+                    finish_scalar_token()
+                    completed_at = i
+                    scalar_delimiter = True
+                    break
+                if in_string:
                     if escaped:
+                        # The JSON decoder validates the escape itself.  The
+                        # framer only needs to prevent an escaped quote from
+                        # terminating this top-level element.
                         escaped = False
-                    elif char == "\\":
+                        i += 1
+                        continue
+                    match = _JSON_STRING_SPECIAL_RE.search(chunk, i)
+                    if match is None:
+                        i = len(chunk)
+                        break
+                    i = match.start()
+                    char = chunk[i]
+                    if char == "\\":
                         escaped = True
-                    elif char == '"':
+                        i += 1
+                        continue
+                    if char == '"':
                         in_string = False
                         count_string_scalar()
                         if kind == "string":
                             completed_at = i + 1
                             break
-                else:
-                    if char == '"':
-                        finish_scalar_token()
-                        in_string = True
-                    elif char in "[{":
-                        finish_scalar_token()
-                        depth += 1
-                        if depth > MAX_JSON_NESTING_DEPTH:
-                            raise JsonSafetyLimitError(
-                                "json_nesting_limit_exceeded",
-                                limit=MAX_JSON_NESTING_DEPTH,
-                            )
-                    elif char in "]}":
-                        finish_scalar_token()
-                        depth -= 1
-                        if depth == 0:
-                            completed_at = i + 1
-                            break
-                    elif char in ",:":
-                        finish_scalar_token()
-                    elif char in " \t\r\n":
-                        finish_scalar_token()
-                    else:
+                    i += 1
+                    continue
+                match = _JSON_OUTSIDE_SPECIAL_RE.search(chunk, i)
+                if match is None:
+                    if i < len(chunk):
                         scalar_token = True
+                    i = len(chunk)
+                    break
+                if match.start() > i:
+                    scalar_token = True
+                i = match.start()
+                char = chunk[i]
+                if char == "\ufeff":
+                    raise InvalidConversationEncodingError("invalid_conversation_encoding")
+                if char == '"':
+                    finish_scalar_token()
+                    in_string = True
+                elif char in "[{":
+                    finish_scalar_token()
+                    depth += 1
+                    if depth > MAX_JSON_NESTING_DEPTH:
+                        raise JsonSafetyLimitError(
+                            "json_nesting_limit_exceeded",
+                            limit=MAX_JSON_NESTING_DEPTH,
+                        )
+                elif char in "]}":
+                    finish_scalar_token()
+                    depth -= 1
+                    if depth == 0:
+                        completed_at = i + 1
+                        break
+                else:
+                    finish_scalar_token()
                 i += 1
             if completed_at is None:
                 append_part(chunk[start:])

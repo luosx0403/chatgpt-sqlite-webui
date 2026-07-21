@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import secrets
 import sqlite3
+import stat
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -26,7 +29,7 @@ from .db import (
     register_archive_sql_functions,
     validate_optional_web_index_ownership,
 )
-from .parser import recover_message_display_text
+from .parser import is_generated_non_text_placeholder, recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
@@ -75,9 +78,72 @@ class WebIndexBuildCancelled(ValueError):
 class WebIndexBuildError(ValueError):
     """A sanitized optional-index publication failure."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, cleanup_warnings: list[dict[str, str]] | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.cleanup_warnings = list(cleanup_warnings or [])
+
+
+class _WebIndexProcessLock:
+    """Kernel-owned cross-process proof held for one complete index build."""
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+
+    def close(self) -> None:
+        if self.fd < 0:
+            return
+        fd, self.fd = self.fd, -1
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def acquire_web_index_process_lock(db_path: Path) -> _WebIndexProcessLock:
+    """Acquire a nonblocking OS lock; its lifetime, not wall time, proves liveness."""
+
+    lock_path = db_path.parent / f".{db_path.name}.web-index.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("unsafe_lock_identity")
+        if info.st_size == 0:
+            os.write(fd, b"\0")
+            os.fsync(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        if "fd" in locals():
+            os.close(fd)
+        raise WebIndexBuildError("web_index_process_lock_failed") from None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _WebIndexProcessLock(fd)
+    except (BlockingIOError, PermissionError):
+        os.close(fd)
+        raise WebIndexBuildError("web_index_build_in_progress") from None
+    except OSError:
+        os.close(fd)
+        raise WebIndexBuildError("web_index_process_lock_failed") from None
 
 
 _LEASE_TABLE_DDL = f"""CREATE TABLE {WEB_INDEX_BUILD_LEASE_TABLE}(
@@ -175,6 +241,32 @@ def _decode_owned_names(value: Any, build_id: str) -> tuple[str, ...]:
     if not isinstance(decoded, list) or tuple(decoded) != expected:
         raise WebIndexBuildError("staging_name_collision")
     return expected
+
+
+def _validate_lease_row_values(row: sqlite3.Row, *, allow_legacy_phase: bool) -> None:
+    owner_token = str(row["owner_token"])
+    if len(owner_token) != 64 or any(ch not in "0123456789abcdef" for ch in owner_token):
+        raise WebIndexBuildError("staging_name_collision")
+    for key in ("message_generation", "title_generation"):
+        parsed = parse_nonnegative_integer(row[key])
+        if parsed is None or str(parsed) != str(row[key]):
+            raise WebIndexBuildError("staging_name_collision")
+    for key in ("created_at", "heartbeat_at", "lease_expires_at"):
+        try:
+            value = float(row[key])
+        except (TypeError, ValueError, OverflowError):
+            raise WebIndexBuildError("staging_name_collision") from None
+        if not math.isfinite(value):
+            raise WebIndexBuildError("staging_name_collision")
+    phase = str(row["phase"])
+    current_phases = {
+        "process_lock_v1:create_staging",
+        *(f"process_lock_v1:{stage}" for stage in WEB_INDEX_BUILD_STAGES),
+    }
+    if phase not in current_phases and not (
+        allow_legacy_phase and phase in {"create_staging", *WEB_INDEX_BUILD_STAGES}
+    ):
+        raise WebIndexBuildError("staging_name_collision")
 
 
 def _validate_staging_objects(
@@ -433,7 +525,8 @@ def detect_trigram(conn: sqlite3.Connection) -> bool:
 
 def _canonical_generations(conn: sqlite3.Connection) -> dict[str, str]:
     rows = list(conn.execute(
-        "SELECT name, generation, typeof(generation) AS generation_type FROM archive_generations"
+        "SELECT name, generation, typeof(generation) AS generation_type "
+        "FROM archive_generations WHERE name IN ('message', 'title')"
     ))
     values: dict[str, str] = {}
     for row in rows:
@@ -451,28 +544,13 @@ def _blob_is_generated_non_text_placeholder(
     rowid: int,
     size: int,
 ) -> bool:
-    """Recognize the generated placeholder grammar without a prefix guess."""
+    """Recognize the canonical placeholder grammar with a bounded BLOB read."""
 
-    prefixes = (b"[non-text content:", b"[non-text part:")
-    if size < min(map(len, prefixes)) + 2:
+    if size <= 0 or size > WEB_INDEX_MAX_INPUT_BYTES:
         return False
     with conn.blobopen("conversation_nodes", "content_text", rowid, readonly=True) as blob:
-        head = blob.read(max(map(len, prefixes)))
-        prefix = next((item for item in prefixes if head.startswith(item)), None)
-        if prefix is None:
-            return False
-        blob.seek(len(prefix))
-        remaining = size - len(prefix) - 1
-        payload_nonspace = False
-        while remaining > 0:
-            chunk = blob.read(min(64 * 1024, remaining))
-            if not chunk:
-                return False
-            if b"]" in chunk or b"\n" in chunk or b"\r" in chunk:
-                return False
-            payload_nonspace = payload_nonspace or bool(chunk.strip())
-            remaining -= len(chunk)
-        return payload_nonspace and blob.read(1) == b"]"
+        value = blob.read().decode("utf-8", errors="replace")
+    return is_generated_non_text_placeholder(value)
 
 
 def _drop_owned_staging_objects(conn: sqlite3.Connection, names: tuple[str, ...]) -> None:
@@ -504,6 +582,7 @@ def _claim_web_index_build(
         f"SELECT * FROM {WEB_INDEX_BUILD_LEASE_TABLE} WHERE slot = 1"
     ).fetchone()
     if row is not None:
+        _validate_lease_row_values(row, allow_legacy_phase=True)
         existing_build_id = str(row["build_id"])
         existing_names = _decode_owned_names(row["object_names_json"], existing_build_id)
         if (
@@ -512,8 +591,13 @@ def _claim_web_index_build(
             or int(row["schema_version"]) != int(conn.execute("PRAGMA user_version").fetchone()[0])
         ):
             raise WebIndexBuildError("staging_name_collision")
-        if float(row["lease_expires_at"]) >= now:
-            raise WebIndexBuildError("web_index_build_in_progress")
+        if not str(row["phase"]).startswith("process_lock_v1:"):
+            if float(row["lease_expires_at"]) >= now:
+                raise WebIndexBuildError("web_index_build_in_progress")
+            raise WebIndexBuildError("web_index_stale_build_recovery_required")
+        # Acquiring the kernel lock proves that a process_lock_v1 owner is no
+        # longer alive. Revalidate every durable binding and staging object
+        # before reclaiming; wall-clock expiry is intentionally irrelevant.
         _drop_owned_staging_objects(conn, existing_names)
         conn.execute(f"DELETE FROM {WEB_INDEX_BUILD_LEASE_TABLE} WHERE slot = 1")
     _validate_staging_objects(conn, names, allow_missing=True)
@@ -541,7 +625,7 @@ def _claim_web_index_build(
             now,
             now,
             now + WEB_INDEX_BUILD_LEASE_SECONDS,
-            "create_staging",
+            "process_lock_v1:create_staging",
             json.dumps(names, ensure_ascii=True, separators=(",", ":")),
         ),
     )
@@ -560,7 +644,13 @@ def _heartbeat_web_index_build(
         f"""UPDATE {WEB_INDEX_BUILD_LEASE_TABLE}
             SET heartbeat_at = ?, lease_expires_at = ?, phase = ?
             WHERE slot = 1 AND build_id = ? AND owner_token = ?""",
-        (now, now + WEB_INDEX_BUILD_LEASE_SECONDS, phase, build_id, owner_token),
+        (
+            now,
+            now + WEB_INDEX_BUILD_LEASE_SECONDS,
+            f"process_lock_v1:{phase}",
+            build_id,
+            owner_token,
+        ),
     ).rowcount
     if changed != 1:
         raise WebIndexBuildError("web_index_build_lease_lost")
@@ -572,11 +662,11 @@ def assert_no_active_web_index_build(conn: sqlite3.Connection) -> None:
     if not _validate_lease_table(conn, create=False):
         return
     row = conn.execute(
-        f"SELECT build_id, object_names_json, database_identity, lease_expires_at "
-        f"FROM {WEB_INDEX_BUILD_LEASE_TABLE} WHERE slot = 1"
+        f"SELECT * FROM {WEB_INDEX_BUILD_LEASE_TABLE} WHERE slot = 1"
     ).fetchone()
     if row is None:
         return
+    _validate_lease_row_values(row, allow_legacy_phase=True)
     build_id = str(row["build_id"])
     _decode_owned_names(row["object_names_json"], build_id)
     if str(row["database_identity"]) != _database_lease_identity(conn):
@@ -592,24 +682,25 @@ def _cleanup_web_index_staging(
     *,
     build_id: str,
     owner_token: str,
-) -> None:
+) -> list[dict[str, str]]:
     """Clean only objects bound to this durable owner; never another build."""
 
+    warnings: list[dict[str, str]] = []
     try:
         conn.execute("BEGIN IMMEDIATE")
         _validate_lease_table(conn, create=False)
         row = conn.execute(
-            f"SELECT build_id, owner_token, object_names_json FROM {WEB_INDEX_BUILD_LEASE_TABLE} "
-            "WHERE slot = 1"
+            f"SELECT * FROM {WEB_INDEX_BUILD_LEASE_TABLE} WHERE slot = 1"
         ).fetchone()
         if row is None:
             conn.rollback()
-            return
+            return warnings
+        _validate_lease_row_values(row, allow_legacy_phase=False)
         if str(row["build_id"]) != build_id or not secrets.compare_digest(
             str(row["owner_token"]), owner_token
         ):
             conn.rollback()
-            return
+            return warnings
         if _decode_owned_names(row["object_names_json"], build_id) != names:
             raise WebIndexBuildError("staging_name_collision")
         _drop_owned_staging_objects(conn, names)
@@ -619,9 +710,15 @@ def _cleanup_web_index_staging(
             (build_id, owner_token),
         )
         conn.commit()
-    except (sqlite3.Error, WebIndexBuildError, DatabaseMigrationError):
+    except (sqlite3.Error, WebIndexBuildError, DatabaseMigrationError) as exc:
         if conn.in_transaction:
             conn.rollback()
+        warnings.append({
+            "code": "web_index_staging_cleanup_failed",
+            "error_type": type(exc).__name__,
+            "path_kind": "web_index_staging",
+        })
+    return warnings
 
 
 def create_web_indexes(
@@ -639,7 +736,12 @@ def create_web_indexes(
     """
 
     batch_size = max(1, min(1_000, int(batch_size)))
-    conn = connect_writable(db_path)
+    process_lock = acquire_web_index_process_lock(db_path)
+    try:
+        conn = connect_writable(db_path)
+    except Exception:
+        process_lock.close()
+        raise
     build_id = secrets.token_hex(16)
     owner_token = secrets.token_hex(32)
     build_names = _build_names(build_id)
@@ -765,7 +867,10 @@ def create_web_indexes(
             rows = conn.execute(
                 """SELECT rowid, conversation_id, node_id, content_type,
                           content_text IS NULL AS content_is_null,
-                          raw_message_json IS NULL AS raw_is_null
+                          raw_message_json IS NULL AS raw_is_null,
+                          length(CAST(content_text AS BLOB)) AS content_size,
+                          substr(CAST(content_text AS BLOB), 1, 256) AS content_prefix,
+                          length(CAST(raw_message_json AS BLOB)) AS raw_size
                    FROM conversation_nodes
                    WHERE rowid > ?
                    ORDER BY rowid
@@ -779,30 +884,24 @@ def create_web_indexes(
             batch_normalized_bytes = 0
             batch_derived_bytes = 0
             processed_in_batch = 0
+            selected_rows: list[tuple[sqlite3.Row, int, int, bool, int]] = []
             for row in rows:
                 check_cancel()
                 rowid = int(row["rowid"])
-                content_size = 0
-                content_prefix_bytes = b""
-                if not row["content_is_null"]:
-                    with conn.blobopen("conversation_nodes", "content_text", rowid, readonly=True) as blob:
-                        content_size = len(blob)
-                        content_prefix_bytes = blob.read(min(len(blob), 256))
+                content_size = int(row["content_size"] or 0)
+                content_prefix_bytes = bytes(row["content_prefix"] or b"")
                 content_prefix = content_prefix_bytes.decode("utf-8", errors="replace")
-                marker_prefix = _blob_is_generated_non_text_placeholder(
+                possible_marker = content_prefix.lstrip().startswith(
+                    ("[non-text content:", "[non-text part:")
+                )
+                marker_prefix = bool(possible_marker) and _blob_is_generated_non_text_placeholder(
                     conn, rowid, content_size
                 )
-                canonical_usable = bool(content_prefix) and not (
-                    marker_prefix
-                    and str(row["content_type"] or "").casefold()
-                    not in {"text", "code", "multimodal_text"}
-                    and not row["raw_is_null"]
-                )
+                canonical_usable = bool(content_prefix) and not marker_prefix
                 chosen_size = content_size
                 raw_size = 0
                 if not canonical_usable and not row["raw_is_null"]:
-                    with conn.blobopen("conversation_nodes", "raw_message_json", rowid, readonly=True) as blob:
-                        raw_size = len(blob)
+                    raw_size = int(row["raw_size"] or 0)
                     chosen_size = raw_size
                 input_bytes = chosen_size if canonical_usable else content_size + raw_size
                 if input_bytes > WEB_INDEX_MAX_INPUT_BYTES:
@@ -811,27 +910,47 @@ def create_web_indexes(
                         (rowid, row["conversation_id"], row["node_id"], input_bytes),
                     )
                     oversized_messages += 1
-                    last_rowid = rowid
+                    last_rowid = max(last_rowid, rowid)
                     processed_in_batch += 1
                     continue
                 if processed_in_batch and batch_materialized_bytes + input_bytes > WEB_INDEX_BATCH_INPUT_BYTES:
                     break
-                if canonical_usable:
-                    with conn.blobopen("conversation_nodes", "content_text", rowid, readonly=True) as blob:
-                        content_value = blob.read().decode("utf-8", errors="replace")
-                    raw_value = None
-                    actual_bytes = len(content_value.encode("utf-8"))
-                else:
-                    with conn.blobopen("conversation_nodes", "content_text", rowid, readonly=True) as blob:
-                        content_value = blob.read().decode("utf-8", errors="replace")
-                    if raw_size:
-                        with conn.blobopen("conversation_nodes", "raw_message_json", rowid, readonly=True) as blob:
-                            raw_value = blob.read().decode("utf-8", errors="replace")
-                    else:
-                        raw_value = None
-                    actual_bytes = len(content_value.encode("utf-8")) + (
-                        len(raw_value.encode("utf-8")) if raw_value else 0
+                selected_rows.append((row, rowid, content_size, canonical_usable, raw_size))
+                batch_materialized_bytes += input_bytes
+                message_materialized_bytes += input_bytes
+                processed_in_batch += 1
+            materialized: dict[int, tuple[bytes, bytes | None]] = {}
+            canonical_ids = [item[1] for item in selected_rows if item[3]]
+            if canonical_ids:
+                placeholders = ",".join("?" for _ in canonical_ids)
+                for value_row in conn.execute(
+                    f"SELECT rowid, CAST(content_text AS BLOB) "
+                    f"FROM conversation_nodes WHERE rowid IN ({placeholders})",
+                    canonical_ids,
+                ):
+                    materialized[int(value_row[0])] = (bytes(value_row[1] or b""), None)
+            fallback_ids = [item[1] for item in selected_rows if not item[3]]
+            if fallback_ids:
+                placeholders = ",".join("?" for _ in fallback_ids)
+                for value_row in conn.execute(
+                    f"SELECT rowid, CAST(content_text AS BLOB), CAST(raw_message_json AS BLOB) "
+                    f"FROM conversation_nodes WHERE rowid IN ({placeholders})",
+                    fallback_ids,
+                ):
+                    materialized[int(value_row[0])] = (
+                        bytes(value_row[1] or b""),
+                        None if value_row[2] is None else bytes(value_row[2]),
                     )
+            selected_processed = 0
+            for row, rowid, content_size, canonical_usable, raw_size in selected_rows:
+                content_bytes, raw_bytes = materialized[rowid]
+                content_value = content_bytes.decode("utf-8", errors="replace")
+                raw_value = (
+                    raw_bytes.decode("utf-8", errors="replace")
+                    if not canonical_usable and raw_bytes is not None
+                    else None
+                )
+                actual_bytes = content_size if canonical_usable else content_size + raw_size
                 display_text = recover_message_display_text(content_value, raw_value)
                 content_norm = normalize_search_text(display_text)
                 if content_norm:
@@ -841,8 +960,6 @@ def create_web_indexes(
                         normalized_bytes > WEB_INDEX_MAX_NORMALIZED_BYTES
                         or derived_bytes > WEB_INDEX_MAX_DERIVED_BYTES
                     ):
-                        batch_materialized_bytes += actual_bytes
-                        message_materialized_bytes += actual_bytes
                         batch_normalized_bytes += normalized_bytes
                         normalized_materialized_bytes += normalized_bytes
                         conn.execute(
@@ -850,34 +967,45 @@ def create_web_indexes(
                             (rowid, row["conversation_id"], row["node_id"], actual_bytes),
                         )
                         oversized_messages += 1
-                        last_rowid = rowid
-                        processed_in_batch += 1
+                        last_rowid = max(last_rowid, rowid)
+                        selected_processed += 1
                         continue
-                    if processed_in_batch and (
+                    if normalized_rows and (
                         batch_normalized_bytes + normalized_bytes
                         > WEB_INDEX_BATCH_NORMALIZED_BYTES
                         or batch_derived_bytes + derived_bytes
                         > WEB_INDEX_BATCH_DERIVED_BYTES
                     ):
-                        # The current row is retried as the first row of the
-                        # next keyset batch; it is never appended to this
-                        # batch's Python bind collection.
-                        break
+                        conn.executemany(
+                            f"INSERT INTO {message_norm_build}(conversation_id, node_id, content_norm) "
+                            "VALUES (?, ?, ?)",
+                            normalized_rows,
+                        )
+                        indexed_messages += len(normalized_rows)
+                        normalized_rows.clear()
+                        resource_progress["peak_batch_normalized_bytes"] = max(
+                            resource_progress["peak_batch_normalized_bytes"],
+                            batch_normalized_bytes,
+                        )
+                        resource_progress["peak_batch_derived_bytes"] = max(
+                            resource_progress["peak_batch_derived_bytes"],
+                            batch_derived_bytes,
+                        )
+                        batch_normalized_bytes = 0
+                        batch_derived_bytes = 0
                     batch_normalized_bytes += normalized_bytes
                     batch_derived_bytes += derived_bytes
                     normalized_materialized_bytes += normalized_bytes
                     normalized_rows.append((row["conversation_id"], row["node_id"], content_norm))
-                batch_materialized_bytes += actual_bytes
-                message_materialized_bytes += actual_bytes
-                last_rowid = rowid
-                processed_in_batch += 1
+                last_rowid = max(last_rowid, rowid)
+                selected_processed += 1
             if normalized_rows:
                 conn.executemany(
                     f"INSERT INTO {message_norm_build}(conversation_id, node_id, content_norm) VALUES (?, ?, ?)",
                     normalized_rows,
                 )
                 indexed_messages += len(normalized_rows)
-            message_processed += processed_in_batch
+            message_processed += processed_in_batch - len(selected_rows) + selected_processed
             resource_progress.update(
                 input_materialized_bytes=message_materialized_bytes,
                 normalized_materialized_bytes=normalized_materialized_bytes,
@@ -1247,22 +1375,32 @@ def create_web_indexes(
         if conn.in_transaction:
             conn.rollback()
         conn.set_progress_handler(None, 0)
-        _cleanup_web_index_staging(
+        cleanup_warnings = _cleanup_web_index_staging(
             conn, build_names, build_id=build_id, owner_token=owner_token
         )
+        if cleanup_warnings:
+            setattr(exc, "cleanup_warnings", cleanup_warnings)
         invalidate_capability_cache(conn)
         if cancelled:
-            raise WebIndexBuildCancelled() from None
+            cancelled_error = WebIndexBuildCancelled()
+            setattr(cancelled_error, "cleanup_warnings", cleanup_warnings)
+            raise cancelled_error from None
         raise
-    except Exception:
+    except Exception as exc:
         if conn.in_transaction:
             conn.rollback()
         conn.set_progress_handler(None, 0)
-        _cleanup_web_index_staging(
+        cleanup_warnings = _cleanup_web_index_staging(
             conn, build_names, build_id=build_id, owner_token=owner_token
         )
+        if cleanup_warnings:
+            existing = list(getattr(exc, "cleanup_warnings", []))
+            setattr(exc, "cleanup_warnings", [*existing, *cleanup_warnings])
         invalidate_capability_cache(conn)
         raise
     finally:
-        conn.set_progress_handler(None, 0)
-        conn.close()
+        try:
+            conn.set_progress_handler(None, 0)
+            conn.close()
+        finally:
+            process_lock.close()

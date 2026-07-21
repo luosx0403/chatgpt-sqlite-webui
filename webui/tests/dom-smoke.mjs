@@ -375,9 +375,16 @@ function makeSyntheticConversations() {
       1_958_206_001,
       ["a"],
     ),
-    a: node("a", "u", "assistant", "Intelligence and Intellicode are longer words for whole-word negative checks.", 1_958_206_002),
+    a: node("a", "u", "assistant", "Intelligence and Intellicode are longer words for whole-word negative checks.", 1_958_206_002, ["late"]),
+    late: node(
+      "late",
+      "a",
+      "assistant",
+      `${"😀".repeat(9_000)}ASTRAL-LATE-NEEDLE cafe\u0301 ﬁ`,
+      1_958_206_003,
+    ),
   };
-  conversations.push(conversation("dom-multiscript", "DOM Multiscript Search Conversation", multiscriptMapping, "a", 1_958_206_000));
+  conversations.push(conversation("dom-multiscript", "DOM Multiscript Search Conversation", multiscriptMapping, "late", 1_958_206_000));
   for (let idx = 0; idx < 3; idx += 1) {
     const mapping = {
       root: root(["u"]),
@@ -851,7 +858,7 @@ async function main() {
     run([
       ...pythonCommand(),
       "-c",
-      "import sqlite3, sys; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = CASE WHEN node_id = 'branch' THEN 1 ELSE 0 END WHERE conversation_id = 'dom-branch-override'\"); conn.execute(\"UPDATE conversation_nodes SET content_text = replace(hex(zeroblob(1100000)), '00', 'L') || ' DOM-LONG-BODY-END', raw_message_json = NULL WHERE conversation_id = 'dom-long-body' AND node_id = 'long-body'\"); conn.commit(); conn.close()",
+      "import sqlite3, sys; from chatgpt_export_archiver.db import migrate_database; conn=sqlite3.connect(sys.argv[1]); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = 0 WHERE conversation_id = 'dom-damaged-current'\"); conn.execute(\"UPDATE conversation_nodes SET is_on_current_path = CASE WHEN node_id = 'branch' THEN 1 ELSE 0 END WHERE conversation_id = 'dom-branch-override'\"); conn.execute(\"UPDATE conversation_nodes SET content_text = replace(hex(zeroblob(1100000)), '00', 'L') || ' DOM-LONG-BODY-END', raw_message_json = NULL WHERE conversation_id = 'dom-long-body' AND node_id = 'long-body'\"); conn.commit(); migrate_database(conn, refresh_compatibility=True); conn.commit(); conn.close()",
       db,
     ]);
     run([...pythonCommand(), "chatgpt_archive.py", "web-index", "--db", db]);
@@ -861,6 +868,7 @@ async function main() {
     server = spawn(python.command, [...python.args, "chatgpt_archive.py", "web", "--db", db, "--host", "127.0.0.1", "--port", String(port)], {
       cwd: repoRoot,
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, CHATGPT_ARCHIVE_READER_MESSAGE_TEXT_CHARS: "8192" },
     });
     server.stdout.on("data", () => undefined);
     server.stderr.on("data", () => undefined);
@@ -1353,6 +1361,44 @@ async function main() {
       await assertHighlightsAllowed(page, sample.expected, sample.label);
       await assertStableMessageViewport(page, sample.label);
     }
+    const directAnchorRequests = [];
+    await page.route("**/api/by-id/display**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("cursor")) {
+        directAnchorRequests.push({
+          cursor: url.searchParams.get("cursor"),
+          offset: url.searchParams.get("offset"),
+          anchor: url.searchParams.get("anchor_char_offset"),
+        });
+      }
+      await route.continue();
+    });
+    await page.getByLabel("Whole word").uncheck();
+    await page.locator("#global-search").fill("ASTRAL-LATE-NEEDLE");
+    await page.waitForFunction(() => document.querySelector(".results-meta")?.textContent?.includes("1 of 1 conversations"), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: /DOM Multiscript Search Conversation/ }).click();
+    await page.waitForFunction(
+      () => document.querySelector(".search-highlight-active")?.textContent === "ASTRAL-LATE-NEEDLE",
+      undefined,
+      { timeout: 20_000 },
+    );
+    assert.ok(directAnchorRequests.length >= 1, "astral late hit should request a revision-bound direct byte cursor");
+    assert.equal(directAnchorRequests.at(-1)?.offset, "9000", "direct cursor should retain the source code-point offset");
+    assert.equal(directAnchorRequests.at(-1)?.anchor, null, "direct byte cursor must replace the legacy prefix-scanning character anchor");
+
+    await page.locator("#global-search").fill("");
+    await waitForCount(page, ".conversation-item", 20);
+    await page.getByRole("button", { name: /DOM Intel Word Conversation/ }).click();
+    await page.locator("#global-search").fill('"café fi"');
+    await page.waitForFunction(() => document.querySelector(".results-meta")?.textContent?.includes("1 of 1 conversations"), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: /DOM Multiscript Search Conversation/ }).click();
+    await page.waitForFunction(
+      () => document.querySelector(".search-highlight-active")?.textContent === "café ﬁ",
+      undefined,
+      { timeout: 20_000 },
+    );
+    assert.ok(directAnchorRequests.length >= 2, "virtual remount should request a fresh direct cursor for combining/NFKC text");
+    await page.unroute("**/api/by-id/display**");
     await page.getByLabel("Whole word").uncheck();
     await page.locator("#global-search").fill("");
     await page.unroute("**/api/conversations**");

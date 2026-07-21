@@ -472,19 +472,19 @@ tools/                             交付檢查與輔助腳本
 
 主資料庫保存 conversations、mapping nodes、import runs 與 warnings。message object 的 raw JSON 欄位按完整物件保留；conversation 與 mapping-node object 會正規化，不做逐位元組保存。輸入 ZIP SHA-256 可選，`source_files`/`file_index` 的逐 entry SHA 欄位目前保留但不填入。CLI FTS 表是 `message_fts`。可選 Web 搜尋輔助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 4）。版本 3 為 canonical TEXT identity 加上 `NOT NULL`；版本 4 新增依欄位劃分的持久 address/graph revision，使 fresh reader 不會重用過期的 compatibility 或 effective-current 判斷。Migration 在同一 write-lock transaction 安裝 revision row 與 managed trigger，並視需要使 optional index 失效。唯讀路徑不執行 migration DDL；舊相容資料庫回傳 `database_migration_required`。升級前先建立並驗證外部備份。
+canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 5）。版本 3 為 canonical TEXT identity 加上 `NOT NULL`；版本 4 新增依欄位劃分的持久 address/graph revision；版本 5 新增持久逐列 display revision 與 compatibility state，使 fresh reader 不會重用過期的正文 cursor、compatibility 或 effective-current 判斷。Migration 在同一 write-lock transaction 安裝 revision row 與 managed trigger，並視需要使 optional index 失效。唯讀路徑不執行 migration DDL；舊相容資料庫回傳 `database_migration_required`。升級前先建立並驗證外部備份。
 
 Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回報 `optional_message_fts_error` 和 `--rebuild-fts` 復原提示；一般 malformed、locked、readonly、I/O 與 SQL 執行期錯誤不會被當成能力缺失，並使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
-## Round 9 資源、所有權與復原契約
+## Round 10 資源、所有權與復原契約
 
-managed FTS、可選 Web 索引、staging、metadata、generation 與 shadow 物件只有在精確核對類型、目標 table、SQL 與 fingerprint 所有權後才能執行破壞性 DDL。名稱衝突分別以 `core_fts_name_collision`、`optional_index_name_collision` 或 `staging_name_collision` 拒絕，絕不因名稱相似就刪除使用者物件。可選 Web 索引格式為 4：每次建置使用不可預測的獨立 staging 名稱與持久 owner-token lease；並行建置回傳 `web_index_build_in_progress`，逾期復原也必須核對 owner、資料庫身分、schema、generation、format 與全部物件名。輸入、正規化、派生及 FTS bind 分別按批預算，並回報實際 current/peak 位元組；完整串流 placeholder 分類不會被超過 256 字元的前綴繞過。
+managed FTS、可選 Web 索引、staging、metadata、generation 與 shadow 物件只有在精確核對類型、目標 table、SQL 與 fingerprint 所有權後才能執行破壞性 DDL。名稱衝突分別以 `core_fts_name_collision`、`optional_index_name_collision` 或 `staging_name_collision` 拒絕，絕不因名稱相似就刪除使用者物件。可選 Web 索引格式為 5：每次建置使用不可預測的獨立 staging 名稱與持久 owner-token lease；並行建置回傳 `web_index_build_in_progress`，逾期復原也必須核對 owner、資料庫身分、schema、generation、format 與全部物件名。輸入、正規化、派生及 FTS bind 分別按批預算，並回報實際 current/peak 位元組；完整串流 placeholder 分類不會被超過 256 字元的前綴繞過。
 
-長正文 cursor 會綁定保存在 `archive_generations` 內部 `display:<rowid>` key 的持久逐列 revision。受管 insert/update trigger 會為每次影響顯示文字的寫入遞增 revision，即使直接外部 SQLite writer 未更新 `content_hash`；無關資料列不會使 cursor 失效。缺少這些 trigger 的既有 version-4 資料庫會進入 migration-required gate，由明確 writer migration 回填 revision。刪除資料列的 revision tombstone 會保留，避免 rowid 重用讓舊 cursor 復活。
+長正文 cursor 會綁定目標 message row 直接保存的持久逐列 revision。受管 insert/update trigger 會為每次影響顯示文字的寫入遞增 revision，即使直接外部 SQLite writer 未更新 `content_hash`；無關資料列不會使 cursor 失效。version 5 之前的資料庫會進入 migration-required gate，由明確 writer migration 回填 revision。cursor 也綁定穩定的 row identity 摘要，避免 rowid 重用讓舊 cursor 復活。
 
-精確訊息搜尋以 64 KiB 重疊分塊增量讀取 canonical BLOB。每列通常限制 32 MiB 解碼字元與 32 MiB UTF-8，可信本機可明確提高到 100 MiB 字元；raw-only fallback 另限 1 MiB/800,000 字元，單次請求另有 128 MiB 位元組/字元總預算。超限回傳完整 HTTP 413，本版本不回傳 partial page，也不承諾 continuation token。第一個 hit 請求取得精確總數，後續頁可分別顯示已載入數；晚位置命中攜帶綁定列 revision 的字元 anchor，reader 直接 seek，不重播數 MB 頁面。
+精確訊息搜尋以 64 KiB 重疊分塊增量讀取 canonical BLOB，並把已驗證結果寫入單一連線本地 TEMP artifact，供計數、分頁、snippet、span 與 anchor 重用。每列通常限制 32 MiB 解碼字元與 32 MiB UTF-8，可信本機可明確提高到 100 MiB 字元；raw-only fallback 另限 1 MiB/800,000 字元，單次請求另有獨立總預算與候選預算。有界請求回傳已確認命中及明確 partial/pending 診斷；仍可續掃時提供綁定 query、資料庫身分與 generation 的簽名 continuation。`count_total=false` 不會宣稱總數精確。晚位置命中攜帶綁定列 revision 的 UTF-8 byte anchor，reader 直接 seek，不重播數 MB 頁面。
 
-單一新匯入對話元素獨立限制為 32 MiB UTF-8、32 MiB 解碼字元、250,000 scalar 與 5,000 mapping node；超出 node 限制以 `conversation_node_limit_exceeded` 略過且不保存內容。reader/effective-current/export 的 100,000-node 上限只為相容 legacy 或外部寫入資料庫，不代表允許匯入 100,000 node。多個 ZIP shard 共用一個讀取 session；目錄探索採增量預算。空 `parent` 視為 legacy root/missing-parent 相容。legacy ID readiness 檢查全部位址/圖欄位長度與不安全 Unicode，並以持久欄位 revision 使快取失效，一般讀取不輪詢 `PRAGMA data_version`。
+單一新匯入對話元素獨立限制為 32 MiB UTF-8、32 MiB 解碼字元、1,000,000 lexical scalar 與 5,000 mapping node；legacy/API sanitizer 另限 250,000 scalar。超出 node 限制以 `conversation_node_limit_exceeded` 略過且不保存內容。reader/effective-current/export 的 100,000-node 上限只為相容 legacy 或外部寫入資料庫，不代表允許匯入 100,000 node。多個 ZIP shard 共用一個讀取 session；目錄探索採增量預算。空 `parent` 視為 legacy root/missing-parent 相容。legacy ID readiness 檢查全部位址/圖欄位長度與不安全 Unicode，並以持久欄位 revision 使快取失效，一般讀取不輪詢 `PRAGMA data_version`。
 
 專案批次匯入在同一寫入鎖 transaction 內暫時替換精確的專案自有 generation trigger，每個 dirty 欄位 domain 只推進一次，再復原並驗證 trigger；rollback 或 crash 會復原原 DDL/資料，外部 writer 仍使用一般逐 statement trigger。有限 effective-current scope 透過有界 SQLite TEMP 批次精確比較。全庫匯出把 plan 與 node spool 到暫存 SQLite，並以 keyset 串流讀取，不在 Python 保存全 archive node graph。
 
@@ -506,7 +506,7 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bi
 
 匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。
 
-獨立 JSON、目錄成員與 ZIP 成員使用同一個單遍、逐頂層陣列元素的解碼器，並位於同一匯入交易；每個元素只掃描和解碼一次，UTF-8 輸入與解碼後字元數各限制為 32 MiB，巢狀最多 256 層、scalar 最多 250,000 個。legacy raw 使用迭代 sanitizer，遍歷最多 100,000 個 node、raw preview 最多 80,000 bytes、完整 sanitized API payload 最多 4 MiB。ZIP 中央目錄全部 entry 與目錄全部 entry 都計入 100,000 member 上限。只移除檔案開頭的一個 UTF-8 BOM；JSON 字串內的 U+FEFF 會保留，重複開頭 BOM、字串外的中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。新 canonical ID 上限為 512 字元且不截斷；主要 query-based `/api/by-id/*` 最多接受 16 Ki 字元 legacy ID，更長舊 ID 會使 readiness 回報 `database_data_incompatible`。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
+獨立 JSON、目錄成員與 ZIP 成員使用同一個單遍、逐頂層陣列元素的解碼器，並位於同一匯入交易；每個元素只掃描和解碼一次，UTF-8 輸入與解碼後字元數各限制為 32 MiB，巢狀最多 256 層、lexical scalar 最多 1,000,000 個。legacy raw 的迭代 sanitizer 另限 250,000 scalar、遍歷最多 100,000 個 node、raw preview 最多 80,000 bytes、完整 sanitized API payload 最多 4 MiB。ZIP 中央目錄全部 entry 與目錄全部 entry 都計入 100,000 member 上限。只移除檔案開頭的一個 UTF-8 BOM；JSON 字串內的 U+FEFF 會保留，重複開頭 BOM、字串外的中間 BOM、UTF-16/32、混合編碼與無效 UTF-8 都會拒絕。新 canonical ID 上限為 512 字元且不截斷；主要 query-based `/api/by-id/*` 最多接受 16 Ki 字元 legacy ID，更長舊 ID 會使 readiness 回報 `database_data_incompatible`。ZIP source-read 會區分加密、缺失、讀取期間變更、CRC 失敗及其他讀取失敗。
 
 檔案身分透過 descriptor-bound stat/hash/read 驗證；`--delete-input-on-success` 使用原子 staging rename 與最終身分屏障，無法復原的佔名競態會產生 `delete_input_recovery_required`。Migration 僅接受定義完全相符的已知 predecessor；任何使用錯誤型別、目標或定義佔用 managed trigger/index 名稱的物件，都會在 DDL 前以 `database_managed_object_name_collision` 拒絕。
 
@@ -530,7 +530,7 @@ message search page 一律含 `total_exact`；空資料庫或可確定為空時�
 
 僅篩選和僅排除可篩選 conversation；只有正向訊息正文詞會產生 message hit、reader 醒目提示與 hit navigation。「複製 URL」使用同一個已套用的 search/list/selected context，不會混入 debounce 中的新輸入。日文與西班牙文在選擇器明確標為部分翻譯。release 收集前會驗證獨立的權威必要檔案清單，缺少任何必要 source/config/doc 都會失敗且不覆蓋舊 ZIP。
 
-request validation 回應最多包含 16 個安全項目，每項只有白名單化的 `location`、`field` 與穩定公開 `code`，絕不回顯 body、path/query 原值或框架驗證類型。Raw API 分開回報精確 UTF-8 byte 與 character 單位。message search 的 candidate 精確驗證、晚位置 snippet、enrichment 與序列化回應都有界；匯入範圍內透過增量 BLOB 精確驗證，更大的 legacy candidate 穩定回傳 413，而不是 false-exact。Web index 計量實際讀取、正規化與 FTS bind 的 byte。Release payload 採分塊串流 hash、寫入與驗證。
+request validation 回應最多包含 16 個安全項目，每項只有白名單化的 `location`、`field` 與穩定公開 `code`，絕不回顯 body、path/query 原值或框架驗證類型。Raw API 分開回報精確 UTF-8 byte 與 character 單位。message search 的 candidate 精確驗證、晚位置 snippet、enrichment 與序列化回應都有界；後續候選耗盡 request budget 時不會丟棄已確認命中，回應會標示 partial/pending，並在可續掃時提供綁定 continuation。超過硬性逐列 verifier 上限的候選保持明確 pending，不會成為 false-exact miss。Web index 計量實際讀取、正規化與 FTS bind 的 byte。Release payload 採分塊串流 hash、寫入與驗證。
 
 Python `zipfile` 與本專案匯入管線支援 ZIP64 結構，並有小型強制 ZIP64 member 回歸測試；一般驗收未建立實體大小超過 4 GiB 的 ZIP。所有 member、byte、壓縮比、磁碟與 CPU 限制仍然適用。
 
@@ -538,4 +538,4 @@ Python `zipfile` 與本專案匯入管線支援 ZIP64 結構，並有小型強�
 
 `npm run build` 使用 `webui/scripts/build.mjs`，先 typecheck，再建置到同層 staging 目錄，驗證 staged `index.html` 引用的所有資源，先發布資源，最後原子取代 `dist/index.html`。注入失敗自我測試保證失敗建置仍保留舊入口及其引用資源可用。
 
-搜尋 candidate 會分別遵守匯入元素的 32 Mi 字元與 32 MiB UTF-8 上限，並透過增量 BLOB 讀取精確驗證；可信本機測試可用 `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` opt in，最多 100 Mi 字元，該明確 opt-in 也會允許相應的合法 UTF-8 位元組容量。更大的 legacy candidate 回傳 HTTP 413 `search_candidate_exact_verify_limit`，不會偽裝成 exact 空結果。長文字 cursor 綁定目標 row revision，無關 row 更新不會使其失效。
+搜尋 candidate 預設分別遵守 32 Mi 字元與 32 MiB UTF-8 上限，並透過增量 BLOB 讀取精確驗證；可信本機測試可用 `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` opt in，最多 100 Mi 字元，該明確 opt-in 也會允許相應的合法 UTF-8 位元組容量。候選預算耗盡時回傳 partial/pending 與可用的簽名 continuation；超過硬性逐列限制的 legacy candidate 保持 pending，不會偽裝成 exact 空結果。長文字 cursor 綁定目標 row revision 與 identity，搜尋 anchor 直接記錄 UTF-8 byte offset。

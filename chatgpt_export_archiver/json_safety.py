@@ -5,11 +5,10 @@ import math
 from typing import Any
 
 
-# Shared import, legacy-raw, reader, and API encoder resource contract. The
-# scalar ceiling must leave room for valid exports near the separate 5,000
-# mapping-node import ceiling: real mapping nodes contain many small metadata
-# scalars even when the complete conversation remains below the 32 MiB element
-# byte/character budgets. Keep this finite to bound JSON object amplification.
+# Legacy-raw, reader, and API encoder resource contract. Conversation-source
+# framing has its own larger lexical scalar ceiling in scanner.py so a valid
+# 5,000-node export is not rejected before structural parsing. Keep this
+# sanitizer ceiling finite to bound copies of externally written legacy JSON.
 MAX_JSON_NESTING_DEPTH = 256
 MAX_JSON_SCALAR_COUNT = 250_000
 MAX_RAW_PREVIEW_NODES = 100_000
