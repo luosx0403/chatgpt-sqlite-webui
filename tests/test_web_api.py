@@ -5817,6 +5817,50 @@ class WebApiTests(unittest.TestCase):
             conn.close()
         self.assertLess(fallback_steps[0], 10_000)
 
+    def test_round10_single_conversation_effective_current_uses_bounded_python_heap(self):
+        from chatgpt_export_archiver.current_path import ensure_effective_current_views
+        from chatgpt_export_archiver.db import init_db
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        node_count = 25_000
+        conn.execute(
+            "INSERT INTO conversations(conversation_id, title, current_node, aggregate_hash) "
+            "VALUES ('bounded-chain', 'Synthetic', ?, 'h')",
+            (f"n{node_count - 1:05d}",),
+        )
+        conn.executemany(
+            "INSERT INTO conversation_nodes("
+            "conversation_id, node_id, parent_node_id, is_on_current_path"
+            ") VALUES ('bounded-chain', ?, ?, 1)",
+            (
+                (f"n{index:05d}", f"n{index - 1:05d}" if index else None)
+                for index in range(node_count)
+            ),
+        )
+        conn.commit()
+        tracing_before = tracemalloc.is_tracing()
+        if not tracing_before:
+            tracemalloc.start()
+        tracemalloc.reset_peak()
+        baseline = tracemalloc.get_traced_memory()[0]
+        try:
+            ensure_effective_current_views(conn, ["bounded-chain"])
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            if not tracing_before:
+                tracemalloc.stop()
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM effective_current_nodes").fetchone()[0],
+            node_count,
+        )
+        self.assertLess(peak - baseline, 16 * 1024 * 1024)
+        metadata = conn.execute("SELECT * FROM effective_current_meta").fetchone()
+        self.assertFalse(metadata["cycle_detected"])
+        self.assertFalse(metadata["partial_chain"])
+        conn.close()
+
     def test_empty_and_filter_only_search_defer_effective_current_materialization(self):
         from chatgpt_export_archiver import current_path as current_path_module
         from chatgpt_export_archiver import search as search_module
@@ -7650,6 +7694,87 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["diagnostics"]["completion_state"], "partial")
         self.assertEqual(payload["diagnostics"]["partial_reason"], "raw_fallback_limit")
         self.assertEqual(payload["diagnostics"]["oversized_candidates_pending"], 1)
+        self.assertTrue(payload["diagnostics"]["continuation_available"])
+
+        continued = client.get(
+            "/api/search/messages",
+            params={
+                "q": needle,
+                "path": "all",
+                "continuation": payload["diagnostics"]["continuation_token"],
+            },
+        )
+        self.assertEqual(continued.status_code, 200, continued.text)
+        continued_payload = continued.json()
+        self.assertEqual(
+            [(item["conversation_id"], item["node_id"]) for item in continued_payload["items"]],
+            [("web-1", "a1")],
+        )
+        self.assertTrue(continued_payload["total_exact"])
+        self.assertEqual(continued_payload["diagnostics"]["completion_state"], "complete")
+        self.assertEqual(continued_payload["diagnostics"]["oversized_candidates_pending"], 0)
+        self.assertFalse(continued_payload["diagnostics"]["continuation_available"])
+
+    def test_round10_unrelated_five_mib_raw_continuation_keeps_confirmed_hit(self):
+        from chatgpt_export_archiver.db import init_db, migrate_database
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "raw-continuation.db"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.executemany(
+                "INSERT INTO conversations(conversation_id,title,current_node,aggregate_hash) "
+                "VALUES (?, 'Synthetic', 'n', ?)",
+                (("confirmed", "h1"), ("raw", "h2")),
+            )
+            conn.execute(
+                "INSERT INTO conversation_nodes("
+                "conversation_id,node_id,content_type,content_text,content_hash,is_on_current_path"
+                ") VALUES ('confirmed','n','text','tiered needle','h1',1)"
+            )
+            raw = json.dumps(
+                {"content": {"content_type": "text", "parts": ["x" * (5 * 1024 * 1024)]}},
+                separators=(",", ":"),
+            )
+            conn.execute(
+                "INSERT INTO conversation_nodes("
+                "conversation_id,node_id,content_type,content_text,raw_message_json,content_hash,is_on_current_path"
+                ") VALUES ('raw','n','legacy','[non-text content: legacy]',?,'h2',1)",
+                (raw,),
+            )
+            conn.commit()
+            migrate_database(conn, refresh_compatibility=True)
+            conn.close()
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            self.addCleanup(client.close)
+
+            seen: set[tuple[str, str]] = set()
+            continuation = None
+            tiers: list[int] = []
+            for _page in range(4):
+                params = {"q": "tiered needle", "path": "all", "count_total": "true"}
+                if continuation is not None:
+                    params["continuation"] = continuation
+                response = client.get("/api/search/messages", params=params)
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                seen.update(
+                    (item["conversation_id"], item["node_id"])
+                    for item in payload["items"]
+                )
+                tiers.append(payload["diagnostics"]["raw_fallback_tier"])
+                continuation = payload["diagnostics"]["continuation_token"]
+                if payload["diagnostics"]["completion_state"] == "complete":
+                    self.assertTrue(payload["total_exact"])
+                    break
+                self.assertFalse(payload["total_exact"])
+                self.assertIsInstance(continuation, str)
+            else:
+                self.fail("raw-only verification continuation did not finish")
+            self.assertEqual(seen, {("confirmed", "n")})
+            self.assertEqual(tiers, [0, 1, 2])
 
     def test_round10_long_placeholder_uses_raw_recall_in_format_five_index(self):
         from chatgpt_export_archiver.web_db import WEB_INDEX_FORMAT_VERSION, create_web_indexes

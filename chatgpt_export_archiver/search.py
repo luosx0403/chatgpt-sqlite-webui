@@ -73,6 +73,7 @@ SEARCH_CONTINUATION_VERSION = 1
 SEARCH_BUDGET_CONTRACT_VERSION = 1
 SEARCH_RAW_EXACT_MAX_BYTES = 1024 * 1024
 SEARCH_RAW_EXACT_MAX_CHARS = 800_000
+SEARCH_RAW_CONTINUATION_TIERS = (5 * 1024 * 1024, 20 * 1024 * 1024)
 SEARCH_ENRICHMENT_MATCH_LIMIT = 10_000
 MAX_API_ROLE_CHARS = 256
 MAX_API_AUTHOR_CHARS = 4096
@@ -479,8 +480,19 @@ def search_exact_verify_limits() -> tuple[int, int]:
 def _ensure_search_functions(
     conn: sqlite3.Connection,
     parsed: ParsedQuery | None = None,
+    *,
+    raw_tier_index: int = 0,
 ) -> dict[str, Any]:
     verify_chars, verify_bytes = search_exact_verify_limits()
+    raw_tiers: list[tuple[int, int]] = [
+        (SEARCH_RAW_EXACT_MAX_CHARS, SEARCH_RAW_EXACT_MAX_BYTES)
+    ]
+    for tier in SEARCH_RAW_CONTINUATION_TIERS:
+        raw_tiers.append((tier, tier))
+    if verify_chars > raw_tiers[-1][0] or verify_bytes > raw_tiers[-1][1]:
+        raw_tiers.append((verify_chars, verify_bytes))
+    raw_tier_index = max(0, min(int(raw_tier_index), len(raw_tiers) - 1))
+    raw_verify_chars, raw_verify_bytes = raw_tiers[raw_tier_index]
     state: dict[str, Any] = {
         "exact_verify_limit_exceeded": False,
         "verify_chars": verify_chars,
@@ -510,6 +522,11 @@ def _ensure_search_functions(
         "budget_exhausted": False,
         "budget_reason": None,
         "started_monotonic": time.monotonic(),
+        "raw_tiers": raw_tiers,
+        "raw_tier_index": raw_tier_index,
+        "raw_verify_chars": raw_verify_chars,
+        "raw_verify_bytes": raw_verify_bytes,
+        "retry_pending_candidate": False,
     }
     conn.create_function("web_search_match", 3, search_fragment_match, deterministic=True)
     conn.create_function("web_display_text", 2, recover_message_display_text)
@@ -780,7 +797,7 @@ def _ensure_search_functions(
             ) as blob:
                 state["blob_reads"] += 1
                 raw_size = len(blob)
-                if raw_size > min(verify_bytes, SEARCH_RAW_EXACT_MAX_BYTES):
+                if raw_size > min(verify_bytes, raw_verify_bytes):
                     mark_pending(storage_rowid, "raw_fallback_limit")
                 else:
                     state["request_verified_bytes"] += raw_size
@@ -788,18 +805,18 @@ def _ensure_search_functions(
                         mark_pending(storage_rowid, "request_aggregate_limit")
                     else:
                         raw, _next, more, _invalid = _read_utf8_blob_chunk(
-                            blob, 0, min(verify_chars, SEARCH_RAW_EXACT_MAX_CHARS) + 1
+                            blob, 0, min(verify_chars, raw_verify_chars) + 1
                         )
                         state["raw_blob_bytes"] += min(
                             raw_size,
-                            (min(verify_chars, SEARCH_RAW_EXACT_MAX_CHARS) + 1) * 4 + 4,
+                            (min(verify_chars, raw_verify_chars) + 1) * 4 + 4,
                         )
                         state["decoded_chars"] += len(raw)
                         state["normalization_units"] += len(raw)
                         state["request_verified_chars"] += len(raw)
                         if (
                             more
-                            or len(raw) > min(verify_chars, SEARCH_RAW_EXACT_MAX_CHARS)
+                            or len(raw) > min(verify_chars, raw_verify_chars)
                             or state["request_verified_chars"] > SEARCH_REQUEST_VERIFY_CHARS
                         ):
                             mark_pending(
@@ -812,7 +829,7 @@ def _ensure_search_functions(
         resolved = recover_message_display_text(
             "[non-text content: indexed-placeholder]" if possible_placeholder else content,
             raw,
-            max_raw_chars=min(verify_chars, SEARCH_RAW_EXACT_MAX_CHARS),
+            max_raw_chars=min(verify_chars, raw_verify_chars),
         )
         if total_chars > SEARCH_CANDIDATE_SCAN_CHARS:
             state["long_proxy_cache"][storage_rowid] = resolved
@@ -1287,6 +1304,8 @@ def search_messages(
     confirmed_hits_before = 0
     pending_candidates_before = 0
     pending_reasons_before: set[str] = set()
+    raw_tier_index = 0
+    retry_pending_candidate = False
     if continuation:
         continuation_payload = _decode_search_continuation(continuation)
         if (
@@ -1324,6 +1343,24 @@ def search_messages(
             raise SearchContinuationError("invalid_search_continuation")
         pending_candidates_before = pending_value
         pending_reasons_before = set(pending_reason_values)
+        raw_tier_value = continuation_payload.get("raw_tier_index", 0)
+        retry_pending_value = continuation_payload.get(
+            "retry_pending_candidate", False
+        )
+        if (
+            isinstance(raw_tier_value, bool)
+            or not isinstance(raw_tier_value, int)
+            or raw_tier_value < 0
+            or not isinstance(retry_pending_value, bool)
+        ):
+            raise SearchContinuationError("invalid_search_continuation")
+        raw_tier_index = raw_tier_value
+        retry_pending_candidate = retry_pending_value
+        if retry_pending_candidate:
+            pending_candidates_before = max(0, pending_candidates_before - 1)
+        search_state = _ensure_search_functions(
+            conn, parsed, raw_tier_index=raw_tier_index
+        )
     _prepare_verified_message_table(conn)
     effective_page_offset = 0 if continuation else offset
     max_verified_results = (
@@ -1356,7 +1393,9 @@ def search_messages(
         if not is_optional_search_capability_missing(exc):
             raise
         _prepare_verified_message_table(conn)
-        search_state = _ensure_search_functions(conn, parsed)
+        search_state = _ensure_search_functions(
+            conn, parsed, raw_tier_index=raw_tier_index
+        )
         last_candidate_rowid, candidate_budget_exhausted = _scan_verified_message_candidates(
             conn,
             scan_parsed,
@@ -1442,6 +1481,16 @@ def search_messages(
         + 768
         for item in items
     )
+    retry_pending = bool(search_state["retry_pending_candidate"])
+    next_raw_tier_index = int(search_state["raw_tier_index"])
+    retry_reason = str(search_state["budget_reason"] or "")
+    if retry_pending and retry_reason == "raw_fallback_limit":
+        next_raw_tier_index += 1
+    raw_tier_available = next_raw_tier_index < len(search_state["raw_tiers"])
+    retry_available = retry_pending and (
+        retry_reason == "request_aggregate_limit"
+        or (retry_reason == "raw_fallback_limit" and raw_tier_available)
+    )
     continuation_token = (
         _encode_search_continuation(
             {
@@ -1453,9 +1502,16 @@ def search_messages(
                 "confirmed_hits_before": cumulative_total,
                 "pending_candidates_before": pending_count,
                 "pending_reasons_before": sorted(cumulative_pending_reasons),
+                "raw_tier_index": (
+                    next_raw_tier_index
+                    if raw_tier_available
+                    else int(search_state["raw_tier_index"])
+                ),
+                "retry_pending_candidate": retry_available,
             }
         )
-        if candidate_budget_exhausted and last_candidate_rowid > resume_after_rowid
+        if candidate_budget_exhausted
+        and (last_candidate_rowid > resume_after_rowid or retry_available)
         else None
     )
     diagnostics.update(
@@ -1484,8 +1540,9 @@ def search_messages(
             "request_verified_chars": int(search_state["request_verified_chars"]),
             "request_verify_bytes_limit": int(search_state["request_verify_bytes_limit"]),
             "request_verify_chars_limit": int(search_state["request_verify_chars_limit"]),
-            "raw_fallback_bytes_per_row": SEARCH_RAW_EXACT_MAX_BYTES,
-            "raw_fallback_chars_per_row": SEARCH_RAW_EXACT_MAX_CHARS,
+            "raw_fallback_bytes_per_row": int(search_state["raw_verify_bytes"]),
+            "raw_fallback_chars_per_row": int(search_state["raw_verify_chars"]),
+            "raw_fallback_tier": int(search_state["raw_tier_index"]),
             "verify_chunk_bytes": SEARCH_STREAM_CHUNK_BYTES,
             "oversized_candidates_seen": max(
                 int(search_state["streamed_candidates"]), pending_count
@@ -2653,8 +2710,23 @@ def _scan_verified_message_candidates(
                 interrupted = True
                 break
             storage_rowid = int(row["storage_rowid"])
+            previous_processed = last_processed
             last_processed = storage_rowid
             text = str(row["resolved_text"] or "")
+            if storage_rowid in search_state["pending_rowids"]:
+                # Stop on the first unverified row.  A continuation either
+                # retries it with a fresh aggregate budget or advances the
+                # bounded raw-only tier; advancing past it would make the
+                # cumulative result permanently false-exact.
+                last_processed = previous_processed
+                search_state["budget_exhausted"] = True
+                search_state["retry_pending_candidate"] = True
+                if search_state["pending_reasons"]:
+                    search_state["budget_reason"] = sorted(
+                        search_state["pending_reasons"]
+                    )[0]
+                interrupted = True
+                break
             if _resolved_message_matches(parsed, text, row["content_type"]):
                 verified_results += 1
                 pending_inserts.append(
