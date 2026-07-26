@@ -100,6 +100,10 @@ function assertStaticFrontendContracts() {
   assert.ok(paneSource.includes("readerDataContextKey"), "reader requests should use a data-only context key");
   assert.ok(paneSource.includes("readerLayoutContextKey"), "reader visual remeasure should use a separate layout context key");
   assert.ok(appSource.includes("canonicalShareUrl"), "Copy URL should use a canonical serializer");
+  assert.ok(
+    appSource.includes("loadConversationPage(listContinuationRef.current ? 0 : (nextOffset ?? 0), true)"),
+    "conversation continuation must preserve the token-bound initial offset",
+  );
   for (const explicitParam of ['params.set("match_mode"', 'params.set("layout"', 'params.set("show_internal"']) {
     assert.ok(appSource.includes(explicitParam), `canonical Copy URL should explicitly include ${explicitParam}`);
   }

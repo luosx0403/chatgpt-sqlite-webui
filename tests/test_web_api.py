@@ -381,6 +381,11 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(db.exists())
         self.assertTrue(first_job["verify"]["ok"])
         self.assertIn("indexed_messages", first_job["web_index"])
+        self.assertEqual(
+            set(first_job["stage_timings"]),
+            {"upload", "import", "verify", "stats", "web_index"},
+        )
+        self.assertTrue(all(value >= 0 for value in first_job["stage_timings"].values()))
         self.assertEqual(client.get("/api/conversations?limit=10").json()["total"], 2)
 
         with second_zip.open("rb") as handle:
@@ -1036,7 +1041,11 @@ class WebApiTests(unittest.TestCase):
             conn.close()
         with mock.patch.object(web_db_module, "recover_message_display_text", side_effect=count_index):
             web_db_module.create_web_indexes(db)
-        self.assertEqual(index_calls["count"], node_count)
+        # Canonical rows bypass the legacy resolver; only the three synthetic
+        # placeholder/empty exception rows need bounded raw recovery, once
+        # each.
+        self.assertEqual(index_calls["count"], 3)
+        self.assertLess(index_calls["count"], node_count)
 
     def test_plain_reader_bounds_large_raw_blob_in_sql(self):
         from chatgpt_export_archiver.search import get_messages
@@ -1974,17 +1983,25 @@ class WebApiTests(unittest.TestCase):
             response_sizes: dict[int, int] = {}
             peak_bytes: dict[int, int] = {}
             for requested_limit in (1, 30, 100, 300):
-                tracemalloc.start()
-                bounded_page = get_messages(
-                    conn,
-                    "budget",
-                    path="all",
-                    limit=requested_limit,
-                    offset=0,
-                    include_internal=True,
-                )
-                _, peak_bytes[requested_limit] = tracemalloc.get_traced_memory()
-                tracemalloc.stop()
+                tracing_before = tracemalloc.is_tracing()
+                if not tracing_before:
+                    tracemalloc.start()
+                baseline_current, _baseline_peak = tracemalloc.get_traced_memory()
+                tracemalloc.reset_peak()
+                try:
+                    bounded_page = get_messages(
+                        conn,
+                        "budget",
+                        path="all",
+                        limit=requested_limit,
+                        offset=0,
+                        include_internal=True,
+                    )
+                    _, peak = tracemalloc.get_traced_memory()
+                    peak_bytes[requested_limit] = max(0, peak - baseline_current)
+                finally:
+                    if not tracing_before:
+                        tracemalloc.stop()
                 encoded = json.dumps(bounded_page, ensure_ascii=False).encode("utf-8")
                 response_sizes[requested_limit] = len(encoded)
                 self.assertLessEqual(sum(len(item["display_text"]) for item in bounded_page["items"]), 32768)
@@ -5884,7 +5901,7 @@ class WebApiTests(unittest.TestCase):
         def spy(connection, ids):
             normalized = None if ids is None else tuple(sorted(str(value) for value in ids))
             scopes.append(normalized)
-            return real_ensure(connection, ids)
+            return real_ensure(connection, normalized)
 
         with (
             mock.patch.object(current_path_module, "ensure_effective_current_views", side_effect=spy),
@@ -5914,6 +5931,15 @@ class WebApiTests(unittest.TestCase):
             self.assertNotIn(None, scopes)
             self.assertTrue(scopes)
             self.assertLessEqual(max(len(scope or ()) for scope in scopes), 21)
+
+            scopes.clear()
+            role_page = search_module.search_conversations(
+                conn,
+                search_module.parse_query("role:user"),
+                limit=20,
+            )
+            self.assertEqual(len(role_page["items"]), 20)
+            self.assertEqual(role_page["total"], 100)
         conn.close()
 
     def test_effective_current_cache_invalidates_after_same_connection_graph_mutations(self):
@@ -5999,7 +6025,7 @@ class WebApiTests(unittest.TestCase):
         approximate = client.get("/api/search/messages?q=python&path=all&count_total=false&limit=1").json()
         self.assertFalse(approximate["total_exact"])
         empty = client.get("/api/search/messages?q=does-not-exist&count_total=false&limit=1").json()
-        self.assertFalse(empty["total_exact"])
+        self.assertTrue(empty["total_exact"])
         self.assertEqual(empty["total"], 0)
 
         selected = client.get("/api/conversations?limit=1&offset=0&sort=created&selected_id=web-1").json()
@@ -7264,6 +7290,8 @@ class WebApiTests(unittest.TestCase):
         conn.close()
 
     def test_round10_search_hit_reports_actual_source_span(self):
+        from chatgpt_export_archiver import search as search_module
+
         td, client, db = self.make_client()
         self.addCleanup(td.cleanup)
         conn = sqlite3.connect(db)
@@ -7302,6 +7330,19 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(hit["match_char_offset"], 0)
         self.assertEqual(hit["match_length"], 1)
         self.assertEqual(hit["matched_term"], "fi")
+        long_non_ascii = ("界" * 300_000) + " ﬁ"
+        with mock.patch.object(
+            search_module,
+            "_normalized_span_units",
+            side_effect=AssertionError(
+                "long source-span lookup must not allocate one tuple per character"
+            ),
+        ):
+            span = search_module._first_source_match_span(
+                long_non_ascii,
+                [("fi", "contains")],
+            )
+        self.assertEqual(span, (300_001, 300_002, "fi"))
 
     def test_round10_message_search_continuation_is_query_and_generation_bound(self):
         import chatgpt_export_archiver.search as search_module
@@ -7345,6 +7386,35 @@ class WebApiTests(unittest.TestCase):
             else:
                 self.fail("message-search continuation did not finish")
         self.assertEqual(seen, expected)
+
+        # Fast message pages must not consume an unreturned probe row when
+        # their signed candidate cursor advances.  Every confirmed hit is
+        # returned exactly once and the terminal segment proves the total.
+        fast_seen: set[tuple[str, str]] = set()
+        fast_continuation = None
+        for _page in range(len(expected) + 5):
+            request_params = {
+                **params,
+                "limit": 1,
+                "count_total": "false",
+            }
+            if fast_continuation is not None:
+                request_params["continuation"] = fast_continuation
+            response = client.get("/api/search/messages", params=request_params)
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            fast_seen.update(
+                (item["conversation_id"], item["node_id"])
+                for item in payload["items"]
+            )
+            if payload["diagnostics"]["completion_state"] == "complete":
+                self.assertTrue(payload["total_exact"])
+                break
+            fast_continuation = payload["diagnostics"]["continuation_token"]
+            self.assertIsInstance(fast_continuation, str)
+        else:
+            self.fail("fast message-search continuation did not finish")
+        self.assertEqual(fast_seen, expected)
 
         with mock.patch.object(search_module, "SEARCH_CANDIDATE_LIMIT", 1):
             first = client.get("/api/search/messages", params=params).json()
@@ -7469,11 +7539,22 @@ class WebApiTests(unittest.TestCase):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
         with mock.patch.object(search_module, "SEARCH_PAGE_ESTIMATED_BYTES", 256):
-            response = client.get(
+            message_response = client.get(
                 "/api/search/messages", params={"q": "answer", "path": "all"}
             )
-        self.assertEqual(response.status_code, 413)
-        self.assertEqual(response.json()["detail"], "search_response_resource_limit_exceeded")
+            conversation_response = client.get(
+                "/api/conversations", params={"q": "answer", "path": "all"}
+            )
+        self.assertEqual(message_response.status_code, 413)
+        self.assertEqual(
+            message_response.json()["detail"],
+            "search_response_resource_limit_exceeded",
+        )
+        self.assertEqual(conversation_response.status_code, 413)
+        self.assertEqual(
+            conversation_response.json()["detail"],
+            "search_response_resource_limit_exceeded",
+        )
 
     def test_round10_exact_search_tracks_utf8_byte_limited_candidate_as_pending(self):
         import chatgpt_export_archiver.search as search_module
@@ -7805,6 +7886,258 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["total"], 1)
+
+    def test_round10_conversation_search_continuation_reuses_verified_segments(self):
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.db import init_db, migrate_database
+        from chatgpt_export_archiver.web_db import connect_readonly
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "conversation-continuation.db"
+            writer = sqlite3.connect(db)
+            writer.row_factory = sqlite3.Row
+            init_db(writer)
+            for index in range(5):
+                conversation_id = f"segment-{index}"
+                node_id = f"node-{index}-0"
+                writer.execute(
+                    "INSERT INTO conversations(conversation_id,title,current_node,aggregate_hash) "
+                    "VALUES (?, 'Synthetic', ?, ?)",
+                    (conversation_id, node_id, f"hash-{index}"),
+                )
+                writer.execute(
+                    "INSERT INTO conversation_nodes("
+                    "conversation_id,node_id,content_type,content_text,content_hash,is_on_current_path"
+                    ") VALUES (?, ?, 'text', 'segmented exact needle', ?, 1)",
+                    (conversation_id, node_id, f"node-hash-{index}"),
+                )
+                if index == 0:
+                    for extra in range(1, 4):
+                        writer.execute(
+                            "INSERT INTO conversation_nodes("
+                            "conversation_id,node_id,content_type,content_text,"
+                            "content_hash,is_on_current_path"
+                            ") VALUES (?, ?, 'text', 'segmented exact needle', ?, 1)",
+                            (
+                                conversation_id,
+                                f"node-{index}-{extra}",
+                                f"node-hash-{index}-{extra}",
+                            ),
+                        )
+            writer.commit()
+            migrate_database(writer, refresh_compatibility=True)
+            writer.close()
+
+            reader = connect_readonly(db)
+            parsed = search_module.parse_query(
+                "segmented exact needle", path_default="all", scope="message"
+            )
+            continuation = None
+            seen: set[str] = set()
+            totals: list[int] = []
+            with mock.patch.object(search_module, "SEARCH_CANDIDATE_LIMIT", 2):
+                for _page in range(4):
+                    payload = search_module.search_conversations(
+                        reader,
+                        parsed,
+                        limit=10,
+                        offset=0,
+                        selected_id="segment-0",
+                        continuation=continuation,
+                    )
+                    self.assertIsNone(payload.get("selected_in_results"))
+                    seen.update(item["conversation_id"] for item in payload["items"])
+                    totals.append(payload["total"])
+                    continuation = payload["diagnostics"]["continuation_token"]
+                self.assertIsNone(continuation)
+            reader.close()
+            self.assertEqual(seen, {f"segment-{index}" for index in range(5)})
+            self.assertEqual(totals, [1, 1, 3, 5])
+
+    def test_round10_conversation_enrichment_is_fair_with_one_hundred_thousand_hits(self):
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.db import (
+            begin_bulk_generation_aggregation,
+            finish_bulk_generation_aggregation,
+            init_db,
+        )
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            init_db(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            begin_bulk_generation_aggregation(conn)
+            for conversation_id in ("fair-big", "fair-small-a", "fair-small-b"):
+                conn.execute(
+                    "INSERT INTO conversations("
+                    "conversation_id,title,current_node,aggregate_hash"
+                    ") VALUES (?, 'Synthetic', 'n000001', ?)",
+                    (conversation_id, f"hash-{conversation_id}"),
+                )
+            conn.execute(
+                """
+                WITH RECURSIVE sequence(value) AS (
+                    VALUES (1)
+                    UNION ALL
+                    SELECT value + 1 FROM sequence WHERE value < 100000
+                )
+                INSERT INTO conversation_nodes(
+                    conversation_id,node_id,role,content_type,content_text,
+                    content_hash,is_on_current_path
+                )
+                SELECT 'fair-big', printf('n%06d', value), 'assistant', 'text',
+                       'fair exact needle', printf('hash-%06d', value), 1
+                FROM sequence
+                """
+            )
+            for conversation_id in ("fair-small-a", "fair-small-b"):
+                conn.execute(
+                    "INSERT INTO conversation_nodes("
+                    "conversation_id,node_id,role,content_type,content_text,"
+                    "content_hash,is_on_current_path"
+                    ") VALUES (?, 'n000001', 'assistant', 'text',"
+                    "'fair exact needle', ?, 1)",
+                    (conversation_id, f"node-hash-{conversation_id}"),
+                )
+            finish_bulk_generation_aggregation(
+                conn, ("title", "message", "address", "graph")
+            )
+            conn.commit()
+
+            search_module._prepare_verified_message_table(conn)
+            conn.execute(
+                """
+                INSERT INTO temp.web_verified_message_results(
+                    storage_rowid,resolved_text,bm25_score,match_reason
+                )
+                SELECT rowid, content_text, NULL, 'substring'
+                FROM conversation_nodes
+                """
+            )
+            items = [
+                {
+                    "conversation_id": "fair-big",
+                    "message_match": True,
+                    "title_match": False,
+                    "hit_count": 100000,
+                },
+                {
+                    "conversation_id": "fair-small-a",
+                    "message_match": True,
+                    "title_match": False,
+                    "hit_count": 1,
+                },
+                {
+                    "conversation_id": "fair-small-b",
+                    "message_match": True,
+                    "title_match": False,
+                    "hit_count": 1,
+                },
+            ]
+            parsed = search_module.parse_query(
+                "fair exact needle", path_default="all", scope="message"
+            )
+            search_module._batch_conversation_enrichment(
+                conn, parsed, items, verified_messages=True
+            )
+            self.assertEqual([len(item["snippets"]) for item in items], [3, 1, 1])
+            self.assertTrue(items[0]["enrichment_partial"])
+            self.assertFalse(items[1]["enrichment_partial"])
+            self.assertFalse(items[2]["enrichment_partial"])
+        finally:
+            conn.close()
+
+    def test_round10_placeholder_boundaries_share_reader_search_and_index_semantics(self):
+        from chatgpt_export_archiver import search as search_module
+        from chatgpt_export_archiver.db import init_db, migrate_database
+        from chatgpt_export_archiver.web_db import create_web_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db = base / "placeholder-boundaries.db"
+            writer = sqlite3.connect(db)
+            writer.row_factory = sqlite3.Row
+            init_db(writer)
+            writer.execute(
+                "INSERT INTO conversations(conversation_id,title,current_node,aggregate_hash) "
+                "VALUES ('boundaries','Synthetic','n7','hash')"
+            )
+            lengths = [255, 256, 257, 199_999, 200_000, 200_001, 300_000, 4 * 1024 * 1024]
+            content_types = ["text", "tool", "code", None, "multimodal_text", "legacy", "text", "tool"]
+            prefix = "[non-text content:"
+            for index, (length, content_type) in enumerate(zip(lengths, content_types)):
+                placeholder = prefix + ("x" * (length - len(prefix) - 1)) + "]"
+                self.assertEqual(len(placeholder), length)
+                raw = json.dumps(
+                    {
+                        "content": {
+                            "content_type": "text",
+                            "parts": [f"shared boundary recall needle {index}"],
+                        }
+                    },
+                    separators=(",", ":"),
+                )
+                writer.execute(
+                    "INSERT INTO conversation_nodes("
+                    "conversation_id,node_id,content_type,content_text,raw_message_json,"
+                    "content_hash,is_on_current_path) VALUES ('boundaries',?,?,?,?,?,1)",
+                    (f"n{index}", content_type, placeholder, raw, f"h{index}"),
+                )
+            writer.commit()
+            migrate_database(writer, refresh_compatibility=True)
+            writer.close()
+
+            client = TestClient(create_app(db, static_dir=self.make_build_dir(base)))
+            self.addCleanup(client.close)
+            params = {"q": "shared boundary recall needle", "path": "all", "scope": "message"}
+            with mock.patch.object(
+                search_module,
+                "_stream_selected_search_hit",
+                side_effect=AssertionError("placeholder selected hit must reuse verified raw artifact"),
+            ):
+                before = client.get("/api/search/messages", params=params)
+            self.assertEqual(before.status_code, 200, before.text)
+            self.assertEqual(before.json()["total"], len(lengths))
+            reader = client.get(
+                "/api/conversations/boundaries/messages",
+                params={"path": "all", "include_internal": "true", "limit": 20},
+            )
+            self.assertEqual(reader.status_code, 200, reader.text)
+            self.assertEqual(
+                {item["display_text"] for item in reader.json()["items"]},
+                {f"shared boundary recall needle {index}" for index in range(len(lengths))},
+            )
+            self.assertFalse(
+                any(
+                    item["display_text_resolver_input_truncated"]
+                    for item in reader.json()["items"]
+                )
+            )
+            display = client.get(
+                "/api/by-id/display",
+                params={
+                    "conversation_id": "boundaries",
+                    "node_id": "n7",
+                    "offset": 0,
+                    "limit": 1024,
+                },
+            )
+            self.assertEqual(display.status_code, 200, display.text)
+            self.assertEqual(display.json()["display_text"], "shared boundary recall needle 7")
+            self.assertEqual(display.json()["source"], "raw_fallback")
+
+            result = create_web_indexes(db)
+            self.assertEqual(result["indexed_messages"], len(lengths) - 1)
+            self.assertEqual(result["oversized_messages"], 1)
+            with mock.patch.object(
+                search_module,
+                "_stream_selected_search_hit",
+                side_effect=AssertionError("indexed placeholder selected hit must reuse verified raw artifact"),
+            ):
+                after = client.get("/api/search/messages", params=params)
+            self.assertEqual(after.status_code, 200, after.text)
+            self.assertEqual(after.json()["total"], len(lengths))
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ const en = {
   jobElapsed: "Elapsed",
   jobLogs: "Job log",
   stageQueued: "Queued",
+  stageUpload: "Receiving upload",
   stageInspect: "Inspecting upload",
   stageImport: "Importing archive",
   stageVerify: "Verifying database",
@@ -324,6 +325,7 @@ const zhHans: Dict = {
   jobElapsed: "耗时",
   jobLogs: "任务日志",
   stageQueued: "已排队",
+  stageUpload: "接收上传文件",
   stageInspect: "检查上传文件",
   stageImport: "导入归档",
   stageVerify: "验证数据库",
@@ -615,6 +617,7 @@ const zhHant: Dict = {
   jobElapsed: "耗時",
   jobLogs: "工作紀錄檔",
   stageQueued: "已排隊",
+  stageUpload: "接收上傳檔案",
   stageInspect: "檢查上傳檔案",
   stageImport: "匯入封存",
   stageVerify: "驗證資料庫",
@@ -878,6 +881,7 @@ const zhHant: Dict = {
 
 const ja: Dict = {
   ...en,
+  stageUpload: "アップロード受信",
   remoteAccessEnabled: "信頼済みネットワークからのアクセスが明示的に有効です",
   archiveResourceContractExceeded: "Reader resource contract を超える conversation があります。CLI verify を実行してください。",
   search: "検索",
@@ -974,6 +978,7 @@ const ja: Dict = {
 
 const es: Dict = {
   ...en,
+  stageUpload: "Recibiendo carga",
   remoteAccessEnabled: "Acceso de red de confianza habilitado explícitamente",
   archiveResourceContractExceeded: "Una conversación supera el contrato de recursos del lector. Ejecuta CLI verify.",
   search: "Buscar",

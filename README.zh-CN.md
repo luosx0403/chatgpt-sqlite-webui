@@ -482,11 +482,11 @@ managed FTS、可选 Web 索引、staging、metadata、generation 与 shadow 对
 
 长正文 cursor 绑定目标 message row 直接保存的持久逐行 revision。受管 insert/update trigger 会为每次影响显示文本的写入递增该 revision，即使直接外部 SQLite writer 没有刷新 `content_hash`；无关行不会使 cursor 失效。version 5 之前的数据库会进入 migration-required 门禁，由显式 writer migration 回填 revision。cursor 还绑定稳定的 row identity 摘要，避免 rowid 重用使旧 cursor 复活。
 
-精确消息搜索以 64 KiB 重叠分块增量读取 canonical BLOB，并把已验证结果写入单个连接本地 TEMP artifact，供计数、分页、snippet、span 与 anchor 复用。每行通常限制 32 MiB 解码字符和 32 MiB UTF-8，可信本机可显式提高到 100 MiB 字符；raw-only fallback 另限 1 MiB/800,000 字符，单请求另有独立总预算和候选预算。有界请求返回已确认命中及明确的 partial/pending 诊断；仍可继续扫描时提供绑定查询、数据库身份和 generation 的签名 continuation。`count_total=false` 绝不声称总数精确。晚位置命中携带绑定行 revision 的 UTF-8 byte anchor，reader 直接 seek，不重放数 MB 页面。
+精确消息搜索与含正向正文词的会话搜索以 64 KiB 重叠分块增量读取 canonical BLOB，并把已验证结果写入单个连接本地 TEMP artifact，供计数、分页、会话聚合/enrichment、snippet、span 与 anchor 复用。每行通常限制 32 MiB 解码字符和 32 MiB UTF-8，可信本机可显式提高到 100 MiB 字符，单请求另有独立总预算和候选预算。raw-only fallback 从 1 MiB/800,000 字符开始，签名 continuation 可对同一未决行依次按 5 MiB、20 MiB 与有效逐行硬上限重试；真正超过硬上限的行保持 pending，且不会返回不可推进的 continuation。有界请求保留已确认命中，并仅在可继续推进时提供绑定查询、数据库身份和 generation 的 continuation。消息页始终返回 `total_exact`：partial 分段为 false；扫描完成（包括 continuation 终页）后，即使 `count_total=false` 也可证明累计总数精确。晚位置命中携带绑定行 revision 的 UTF-8 byte anchor；命中导航把该不透明 byte cursor 交给增量 BLOB 读取，兼容的字符 anchor 路径仍可能扫描一次请求前缀。
 
 单个新导入会话元素独立限制为 32 MiB UTF-8、32 MiB 解码字符、1,000,000 lexical scalar 与 5,000 mapping node；legacy/API sanitizer 另限 250,000 scalar。超出 node 限制以 `conversation_node_limit_exceeded` 跳过且不保存内容。reader/effective-current/export 的 100,000-node 上限只为兼容 legacy 或外部写入数据库，不代表允许导入 100,000 node。多个 ZIP shard 共用一个读取 session；目录发现采用增量预算。空 `parent` 按 legacy root/missing-parent 兼容。legacy ID readiness 检查全部地址/图字段的长度与不安全 Unicode，并以持久字段 revision 失效缓存，普通读取不轮询 `PRAGMA data_version`。
 
-项目批量导入在同一写锁事务内临时替换精确的项目自有 generation trigger，每个 dirty 字段域只推进一次，再恢复并校验 trigger；回滚或崩溃恢复原 DDL/数据，外部 writer 仍使用普通逐语句 trigger。有限 effective-current scope 通过有界 SQLite TEMP 批次精确比较。整库导出将 plan 与 node spool 到临时 SQLite，并 keyset 流式读取，不在 Python 中保存全归档 node graph。
+项目批量导入在同一写锁事务内临时替换精确的项目自有 generation trigger，每个 dirty 字段域只推进一次，再恢复并校验 trigger；回滚或崩溃恢复原 DDL/数据，外部 writer 仍使用普通逐语句 trigger。有限 effective-current scope（包括单个 100,000-node legacy 会话）通过 SQLite TEMP relation 精确比较；raw-flag cycle 遍历使用紧凑整数数组，不再复制多份 Python 字符串图。整库导出将 plan 与 node spool 到临时 SQLite，并 keyset 流式读取，不在 Python 中保存全归档 node graph。
 
 使用 `--delete-input-on-success` 时，canonical commit 成功前用户原路径始终存在。commit 后先持久写入并 fsync 绑定身份的恢复 journal，再 rename；中断会留下 token，可用 `python chatgpt_archive.py recover-delete-input --directory <目录> --token <token>` 明确恢复，且绝不覆盖替换文件。Windows 或缺少 descriptor-relative no-follow 身份能力的平台会拒绝安全删除。Web Python constraints 只固定 resolved version，仍不是跨平台 hash lock；应使用可信包索引。
 

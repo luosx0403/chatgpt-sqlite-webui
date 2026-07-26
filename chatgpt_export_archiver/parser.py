@@ -8,6 +8,7 @@ from typing import Any
 from .identifiers import MAX_CANONICAL_ID_LENGTH, canonical_id_length, canonical_id_text, unicode_scalar_text
 from .json_safety import JsonSafetyLimitError, validate_json_lexical_limits
 from .utils import canonical_json, compact_json, sha256_text
+from .display_resolver import is_generated_placeholder, normalize_visible_text
 
 
 RAW_MESSAGE_NOT_PARSED = object()
@@ -17,13 +18,7 @@ MAX_IMPORT_NODES_PER_CONVERSATION = 5_000
 def is_generated_non_text_placeholder(value: str | None) -> bool:
     """Return true only for the complete canonical placeholder grammar."""
 
-    stripped = normalize_display_text(value).strip()
-    for prefix in ("[non-text content:", "[non-text part:"):
-        if not stripped.startswith(prefix) or not stripped.endswith("]"):
-            continue
-        payload = stripped[len(prefix) : -1]
-        return bool(payload.strip()) and "]" not in payload and "\n" not in payload and "\r" not in payload
-    return False
+    return is_generated_placeholder(value)
 
 
 @dataclass
@@ -370,8 +365,7 @@ def _normalize_title(value: Any, source_file: str, array_index: int, warnings: l
 def normalize_display_text(value: str | None) -> str:
     """Canonical visible/search representation for legacy and new text."""
 
-    scalar, _changed = unicode_scalar_text(value or "", replace_invalid=True)
-    return (scalar or "").replace("\x00", "\ufffd")
+    return normalize_visible_text(value)
 
 
 def _normalize_visible_scalar(

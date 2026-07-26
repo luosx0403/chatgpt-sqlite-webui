@@ -6,6 +6,7 @@ import math
 import os
 import re
 import sqlite3
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -836,7 +837,7 @@ def create_api_router(
                     "raw_fallback_chars_per_row": SEARCH_RAW_EXACT_MAX_CHARS,
                     "candidate_limit": SEARCH_CANDIDATE_LIMIT,
                     "wall_deadline_seconds": SEARCH_WALL_DEADLINE_SECONDS,
-                    "exact_verifier": "candidate rows are verified once into a connection-local TEMP result artifact through bounded incremental BLOB reads; count, page, payload, snippet, source span, and byte anchor reuse that artifact. Candidate, decoded-character, UTF-8 byte, raw-fallback, request-aggregate, SQLite VM, wall, and response ceilings produce an explicit partial page rather than erasing confirmed hits",
+                    "exact_verifier": "message results and positive-body conversation results verify candidate rows once into a connection-local TEMP result artifact through bounded incremental BLOB reads; count, page, conversation aggregation/enrichment, payload, snippet, source span, and byte anchor reuse that artifact. Candidate, decoded-character, UTF-8 byte, raw-fallback, request-aggregate, SQLite VM, wall, and response ceilings produce an explicit partial page rather than erasing confirmed hits",
                     "continuation": "a signed opaque candidate cursor binds database identity, schema and optional-index format, durable generations, the full query/filter/path/scope/match/order/page contract, cumulative confirmed/pending counts, and the budget-contract version; query or database changes return search_continuation_stale",
                     "resource_error_codes": ["search_page_exact_materialization_limit", "search_response_resource_limit_exceeded", "invalid_search_continuation", "search_continuation_stale"],
                 },
@@ -921,7 +922,8 @@ def create_api_router(
                 "job_id": "lowercase 32-character hexadecimal UUID; invalid syntax returns invalid_job_id and a valid unknown ID returns job_not_found",
                 "statuses": ["queued", "running", "succeeded", "failed", "postcheck_failed"],
                 "outcomes": ["queued", "import_running", "import_job_start_failed", "input_preflight_failed", "source_scan_failed", "source_read_failed", "json_decode_failed", "top_level_contract_failed", "import_transaction_failed", "canonical_commit_succeeded", "verify_failed", "stats_failed", "web_index_failed", "web_index_cancelled", "succeeded"],
-                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index", "web_index_cancel_requested", "web_index_cancelled"],
+                "fields": ["status", "stage", "outcome", "canonical_commit_succeeded", "error_code", "error_type", "cleanup_warning", "cleanup_warnings", "summary", "verify", "stats", "web_index", "web_index_cancel_requested", "web_index_cancelled", "stage_timings"],
+                "stage_timings": "content-free wall seconds accumulated separately for upload, canonical import, verify, stats, and optional Web-index build",
                 "web_index_progress": ["status", "build_stage", "processed", "total", "complete", "batch_size", "processed_input_bytes", "processed_normalized_bytes", "current_batch_input_bytes", "current_batch_normalized_bytes", "current_batch_derived_bytes", "peak_batch_input_bytes", "peak_batch_normalized_bytes", "peak_batch_derived_bytes", "oversized_rows"],
                 "web_index_cancellation": "the cancel endpoint is accepted only while the import job is in web-index or web-index-recovery; cancellation rolls back staging objects and keeps the previous optional index readable",
                 "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "upload_disk_space_insufficient", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "source_member_limit_exceeded", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "json_nesting_limit_exceeded", "json_scalar_limit_exceeded", "conversation_json_element_too_large", "conversation_node_limit_exceeded", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_empty", "import_disk_space_insufficient", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_disk_space_insufficient", "web_index_failed"],
@@ -1041,6 +1043,7 @@ def create_api_router(
         path: str = "current",
         match_mode: str = "contains",
         selected_id: Annotated[str | None, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)] = None,
+        continuation: Annotated[str | None, Query(max_length=4096)] = None,
         conn=Depends(get_optional_conn),
     ):
         _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
@@ -1062,11 +1065,26 @@ def create_api_router(
         if conn is None:
             return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
         if parsed.has_search_context():
-            return search_conversations(conn, parsed, limit=limit, offset=offset, sort=sort, selected_id=selected_id)
+            try:
+                return search_conversations(
+                    conn,
+                    parsed,
+                    limit=limit,
+                    offset=offset,
+                    sort=sort,
+                    selected_id=selected_id,
+                    continuation=continuation,
+                )
+            except SearchContinuationError as exc:
+                status = 409 if exc.code == "search_continuation_stale" else 400
+                raise HTTPException(status_code=status, detail=exc.code) from exc
+            except SearchResourceLimitError as exc:
+                raise HTTPException(status_code=413, detail=exc.code) from exc
         return list_conversations(conn, limit=limit, offset=offset, sort=sort, after=parsed.after, before=parsed.before, selected_id=selected_id)
 
     @router.post("/import/upload")
     async def import_upload(request: Request, file: UploadFile = File(...)):
+        upload_started = time.perf_counter()
         ingress_reserved = bool(getattr(request.state, "upload_slot_reserved", False))
         if not ingress_reserved and not manager.acquire_pending_upload_slot():
             raise HTTPException(status_code=409, detail="import_job_active")
@@ -1105,7 +1123,12 @@ def create_api_router(
                 raise HTTPException(status_code=400, detail="uploaded_file_invalid_zip")
             _validate_upload_zip_members(upload_path, policy)
             try:
-                job = manager.start_import(upload_path, filename=Path(filename.replace("\\", "/")).name, size=size)
+                job = manager.start_import(
+                    upload_path,
+                    filename=Path(filename.replace("\\", "/")).name,
+                    size=size,
+                    upload_seconds=time.perf_counter() - upload_started,
+                )
             except ImportJobStartError as exc:
                 raise HTTPException(
                     status_code=503,
@@ -1530,6 +1553,7 @@ def create_api_router(
         source: Annotated[str | None, Query(max_length=200)] = None,
         match_mode: str = "contains",
         selected_id: Annotated[str | None, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)] = None,
+        continuation: Annotated[str | None, Query(max_length=4096)] = None,
         conn=Depends(get_optional_conn),
     ):
         _validate_common(sort=sort, scope=scope, role=role, path=path, match_mode=match_mode)
@@ -1538,7 +1562,18 @@ def create_api_router(
         if conn is None:
             return _empty_page(limit, offset, selected_id=selected_id, db_ready=False)
         try:
-            return search_conversations(conn, parsed, limit=limit, offset=offset, sort=sort, selected_id=selected_id)
+            return search_conversations(
+                conn,
+                parsed,
+                limit=limit,
+                offset=offset,
+                sort=sort,
+                selected_id=selected_id,
+                continuation=continuation,
+            )
+        except SearchContinuationError as exc:
+            status = 409 if exc.code == "search_continuation_stale" else 400
+            raise HTTPException(status_code=status, detail=exc.code) from exc
         except SearchResourceLimitError as exc:
             raise HTTPException(status_code=413, detail=exc.code) from exc
 

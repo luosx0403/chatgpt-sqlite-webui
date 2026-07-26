@@ -1190,7 +1190,11 @@ class ArchiverTests(unittest.TestCase):
                 resolver_calls += 1
                 return real_resolver(*args, **kwargs)
 
-            tracemalloc.start()
+            tracing_before = tracemalloc.is_tracing()
+            if not tracing_before:
+                tracemalloc.start()
+            baseline_current, _baseline_peak = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
             try:
                 with mock.patch.object(web_db_module, "recover_message_display_text", side_effect=counted_resolver):
                     result = create_web_indexes(
@@ -1199,14 +1203,19 @@ class ArchiverTests(unittest.TestCase):
                         progress_callback=lambda stage, state: progress.append((stage, dict(state))),
                     )
                 _current, peak = tracemalloc.get_traced_memory()
+                peak_delta = max(0, peak - baseline_current)
             finally:
-                tracemalloc.stop()
+                if not tracing_before:
+                    tracemalloc.stop()
             self.assertEqual(result["indexed_messages"], count)
             self.assertEqual(result["indexed_titles"], count)
             self.assertEqual(result["batch_size"], 127)
             self.assertTrue(result["atomic_publish"])
-            self.assertEqual(resolver_calls, count)
-            self.assertLess(peak, 96 * 1024 * 1024)
+            # Ordinary canonical text is already proven usable by the
+            # bounded prefix classifier and must not traverse the legacy/raw
+            # resolver at all.
+            self.assertEqual(resolver_calls, 0)
+            self.assertLess(peak_delta, 96 * 1024 * 1024)
             self.assertEqual({stage for stage, _state in progress}, set(result["progress_stages"]))
             for stage in result["progress_stages"]:
                 states = [state for observed, state in progress if observed == stage]
@@ -1820,12 +1829,20 @@ class ArchiverTests(unittest.TestCase):
                 encoding="utf-8",
             )
             source = resolve_input(str(source_json), base)
-            tracemalloc.start()
-            count = sum(1 for _ in iter_json_array_from_source(source, "conversations.json"))
-            _, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
+            tracing_before = tracemalloc.is_tracing()
+            if not tracing_before:
+                tracemalloc.start()
+            baseline_current, _baseline_peak = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
+            try:
+                count = sum(1 for _ in iter_json_array_from_source(source, "conversations.json"))
+                _, peak = tracemalloc.get_traced_memory()
+                peak_delta = max(0, peak - baseline_current)
+            finally:
+                if not tracing_before:
+                    tracemalloc.stop()
             self.assertEqual(count, 3000)
-            self.assertLess(peak, 8_000_000)
+            self.assertLess(peak_delta, 8_000_000)
 
             valid_prefix = ",".join(
                 json.dumps(conversation(f"rollback-{index}", mapping={"root": null_message_node("root", None, [])}, current_node="root"))
@@ -2989,7 +3006,11 @@ class ArchiverTests(unittest.TestCase):
             conn.commit()
             statements: list[str] = []
             conn.set_trace_callback(statements.append)
-            tracemalloc.start()
+            tracing_before = tracemalloc.is_tracing()
+            if not tracing_before:
+                tracemalloc.start()
+            tracemalloc.reset_peak()
+            baseline_allocated = tracemalloc.get_traced_memory()[0]
             try:
                 with (
                     mock.patch.object(exporter, "write_chunks_if_changed", return_value=(False, "synthetic-hash", 0)),
@@ -3005,7 +3026,8 @@ class ArchiverTests(unittest.TestCase):
                     )
                 _current, peak = tracemalloc.get_traced_memory()
             finally:
-                tracemalloc.stop()
+                if not tracing_before:
+                    tracemalloc.stop()
                 conn.set_trace_callback(None)
                 conn.close()
             node_selects = [
@@ -3017,7 +3039,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertEqual(result["conversations"], count)
             self.assertEqual(len(node_selects), count // 200)
             self.assertFalse(any("WHERE conversation_id = 'export-" in sql for sql in statements))
-            self.assertLess(peak, 160 * 1024 * 1024)
+            self.assertLess(peak - baseline_allocated, 160 * 1024 * 1024)
 
     @unittest.skipUnless(
         os.environ.get("CHATGPT_ARCHIVE_ROUND7_SCALE_TEST") == "1",
@@ -3049,21 +3071,29 @@ class ArchiverTests(unittest.TestCase):
                     for conversation_id in conversation_ids
                 }
 
-            tracemalloc.start()
+            tracing_before = tracemalloc.is_tracing()
+            if not tracing_before:
+                tracemalloc.start()
+            baseline_current, _baseline_peak = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
             started = time.perf_counter()
-            with (
-                mock.patch.object(exporter, "check_conversation_export_budgets", new=synthetic_budgets),
-                mock.patch.object(exporter, "write_chunks_if_changed", new=lambda *_args, **_kwargs: (False, "synthetic-hash", 0)),
-                mock.patch.object(exporter, "_write_manifest_from_plan", new=lambda *_args, **_kwargs: None),
-                mock.patch.object(exporter, "_validate_archive_export_outputs", new=lambda *_args, **_kwargs: None),
-                mock.patch.object(exporter, "record_export", new=lambda *_args, **_kwargs: None),
-            ):
-                result = exporter.export_conversations(conn, base / "output", ["txt"])
-            elapsed = time.perf_counter() - started
-            _current, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
+            try:
+                with (
+                    mock.patch.object(exporter, "check_conversation_export_budgets", new=synthetic_budgets),
+                    mock.patch.object(exporter, "write_chunks_if_changed", new=lambda *_args, **_kwargs: (False, "synthetic-hash", 0)),
+                    mock.patch.object(exporter, "_write_manifest_from_plan", new=lambda *_args, **_kwargs: None),
+                    mock.patch.object(exporter, "_validate_archive_export_outputs", new=lambda *_args, **_kwargs: None),
+                    mock.patch.object(exporter, "record_export", new=lambda *_args, **_kwargs: None),
+                ):
+                    result = exporter.export_conversations(conn, base / "output", ["txt"])
+                elapsed = time.perf_counter() - started
+                _current, peak = tracemalloc.get_traced_memory()
+                peak_delta = max(0, peak - baseline_current)
+            finally:
+                if not tracing_before:
+                    tracemalloc.stop()
             self.assertEqual(result["conversations"], count)
-            self.assertLess(peak, 256 * 1024 * 1024)
+            self.assertLess(peak_delta, 256 * 1024 * 1024)
             self.assertLess(elapsed, 600)
             self.assertFalse(list((base / "output").glob(".chatgpt-archive-export-plan-*.sqlite3")))
             conn.close()
@@ -4427,12 +4457,18 @@ class ArchiverTests(unittest.TestCase):
                 return 0
 
             conn.set_progress_handler(progress, 10_000)
-            tracemalloc.start()
+            tracing_before = tracemalloc.is_tracing()
+            if not tracing_before:
+                tracemalloc.start()
+            baseline_current, _baseline_peak = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
             try:
                 violations = foreign_key_diagnostics(conn, sample_limit=20)
                 _current, peak = tracemalloc.get_traced_memory()
+                peak_delta = max(0, peak - baseline_current)
             finally:
-                tracemalloc.stop()
+                if not tracing_before:
+                    tracemalloc.stop()
                 conn.set_progress_handler(None, 0)
                 conn.close()
             self.assertEqual(violations["foreign_key_violations"], 100_000)
@@ -4444,7 +4480,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertTrue(violations["foreign_key_check_complete"])
             self.assertTrue(violations["foreign_key_violations_exact"])
             self.assertGreater(progress_calls, 0)
-            self.assertLess(peak, 16 * 1024 * 1024)
+            self.assertLess(peak_delta, 16 * 1024 * 1024)
 
     def test_export_basenames_respect_utf8_component_budget_on_disk(self):
         from chatgpt_export_archiver.exporter import MAX_EXPORT_BASENAME_BYTES, export_conversations
@@ -4633,6 +4669,10 @@ class ArchiverTests(unittest.TestCase):
         from tools import make_release_zip
 
         root = Path(__file__).resolve().parents[1]
+        self.assertIn(
+            "chatgpt_export_archiver/display_resolver.py",
+            make_release_zip.AUTHORITATIVE_REQUIRED_FILES,
+        )
         with tempfile.TemporaryDirectory() as td:
             output = Path(td) / "release.zip"
             original = b"previous-verified-release"
@@ -6580,12 +6620,20 @@ class ArchiverTests(unittest.TestCase):
             output = base / "large.zip"
             payload = [("large.bin", source)]
             manifest = make_release_zip._file_manifest(payload)
-            tracemalloc.start()
-            make_release_zip._write_archive_paths(output, payload, manifest)
-            make_release_zip._verify_archive_paths(output, manifest)
-            _current, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
-            self.assertLess(peak, 8 * 1024 * 1024)
+            tracing_before = tracemalloc.is_tracing()
+            if not tracing_before:
+                tracemalloc.start()
+            baseline_current, _baseline_peak = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
+            try:
+                make_release_zip._write_archive_paths(output, payload, manifest)
+                make_release_zip._verify_archive_paths(output, manifest)
+                _current, peak = tracemalloc.get_traced_memory()
+                peak_delta = max(0, peak - baseline_current)
+            finally:
+                if not tracing_before:
+                    tracemalloc.stop()
+            self.assertLess(peak_delta, 8 * 1024 * 1024)
             self.assertEqual(manifest[0]["size"], source.stat().st_size)
 
     def test_round7_effective_current_metadata_never_uses_cardinality_as_identity(self):

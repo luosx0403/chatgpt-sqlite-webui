@@ -223,6 +223,7 @@ function importStageLabel(t: (key: string) => string, stage: string): string {
     inspect: t("stageInspect"),
     inspecting: t("stageInspect"),
     validating_upload: t("stageInspect"),
+    upload: t("stageUpload"),
     import: t("stageImport"),
     importing: t("stageImport"),
     source_scan_complete: t("stageImport"),
@@ -417,6 +418,7 @@ export default function App() {
   const detailRequestRef = useRef(0);
   const detailControllerRef = useRef<AbortController | null>(null);
   const listControllerRef = useRef<AbortController | null>(null);
+  const listContinuationRef = useRef<string | null>(null);
   const selectedIdRef = useRef<string | null>(null);
   const selectedRef = useRef<ConversationSummary | null>(null);
   const importPollGenerationRef = useRef(0);
@@ -552,6 +554,8 @@ export default function App() {
     const requestId = ++listRequestRef.current;
     const requestedSelectedId = selectedIdRef.current;
     const requestedContextKey = searchContextKey;
+    const requestedContinuation = append ? listContinuationRef.current : null;
+    if (!append) listContinuationRef.current = null;
     if (append) setLoadingMore(true);
     else setLoading(true);
     setError(null);
@@ -564,6 +568,7 @@ export default function App() {
       offset,
       limit: settings.listPageSize,
       selectedId: requestedSelectedId,
+      continuation: requestedContinuation,
       signal: controller.signal
     })
       .then((page) => {
@@ -581,8 +586,9 @@ export default function App() {
         setTotal(page.total);
         setHasMore(page.has_more);
         setNextOffset(page.next_offset);
-        if (append) return;
+        listContinuationRef.current = page.diagnostics?.continuation_token ?? null;
         setDiagnostics(page.diagnostics ?? null);
+        if (append) return;
         if (selectedIdRef.current !== requestedSelectedId) return;
         const selectedStillMatches = requestedSelectedId ? page.selected_in_results !== false : false;
         if (selectedStillMatches && requestedSelectedId) {
@@ -681,8 +687,11 @@ export default function App() {
   };
 
   const loadMore = () => {
-    if (!hasMore || nextOffset === null || loading || loadingMore) return;
-    loadConversationPage(nextOffset, true);
+    if (!hasMore || (nextOffset === null && !listContinuationRef.current) || loading || loadingMore) return;
+    // A signed continuation already binds the initial offset. Sending the
+    // ordinary next_offset alongside it would change that contract and make
+    // the backend correctly reject the token as stale.
+    loadConversationPage(listContinuationRef.current ? 0 : (nextOffset ?? 0), true);
   };
 
   const startImport = () => {
@@ -865,6 +874,14 @@ export default function App() {
                 <span>{importJob.status === "succeeded" ? t("importSucceeded") : importJob.status === "postcheck_failed" ? t("importPostcheckFailed") : importJob.status === "failed" ? t("importFailed") : t("importRunning")}</span>
                 <span>{t("jobStage")}: {importStageLabel(t, importJob.stage)}</span>
                 <span>{t("jobElapsed")}: {importJob.elapsed_seconds.toFixed(1)}s</span>
+                {importJob.stage_timings && Object.keys(importJob.stage_timings).length > 0 && (
+                  <span data-testid="import-stage-timings">
+                    {Object.entries(importJob.stage_timings)
+                      .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+                      .map(([stage, seconds]) => `${importStageLabel(t, stage)} ${Math.max(0, seconds).toFixed(1)}s`)
+                      .join(" · ")}
+                  </span>
+                )}
                 {importJob.summary && <span>{String(importJob.summary.valid_conversations ?? 0)} {t("conversations")}</span>}
                 {importJob.web_index && ["building", "cancelling"].includes(String(importJob.web_index.status || "")) ? (
                   <span data-testid="web-index-progress">{webIndexProgressLabel(t, importJob.web_index)}</span>

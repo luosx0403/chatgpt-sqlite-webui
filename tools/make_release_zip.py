@@ -27,6 +27,7 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "chatgpt_archive.py",
     "chatgpt_export_archiver/__init__.py",
     "chatgpt_export_archiver/current_path.py",
+    "chatgpt_export_archiver/display_resolver.py",
     "chatgpt_export_archiver/search.py",
     "chatgpt_export_archiver/exporter.py",
     "chatgpt_export_archiver/identifiers.py",

@@ -102,6 +102,7 @@ export function getConversations(args: {
   limit?: number;
   offset?: number;
   selectedId?: string | null;
+  continuation?: string | null;
   matchMode?: MatchMode;
   signal?: AbortSignal;
 }): Promise<ConversationPage> {
@@ -112,6 +113,7 @@ export function getConversations(args: {
     limit: args.limit ?? 50,
     offset: args.offset ?? 0,
     selected_id: args.selectedId,
+    continuation: args.continuation,
     role: args.filters?.role,
     scope: args.filters?.scope,
     title: args.filters?.title,

@@ -387,6 +387,7 @@ export interface ImportJob {
   error_type: string | null;
   cleanup_warning: string | null;
   cleanup_warnings: CleanupWarning[];
+  stage_timings?: Record<string, number>;
   log_tail: string[];
 }
 

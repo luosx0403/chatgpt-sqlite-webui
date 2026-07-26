@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -80,6 +81,7 @@ class ImportJob:
     canonical_commit_succeeded: bool = False
     cleanup_warning: str | None = None
     cleanup_warnings: list[dict[str, str]] = field(default_factory=list)
+    stage_timings: dict[str, float] = field(default_factory=dict)
     _web_index_cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=1000))
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
@@ -109,6 +111,7 @@ class ImportJob:
                 "error_type": self.error_type,
                 "cleanup_warning": self.cleanup_warning,
                 "cleanup_warnings": [dict(item) for item in self.cleanup_warnings],
+                "stage_timings": dict(self.stage_timings),
                 "log_tail": list(self.logs)[-100:],
             }
 
@@ -120,6 +123,22 @@ class ImportJobStartError(RuntimeError):
         super().__init__("import_job_start_failed")
         self.code = "import_job_start_failed"
         self.error_type = error_type
+
+
+@contextmanager
+def _timed_job_stage(job: ImportJob, name: str):
+    """Accumulate content-free wall timing for one production job stage."""
+
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = max(0.0, time.perf_counter() - started)
+        with job._lock:
+            job.stage_timings[name] = round(
+                float(job.stage_timings.get(name, 0.0)) + elapsed,
+                6,
+            )
 
 
 def _add_cleanup_warning(
@@ -183,13 +202,21 @@ class ImportJobManager:
             if self._running_job_id == "__pending_upload__":
                 self._running_job_id = None
 
-    def start_import(self, upload_path: Path, *, filename: str, size: int) -> ImportJob:
+    def start_import(
+        self,
+        upload_path: Path,
+        *,
+        filename: str,
+        size: int,
+        upload_seconds: float = 0.0,
+    ) -> ImportJob:
         with self._lock:
             self._prune_jobs_locked()
             if self._running_job_id is not None and self._running_job_id != "__pending_upload__":
                 raise RuntimeError("an import job is already running")
             job_id = uuid.uuid4().hex
             job = ImportJob(job_id=job_id, db_path=self.db_path, upload_path=upload_path, filename=filename, size=size)
+            job.stage_timings["upload"] = round(max(0.0, upload_seconds), 6)
             self._jobs[job_id] = job
             self._running_job_id = job_id
         try:
@@ -303,17 +330,18 @@ class ImportJobManager:
         self._set_stage(job, "import")
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            result = run_import_pipeline(
-                self.db_path,
-                str(job.upload_path),
-                cwd=Path.cwd(),
-                no_input_sha256=True,
-                rebuild_fts=True,
-                optimize_after_import_flag=False,
-                optimize_fts_after_import=False,
-                delete_input_on_success=False,
-                progress_callback=lambda stage, summary: self._progress(job, stage, summary),
-            )
+            with _timed_job_stage(job, "import"):
+                result = run_import_pipeline(
+                    self.db_path,
+                    str(job.upload_path),
+                    cwd=Path.cwd(),
+                    no_input_sha256=True,
+                    rebuild_fts=True,
+                    optimize_after_import_flag=False,
+                    optimize_fts_after_import=False,
+                    delete_input_on_success=False,
+                    progress_callback=lambda stage, summary: self._progress(job, stage, summary),
+                )
             with job._lock:
                 job.summary = dict(result["summary"])
                 job.canonical_commit_succeeded = True
@@ -329,11 +357,12 @@ class ImportJobManager:
                 self._log(job, "warning", f"summary_update_after_close_failed {result['summary_update_after_close_failed']}")
             self._set_stage(job, "verify")
             try:
-                conn = connect(self.db_path)
-                try:
-                    verify_result = verify_database(conn)
-                finally:
-                    conn.close()
+                with _timed_job_stage(job, "verify"):
+                    conn = connect(self.db_path)
+                    try:
+                        verify_result = verify_database(conn)
+                    finally:
+                        conn.close()
                 with job._lock:
                     job.verify = verify_result
             except Exception as exc:
@@ -352,11 +381,12 @@ class ImportJobManager:
                     self._set_stage(job, "web-index-recovery")
                     try:
                         builder: WebIndexBuilder = create_web_indexes
-                        web_index_result = builder(
-                            self.db_path,
-                            progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
-                            cancel_check=job._web_index_cancel_event.is_set,
-                        )
+                        with _timed_job_stage(job, "web_index"):
+                            web_index_result = builder(
+                                self.db_path,
+                                progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
+                                cancel_check=job._web_index_cancel_event.is_set,
+                            )
                         web_index_result["recovered_optional_web_index"] = True
                         conn = connect(self.db_path)
                         try:
@@ -397,11 +427,12 @@ class ImportJobManager:
                     return
             self._set_stage(job, "stats")
             try:
-                conn = connect(self.db_path)
-                try:
-                    stats_result = get_stats(conn)
-                finally:
-                    conn.close()
+                with _timed_job_stage(job, "stats"):
+                    conn = connect(self.db_path)
+                    try:
+                        stats_result = get_stats(conn)
+                    finally:
+                        conn.close()
                 with job._lock:
                     job.stats = stats_result
             except Exception as exc:
@@ -419,11 +450,12 @@ class ImportJobManager:
             if job.web_index is None:
                 try:
                     builder: WebIndexBuilder = create_web_indexes
-                    web_index_result = builder(
-                        self.db_path,
-                        progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
-                        cancel_check=job._web_index_cancel_event.is_set,
-                    )
+                    with _timed_job_stage(job, "web_index"):
+                        web_index_result = builder(
+                            self.db_path,
+                            progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
+                            cancel_check=job._web_index_cancel_event.is_set,
+                        )
                     with job._lock:
                         job.web_index = web_index_result
                 except WebIndexBuildCancelled as exc:

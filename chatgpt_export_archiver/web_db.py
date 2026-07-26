@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import codecs
 import json
 import math
 import os
@@ -36,7 +37,8 @@ from .disk_resources import (
     require_free_space,
     web_index_required_bytes,
 )
-from .parser import is_generated_non_text_placeholder, recover_message_display_text
+from .display_resolver import PlaceholderStreamClassifier
+from .parser import recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
@@ -52,7 +54,7 @@ from .sqlite_errors import (
 from .search import _derived_generation_is_current, invalidate_capability_cache, normalize_search_text
 
 WEB_INDEX_FORMAT_VERSION = OPTIONAL_WEB_INDEX_FORMAT_VERSION
-WEB_INDEX_BATCH_SIZE = 200
+WEB_INDEX_BATCH_SIZE = 5_000
 WEB_INDEX_PROGRESS_VM_STEPS = 10_000
 WEB_INDEX_MAX_INPUT_BYTES = 4 * 1024 * 1024
 WEB_INDEX_MAX_NORMALIZED_BYTES = 2 * 1024 * 1024
@@ -555,9 +557,18 @@ def _blob_is_generated_non_text_placeholder(
 
     if size <= 0 or size > WEB_INDEX_MAX_INPUT_BYTES:
         return False
+    classifier = PlaceholderStreamClassifier()
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     with conn.blobopen("conversation_nodes", "content_text", rowid, readonly=True) as blob:
-        value = blob.read().decode("utf-8", errors="replace")
-    return is_generated_non_text_placeholder(value)
+        while True:
+            data = blob.read(64 * 1024)
+            if not data:
+                break
+            classifier.feed(decoder.decode(data, final=False))
+            if classifier.phase == "invalid":
+                return False
+        classifier.feed(decoder.decode(b"", final=True))
+    return classifier.exact_placeholder
 
 
 def _drop_owned_staging_objects(conn: sqlite3.Connection, names: tuple[str, ...]) -> None:
@@ -742,7 +753,7 @@ def create_web_indexes(
     the atomic rename transaction commits.
     """
 
-    batch_size = max(1, min(1_000, int(batch_size)))
+    batch_size = max(1, min(10_000, int(batch_size)))
     process_lock = acquire_web_index_process_lock(db_path)
     try:
         conn = connect_writable(db_path)
@@ -913,7 +924,7 @@ def create_web_indexes(
             batch_normalized_bytes = 0
             batch_derived_bytes = 0
             processed_in_batch = 0
-            selected_rows: list[tuple[sqlite3.Row, int, int, bool, int]] = []
+            selected_rows: list[tuple[sqlite3.Row, int, int, bool, int, bool]] = []
             for row in rows:
                 check_cancel()
                 rowid = int(row["rowid"])
@@ -944,7 +955,7 @@ def create_web_indexes(
                     continue
                 if processed_in_batch and batch_materialized_bytes + input_bytes > WEB_INDEX_BATCH_INPUT_BYTES:
                     break
-                selected_rows.append((row, rowid, content_size, canonical_usable, raw_size))
+                selected_rows.append((row, rowid, content_size, canonical_usable, raw_size, marker_prefix))
                 batch_materialized_bytes += input_bytes
                 message_materialized_bytes += input_bytes
                 processed_in_batch += 1
@@ -959,19 +970,24 @@ def create_web_indexes(
                 ):
                     materialized[int(value_row[0])] = (bytes(value_row[1] or b""), None)
             fallback_ids = [item[1] for item in selected_rows if not item[3]]
+            marker_ids = {item[1] for item in selected_rows if item[5]}
             if fallback_ids:
                 placeholders = ",".join("?" for _ in fallback_ids)
                 for value_row in conn.execute(
-                    f"SELECT rowid, CAST(content_text AS BLOB), CAST(raw_message_json AS BLOB) "
+                    f"SELECT rowid, CAST(raw_message_json AS BLOB) "
                     f"FROM conversation_nodes WHERE rowid IN ({placeholders})",
                     fallback_ids,
                 ):
                     materialized[int(value_row[0])] = (
-                        bytes(value_row[1] or b""),
-                        None if value_row[2] is None else bytes(value_row[2]),
+                        (
+                            b"[non-text content: streamed-placeholder]"
+                            if int(value_row[0]) in marker_ids
+                            else b""
+                        ),
+                        None if value_row[1] is None else bytes(value_row[1]),
                     )
             selected_processed = 0
-            for row, rowid, content_size, canonical_usable, raw_size in selected_rows:
+            for row, rowid, content_size, canonical_usable, raw_size, _marker_prefix in selected_rows:
                 content_bytes, raw_bytes = materialized[rowid]
                 content_value = content_bytes.decode("utf-8", errors="replace")
                 raw_value = (
@@ -980,7 +996,15 @@ def create_web_indexes(
                     else None
                 )
                 actual_bytes = content_size if canonical_usable else content_size + raw_size
-                display_text = recover_message_display_text(content_value, raw_value)
+                # The bounded prefix/full-placeholder classifier above has
+                # already established that an ordinary canonical row is the
+                # display body.  Re-running the legacy resolver here would
+                # normalize and classify the complete body a second time.
+                display_text = (
+                    content_value
+                    if canonical_usable
+                    else recover_message_display_text(content_value, raw_value)
+                )
                 content_norm = normalize_search_text(display_text)
                 if content_norm:
                     normalized_bytes = len(content_norm.encode("utf-8"))
@@ -1177,7 +1201,8 @@ def create_web_indexes(
             trigram_processed = 0
             while True:
                 rows = conn.execute(
-                    f"""SELECT n.rowid AS source_rowid, mn.rowid AS normalized_rowid
+                    f"""SELECT n.rowid AS source_rowid,
+                               length(CAST(mn.content_norm AS BLOB)) AS normalized_bytes
                        FROM conversation_nodes n
                        JOIN {message_norm_build} mn
                          ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
@@ -1188,37 +1213,33 @@ def create_web_indexes(
                 ).fetchall()
                 if not rows:
                     break
-                bind_rows: list[tuple[int, str]] = []
-                bind_bytes = 0
-                peak_bind_bytes = 0
+                batch_rows = 0
+                batch_bytes = 0
+                batch_last_rowid = last_rowid
                 for row in rows:
                     check_cancel()
-                    with conn.blobopen(
-                        message_norm_build, "content_norm", int(row["normalized_rowid"]), readonly=True
-                    ) as blob:
-                        value_bytes = blob.read()
-                    if bind_rows and bind_bytes + len(value_bytes) > WEB_INDEX_FTS_BIND_BATCH_BYTES:
-                        conn.executemany(
-                            f"INSERT INTO {message_trigram_build}(rowid, content_text) VALUES (?, ?)",
-                            bind_rows,
-                        )
-                        bind_rows = []
-                        bind_bytes = 0
-                        check_cancel()
-                    bind_rows.append((int(row["source_rowid"]), value_bytes.decode("utf-8", errors="replace")))
-                    bind_bytes += len(value_bytes)
-                    peak_bind_bytes = max(peak_bind_bytes, bind_bytes)
-                if bind_rows:
-                    conn.executemany(
-                        f"INSERT INTO {message_trigram_build}(rowid, content_text) VALUES (?, ?)",
-                        bind_rows,
-                    )
-                resource_progress["current_batch_normalized_bytes"] = peak_bind_bytes
-                resource_progress["peak_batch_normalized_bytes"] = max(
-                    resource_progress["peak_batch_normalized_bytes"], peak_bind_bytes
+                    value_bytes = int(row["normalized_bytes"] or 0)
+                    if batch_rows and batch_bytes + value_bytes > WEB_INDEX_FTS_BIND_BATCH_BYTES:
+                        break
+                    batch_rows += 1
+                    batch_bytes += value_bytes
+                    batch_last_rowid = int(row["source_rowid"])
+                conn.execute(
+                    f"""INSERT INTO {message_trigram_build}(rowid, content_text)
+                        SELECT n.rowid, mn.content_norm
+                        FROM conversation_nodes n
+                        JOIN {message_norm_build} mn
+                          ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
+                        WHERE n.rowid > ? AND n.rowid <= ?
+                        ORDER BY n.rowid""",
+                    (last_rowid, batch_last_rowid),
                 )
-                last_rowid = int(rows[-1]["source_rowid"])
-                trigram_processed += len(rows)
+                resource_progress["current_batch_normalized_bytes"] = batch_bytes
+                resource_progress["peak_batch_normalized_bytes"] = max(
+                    resource_progress["peak_batch_normalized_bytes"], batch_bytes
+                )
+                last_rowid = batch_last_rowid
+                trigram_processed += batch_rows
                 commit_phase("build_message_trigram")
                 report("build_message_trigram", trigram_processed, indexed_messages)
 
@@ -1229,7 +1250,8 @@ def create_web_indexes(
             trigram_processed = 0
             while True:
                 rows = conn.execute(
-                    f"""SELECT c.rowid AS source_rowid, tn.rowid AS normalized_rowid
+                    f"""SELECT c.rowid AS source_rowid,
+                               length(CAST(tn.title_norm AS BLOB)) AS normalized_bytes
                        FROM conversations c
                        JOIN {title_norm_build} tn ON tn.conversation_id = c.conversation_id
                        WHERE c.rowid > ?
@@ -1239,37 +1261,32 @@ def create_web_indexes(
                 ).fetchall()
                 if not rows:
                     break
-                bind_rows = []
-                bind_bytes = 0
-                peak_bind_bytes = 0
+                batch_rows = 0
+                batch_bytes = 0
+                batch_last_rowid = last_rowid
                 for row in rows:
                     check_cancel()
-                    with conn.blobopen(
-                        title_norm_build, "title_norm", int(row["normalized_rowid"]), readonly=True
-                    ) as blob:
-                        value_bytes = blob.read()
-                    if bind_rows and bind_bytes + len(value_bytes) > WEB_INDEX_FTS_BIND_BATCH_BYTES:
-                        conn.executemany(
-                            f"INSERT INTO {title_trigram_build}(rowid, title) VALUES (?, ?)",
-                            bind_rows,
-                        )
-                        bind_rows = []
-                        bind_bytes = 0
-                        check_cancel()
-                    bind_rows.append((int(row["source_rowid"]), value_bytes.decode("utf-8", errors="replace")))
-                    bind_bytes += len(value_bytes)
-                    peak_bind_bytes = max(peak_bind_bytes, bind_bytes)
-                if bind_rows:
-                    conn.executemany(
-                        f"INSERT INTO {title_trigram_build}(rowid, title) VALUES (?, ?)",
-                        bind_rows,
-                    )
-                resource_progress["current_batch_normalized_bytes"] = peak_bind_bytes
-                resource_progress["peak_batch_normalized_bytes"] = max(
-                    resource_progress["peak_batch_normalized_bytes"], peak_bind_bytes
+                    value_bytes = int(row["normalized_bytes"] or 0)
+                    if batch_rows and batch_bytes + value_bytes > WEB_INDEX_FTS_BIND_BATCH_BYTES:
+                        break
+                    batch_rows += 1
+                    batch_bytes += value_bytes
+                    batch_last_rowid = int(row["source_rowid"])
+                conn.execute(
+                    f"""INSERT INTO {title_trigram_build}(rowid, title)
+                        SELECT c.rowid, tn.title_norm
+                        FROM conversations c
+                        JOIN {title_norm_build} tn ON tn.conversation_id = c.conversation_id
+                        WHERE c.rowid > ? AND c.rowid <= ?
+                        ORDER BY c.rowid""",
+                    (last_rowid, batch_last_rowid),
                 )
-                last_rowid = int(rows[-1]["source_rowid"])
-                trigram_processed += len(rows)
+                resource_progress["current_batch_normalized_bytes"] = batch_bytes
+                resource_progress["peak_batch_normalized_bytes"] = max(
+                    resource_progress["peak_batch_normalized_bytes"], batch_bytes
+                )
+                last_rowid = batch_last_rowid
+                trigram_processed += batch_rows
                 commit_phase("build_title_trigram")
                 report("build_title_trigram", trigram_processed, indexed_titles)
         else:

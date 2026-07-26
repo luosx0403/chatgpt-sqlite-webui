@@ -11,7 +11,7 @@ import codecs
 import secrets
 import struct
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
@@ -26,14 +26,18 @@ SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
 MAX_JSON_INTEGER_DIGITS = 1000
 JSON_STREAM_CHUNK_BYTES = 64 * 1024
 MAX_CONVERSATION_JSON_SCALARS = 1_000_000
-_JSON_OUTSIDE_SPECIAL_RE = re.compile(r'["\[\]{},:\s\ufeff]')
+_JSON_OUTSIDE_SPECIAL_RE = re.compile(
+    r'"(?:\\[\s\S]|[^"\\])*"|["\[\]{}\ufeff]'
+)
 _JSON_STRING_SPECIAL_RE = re.compile(r'["\\]')
 _JSON_SCALAR_END_RE = re.compile(r'[,\]]')
+_JSON_NON_STRING_SCALAR_RE = re.compile(r'[^\s,\]:{}\[\]"]+')
 # Both limits are intentional.  The byte limit is the externally documented
 # resource contract; the character limit independently bounds the Python
 # decoded representation for ASCII-heavy input.
 MAX_JSON_ELEMENT_BYTES = 32 * 1024 * 1024
 MAX_JSON_ELEMENT_CHARS = 32 * 1024 * 1024
+JSON_RAW_DECODE_WINDOW_CHARS = 4 * 1024 * 1024
 MAX_SOURCE_TOTAL_MEMBERS = 100_000
 MAX_SOURCE_DIRECTORY_DEPTH = 256
 MAX_SOURCE_RELATIVE_PATH_BYTES = 32 * 1024
@@ -1010,7 +1014,13 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
         entries = []
         root_identity = _file_identity(base)
         discovered_identities: dict[str, tuple[int, int, int, int, int]] = {}
-        for rel, size, identity in _walk_directory_without_links(base):
+        # Consume the sorted discovery tuples destructively.  At the 100,000
+        # member boundary this transfers their path/identity objects into the
+        # durable entry and identity collections instead of retaining a third
+        # complete helper collection until every SourceEntry has been built.
+        discovered = _walk_directory_without_links(base)
+        while discovered:
+            rel, size, identity = discovered.pop()
             discovered_identities[rel] = identity
             if is_metadata_path(rel):
                 continue
@@ -1025,18 +1035,14 @@ def list_source_entries(input_source: InputSource) -> list[SourceEntry]:
             )
         object.__setattr__(input_source, "directory_identities", discovered_identities)
         object.__setattr__(input_source, "directory_root_identity", root_identity)
-    selected = set(e.source_path for e in select_conversation_sources(entries))
-    return [
-        SourceEntry(
-            source_path=e.source_path,
-            file_type=e.file_type,
-            size=e.size,
-            extension=e.extension,
-            is_conversation_json=e.is_conversation_json,
-            is_selected_conversation_source=e.source_path in selected,
-        )
-        for e in entries
-    ]
+    selected = {e.source_path for e in select_conversation_sources(entries)}
+    # Only the normally tiny selected subset needs replacement.  Rebuilding
+    # every frozen SourceEntry used to double the complete member list at the
+    # scanner's upper bound.
+    for index, entry in enumerate(entries):
+        if entry.source_path in selected:
+            entries[index] = replace(entry, is_selected_conversation_source=True)
+    return entries
 
 
 def select_conversation_sources(entries: Iterable[SourceEntry]) -> list[SourceEntry]:
@@ -1227,7 +1233,163 @@ def _iter_utf8_chunks(stream: BinaryIO) -> Iterator[str]:
         yield tail
 
 
+class _MeasuredJsonObject(dict[str, Any]):
+    json_scalar_count: int
+    json_depth: int
+
+
+def _measure_decoded_json(value: Any) -> tuple[int, int]:
+    if isinstance(value, _MeasuredJsonObject):
+        return value.json_scalar_count, value.json_depth
+    if isinstance(value, list):
+        scalar_count = 0
+        child_depth = 0
+        for child in value:
+            child_scalars, depth = _measure_decoded_json(child)
+            scalar_count += child_scalars
+            child_depth = max(child_depth, depth)
+            if scalar_count > MAX_CONVERSATION_JSON_SCALARS:
+                raise JsonSafetyLimitError(
+                    "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
+                )
+        depth = child_depth + 1
+        if depth > MAX_JSON_NESTING_DEPTH:
+            raise JsonSafetyLimitError(
+                "json_nesting_limit_exceeded", limit=MAX_JSON_NESTING_DEPTH
+            )
+        return scalar_count, depth
+    return 1, 0
+
+
+def _measured_object_pairs(pairs: list[tuple[str, Any]]) -> _MeasuredJsonObject:
+    scalar_count = len(pairs)  # Every object key is a JSON string scalar.
+    child_depth = 0
+    for _key, value in pairs:
+        child_scalars, depth = _measure_decoded_json(value)
+        scalar_count += child_scalars
+        child_depth = max(child_depth, depth)
+        if scalar_count > MAX_CONVERSATION_JSON_SCALARS:
+            raise JsonSafetyLimitError(
+                "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
+            )
+    depth = child_depth + 1
+    if depth > MAX_JSON_NESTING_DEPTH:
+        raise JsonSafetyLimitError(
+            "json_nesting_limit_exceeded", limit=MAX_JSON_NESTING_DEPTH
+        )
+    value = _MeasuredJsonObject(pairs)
+    value.json_scalar_count = scalar_count
+    value.json_depth = depth
+    return value
+
+
 def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
+    """Decode retained top-level tails with the C JSON decoder.
+
+    Input is still consumed incrementally and only one decoded array element
+    is yielded at a time.  A 4 MiB coalescing window avoids rescanning a
+    growing tail for every 64 KiB source read; the existing 32 MiB per-element
+    byte and character ceilings bound the retained tail.
+    """
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_measured_object_pairs,
+        parse_constant=_reject_non_finite_json_number,
+        parse_float=_parse_finite_json_float,
+        parse_int=_parse_bounded_json_int,
+    )
+    phase = "start"
+    saw_element = False
+    tail = ""
+    pending: list[str] = []
+    pending_chars = 0
+
+    def decode_window(data: str, *, final: bool) -> Iterator[Any]:
+        nonlocal phase, saw_element, tail
+        position = 0
+        length = len(data)
+        while True:
+            while position < length and data[position] in " \t\r\n":
+                position += 1
+            if position >= length:
+                tail = ""
+                return
+            character = data[position]
+            if character == "\ufeff":
+                raise InvalidConversationEncodingError("invalid_conversation_encoding")
+            if phase == "start":
+                if character != "[":
+                    top_level_type = {
+                        "{": "dict", '"': "str", "t": "bool", "f": "bool", "n": "NoneType"
+                    }.get(character, "number")
+                    raise ConversationJsonTopLevelError(top_level_type)
+                phase = "between"
+                position += 1
+                continue
+            if phase == "after":
+                if character == ",":
+                    phase = "between"
+                    position += 1
+                    continue
+                if character == "]":
+                    phase = "done"
+                    position += 1
+                    continue
+                raise json.JSONDecodeError("Expecting ',' delimiter", data, position)
+            if phase == "done":
+                raise json.JSONDecodeError("Extra data", data, position)
+            if character == "]":
+                if saw_element:
+                    raise json.JSONDecodeError("Expecting value", data, position)
+                phase = "done"
+                position += 1
+                continue
+
+            element_start = position
+            try:
+                value, element_end = decoder.raw_decode(data, position)
+            except json.JSONDecodeError:
+                tail = data[element_start:]
+                tail_chars = len(tail)
+                if tail_chars > MAX_JSON_ELEMENT_CHARS or len(tail.encode("utf-8")) > MAX_JSON_ELEMENT_BYTES:
+                    raise ConversationJsonElementTooLargeError("conversation_json_element_too_large")
+                if final:
+                    raise
+                return
+            element_text = data[element_start:element_end]
+            element_chars = len(element_text)
+            element_bytes = len(element_text.encode("utf-8"))
+            if element_chars > MAX_JSON_ELEMENT_CHARS or element_bytes > MAX_JSON_ELEMENT_BYTES:
+                raise ConversationJsonElementTooLargeError("conversation_json_element_too_large")
+            _measure_decoded_json(value)
+            if isinstance(value, dict):
+                measured = ConversationJsonObject(value)
+                measured.input_utf8_bytes = element_bytes
+                measured.decoded_chars = element_chars
+                value = measured
+            position = element_end
+            phase = "after"
+            saw_element = True
+            yield value
+
+    for chunk in chunks:
+        pending.append(chunk)
+        pending_chars += len(chunk)
+        if pending_chars < JSON_RAW_DECODE_WINDOW_CHARS:
+            continue
+        window = tail + "".join(pending)
+        tail = ""
+        pending.clear()
+        pending_chars = 0
+        yield from decode_window(window, final=False)
+    window = tail + "".join(pending)
+    tail = ""
+    yield from decode_window(window, final=True)
+    if phase != "done":
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+
+def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
     decoder = json.JSONDecoder(
         parse_constant=_reject_non_finite_json_number,
         parse_float=_parse_finite_json_float,
@@ -1291,6 +1453,28 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
             raise JsonSafetyLimitError(
                 "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
             )
+
+    def scan_outside_segment(value: str) -> None:
+        """Count non-string tokens while C regex skips punctuation runs.
+
+        The previous scanner returned to Python for every comma, colon and
+        whitespace character.  Large metadata-rich exports contain millions
+        of those delimiters.  This keeps the exact lexical accounting while
+        returning only for the much rarer scalar token spans.
+        """
+
+        nonlocal scalar_token
+        position = 0
+        for match in _JSON_NON_STRING_SCALAR_RE.finditer(value):
+            if match.start() > position:
+                finish_scalar_token()
+            if not scalar_token:
+                # A token may continue from the preceding chunk; in that case
+                # scalar_token is already true and must be counted only once.
+                scalar_token = True
+            position = match.end()
+        if position < len(value):
+            finish_scalar_token()
 
     for chunk in chunks:
         i = 0
@@ -1388,18 +1572,27 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
                     continue
                 match = _JSON_OUTSIDE_SPECIAL_RE.search(chunk, i)
                 if match is None:
-                    if i < len(chunk):
-                        scalar_token = True
+                    scan_outside_segment(chunk[i:])
                     i = len(chunk)
                     break
                 if match.start() > i:
-                    scalar_token = True
+                    scan_outside_segment(chunk[i : match.start()])
                 i = match.start()
                 char = chunk[i]
                 if char == "\ufeff":
                     raise InvalidConversationEncodingError("invalid_conversation_encoding")
                 if char == '"':
                     finish_scalar_token()
+                    if match.end() - match.start() > 1:
+                        # A complete JSON string is recognized in the C regex
+                        # engine.  Only strings split across chunks fall back
+                        # to the incremental escape/quote state machine.
+                        count_string_scalar()
+                        i = match.end()
+                        if kind == "string":
+                            completed_at = i
+                            break
+                        continue
                     in_string = True
                 elif char in "[{":
                     finish_scalar_token()
@@ -1485,7 +1678,9 @@ def _walk_directory_without_links(
                         ))
         except OSError as exc:
             raise ValueError("input_source_scan_failed") from exc
-    results.sort(key=lambda item: item[0])
+    # list_source_entries consumes this with pop(), yielding ascending paths
+    # without a second complete path list.
+    results.sort(key=lambda item: item[0], reverse=True)
     return results
 
 
