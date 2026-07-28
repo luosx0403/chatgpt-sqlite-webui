@@ -8,6 +8,7 @@ import os
 import secrets
 import sqlite3
 import stat
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -37,12 +38,13 @@ from .disk_resources import (
     require_free_space,
     web_index_required_bytes,
 )
-from .display_resolver import PlaceholderStreamClassifier
+from .display_resolver import PlaceholderStreamClassifier, placeholder_prefix_may_match
 from .parser import recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
     OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+    STABLE_OPTIONAL_ADDRESS_VERSION,
     parse_nonnegative_integer,
 )
 from .sqlite_errors import (
@@ -96,48 +98,128 @@ class WebIndexBuildError(ValueError):
 class _WebIndexProcessLock:
     """Kernel-owned cross-process proof held for one complete index build."""
 
-    def __init__(self, fd: int) -> None:
-        self.fd = fd
+    def __init__(self, fds: list[int], keys: set[tuple[str, str]]) -> None:
+        self.fds = fds
+        self.keys = set(keys)
+
+    def bind_database(self, db_path: Path) -> None:
+        """Acquire any newly-created entity lock before database work begins."""
+
+        registry = _process_lock_registry()
+        for key in _database_lock_keys(db_path):
+            if key in self.keys:
+                continue
+            self.fds.append(_acquire_process_lock_key(registry, key))
+            self.keys.add(key)
+
+    def revalidate(self, db_path: Path) -> None:
+        """Fail if the path now names a different database entity."""
+
+        current = set(_database_lock_keys(db_path))
+        if current != self.keys:
+            raise WebIndexBuildError("database_identity_changed")
 
     def close(self) -> None:
-        if self.fd < 0:
-            return
-        fd, self.fd = self.fd, -1
-        try:
-            if os.name == "nt":
-                import msvcrt
+        fds, self.fds = self.fds, []
+        for fd in reversed(fds):
+            try:
+                if os.name == "nt":
+                    import msvcrt
 
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
-def acquire_web_index_process_lock(db_path: Path) -> _WebIndexProcessLock:
-    """Acquire a nonblocking OS lock; its lifetime, not wall time, proves liveness."""
+_PROCESS_LOCK_MAGIC = "chatgpt-sqlite-webui-process-lock"
+_PROCESS_LOCK_FORMAT = 2
 
-    lock_path = db_path.parent / f".{db_path.name}.web-index.lock"
-    flags = os.O_RDWR | os.O_CREAT
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+
+def _process_lock_registry() -> Path:
+    uid = getattr(os, "getuid", lambda: 0)()
+    directory = Path(tempfile.gettempdir()) / f"chatgpt-sqlite-webui-locks-{uid}"
     try:
-        fd = os.open(lock_path, flags, 0o600)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise OSError("unsafe_lock_identity")
-        if info.st_size == 0:
-            os.write(fd, b"\0")
-            os.fsync(fd)
-        os.lseek(fd, 0, os.SEEK_SET)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_uid", uid) != uid
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise OSError("unsafe_lock_registry")
     except OSError:
-        if "fd" in locals():
-            os.close(fd)
         raise WebIndexBuildError("web_index_process_lock_failed") from None
+    return directory
+
+
+def _database_lock_keys(db_path: Path) -> list[tuple[str, str]]:
+    """Return path and existing-file identity domains without storing paths."""
+
+    canonical = db_path.expanduser().absolute().resolve(strict=False)
+    path_identity = hashlib.sha256(
+        b"path\0" + os.fsencode(str(canonical))
+    ).hexdigest()
+    keys = [("path", path_identity)]
     try:
+        info = canonical.stat()
+    except FileNotFoundError:
+        return keys
+    except OSError:
+        raise WebIndexBuildError("web_index_process_lock_failed") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise WebIndexBuildError("web_index_process_lock_failed")
+    entity = f"{int(info.st_dev)}:{int(info.st_ino)}".encode("ascii")
+    keys.append(("entity", hashlib.sha256(b"entity\0" + entity).hexdigest()))
+    return sorted(keys)
+
+
+def _acquire_process_lock_key(registry: Path, key: tuple[str, str]) -> int:
+    kind, identity = key
+    name = f"{kind}-{identity}.lock"
+    payload = json.dumps(
+        {
+            "database_identity": identity,
+            "format_version": _PROCESS_LOCK_FORMAT,
+            "kind": kind,
+            "magic": _PROCESS_LOCK_MAGIC,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    fd: int | None = None
+    try:
+        directory_fd = os.open(
+            registry,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory_fd)
+                os.write(fd, payload)
+                os.fsync(fd)
+            except FileExistsError:
+                fd = os.open(name, flags, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size != len(payload)
+        ):
+            raise OSError("unsafe_lock_identity")
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.read(fd, len(payload) + 1) != payload:
+            raise OSError("unknown_lock_payload")
+        os.lseek(fd, 0, os.SEEK_SET)
         if os.name == "nt":
             import msvcrt
 
@@ -146,13 +228,31 @@ def acquire_web_index_process_lock(db_path: Path) -> _WebIndexProcessLock:
             import fcntl
 
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return _WebIndexProcessLock(fd)
+        return fd
     except (BlockingIOError, PermissionError):
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
         raise WebIndexBuildError("web_index_build_in_progress") from None
     except OSError:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
         raise WebIndexBuildError("web_index_process_lock_failed") from None
+
+
+def acquire_web_index_process_lock(db_path: Path) -> _WebIndexProcessLock:
+    """Acquire a nonblocking OS lock; its lifetime, not wall time, proves liveness."""
+
+    registry = _process_lock_registry()
+    keys = _database_lock_keys(db_path)
+    lock = _WebIndexProcessLock([], set())
+    try:
+        for key in keys:
+            lock.fds.append(_acquire_process_lock_key(registry, key))
+            lock.keys.add(key)
+        return lock
+    except Exception:
+        lock.close()
+        raise
 
 
 _LEASE_TABLE_DDL = f"""CREATE TABLE {WEB_INDEX_BUILD_LEASE_TABLE}(
@@ -327,12 +427,14 @@ def _validate_staging_objects(
 
 
 _LEASE_MESSAGE_XINFO = (
-    ("conversation_id", "TEXT", True, None, 1, False),
-    ("node_id", "TEXT", True, None, 2, False),
+    ("stable_id", "INTEGER", False, None, 1, False),
+    ("conversation_id", "TEXT", True, None, 0, False),
+    ("node_id", "TEXT", True, None, 0, False),
     ("content_norm", "TEXT", True, None, 0, False),
 )
 _LEASE_TITLE_XINFO = (
-    ("conversation_id", "TEXT", True, None, 1, False),
+    ("stable_id", "INTEGER", False, None, 1, False),
+    ("conversation_id", "TEXT", True, None, 0, False),
     ("title_norm", "TEXT", True, None, 0, False),
 )
 _LEASE_METADATA_XINFO = (
@@ -340,8 +442,8 @@ _LEASE_METADATA_XINFO = (
     ("value", "TEXT", True, None, 0, False),
 )
 _LEASE_OVERSIZED_XINFO = (
-    ("kind", "TEXT", True, None, 1, False),
-    ("source_rowid", "INTEGER", True, None, 2, False),
+    ("stable_id", "INTEGER", False, None, 1, False),
+    ("kind", "TEXT", True, None, 0, False),
     ("conversation_id", "TEXT", True, None, 0, False),
     ("node_id", "TEXT", False, None, 0, False),
     ("input_bytes", "INTEGER", True, None, 0, False),
@@ -436,6 +538,8 @@ def web_index_status(
         and metadata.get("web_index_format_version") == WEB_INDEX_FORMAT_VERSION
         and metadata.get("display_text_resolver_version") == DISPLAY_TEXT_RESOLVER_VERSION
         and metadata.get("normalization_index_format_version") == NORMALIZATION_INDEX_FORMAT_VERSION
+        and metadata.get("stable_optional_address_version") == STABLE_OPTIONAL_ADDRESS_VERSION
+        and len(metadata.get("stable_optional_address_identity", "")) == 32
     )
     message_norm_normalized = format_current and schema["web_message_norm"] and (
         metadata.get("message_norm_text") == "normalized" or metadata.get("message_trigram_text") == "normalized"
@@ -757,6 +861,8 @@ def create_web_indexes(
     process_lock = acquire_web_index_process_lock(db_path)
     try:
         conn = connect_writable(db_path)
+        process_lock.bind_database(db_path)
+        process_lock.revalidate(db_path)
     except Exception:
         process_lock.close()
         raise
@@ -864,15 +970,17 @@ def create_web_indexes(
         title_total = int(conn.execute("SELECT COUNT(*) AS c FROM conversations").fetchone()["c"])
         conn.execute(
             f"""CREATE TABLE {message_norm_build}(
+                   stable_id INTEGER PRIMARY KEY,
                    conversation_id TEXT NOT NULL,
                    node_id TEXT NOT NULL,
                    content_norm TEXT NOT NULL,
-                   PRIMARY KEY(conversation_id, node_id)
+                   UNIQUE(conversation_id, node_id)
                )"""
         )
         conn.execute(
             f"""CREATE TABLE {title_norm_build}(
-                   conversation_id TEXT NOT NULL PRIMARY KEY,
+                   stable_id INTEGER PRIMARY KEY,
+                   conversation_id TEXT NOT NULL UNIQUE,
                    title_norm TEXT NOT NULL
                )"""
         )
@@ -884,13 +992,12 @@ def create_web_indexes(
         )
         conn.execute(
             f"""CREATE TABLE {oversized_build}(
+                   stable_id INTEGER PRIMARY KEY,
                    kind TEXT NOT NULL,
-                   source_rowid INTEGER NOT NULL,
                    conversation_id TEXT NOT NULL,
                    node_id TEXT,
                    input_bytes INTEGER NOT NULL,
-                   reason TEXT NOT NULL,
-                   PRIMARY KEY(kind, source_rowid)
+                   reason TEXT NOT NULL
                )"""
         )
         commit_phase("scan_normalize_messages")
@@ -931,8 +1038,9 @@ def create_web_indexes(
                 content_size = int(row["content_size"] or 0)
                 content_prefix_bytes = bytes(row["content_prefix"] or b"")
                 content_prefix = content_prefix_bytes.decode("utf-8", errors="replace")
-                possible_marker = content_prefix.lstrip().startswith(
-                    ("[non-text content:", "[non-text part:")
+                possible_marker = placeholder_prefix_may_match(
+                    content_prefix,
+                    truncated=content_size > len(content_prefix_bytes),
                 )
                 marker_prefix = bool(possible_marker) and _blob_is_generated_non_text_placeholder(
                     conn, rowid, content_size
@@ -946,8 +1054,10 @@ def create_web_indexes(
                 input_bytes = chosen_size if canonical_usable else content_size + raw_size
                 if input_bytes > WEB_INDEX_MAX_INPUT_BYTES:
                     conn.execute(
-                        f"INSERT INTO {oversized_build} VALUES ('message', ?, ?, ?, ?, 'input_bytes')",
-                        (rowid, row["conversation_id"], row["node_id"], input_bytes),
+                        f"INSERT INTO {oversized_build}"
+                        "(kind, conversation_id, node_id, input_bytes, reason) "
+                        "VALUES ('message', ?, ?, ?, 'input_bytes')",
+                        (row["conversation_id"], row["node_id"], input_bytes),
                     )
                     oversized_messages += 1
                     last_rowid = max(last_rowid, rowid)
@@ -1016,8 +1126,10 @@ def create_web_indexes(
                         batch_normalized_bytes += normalized_bytes
                         normalized_materialized_bytes += normalized_bytes
                         conn.execute(
-                            f"INSERT INTO {oversized_build} VALUES ('message', ?, ?, ?, ?, 'derived_bytes')",
-                            (rowid, row["conversation_id"], row["node_id"], actual_bytes),
+                            f"INSERT INTO {oversized_build}"
+                            "(kind, conversation_id, node_id, input_bytes, reason) "
+                            "VALUES ('message', ?, ?, ?, 'derived_bytes')",
+                            (row["conversation_id"], row["node_id"], actual_bytes),
                         )
                         oversized_messages += 1
                         last_rowid = max(last_rowid, rowid)
@@ -1141,8 +1253,10 @@ def create_web_indexes(
                     or normalized_bytes * 4 > WEB_INDEX_MAX_DERIVED_BYTES
                 ):
                     conn.execute(
-                        f"INSERT INTO {oversized_build} VALUES ('title', ?, ?, NULL, ?, 'byte_budget')",
-                        (rowid, row["conversation_id"], input_bytes),
+                        f"INSERT INTO {oversized_build}"
+                        "(kind, conversation_id, node_id, input_bytes, reason) "
+                        "VALUES ('title', ?, NULL, ?, 'byte_budget')",
+                        (row["conversation_id"], input_bytes),
                     )
                     oversized_titles += 1
                 else:
@@ -1201,13 +1315,11 @@ def create_web_indexes(
             trigram_processed = 0
             while True:
                 rows = conn.execute(
-                    f"""SELECT n.rowid AS source_rowid,
+                    f"""SELECT mn.stable_id AS stable_id,
                                length(CAST(mn.content_norm AS BLOB)) AS normalized_bytes
-                       FROM conversation_nodes n
-                       JOIN {message_norm_build} mn
-                         ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
-                       WHERE n.rowid > ?
-                       ORDER BY n.rowid
+                       FROM {message_norm_build} mn
+                       WHERE mn.stable_id > ?
+                       ORDER BY mn.stable_id
                        LIMIT ?""",
                     (last_rowid, batch_size),
                 ).fetchall()
@@ -1223,15 +1335,13 @@ def create_web_indexes(
                         break
                     batch_rows += 1
                     batch_bytes += value_bytes
-                    batch_last_rowid = int(row["source_rowid"])
+                    batch_last_rowid = int(row["stable_id"])
                 conn.execute(
                     f"""INSERT INTO {message_trigram_build}(rowid, content_text)
-                        SELECT n.rowid, mn.content_norm
-                        FROM conversation_nodes n
-                        JOIN {message_norm_build} mn
-                          ON mn.conversation_id = n.conversation_id AND mn.node_id = n.node_id
-                        WHERE n.rowid > ? AND n.rowid <= ?
-                        ORDER BY n.rowid""",
+                        SELECT mn.stable_id, mn.content_norm
+                        FROM {message_norm_build} mn
+                        WHERE mn.stable_id > ? AND mn.stable_id <= ?
+                        ORDER BY mn.stable_id""",
                     (last_rowid, batch_last_rowid),
                 )
                 resource_progress["current_batch_normalized_bytes"] = batch_bytes
@@ -1250,12 +1360,11 @@ def create_web_indexes(
             trigram_processed = 0
             while True:
                 rows = conn.execute(
-                    f"""SELECT c.rowid AS source_rowid,
+                    f"""SELECT tn.stable_id AS stable_id,
                                length(CAST(tn.title_norm AS BLOB)) AS normalized_bytes
-                       FROM conversations c
-                       JOIN {title_norm_build} tn ON tn.conversation_id = c.conversation_id
-                       WHERE c.rowid > ?
-                       ORDER BY c.rowid
+                       FROM {title_norm_build} tn
+                       WHERE tn.stable_id > ?
+                       ORDER BY tn.stable_id
                        LIMIT ?""",
                     (last_rowid, batch_size),
                 ).fetchall()
@@ -1271,14 +1380,13 @@ def create_web_indexes(
                         break
                     batch_rows += 1
                     batch_bytes += value_bytes
-                    batch_last_rowid = int(row["source_rowid"])
+                    batch_last_rowid = int(row["stable_id"])
                 conn.execute(
                     f"""INSERT INTO {title_trigram_build}(rowid, title)
-                        SELECT c.rowid, tn.title_norm
-                        FROM conversations c
-                        JOIN {title_norm_build} tn ON tn.conversation_id = c.conversation_id
-                        WHERE c.rowid > ? AND c.rowid <= ?
-                        ORDER BY c.rowid""",
+                        SELECT tn.stable_id, tn.title_norm
+                        FROM {title_norm_build} tn
+                        WHERE tn.stable_id > ? AND tn.stable_id <= ?
+                        ORDER BY tn.stable_id""",
                     (last_rowid, batch_last_rowid),
                 )
                 resource_progress["current_batch_normalized_bytes"] = batch_bytes
@@ -1301,6 +1409,8 @@ def create_web_indexes(
             ("web_index_format_version", WEB_INDEX_FORMAT_VERSION),
             ("display_text_resolver_version", DISPLAY_TEXT_RESOLVER_VERSION),
             ("normalization_index_format_version", NORMALIZATION_INDEX_FORMAT_VERSION),
+            ("stable_optional_address_version", STABLE_OPTIONAL_ADDRESS_VERSION),
+            ("stable_optional_address_identity", build_id),
             ("oversized_fallback", "required"),
             ("max_input_bytes", str(WEB_INDEX_MAX_INPUT_BYTES)),
             ("max_normalized_bytes", str(WEB_INDEX_MAX_NORMALIZED_BYTES)),
@@ -1326,6 +1436,7 @@ def create_web_indexes(
 
         report("commit_swap", 0, 1)
         conn.execute("BEGIN IMMEDIATE")
+        process_lock.revalidate(db_path)
         _validate_lease_table(conn, create=False)
         lease = conn.execute(
             f"SELECT * FROM {WEB_INDEX_BUILD_LEASE_TABLE} WHERE slot = 1"

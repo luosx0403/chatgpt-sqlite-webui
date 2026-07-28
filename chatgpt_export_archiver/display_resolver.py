@@ -99,3 +99,21 @@ def classify_placeholder_chunks(chunks: Iterable[str]) -> bool:
         if classifier.phase == "invalid":
             return False
     return classifier.exact_placeholder
+
+
+def placeholder_prefix_may_match(value: str | None, *, truncated: bool) -> bool:
+    """Return whether a bounded prefix still can be the placeholder grammar.
+
+    This is deliberately state based rather than a fixed-prefix string test:
+    an all-whitespace prefix, a marker split across chunks, and a payload whose
+    closing bracket is not loaded yet must all continue through the bounded
+    streaming classifier.
+    """
+
+    classifier = PlaceholderStreamClassifier()
+    classifier.feed(value or "")
+    if classifier.phase == "invalid":
+        return False
+    return classifier.exact_placeholder or (
+        truncated and classifier.phase in {"leading", "prefix", "payload", "trailing"}
+    )

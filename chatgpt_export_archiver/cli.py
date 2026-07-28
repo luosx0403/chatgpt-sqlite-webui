@@ -52,7 +52,24 @@ from .disk_resources import (
 )
 from .logging_utils import configure_logging, get_logger
 from .json_safety import JsonSafetyLimitError
-from .parser import WarningRecord, conversation_id_from_value, parse_conversation, validate_conversation_element
+from .parser import (
+    MAX_IMPORT_NODES_PER_CONVERSATION,
+    WarningRecord,
+    conversation_id_from_value,
+    parse_conversation,
+    validate_conversation_element,
+)
+from .resource_contract import (
+    IMPORT_BATCH_MAX_CONVERSATIONS,
+    IMPORT_BATCH_MAX_DECODED_CHARS,
+    IMPORT_BATCH_MAX_ESTIMATED_HEAP_BYTES,
+    IMPORT_BATCH_MAX_INPUT_BYTES,
+    IMPORT_BATCH_MAX_METADATA_BYTES,
+    IMPORT_BATCH_MAX_NODES,
+    IMPORT_BATCH_MAX_RAW_BYTES,
+    IMPORT_BATCH_MAX_SQLITE_BIND_BYTES,
+    import_batch_resource_profile,
+)
 from .scanner import (
     ConversationJsonTopLevelError,
     ConversationJsonElementTooLargeError,
@@ -61,6 +78,14 @@ from .scanner import (
     InputSource,
     InvalidConversationEncodingError,
     JsonIntegerTooLargeError,
+    MAX_JSON_ARRAY_ITEMS,
+    MAX_JSON_ELEMENT_BYTES,
+    MAX_JSON_ELEMENT_CHARS,
+    MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES,
+    MAX_JSON_INTEGER_DIGITS,
+    MAX_JSON_MAPPING_ENTRIES,
+    MAX_JSON_NESTING_DEPTH,
+    MAX_JSON_STRING_PRIMITIVE_TOKENS,
     NonFiniteJsonNumberError,
     SourceChangedDuringReadError,
     ZipMemberCrcError,
@@ -84,14 +109,6 @@ from .web_db import WebIndexBuildError, acquire_web_index_process_lock, create_w
 
 LOGGER = get_logger("cli")
 REQUIRED_IMPORT_GENERATION_DOMAINS = ("title", "message", "address", "graph")
-IMPORT_BATCH_MAX_CONVERSATIONS = 100
-IMPORT_BATCH_MAX_NODES = 20_000
-IMPORT_BATCH_MAX_INPUT_BYTES = 32 * 1024 * 1024
-IMPORT_BATCH_MAX_DECODED_CHARS = 32 * 1024 * 1024
-IMPORT_BATCH_MAX_RAW_BYTES = 24 * 1024 * 1024
-IMPORT_BATCH_MAX_METADATA_BYTES = 16 * 1024 * 1024
-IMPORT_BATCH_MAX_ESTIMATED_HEAP_BYTES = 96 * 1024 * 1024
-IMPORT_BATCH_MAX_SQLITE_BIND_BYTES = 48 * 1024 * 1024
 
 
 class ImportPipelineError(ValueError):
@@ -153,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
         for key in (
             "current_database_schema_version",
             "required_database_schema_version",
+            "required_bytes",
+            "free_bytes",
+            "estimated_peak_bytes",
         ):
             if key in exc.detail:
                 print(f"{key} {exc.detail[key]}", file=sys.stderr)
@@ -351,13 +371,34 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     try:
         before = database_schema_status(conn)
         print("WARNING: create and verify an external database backup before migration.", file=sys.stderr)
-        result = migrate_database(conn, refresh_compatibility=True)
+        def migration_progress(stage: str, progress: dict[str, int]) -> None:
+            print(
+                f"migration_stage {stage} "
+                f"processed {progress.get('processed', 0)} "
+                f"total {progress.get('total', 0)}",
+                file=sys.stderr,
+            )
+
+        result = migrate_database(
+            conn,
+            refresh_compatibility=True,
+            progress_callback=migration_progress,
+        )
     finally:
         conn.close()
     print(f"current_database_schema_version {before['current_database_schema_version']}")
     print(f"required_database_schema_version {before['required_database_schema_version']}")
     print(f"migration_changed {str(result['changed']).lower()}")
     print(f"database_schema_version {result['current_database_schema_version']}")
+    if result.get("migration_disk_preflight"):
+        print(
+            "migration_disk_preflight_required_bytes "
+            f"{result['migration_disk_preflight']['required_bytes']}"
+        )
+        print(
+            "migration_disk_preflight_free_bytes "
+            f"{result['migration_disk_preflight']['free_bytes']}"
+        )
     print("backup_created false")
     return 0
 
@@ -561,6 +602,20 @@ def cmd_import(args: argparse.Namespace) -> int:
             print(f"delete_input_error_type {result['delete_input_error_type']}")
             if result.get("delete_input_recovery_required"):
                 print("delete_input_recovery_required true")
+                if result.get("delete_input_recovery_token"):
+                    print(
+                        "delete_input_recovery_token "
+                        f"{result['delete_input_recovery_token']}"
+                    )
+                    print(
+                        "delete_input_recovery_journal_format_version "
+                        f"{result['delete_input_recovery_journal_format_version']}"
+                    )
+                    print(
+                        "delete_input_recovery_command "
+                        "recover-delete-input --directory <original-directory> "
+                        f"--token {result['delete_input_recovery_token']}"
+                    )
     return 0
 
 
@@ -578,11 +633,33 @@ def run_import_pipeline(
 ) -> dict[str, Any]:
     """Serialize canonical import against optional Web-index builders."""
 
+    if optimize_fts_after_import and not rebuild_fts:
+        raise ValueError("--optimize-fts-after-import requires --rebuild-fts")
+    source = resolve_input(input_value, cwd)
+    if delete_input_on_success and source.kind != "zip":
+        raise ValueError("--delete-input-on-success is only supported for ZIP inputs")
+    if delete_input_on_success and not delete_input_secure_identity_supported():
+        raise ValueError("delete_input_secure_identity_unsupported")
+    if delete_input_on_success and not delete_input_identity_is_current(source):
+        raise SourceChangedDuringReadError("source_changed_during_read")
+    db_path = db_path.expanduser()
+    if db_path.exists() and (db_path.is_symlink() or not db_path.is_file()):
+        raise ImportPipelineError("database_target_invalid", stage="input_preflight")
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ImportPipelineError(
+            "database_parent_create_failed",
+            stage="input_preflight",
+            detail={"error_type": type(exc).__name__},
+        ) from None
     try:
         writer_lock = acquire_web_index_process_lock(db_path)
     except WebIndexBuildError as exc:
         raise ImportPipelineError(exc.code, stage="input_preflight") from None
     try:
+        writer_lock.bind_database(db_path)
+        writer_lock.revalidate(db_path)
         return _run_import_pipeline_locked(
             db_path,
             input_value,
@@ -593,6 +670,8 @@ def run_import_pipeline(
             optimize_fts_after_import=optimize_fts_after_import,
             delete_input_on_success=delete_input_on_success,
             progress_callback=progress_callback,
+            _resolved_source=source,
+            _writer_lock=writer_lock,
         )
     finally:
         writer_lock.close()
@@ -609,12 +688,12 @@ def _run_import_pipeline_locked(
     optimize_fts_after_import: bool = False,
     delete_input_on_success: bool = False,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    _resolved_source: InputSource | None = None,
+    _writer_lock: Any | None = None,
 ) -> dict[str, Any]:
     """Import a ZIP/directory and return structural summary without printing chat content."""
     import_started = time.perf_counter()
-    if optimize_fts_after_import and not rebuild_fts:
-        raise ValueError("--optimize-fts-after-import requires --rebuild-fts")
-    source = resolve_input(input_value, cwd)
+    source = _resolved_source if _resolved_source is not None else resolve_input(input_value, cwd)
     if delete_input_on_success and source.kind != "zip":
         raise ValueError("--delete-input-on-success is only supported for ZIP inputs")
     if delete_input_on_success and not delete_input_secure_identity_supported():
@@ -627,6 +706,9 @@ def _run_import_pipeline_locked(
     bound_source_sha256: str | None = None
     try:
         conn = connect(db_path)
+        if _writer_lock is not None:
+            _writer_lock.bind_database(db_path)
+            _writer_lock.revalidate(db_path)
         configure_import_connection(conn)
         init_db(conn)
         compatibility = legacy_compatibility_state(conn)
@@ -686,6 +768,19 @@ def _run_import_pipeline_locked(
         "import_batch_peak_metadata_bytes": 0,
         "import_batch_peak_estimated_heap_bytes": 0,
         "import_batch_peak_sqlite_bind_bytes": 0,
+        "json_resource_profile": {
+            "max_element_utf8_bytes": MAX_JSON_ELEMENT_BYTES,
+            "max_element_decoded_chars": MAX_JSON_ELEMENT_CHARS,
+            "max_string_primitive_tokens": MAX_JSON_STRING_PRIMITIVE_TOKENS,
+            "max_mapping_entries": MAX_JSON_MAPPING_ENTRIES,
+            "max_array_items": MAX_JSON_ARRAY_ITEMS,
+            "max_nesting_depth": MAX_JSON_NESTING_DEPTH,
+            "max_integer_digits": MAX_JSON_INTEGER_DIGITS,
+            "max_estimated_decoded_heap_bytes": MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES,
+            "max_nodes_per_conversation": MAX_IMPORT_NODES_PER_CONVERSATION,
+            "import_batch_materialized_bytes": IMPORT_BATCH_MAX_ESTIMATED_HEAP_BYTES,
+            "import_batch": import_batch_resource_profile(),
+        },
     }
     import_succeeded = False
     result: dict[str, Any] = {
@@ -695,6 +790,8 @@ def _run_import_pipeline_locked(
         "delete_input_changed": None,
         "delete_input_failed": None,
         "delete_input_recovery_required": None,
+        "delete_input_recovery_token": None,
+        "delete_input_recovery_journal_format_version": None,
         "delete_input_error_type": None,
         "summary_update_after_commit_failed": None,
         "import_connection_close_failed": None,
@@ -719,10 +816,12 @@ def _run_import_pipeline_locked(
         )
         summary["warnings"] += 1
 
+    dirty_domains: set[str] = set()
+    bulk_generation_started = False
+
     try:
         conn.execute("PRAGMA temp_store = FILE")
         conn.execute("BEGIN")
-        begin_bulk_generation_aggregation(conn)
         conn.execute(
             """CREATE TEMP TABLE import_run_state(
                    conversation_id TEXT NOT NULL PRIMARY KEY,
@@ -776,23 +875,6 @@ def _run_import_pipeline_locked(
         summary["disk_preflight_required_bytes"] = capacity["required_bytes"]
         summary["disk_preflight_free_bytes"] = capacity["free_bytes"]
         disk_guard = DiskSpaceGuard(db_path, "import_disk_space_insufficient")
-        optional_drop_failures = drop_optional_web_indexes(conn)
-        if optional_drop_failures:
-            summary["optional_web_index_drop_failures"] = len(optional_drop_failures)
-            for failure in optional_drop_failures:
-                record_warning(
-                    conn,
-                    run_id,
-                    WarningRecord(
-                        "optional_web_index",
-                        None,
-                        "optional_web_index_drop_failed",
-                        compact_json({"table": failure["table"], "error_type": failure["error_type"]}),
-                        None,
-                    ),
-            )
-            summary["warnings"] += len(optional_drop_failures)
-        drop_import_rebuildable_indexes(conn)
         notify("source_scan_complete")
 
         batch_usage = {
@@ -858,11 +940,12 @@ def _run_import_pipeline_locked(
                 sqlite_bind_bytes += sum(byte_size(value) for value in node_fields)
                 raw_bytes += byte_size(node_value.raw_message_json)
                 metadata_bytes += byte_size(node_value.children_json) + byte_size(node_value.metadata_json)
-            estimated_heap = (
+            estimated_heap = max(
+                int(getattr(item, "estimated_decoded_heap_bytes", 0) or 0),
                 int(input_bytes)
                 + sqlite_bind_bytes
                 + len(parsed.nodes) * 512
-                + len(parsed.warnings) * 256
+                + len(parsed.warnings) * 256,
             )
             return {
                 "conversations": 1,
@@ -876,12 +959,27 @@ def _run_import_pipeline_locked(
             }
 
         def flush_batch(batch: list[Any]) -> None:
+            nonlocal bulk_generation_started
             if not batch:
                 return
-            statuses = upsert_conversations_batch(conn, run_id, batch, skip_fts=rebuild_fts)
+
+            def ensure_bulk_generation_started() -> None:
+                nonlocal bulk_generation_started
+                if not bulk_generation_started:
+                    begin_bulk_generation_aggregation(conn)
+                    bulk_generation_started = True
+
+            statuses = upsert_conversations_batch(
+                conn,
+                run_id,
+                batch,
+                skip_fts=rebuild_fts,
+                before_first_write=ensure_bulk_generation_started,
+            )
             summary["attempted_unchanged_conversations"] += statuses["unchanged"]
             summary["attempted_updated_conversations"] += statuses["updated"]
             summary["attempted_inserted_conversations"] += statuses["inserted"]
+            dirty_domains.update(statuses.get("dirty_domains", ()))
             for conversation_id, status in statuses.get("outcomes", {}).items():
                 conn.execute(
                     """UPDATE import_run_state
@@ -1015,7 +1113,29 @@ def _run_import_pipeline_locked(
             summary["optimize_fts_after_import"] = bool(optimize_fts_after_import)
             notify("fts_rebuild_complete")
         index_started = time.perf_counter()
-        recreate_import_rebuildable_indexes(conn)
+        if dirty_domains.intersection({"message", "title"}):
+            optional_drop_failures = drop_optional_web_indexes(conn)
+            if optional_drop_failures:
+                summary["optional_web_index_drop_failures"] = len(optional_drop_failures)
+                for failure in optional_drop_failures:
+                    record_warning(
+                        conn,
+                        run_id,
+                        WarningRecord(
+                            "optional_web_index",
+                            None,
+                            "optional_web_index_drop_failed",
+                            compact_json(
+                                {
+                                    "table": failure["table"],
+                                    "error_type": failure["error_type"],
+                                }
+                            ),
+                            None,
+                        ),
+                    )
+                summary["warnings"] += len(optional_drop_failures)
+        summary["dirty_domains"] = sorted(dirty_domains)
         summary["import_index_rebuild_seconds"] = _elapsed(index_started)
         notify("import_index_rebuild_complete")
         if optimize_after_import_flag:
@@ -1043,10 +1163,19 @@ def _run_import_pipeline_locked(
         summary["wall_total_seconds"] = summary["legacy_pre_commit_seconds"]
         summary["total_import_seconds"] = summary["wall_total_seconds"]
         commit_started = time.perf_counter()
-        finish_bulk_generation_aggregation(
-            conn,
-            REQUIRED_IMPORT_GENERATION_DOMAINS if summary["attempted_valid_conversations"] else (),
-        )
+        warning_rows = conn.execute(
+            """SELECT warning_type, COUNT(*) AS count
+               FROM import_warnings WHERE import_run_id = ?
+               GROUP BY warning_type ORDER BY warning_type""",
+            (run_id,),
+        ).fetchall()
+        summary["warnings"] = sum(int(row["count"]) for row in warning_rows)
+        summary["warnings_by_type"] = [dict(row) for row in warning_rows]
+        if bulk_generation_started:
+            finish_bulk_generation_aggregation(
+                conn,
+                dirty_domains,
+            )
         mark_legacy_compatibility_current(conn)
         finish_import_run(conn, run_id, "finished", summary)
         summary["finalize_commit_seconds"] = _elapsed(commit_started)
@@ -1177,6 +1306,15 @@ def _run_import_pipeline_locked(
             summary["delete_input_failed"] = True
             summary["delete_input_error_type"] = error_type
             summary["delete_input_recovery_required"] = recovery_required
+            if recovery_required:
+                recovery_token = getattr(delete_error, "recovery_token", None)
+                recovery_version = getattr(
+                    delete_error, "journal_format_version", None
+                )
+                result["delete_input_recovery_token"] = recovery_token
+                result["delete_input_recovery_journal_format_version"] = recovery_version
+                summary["delete_input_recovery_token"] = recovery_token
+                summary["delete_input_recovery_journal_format_version"] = recovery_version
             summary["warnings"] += 1
             _record_post_import_warning(
                 db_path,

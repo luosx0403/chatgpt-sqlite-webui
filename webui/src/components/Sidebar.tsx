@@ -232,6 +232,8 @@ function SearchLoadingProgress({ label }: { label: string }) {
 }
 
 function diagnosticsLabel(t: (key: string) => string, diag: SearchDiagnostics): string | null {
+  if (diag.provisional_order && diag.scan_complete) return t("searchDiagnosticsProvisionalComplete");
+  if (diag.provisional_order) return t("searchDiagnosticsProvisional");
   if (diag.partial || diag.completion_state === "partial") return t("searchDiagnosticsPartial");
   if (diag.web_index_missing && diag.short_query) return t("searchDiagnosticsMissingShort");
   if (diag.web_index_missing) return t("searchDiagnosticsMissing");

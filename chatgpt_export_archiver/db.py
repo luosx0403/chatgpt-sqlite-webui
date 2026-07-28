@@ -11,11 +11,17 @@ from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from .current_path import (
     EffectiveCurrentResourceLimitError,
     ensure_effective_current_views,
+)
+from .identifiers import identifier_text_is_safe
+from .disk_resources import (
+    DiskSpaceInsufficientError,
+    migration_required_bytes,
+    require_free_space,
 )
 
 from .parser import ParsedConversation, WarningRecord
@@ -26,6 +32,7 @@ from .schema_contract import (
     NORMALIZATION_INDEX_FORMAT_VERSION,
     OPTIONAL_WEB_INDEX_FORMAT_VERSION,
     OPTIONAL_WEB_INDEX_PREDECESSOR_FORMAT_VERSIONS,
+    STABLE_OPTIONAL_ADDRESS_VERSION,
     parse_nonnegative_integer,
 )
 from .sqlite_errors import (
@@ -232,13 +239,21 @@ GENERATION_TRIGGER_DDL = {
 # domains, a row revision must change for every affected canonical row.
 DISPLAY_REVISION_TRIGGER_DDL = {
     "archive_display_revision_node_insert": """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_insert
-        AFTER INSERT ON conversation_nodes BEGIN
+        AFTER INSERT ON conversation_nodes
+        WHEN length(NEW.display_revision) != 32
+          OR NEW.display_revision GLOB '*[^0-9a-f]*'
+        BEGIN
             UPDATE conversation_nodes
             SET display_revision = lower(hex(randomblob(16)))
             WHERE conversation_id = NEW.conversation_id AND node_id = NEW.node_id;
         END""",
     "archive_display_revision_node_update": """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_update
-        AFTER UPDATE OF content_type, content_text, content_hash, raw_message_json ON conversation_nodes BEGIN
+        AFTER UPDATE OF content_type, content_text, content_hash, raw_message_json ON conversation_nodes
+        WHEN OLD.content_type IS NOT NEW.content_type
+          OR OLD.content_text IS NOT NEW.content_text
+          OR OLD.content_hash IS NOT NEW.content_hash
+          OR OLD.raw_message_json IS NOT NEW.raw_message_json
+        BEGIN
             UPDATE conversation_nodes
             SET display_revision = lower(hex(randomblob(16)))
             WHERE conversation_id = NEW.conversation_id AND node_id = NEW.node_id;
@@ -406,14 +421,14 @@ GENERATION_TRIGGER_CONTRACT = {
     "archive_graph_generation_node_update": ("conversation_nodes", "AFTER", "UPDATE", ("conversation_id", "node_id", "parent_node_id", "children_json", "is_on_current_path"), None, "graph"),
     "archive_graph_generation_node_delete": ("conversation_nodes", "AFTER", "DELETE", (), None, "graph"),
     "archive_display_revision_node_insert": (
-        "conversation_nodes", "AFTER", "INSERT", (), None, "display"
+        "conversation_nodes", "AFTER", "INSERT", (), "present", "display"
     ),
     "archive_display_revision_node_update": (
         "conversation_nodes",
         "AFTER",
         "UPDATE",
         ("content_type", "content_text", "content_hash", "raw_message_json"),
-        None,
+        "present",
         "display",
     ),
 }
@@ -718,19 +733,7 @@ def _legacy_graph_id_is_safe(value: Any, limit: int = 16 * 1024) -> bool:
             value = value.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
             return False
-    if not isinstance(value, str) or len(value) > limit:
-        return False
-    for character in value:
-        codepoint = ord(character)
-        if (
-            codepoint <= 0x1F
-            or codepoint == 0x7F
-            or 0xD800 <= codepoint <= 0xDFFF
-            or 0xFDD0 <= codepoint <= 0xFDEF
-            or codepoint & 0xFFFF in (0xFFFE, 0xFFFF)
-        ):
-            return False
-    return True
+    return identifier_text_is_safe(value, limit=limit)
 
 
 def _legacy_compatibility_generations(conn: sqlite3.Connection) -> dict[str, int]:
@@ -961,11 +964,23 @@ _KNOWN_MANAGED_TRIGGER_PREDECESSORS = {
         AFTER UPDATE OF conversation_id, node_id, content_text, raw_message_json ON conversation_nodes BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'message';
         END""",
+        """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            UPDATE conversation_nodes
+            SET display_revision = lower(hex(randomblob(16)))
+            WHERE conversation_id = NEW.conversation_id AND node_id = NEW.node_id;
+        END""",
     ),
     "archive_address_generation_conversation_update": (
         """CREATE TRIGGER IF NOT EXISTS archive_address_generation_conversation_update
         AFTER UPDATE OF conversation_id, current_node ON conversations BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'address';
+        END""",
+        """CREATE TRIGGER IF NOT EXISTS archive_display_revision_node_update
+        AFTER UPDATE OF content_type, content_text, content_hash, raw_message_json ON conversation_nodes BEGIN
+            UPDATE conversation_nodes
+            SET display_revision = lower(hex(randomblob(16)))
+            WHERE conversation_id = NEW.conversation_id AND node_id = NEW.node_id;
         END""",
     ),
     "archive_display_revision_node_insert": (
@@ -1278,6 +1293,8 @@ def migrate_database(
     *,
     allow_initialize: bool = False,
     refresh_compatibility: bool = False,
+    progress_callback: Callable[[str, dict[str, int]], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Initialize or migrate the canonical schema in one protected transaction.
 
@@ -1292,6 +1309,54 @@ def migrate_database(
                 "database_schema_incompatible", detail=_base_schema_compatibility(conn)
             )
         raise DatabaseMigrationError("database_transaction_active")
+    try:
+        preflight_version = _database_user_version(conn)
+    except sqlite3.Error as exc:
+        raise DatabaseMigrationError(
+            _migration_sqlite_error_code(exc),
+            detail={"error_type": type(exc).__name__},
+        ) from exc
+    migration_capacity: dict[str, int] | None = None
+    migration_node_count = 0
+    if 0 < preflight_version < DATABASE_SCHEMA_VERSION:
+        database_row = conn.execute("PRAGMA database_list").fetchone()
+        database_name = str(database_row[2]) if database_row and database_row[2] else ""
+        if database_name:
+            database_path = Path(database_name)
+            try:
+                database_bytes = database_path.stat().st_size
+            except OSError:
+                database_bytes = 0
+            if preflight_version < 5:
+                try:
+                    migration_node_count = int(
+                        conn.execute("SELECT COUNT(*) FROM conversation_nodes").fetchone()[0]
+                    )
+                except sqlite3.Error:
+                    migration_node_count = 0
+            required = migration_required_bytes(database_bytes, migration_node_count)
+            try:
+                migration_capacity = require_free_space(
+                    database_path,
+                    required,
+                    "migration_disk_space_insufficient",
+                )
+            except DiskSpaceInsufficientError as exc:
+                raise DatabaseMigrationError(
+                    exc.code,
+                    detail={
+                        "required_bytes": exc.required_bytes,
+                        "free_bytes": exc.free_bytes,
+                        "estimated_peak_bytes": required,
+                    },
+                ) from exc
+        if progress_callback:
+            progress_callback(
+                "preflight",
+                {"processed": 0, "total": migration_node_count},
+            )
+        if cancel_check and cancel_check():
+            raise DatabaseMigrationError("database_migration_cancelled")
     foreign_keys_before = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
     try:
         # SQLite requires foreign_keys to be changed outside a transaction for
@@ -1378,10 +1443,32 @@ def migrate_database(
                     "ALTER TABLE conversation_nodes ADD COLUMN "
                     "display_revision TEXT NOT NULL DEFAULT ''"
                 )
-            conn.execute(
-                "UPDATE conversation_nodes "
-                "SET display_revision = lower(hex(randomblob(16)))"
-            )
+            processed = 0
+            last_rowid = -1
+            while True:
+                if cancel_check and cancel_check():
+                    raise DatabaseMigrationError("database_migration_cancelled")
+                rows = conn.execute(
+                    "SELECT rowid FROM conversation_nodes "
+                    "WHERE rowid > ? ORDER BY rowid LIMIT 10000",
+                    (last_rowid,),
+                ).fetchall()
+                if not rows:
+                    break
+                next_rowid = int(rows[-1][0])
+                conn.execute(
+                    "UPDATE conversation_nodes "
+                    "SET display_revision = lower(hex(randomblob(16))) "
+                    "WHERE rowid > ? AND rowid <= ?",
+                    (last_rowid, next_rowid),
+                )
+                processed += len(rows)
+                last_rowid = next_rowid
+                if progress_callback:
+                    progress_callback(
+                        "backfill_display_revisions",
+                        {"processed": processed, "total": migration_node_count},
+                    )
         if has_objects and "archive_compatibility_state" in set(
             (locked_status or {}).get("missing_tables") or ()
         ):
@@ -1453,6 +1540,10 @@ def migrate_database(
         if conn.in_transaction:
             conn.rollback()
         raise
+    except (KeyboardInterrupt, SystemExit):
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     except sqlite3.Error as exc:
         if conn.in_transaction:
             conn.rollback()
@@ -1463,7 +1554,10 @@ def migrate_database(
     finally:
         if foreign_keys_before and not conn.in_transaction:
             conn.execute("PRAGMA foreign_keys = ON")
-    return {"changed": True, "initialized": initialized, **after}
+    result = {"changed": True, "initialized": initialized, **after}
+    if migration_capacity is not None:
+        result["migration_disk_preflight"] = migration_capacity
+    return result
 
 
 def init_db(conn: sqlite3.Connection) -> bool:
@@ -1491,6 +1585,9 @@ _OPTIONAL_WEB_INDEX_FIXED_METADATA = {
     "max_input_bytes": "4194304",
     "max_normalized_bytes": "2097152",
     "max_derived_bytes": "8388608",
+}
+_OPTIONAL_WEB_INDEX_STABLE_ADDRESS_METADATA = {
+    "stable_optional_address_version": STABLE_OPTIONAL_ADDRESS_VERSION,
 }
 _OPTIONAL_WEB_INDEX_BATCH_METADATA = {
     "batch_input_bytes": "16777216",
@@ -1566,7 +1663,7 @@ def _table_xinfo_contract(
     )
 
 
-_OPTIONAL_TABLE_XINFO = {
+_OPTIONAL_PREDECESSOR_TABLE_XINFO = {
     "web_message_norm": (
         ("conversation_id", "TEXT", True, None, 1, False),
         ("node_id", "TEXT", True, None, 2, False),
@@ -1583,6 +1680,28 @@ _OPTIONAL_TABLE_XINFO = {
     "web_index_oversized": (
         ("kind", "TEXT", True, None, 1, False),
         ("source_rowid", "INTEGER", True, None, 2, False),
+        ("conversation_id", "TEXT", True, None, 0, False),
+        ("node_id", "TEXT", False, None, 0, False),
+        ("input_bytes", "INTEGER", True, None, 0, False),
+        ("reason", "TEXT", True, None, 0, False),
+    ),
+}
+_OPTIONAL_CURRENT_TABLE_XINFO = {
+    "web_message_norm": (
+        ("stable_id", "INTEGER", False, None, 1, False),
+        ("conversation_id", "TEXT", True, None, 0, False),
+        ("node_id", "TEXT", True, None, 0, False),
+        ("content_norm", "TEXT", True, None, 0, False),
+    ),
+    "web_title_norm": (
+        ("stable_id", "INTEGER", False, None, 1, False),
+        ("conversation_id", "TEXT", True, None, 0, False),
+        ("title_norm", "TEXT", True, None, 0, False),
+    ),
+    "web_index_metadata": _OPTIONAL_PREDECESSOR_TABLE_XINFO["web_index_metadata"],
+    "web_index_oversized": (
+        ("stable_id", "INTEGER", False, None, 1, False),
+        ("kind", "TEXT", True, None, 0, False),
         ("conversation_id", "TEXT", True, None, 0, False),
         ("node_id", "TEXT", False, None, 0, False),
         ("input_bytes", "INTEGER", True, None, 0, False),
@@ -1699,7 +1818,7 @@ def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
     any name/type/shape/shadow collision is refused as an unknown user object.
     """
 
-    base_names = tuple(_OPTIONAL_TABLE_XINFO)
+    base_names = tuple(_OPTIONAL_PREDECESSOR_TABLE_XINFO)
     trigram_names = OPTIONAL_WEB_TRIGRAM_TABLES
     all_names = base_names + trigram_names + tuple(
         f"{name}{suffix}"
@@ -1713,7 +1832,26 @@ def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
     base_present = [bool(rows_by_name[name]) for name in base_names]
     if not all(base_present):
         _raise_object_collision("optional_index_name_collision", present_rows)
-    for name, expected in _OPTIONAL_TABLE_XINFO.items():
+    try:
+        metadata = {
+            str(row[0]): str(row[1])
+            for row in conn.execute("SELECT key, value FROM web_index_metadata")
+        }
+    except sqlite3.Error:
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    format_version = metadata.get("web_index_format_version")
+    supported_formats = {
+        OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+        *OPTIONAL_WEB_INDEX_PREDECESSOR_FORMAT_VERSIONS,
+    }
+    if format_version not in supported_formats:
+        _raise_object_collision("optional_index_name_collision", present_rows)
+    expected_shapes = (
+        _OPTIONAL_CURRENT_TABLE_XINFO
+        if format_version == OPTIONAL_WEB_INDEX_FORMAT_VERSION
+        else _OPTIONAL_PREDECESSOR_TABLE_XINFO
+    )
+    for name, expected in expected_shapes.items():
         rows = rows_by_name[name]
         if len(rows) != 1:
             _raise_object_collision("optional_index_name_collision", present_rows)
@@ -1725,35 +1863,32 @@ def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
             or _table_xinfo_contract(conn, name) != expected
         ):
             _raise_object_collision("optional_index_name_collision", present_rows)
-    try:
-        metadata = {
-            str(row[0]): str(row[1])
-            for row in conn.execute("SELECT key, value FROM web_index_metadata")
-        }
-    except sqlite3.Error:
-        _raise_object_collision("optional_index_name_collision", present_rows)
     if any(
         parse_nonnegative_integer(metadata.get(key)) is None
         for key in ("message_generation", "title_generation")
     ):
         _raise_object_collision("optional_index_name_collision", present_rows)
     trigram_any = any(bool(rows_by_name[name]) for name in all_names if name not in base_names)
-    format_version = metadata.get("web_index_format_version")
-    supported_formats = {
-        OPTIONAL_WEB_INDEX_FORMAT_VERSION,
-        *OPTIONAL_WEB_INDEX_PREDECESSOR_FORMAT_VERSIONS,
-    }
-    if format_version not in supported_formats:
-        _raise_object_collision("optional_index_name_collision", present_rows)
     expected_metadata = {
         **_OPTIONAL_WEB_INDEX_FIXED_METADATA,
         "web_index_format_version": str(format_version),
         "message_generation": metadata.get("message_generation", ""),
         "title_generation": metadata.get("title_generation", ""),
     }
+    if format_version != OPTIONAL_WEB_INDEX_FORMAT_VERSION:
+        expected_metadata["display_text_resolver_version"] = "1"
     if format_version != "3":
         expected_metadata.update(_OPTIONAL_WEB_INDEX_BATCH_METADATA)
         expected_metadata[OPTIONAL_WEB_INDEX_OWNER_KEY] = OPTIONAL_WEB_INDEX_OWNER
+    if format_version == OPTIONAL_WEB_INDEX_FORMAT_VERSION:
+        expected_metadata.update(_OPTIONAL_WEB_INDEX_STABLE_ADDRESS_METADATA)
+        address_identity = metadata.get("stable_optional_address_identity", "")
+        if (
+            len(address_identity) != 32
+            or any(character not in "0123456789abcdef" for character in address_identity)
+        ):
+            _raise_object_collision("optional_index_name_collision", present_rows)
+        expected_metadata["stable_optional_address_identity"] = address_identity
     if trigram_any:
         expected_metadata.update({
             "message_trigram_text": "normalized",
@@ -1761,6 +1896,14 @@ def validate_optional_web_index_ownership(conn: sqlite3.Connection) -> bool:
         })
     if metadata != expected_metadata:
         _raise_object_collision("optional_index_name_collision", present_rows)
+    if format_version == OPTIONAL_WEB_INDEX_FORMAT_VERSION:
+        if (
+            ("conversation_id", "node_id")
+            not in _table_unique_keys(conn, "web_message_norm")
+            or ("conversation_id",)
+            not in _table_unique_keys(conn, "web_title_norm")
+        ):
+            _raise_object_collision("optional_index_name_collision", present_rows)
     owner = metadata.get(OPTIONAL_WEB_INDEX_OWNER_KEY)
     if trigram_any:
         _validate_fts5_family(
@@ -2057,9 +2200,10 @@ def upsert_conversation(conn: sqlite3.Connection, run_id: int, conv: ParsedConve
         INSERT INTO conversation_nodes(
             conversation_id, node_id, parent_node_id, children_json, message_id,
             role, author_name, create_time, update_time, content_type, content_text,
-            content_hash, metadata_json, is_on_current_path, raw_message_json, last_import_run_id
+            content_hash, metadata_json, is_on_current_path, raw_message_json,
+            last_import_run_id, display_revision
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -2079,6 +2223,7 @@ def upsert_conversation(conn: sqlite3.Connection, run_id: int, conv: ParsedConve
                 n.is_on_current_path,
                 n.raw_message_json,
                 run_id,
+                secrets.token_hex(16),
             )
             for n in conv.nodes
         ],
@@ -2093,6 +2238,7 @@ def upsert_conversations_batch(
     conversations: list[ParsedConversation],
     *,
     skip_fts: bool = False,
+    before_first_write: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Upsert a shard worth of conversations with batched node and FTS writes."""
     if not conversations:
@@ -2102,30 +2248,50 @@ def upsert_conversations_batch(
     conversations = _dedupe_conversations_last_wins(conversations)
 
     ids = [conv.conversation_id for conv in conversations]
-    existing_hashes = _load_existing_hashes(conn, ids)
+    existing_rows = _load_existing_conversation_rows(conn, ids)
     inserted: list[ParsedConversation] = []
     updated: list[ParsedConversation] = []
     unchanged: list[ParsedConversation] = []
+    dirty_domains: set[str] = set()
     for conv in conversations:
-        existing_hash = existing_hashes.get(conv.conversation_id)
-        if existing_hash is None:
+        existing = existing_rows.get(conv.conversation_id)
+        if existing is None:
             inserted.append(conv)
-        elif existing_hash == conv.aggregate_hash:
+            dirty_domains.update(REQUIRED_GENERATION_ROWS)
+        elif _conversation_stored_values(existing) == _conversation_import_values(conv):
             unchanged.append(conv)
         else:
             updated.append(conv)
-
-    if updated:
-        _delete_nodes_for_conversations(conn, [conv.conversation_id for conv in updated])
-        if not skip_fts:
-            _delete_fts_for_conversations(conn, [conv.conversation_id for conv in updated])
-
-    conn.executemany(_UPSERT_CONVERSATION_SQL, [_conversation_row(conv, run_id) for conv in conversations])
+            if existing["title"] != conv.title:
+                dirty_domains.add("title")
+            if (
+                existing["exported_id"] != conv.exported_id
+                or existing["current_node"] != conv.current_node
+            ):
+                dirty_domains.add("address")
+            if existing["current_node"] != conv.current_node:
+                dirty_domains.add("graph")
 
     changed = inserted + updated
-    _insert_nodes_batch(conn, run_id, changed)
-    if changed and not skip_fts:
-        _insert_fts_batch(conn, changed)
+    if changed:
+        if before_first_write is not None:
+            before_first_write()
+        conn.executemany(
+            _UPSERT_CONVERSATION_SQL,
+            [_conversation_row(conv, run_id) for conv in changed],
+        )
+    if inserted:
+        _insert_nodes_batch(conn, run_id, inserted)
+        if not skip_fts:
+            _insert_fts_batch(conn, inserted)
+    if updated:
+        node_domains = _synchronize_updated_conversation_nodes(
+            conn,
+            run_id,
+            updated,
+            skip_fts=skip_fts,
+        )
+        dirty_domains.update(node_domains)
 
     return {
         "inserted": len(inserted),
@@ -2136,6 +2302,7 @@ def upsert_conversations_batch(
             **{conv.conversation_id: "updated" for conv in updated},
             **{conv.conversation_id: "unchanged" for conv in unchanged},
         },
+        "dirty_domains": sorted(dirty_domains),
     }
 
 
@@ -2179,16 +2346,167 @@ def optimize_after_import(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def _load_existing_hashes(conn: sqlite3.Connection, conversation_ids: list[str]) -> dict[str, str]:
-    result: dict[str, str] = {}
+def _load_existing_conversation_rows(
+    conn: sqlite3.Connection,
+    conversation_ids: list[str],
+) -> dict[str, sqlite3.Row]:
+    result: dict[str, sqlite3.Row] = {}
     for chunk in _chunks(conversation_ids, SQLITE_VARIABLE_CHUNK):
         placeholders = ",".join("?" for _ in chunk)
         rows = conn.execute(
-            f"SELECT conversation_id, aggregate_hash FROM conversations WHERE conversation_id IN ({placeholders})",
+            f"""SELECT conversation_id, exported_id, title, create_time, update_time,
+                       current_node, source_file, source_array_index, aggregate_hash,
+                       is_archived, is_starred, default_model_slug, metadata_json
+                FROM conversations
+                WHERE conversation_id IN ({placeholders})""",
             chunk,
         ).fetchall()
-        result.update({row["conversation_id"]: row["aggregate_hash"] for row in rows})
+        result.update({str(row["conversation_id"]): row for row in rows})
     return result
+
+
+def _conversation_import_values(conv: ParsedConversation) -> tuple[Any, ...]:
+    return (
+        conv.exported_id,
+        conv.title,
+        conv.create_time,
+        conv.update_time,
+        conv.current_node,
+        conv.source_file,
+        conv.source_array_index,
+        conv.aggregate_hash,
+        conv.is_archived,
+        conv.is_starred,
+        conv.default_model_slug,
+        conv.metadata_json,
+    )
+
+
+def _conversation_stored_values(row: sqlite3.Row) -> tuple[Any, ...]:
+    return tuple(
+        row[name]
+        for name in (
+            "exported_id", "title", "create_time", "update_time", "current_node",
+            "source_file", "source_array_index", "aggregate_hash", "is_archived",
+            "is_starred", "default_model_slug", "metadata_json",
+        )
+    )
+
+
+_NODE_SYNC_FIELDS = (
+    "parent_node_id", "children_json", "message_id", "role", "author_name",
+    "create_time", "update_time", "content_type", "content_text", "content_hash",
+    "metadata_json", "is_on_current_path", "raw_message_json",
+)
+_NODE_MESSAGE_FIELDS = {
+    "message_id", "role", "author_name", "create_time", "update_time",
+    "content_type", "content_text", "content_hash", "metadata_json",
+    "raw_message_json",
+}
+_NODE_ADDRESS_FIELDS = {"parent_node_id", "children_json", "message_id"}
+_NODE_GRAPH_FIELDS = {"parent_node_id", "children_json", "is_on_current_path"}
+_NODE_DISPLAY_FIELDS = {
+    "content_type", "content_text", "content_hash", "raw_message_json"
+}
+
+
+def _parsed_node_values(node: Any) -> dict[str, Any]:
+    return {name: getattr(node, name) for name in _NODE_SYNC_FIELDS}
+
+
+def _load_existing_nodes(
+    conn: sqlite3.Connection,
+    conversation_ids: list[str],
+) -> dict[str, dict[str, sqlite3.Row]]:
+    result: dict[str, dict[str, sqlite3.Row]] = {
+        conversation_id: {} for conversation_id in conversation_ids
+    }
+    for chunk in _chunks(conversation_ids, SQLITE_VARIABLE_CHUNK):
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"""SELECT conversation_id, node_id, {", ".join(_NODE_SYNC_FIELDS)},
+                       display_revision
+                FROM conversation_nodes
+                WHERE conversation_id IN ({placeholders})""",
+            chunk,
+        ):
+            result[str(row["conversation_id"])][str(row["node_id"])] = row
+    return result
+
+
+def _synchronize_updated_conversation_nodes(
+    conn: sqlite3.Connection,
+    run_id: int,
+    conversations: list[ParsedConversation],
+    *,
+    skip_fts: bool,
+) -> set[str]:
+    dirty_domains: set[str] = set()
+    existing_by_conversation = _load_existing_nodes(
+        conn, [conversation.conversation_id for conversation in conversations]
+    )
+    inserted_nodes: list[tuple[Any, ...]] = []
+    update_rows: list[tuple[Any, ...]] = []
+    message_dirty_conversations: set[str] = set()
+    for conversation in conversations:
+        existing = existing_by_conversation[conversation.conversation_id]
+        incoming = {node.node_id: node for node in conversation.nodes}
+        removed = sorted(set(existing) - set(incoming))
+        added = sorted(set(incoming) - set(existing))
+        if removed or added:
+            dirty_domains.update(("message", "address", "graph"))
+            message_dirty_conversations.add(conversation.conversation_id)
+        for node_id in removed:
+            conn.execute(
+                "DELETE FROM conversation_nodes WHERE conversation_id = ? AND node_id = ?",
+                (conversation.conversation_id, node_id),
+            )
+        for node_id in added:
+            inserted_nodes.append(_node_row(incoming[node_id], run_id))
+        for node_id in sorted(set(existing).intersection(incoming)):
+            old = existing[node_id]
+            node = incoming[node_id]
+            values = _parsed_node_values(node)
+            changed_fields = {
+                name for name in _NODE_SYNC_FIELDS if old[name] != values[name]
+            }
+            if not changed_fields:
+                continue
+            if changed_fields & _NODE_MESSAGE_FIELDS:
+                dirty_domains.add("message")
+                message_dirty_conversations.add(conversation.conversation_id)
+            if changed_fields & _NODE_ADDRESS_FIELDS:
+                dirty_domains.add("address")
+            if changed_fields & _NODE_GRAPH_FIELDS:
+                dirty_domains.add("graph")
+            revision = (
+                secrets.token_hex(16)
+                if changed_fields & _NODE_DISPLAY_FIELDS
+                else str(old["display_revision"])
+            )
+            update_rows.append(
+                tuple(values[name] for name in _NODE_SYNC_FIELDS)
+                + (run_id, revision, conversation.conversation_id, node_id)
+            )
+    if inserted_nodes:
+        conn.executemany(_INSERT_NODE_SQL, inserted_nodes)
+    if update_rows:
+        conn.executemany(
+            f"""UPDATE conversation_nodes
+                SET {", ".join(f"{name} = ?" for name in _NODE_SYNC_FIELDS)},
+                    last_import_run_id = ?,
+                    display_revision = ?
+                WHERE conversation_id = ? AND node_id = ?""",
+            update_rows,
+        )
+    if message_dirty_conversations and not skip_fts:
+        ids = sorted(message_dirty_conversations)
+        _delete_fts_for_conversations(conn, ids)
+        by_id = {
+            conversation.conversation_id: conversation for conversation in conversations
+        }
+        _insert_fts_batch(conn, [by_id[conversation_id] for conversation_id in ids])
+    return dirty_domains
 
 
 _UPSERT_CONVERSATION_SQL = """
@@ -2238,9 +2556,10 @@ _INSERT_NODE_SQL = """
     INSERT INTO conversation_nodes(
         conversation_id, node_id, parent_node_id, children_json, message_id,
         role, author_name, create_time, update_time, content_type, content_text,
-        content_hash, metadata_json, is_on_current_path, raw_message_json, last_import_run_id
+        content_hash, metadata_json, is_on_current_path, raw_message_json,
+        last_import_run_id, display_revision
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -2262,6 +2581,7 @@ def _node_row(node: Any, run_id: int) -> tuple[Any, ...]:
         node.is_on_current_path,
         node.raw_message_json,
         run_id,
+        secrets.token_hex(16),
     )
 
 

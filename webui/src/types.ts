@@ -154,6 +154,10 @@ export interface BasePage<T> {
   offset: number;
   has_more: boolean;
   next_offset: number | null;
+  total_exact?: boolean;
+  order_exact?: boolean;
+  scan_complete?: boolean;
+  provisional_order?: boolean;
   visible_total?: number;
   empty_hidden_count?: number;
   internal_hidden_count?: number;
@@ -243,6 +247,17 @@ export interface SearchDiagnostics {
   actual_fallback_note?: string;
   estimated_backend_note?: string;
   resource_contract?: string;
+  configured_candidate_scan_char_limit?: number;
+  configured_verified_char_limit_per_candidate?: number;
+  configured_verified_byte_limit_per_candidate?: number;
+  max_observed_verified_chars_per_candidate?: number;
+  max_observed_verified_bytes_per_candidate?: number;
+  candidates_seen?: number;
+  candidates_verified?: number;
+  candidate_sql_rows?: number;
+  blob_read_bytes?: number;
+  temp_page_delta?: number;
+  /** @deprecated Configured ceiling; use configured_candidate_scan_char_limit. */
   candidate_scan_chars_per_row?: number;
   hit_preview_chars?: number;
   snippet_scan_chars?: number;
@@ -251,7 +266,12 @@ export interface SearchDiagnostics {
   partial_due_to_oversized_input?: boolean;
   partial?: boolean;
   partial_reason?: string | null;
+  order_exact?: boolean;
+  scan_complete?: boolean;
+  provisional_order?: boolean;
+  /** @deprecated Configured ceiling; use configured_verified_char_limit_per_candidate. */
   verified_chars_per_candidate?: number;
+  /** @deprecated Configured ceiling; use configured_verified_byte_limit_per_candidate. */
   verified_bytes_per_candidate?: number;
   request_verified_bytes?: number;
   request_verified_chars?: number;
@@ -364,11 +384,69 @@ export interface CleanupWarning {
   path_kind: string;
 }
 
+export interface ImportWarningCount {
+  warning_type: string;
+  count: number;
+}
+
+export interface ImportBatchResourceProfile {
+  max_conversations: number;
+  max_nodes: number;
+  max_input_bytes: number;
+  max_decoded_chars: number;
+  max_raw_bytes: number;
+  max_metadata_bytes: number;
+  max_estimated_heap_bytes: number;
+  max_sqlite_bind_bytes: number;
+}
+
+export interface ImportJsonResourceProfile {
+  max_element_utf8_bytes: number;
+  max_element_decoded_chars: number;
+  max_string_primitive_tokens: number;
+  max_mapping_entries: number;
+  max_array_items: number;
+  max_nesting_depth: number;
+  max_integer_digits: number;
+  max_estimated_decoded_heap_bytes: number;
+  max_nodes_per_conversation: number;
+  import_batch_materialized_bytes: number;
+  import_batch: ImportBatchResourceProfile;
+}
+
+export interface ImportSummary {
+  attempted_valid_conversations?: number;
+  committed_conversations?: number;
+  committed_nodes?: number;
+  valid_conversations?: number;
+  nodes?: number;
+  skipped_invalid_elements?: number;
+  warnings?: number;
+  warnings_by_type?: ImportWarningCount[];
+  unchanged_conversations?: number;
+  inserted_conversations?: number;
+  updated_conversations?: number;
+  dirty_domains?: string[];
+  json_resource_profile?: ImportJsonResourceProfile;
+  import_batch_count?: number;
+  import_batch_total_input_bytes?: number;
+  import_batch_peak_input_bytes?: number;
+  import_batch_peak_decoded_chars?: number;
+  import_batch_peak_nodes?: number;
+  import_batch_peak_raw_bytes?: number;
+  import_batch_peak_metadata_bytes?: number;
+  import_batch_peak_estimated_heap_bytes?: number;
+  import_batch_peak_sqlite_bind_bytes?: number;
+  [key: string]: unknown;
+}
+
 export interface ImportJob {
   job_id: string;
   status: "queued" | "running" | "succeeded" | "failed" | "postcheck_failed";
   stage: string;
   outcome: "queued" | "import_running" | "import_job_start_failed" | "input_preflight_failed" | "source_scan_failed" | "source_read_failed" | "json_decode_failed" | "top_level_contract_failed" | "import_transaction_failed" | "canonical_commit_succeeded" | "verify_failed" | "stats_failed" | "web_index_failed" | "web_index_cancelled" | "succeeded";
+  completion_outcome: "queued" | "running" | "success" | "success_with_warnings" | "partial_success" | "failed_before_commit" | "failed_after_canonical_commit" | "cleanup_warning" | "cancelled";
+  canonical_import_outcome: "queued" | "running" | "success" | "success_with_warnings" | "partial_success" | "failed_before_commit";
   canonical_commit_succeeded: boolean;
   filename: string;
   size: number;
@@ -376,7 +454,7 @@ export interface ImportJob {
   started_at: number | null;
   finished_at: number | null;
   elapsed_seconds: number;
-  summary: Record<string, unknown> | null;
+  summary: ImportSummary | null;
   verify: Record<string, unknown> | null;
   stats: Stats | null;
   web_index: Record<string, unknown> | null;

@@ -754,6 +754,8 @@ async function main() {
             status: "running",
             stage: "web-index",
             outcome: "canonical_commit_succeeded",
+            completion_outcome: "running",
+            canonical_import_outcome: "running",
             canonical_commit_succeeded: true,
             elapsed_seconds: 1.8,
             web_index_cancel_requested: true,
@@ -780,6 +782,8 @@ async function main() {
               status: "running",
               stage: "web-index",
               outcome: "canonical_commit_succeeded",
+              completion_outcome: "running",
+              canonical_import_outcome: "running",
               canonical_commit_succeeded: true,
               elapsed_seconds: 1.6,
               web_index: {
@@ -802,8 +806,19 @@ async function main() {
               status: "succeeded",
               stage: "succeeded",
               outcome: "succeeded",
+              completion_outcome: "cleanup_warning",
+              canonical_import_outcome: "partial_success",
               canonical_commit_succeeded: true,
               elapsed_seconds: 3.0,
+              summary: {
+                committed_conversations: 2,
+                committed_nodes: 7,
+                skipped_invalid_elements: 1,
+                warnings: 1,
+                warnings_by_type: [
+                  { warning_type: "conversation_node_limit_exceeded", count: 1 },
+                ],
+              },
               cleanup_warning: "summary_update_after_commit_failed",
               cleanup_warnings: [
                 { code: "summary_update_after_commit_failed", error_type: "OperationalError", path_kind: "import_summary" },
@@ -838,6 +853,14 @@ async function main() {
     await noDbPage.waitForTimeout(1_500);
     assert.equal(maxActiveJobPolls, 1, "import job polling must be serial even when one response exceeds the polling interval");
     assert.ok((await noDbPage.getByTestId("import-status").textContent())?.includes("succeeded"), "a late running response must not regress a terminal import status");
+    const importSummary = await noDbPage.getByTestId("import-summary").textContent();
+    assert.ok(importSummary?.includes("Canonical commit: yes"), "terminal import summary should state canonical commit status");
+    assert.ok(importSummary?.includes("2 conversations"), "terminal import summary should show committed conversations");
+    assert.ok(importSummary?.includes("7 nodes"), "terminal import summary should show committed nodes");
+    assert.ok(importSummary?.includes("Skipped conversations/elements: 1"), "terminal import summary should make skipped elements visible");
+    assert.ok(importSummary?.includes("Warnings: 1"), "terminal import summary should show warning totals");
+    assert.ok(importSummary?.includes("Conversation exceeded the import node limit: 1"), "warning codes should use a safe localized label");
+    assert.equal(importSummary?.includes("conversation_node_limit_exceeded"), false, "terminal UI must not expose internal warning enum names");
     const terminalWarnings = await noDbPage.getByTestId("import-cleanup-warnings").textContent();
     assert.ok(terminalWarnings?.includes("committed import summary"), "terminal cleanup should show the localized summary warning");
     assert.ok(terminalWarnings?.includes("database connection"), "terminal cleanup should show every localized path kind");

@@ -71,6 +71,20 @@ def web_index_required_bytes(database_bytes: int) -> int:
     return max(512 * 1024 * 1024, max(0, int(database_bytes)) * 2) + DISK_RESERVE_BYTES
 
 
+def migration_required_bytes(database_bytes: int, row_count: int = 0) -> int:
+    """Conservative coexistence budget for a schema rewrite and its journal.
+
+    The existing database, rollback journal/WAL, rewritten pages, indexes and
+    safety reserve may coexist.  The row allowance covers the v4→v5 display
+    revision material written for every canonical node.
+    """
+
+    database = max(0, int(database_bytes))
+    rows = max(0, int(row_count))
+    rewritten = max(database, rows * 96)
+    return max(512 * 1024 * 1024, database + rewritten) + DISK_RESERVE_BYTES
+
+
 @dataclass
 class DiskSpaceGuard:
     path: Path

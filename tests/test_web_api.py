@@ -2381,10 +2381,20 @@ class WebApiTests(unittest.TestCase):
         try:
             parsed = parse_query("python", path_default="all")
             first = search_messages(conn, parsed, limit=1, offset=0, order="display", count_total=False)
-            second = search_messages(conn, parsed, limit=1, offset=1, order="display", count_total=False)
+            continuation = first["diagnostics"]["continuation_token"]
+            second = search_messages(
+                conn,
+                parsed,
+                limit=1,
+                offset=0,
+                order="display",
+                count_total=False,
+                continuation=continuation,
+            )
             self.assertEqual(len(first["items"]), 1)
             self.assertTrue(first["has_more"])
-            self.assertEqual(first["next_offset"], 1)
+            self.assertIsNone(first["next_offset"])
+            self.assertIsInstance(continuation, str)
             self.assertNotEqual(first["items"][0]["node_id"], second["items"][0]["node_id"])
             self.assertLessEqual(first["total"], 2)
         finally:
@@ -4080,9 +4090,9 @@ class WebApiTests(unittest.TestCase):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
         schema = client.get("/api/schema").json()
-        self.assertEqual(schema["version"], 6)
+        self.assertEqual(schema["version"], 7)
         self.assertEqual(schema["versions"]["required_database_schema_version"], 5)
-        self.assertEqual(schema["versions"]["optional_web_index_format_version"], "5")
+        self.assertEqual(schema["versions"]["optional_web_index_format_version"], "6")
         self.assertIn("include_internal", json.dumps(schema))
         self.assertIn("hidden_counts", json.dumps(schema))
         self.assertIn("match_mode", json.dumps(schema))
@@ -4097,7 +4107,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(schema["import_contract"]["max_element_decoded_chars"], 32 * 1024 * 1024)
         self.assertEqual(
             schema["import_contract"]["json_limits"]["max_conversation_element_scalar_count"],
-            1_000_000,
+            2_500_000,
         )
         self.assertEqual(
             schema["import_contract"]["json_limits"]["max_legacy_sanitizer_scalar_count"],
@@ -4151,7 +4161,10 @@ class WebApiTests(unittest.TestCase):
             1024 * 1024,
         )
         self.assertIn("continuation", schema["search"]["parameters"])
-        self.assertIn("signed opaque candidate cursor", schema["search"]["message_resource_contract"]["continuation"])
+        self.assertIn(
+            "signed opaque server-instance session ID",
+            schema["search"]["message_resource_contract"]["continuation"],
+        )
         self.assertIn("direct UTF-8 byte seek", schema["messages"]["display_cursor"])
         for field in (
             "candidate_count",
@@ -4190,7 +4203,10 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(set(schema["conversations"]["response"]) <= conversation_fields)
         self.assertEqual(
             set(schema["pagination"]["conversation_page"]),
-            {"items", "total", "limit", "offset", "has_more", "next_offset"},
+            {
+                "items", "total", "limit", "offset", "has_more", "next_offset",
+                "order_exact", "scan_complete", "provisional_order",
+            },
         )
         self.assertTrue(set(schema["pagination"]["conversation_page"]) <= set(conversation_page))
         self.assertNotIn("total_exact", conversation_page)
@@ -4697,6 +4713,7 @@ class WebApiTests(unittest.TestCase):
             [
                 "upload_disk_space_insufficient",
                 "import_disk_space_insufficient",
+                "migration_disk_space_insufficient",
                 "web_index_disk_space_insufficient",
             ],
         )
@@ -6706,7 +6723,7 @@ class WebApiTests(unittest.TestCase):
                     conn, "c", "n", offset=first["next_offset"], limit=65_536,
                     cursor=invalid_cursor,
                 )
-            self.assertEqual(invalid.exception.code, "invalid_display_cursor")
+            self.assertEqual(invalid.exception.code, "display_cursor_stale")
             conn.close()
 
     def test_round6_effective_current_and_export_node_budgets_reject_before_materialization(self):
@@ -7857,7 +7874,7 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(seen, {("confirmed", "n")})
             self.assertEqual(tiers, [0, 1, 2])
 
-    def test_round10_long_placeholder_uses_raw_recall_in_format_five_index(self):
+    def test_round10_long_placeholder_uses_raw_recall_in_current_index_format(self):
         from chatgpt_export_archiver.web_db import WEB_INDEX_FORMAT_VERSION, create_web_indexes
 
         td, client, db = self.make_client()
@@ -7879,7 +7896,7 @@ class WebApiTests(unittest.TestCase):
         finally:
             conn.close()
         result = create_web_indexes(db)
-        self.assertEqual(WEB_INDEX_FORMAT_VERSION, "5")
+        self.assertEqual(WEB_INDEX_FORMAT_VERSION, "6")
         self.assertGreater(result["peak_batch_derived_bytes"], 0)
         response = client.get(
             "/api/search/messages", params={"q": needle, "path": "all"}

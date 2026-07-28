@@ -304,6 +304,26 @@ function jobCleanupWarnings(job: ImportJob | null): CleanupWarning[] {
     : [];
 }
 
+function importWarningLabel(t: (key: string) => string, code: string): string {
+  if (code === "conversation_node_limit_exceeded") return t("importWarningNodeLimit");
+  if (code === "duplicate_conversation_id") return t("importWarningDuplicate");
+  if (new Set([
+    "current_node_missing",
+    "parent_cycle",
+    "current_path_invalid_node",
+    "parent_invalid",
+    "parent_missing",
+  ]).has(code)) return t("importWarningGraph");
+  if (code.includes("timestamp") || code.includes("time_")) return t("importWarningTimestamp");
+  if (
+    code.startsWith("invalid_")
+    || code.startsWith("missing_")
+    || code.startsWith("canonical_id_")
+    || code === "empty_mapping"
+  ) return t("importWarningInvalidElement");
+  return t("importWarningOther");
+}
+
 function importErrorLabel(t: (key: string) => string, code: string | null | undefined): string {
   const direct = new Set([
     "no_conversation_sources",
@@ -347,6 +367,9 @@ function importErrorLabel(t: (key: string) => string, code: string | null | unde
   if (code && new Set([
     "json_nesting_limit_exceeded",
     "json_scalar_limit_exceeded",
+    "json_mapping_entry_limit_exceeded",
+    "json_array_item_limit_exceeded",
+    "json_estimated_heap_limit_exceeded",
     "conversation_json_element_too_large",
     "conversation_node_limit_exceeded",
   ]).has(code)) return t("importError_json_resource_limits");
@@ -419,6 +442,7 @@ export default function App() {
   const detailControllerRef = useRef<AbortController | null>(null);
   const listControllerRef = useRef<AbortController | null>(null);
   const listContinuationRef = useRef<string | null>(null);
+  const listHadProvisionalOrderRef = useRef(false);
   const selectedIdRef = useRef<string | null>(null);
   const selectedRef = useRef<ConversationSummary | null>(null);
   const importPollGenerationRef = useRef(0);
@@ -555,7 +579,10 @@ export default function App() {
     const requestedSelectedId = selectedIdRef.current;
     const requestedContextKey = searchContextKey;
     const requestedContinuation = append ? listContinuationRef.current : null;
-    if (!append) listContinuationRef.current = null;
+    if (!append) {
+      listContinuationRef.current = null;
+      listHadProvisionalOrderRef.current = false;
+    }
     if (append) setLoadingMore(true);
     else setLoading(true);
     setError(null);
@@ -587,7 +614,18 @@ export default function App() {
         setHasMore(page.has_more);
         setNextOffset(page.next_offset);
         listContinuationRef.current = page.diagnostics?.continuation_token ?? null;
-        setDiagnostics(page.diagnostics ?? null);
+        const pageDiagnostics: SearchDiagnostics = {
+          ...(page.diagnostics ?? {}),
+          order_exact: page.order_exact,
+          scan_complete: page.scan_complete,
+          provisional_order: page.provisional_order,
+        };
+        if (page.provisional_order) listHadProvisionalOrderRef.current = true;
+        if (append && listHadProvisionalOrderRef.current) {
+          pageDiagnostics.order_exact = false;
+          pageDiagnostics.provisional_order = true;
+        }
+        setDiagnostics(pageDiagnostics);
         if (append) return;
         if (selectedIdRef.current !== requestedSelectedId) return;
         const selectedStillMatches = requestedSelectedId ? page.selected_in_results !== false : false;
@@ -871,7 +909,21 @@ export default function App() {
             )}
             {importJob && (
               <div data-testid="import-status">
-                <span>{importJob.status === "succeeded" ? t("importSucceeded") : importJob.status === "postcheck_failed" ? t("importPostcheckFailed") : importJob.status === "failed" ? t("importFailed") : t("importRunning")}</span>
+                <span data-testid={`import-outcome-${importJob.completion_outcome}`}>
+                  {importJob.canonical_import_outcome === "partial_success"
+                    ? t("importPartialSuccess")
+                    : importJob.canonical_import_outcome === "success_with_warnings"
+                      ? t("importSuccessWithWarnings")
+                      : importJob.completion_outcome === "cleanup_warning"
+                        ? t("importCleanupOutcome")
+                        : importJob.status === "succeeded"
+                          ? t("importSucceeded")
+                          : importJob.status === "postcheck_failed"
+                            ? t("importPostcheckFailed")
+                            : importJob.status === "failed"
+                              ? t("importFailed")
+                              : t("importRunning")}
+                </span>
                 <span>{t("jobStage")}: {importStageLabel(t, importJob.stage)}</span>
                 <span>{t("jobElapsed")}: {importJob.elapsed_seconds.toFixed(1)}s</span>
                 {importJob.stage_timings && Object.keys(importJob.stage_timings).length > 0 && (
@@ -882,7 +934,24 @@ export default function App() {
                       .join(" · ")}
                   </span>
                 )}
-                {importJob.summary && <span>{String(importJob.summary.valid_conversations ?? 0)} {t("conversations")}</span>}
+                {importJob.summary && (
+                  <div data-testid="import-summary">
+                    <span>{t("importCanonicalCommit")}: {importJob.canonical_commit_succeeded ? t("yes") : t("no")}</span>
+                    <span>{String(importJob.summary.committed_conversations ?? importJob.summary.valid_conversations ?? 0)} {t("conversations")}</span>
+                    <span>{String(importJob.summary.committed_nodes ?? importJob.summary.nodes ?? 0)} {t("nodes")}</span>
+                    <span>{t("importSkipped")}: {String(importJob.summary.skipped_invalid_elements ?? 0)}</span>
+                    <span>{t("importWarnings")}: {String(importJob.summary.warnings ?? 0)}</span>
+                    {Array.isArray(importJob.summary.warnings_by_type) && importJob.summary.warnings_by_type.length > 0 && (
+                      <ul data-testid="import-warning-counts">
+                        {importJob.summary.warnings_by_type.map((warning) => (
+                          <li key={warning.warning_type}>
+                            {importWarningLabel(t, warning.warning_type)}: {warning.count}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
                 {importJob.web_index && ["building", "cancelling"].includes(String(importJob.web_index.status || "")) ? (
                   <span data-testid="web-index-progress">{webIndexProgressLabel(t, importJob.web_index)}</span>
                 ) : importJob.web_index?.status === "cancelled" ? <span>{t("webIndexCancelled")}</span> : importJob.web_index ? <span>{t("webIndexOk")}</span> : null}

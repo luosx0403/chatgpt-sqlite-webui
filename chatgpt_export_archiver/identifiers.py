@@ -49,13 +49,31 @@ def canonical_id_text(value: Any, *, strip: bool = False) -> str | None:
     else:
         return None
     result, _changed = unicode_scalar_text(result)
-    if (
-        not result
-        or len(result) > MAX_CANONICAL_ID_LENGTH
-        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in result)
-    ):
+    if not identifier_text_is_safe(result, limit=MAX_CANONICAL_ID_LENGTH, allow_empty=False):
         return None
     return result
+
+
+def identifier_text_is_safe(
+    value: str,
+    *,
+    limit: int,
+    allow_empty: bool = True,
+) -> bool:
+    """Apply the shared canonical/legacy identifier Unicode policy.
+
+    Unicode noncharacters are valid scalar values and are intentionally
+    accepted. Controls, DEL, isolated surrogates, and overlong values are not.
+    """
+
+    if not isinstance(value, str) or len(value) > limit or (not value and not allow_empty):
+        return False
+    return not any(
+        ord(character) <= 0x1F
+        or ord(character) == 0x7F
+        or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    )
 
 
 def canonical_id_length(value: Any, *, strip: bool = False) -> int | None:

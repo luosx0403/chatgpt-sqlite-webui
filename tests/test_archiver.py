@@ -4,6 +4,7 @@ import json
 import argparse
 import base64
 import contextlib
+import functools
 import hashlib
 import io
 import logging
@@ -35,6 +36,23 @@ from chatgpt_export_archiver.web_db import connect_readonly, create_web_indexes
 from tools.check_delivery_clean import is_forbidden_member, main as delivery_clean_main
 from tools import clean_generated_artifacts
 from tools.clean_generated_artifacts import main as clean_generated_main
+
+
+def legacy_delete_contract_test(function):
+    """Exercise recovery compatibility code that production now fails closed before."""
+
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        with mock.patch(
+            "chatgpt_export_archiver.cli.delete_input_secure_identity_supported",
+            return_value=True,
+        ), mock.patch(
+            "chatgpt_export_archiver.scanner.delete_input_secure_identity_supported",
+            return_value=True,
+        ):
+            return function(*args, **kwargs)
+
+    return wrapped
 
 
 def message_node(node_id, parent, role, text, ts, children=None):
@@ -154,6 +172,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertNotIn("SENSITIVE_SYNTHETIC_TOKEN", "\n".join(job.logs))
             self.assertIn("safe error", "\n".join(job.logs))
 
+    @legacy_delete_contract_test
     def test_post_close_summary_update_failure_warns_but_import_succeeds(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -192,6 +211,7 @@ class ArchiverTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    @legacy_delete_contract_test
     def test_post_commit_summary_update_failure_warns_but_import_succeeds(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -2739,6 +2759,45 @@ class ArchiverTests(unittest.TestCase):
         self.assertIn("ORDER BY bm25(message_fts) LIMIT ?", normalized_sql)
         self.assertEqual(conn.params, ["common*", 5])
 
+    def test_round11_strict_delete_fails_closed_before_database_or_staging(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            source = base / "source.zip"
+            database = base / "new-parent" / "archive.db"
+            write_zip(source, {"conversations.json": [conversation("strict-delete")]})
+            before = (
+                source.stat().st_dev,
+                source.stat().st_ino,
+                source.stat().st_size,
+                source.stat().st_mtime_ns,
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+            )
+            code, output = run_cli([
+                "--db",
+                str(database),
+                "import",
+                "--input",
+                str(source),
+                "--delete-input-on-success",
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("delete_input_secure_identity_unsupported", output)
+            self.assertEqual(
+                before,
+                (
+                    source.stat().st_dev,
+                    source.stat().st_ino,
+                    source.stat().st_size,
+                    source.stat().st_mtime_ns,
+                    hashlib.sha256(source.read_bytes()).hexdigest(),
+                ),
+            )
+            self.assertFalse(database.exists())
+            self.assertFalse(database.parent.exists())
+            self.assertEqual(list(base.glob(".chatgpt-archive-delete-*")), [])
+            self.assertEqual(list(base.glob(".chatgpt-archive-delete-recovery-*")), [])
+
+    @legacy_delete_contract_test
     def test_delete_input_on_success_deletes_zip_only_after_success(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -2768,6 +2827,7 @@ class ArchiverTests(unittest.TestCase):
                 conn.close()
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink is not available")
+    @legacy_delete_contract_test
     def test_delete_input_on_success_unlinks_explicit_symlink_not_zip_target(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -2801,6 +2861,7 @@ class ArchiverTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    @legacy_delete_contract_test
     def test_delete_input_on_success_unlink_failure_keeps_successful_import(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -5429,6 +5490,7 @@ class ArchiverTests(unittest.TestCase):
             ).fetchone()[0], 2)
             generation_null.close()
 
+    @legacy_delete_contract_test
     def test_round6_delete_input_replacement_is_preserved(self):
         from chatgpt_export_archiver.cli import run_import_pipeline
 
@@ -5468,6 +5530,7 @@ class ArchiverTests(unittest.TestCase):
             conn.close()
 
     @unittest.skipUnless(hasattr(os, "link"), "hardlink support required")
+    @legacy_delete_contract_test
     def test_round6_delete_input_hardlink_is_conservatively_preserved(self):
         from chatgpt_export_archiver.cli import run_import_pipeline
 
@@ -5487,6 +5550,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertFalse((base / "archive.db").exists())
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    @legacy_delete_contract_test
     def test_round6_delete_input_retargeted_symlink_is_preserved(self):
         from chatgpt_export_archiver.cli import run_import_pipeline
 
@@ -5922,6 +5986,7 @@ class ArchiverTests(unittest.TestCase):
         self.assertFalse(any("length(CAST(content_text AS BLOB))" in sql for sql in statements))
         conn.close()
 
+    @legacy_delete_contract_test
     def test_round7_delete_barrier_never_unlinks_replacement_after_identity_check(self):
         from chatgpt_export_archiver import scanner
 
@@ -6383,7 +6448,7 @@ class ArchiverTests(unittest.TestCase):
             reader = connect_readonly(db)
             status = web_index_status(reader)
             self.assertTrue(status["web_normalized_indexed"])
-            self.assertEqual(status["web_index_format_version"], "5")
+            self.assertEqual(status["web_index_format_version"], "6")
             reader.close()
 
     def test_round10_malformed_format3_metadata_is_not_claimed_as_project_owned(self):
@@ -6841,6 +6906,7 @@ class ArchiverTests(unittest.TestCase):
             "canonical_id_empty",
         )
 
+    @legacy_delete_contract_test
     def test_round8_delete_staging_rejects_same_inode_rewrite_with_restored_size_and_mtime(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -6877,6 +6943,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertTrue(result["delete_input_changed"])
             self.assertIsNone(result["deleted_input"])
 
+    @legacy_delete_contract_test
     def test_round8_delete_replacement_b_and_c_preserves_recovery_object(self):
         from chatgpt_export_archiver import scanner
         from chatgpt_export_archiver.cli import run_import_pipeline
@@ -6920,6 +6987,7 @@ class ArchiverTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    @legacy_delete_contract_test
     def test_round10_delete_staged_descriptor_sha_must_match_import_bound_sha(self):
         from chatgpt_export_archiver import scanner
 
@@ -6964,6 +7032,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertEqual(source_path.read_bytes(), replacement)
             self.assertFalse(any(base.glob(".chatgpt-archive-delete-*")))
 
+    @legacy_delete_contract_test
     def test_round10_delete_rename_after_effect_interrupt_is_recoverable(self):
         from chatgpt_export_archiver import scanner
 
@@ -6999,6 +7068,7 @@ class ArchiverTests(unittest.TestCase):
             self.assertEqual(scanner.recover_delete_input(base, token), "restored")
             self.assertEqual(source_path.read_bytes(), payload)
 
+    @legacy_delete_contract_test
     def test_round10_delete_recovery_rejects_tampered_staged_sha(self):
         from chatgpt_export_archiver import scanner
 

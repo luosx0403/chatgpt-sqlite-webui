@@ -29,12 +29,13 @@ from .current_path import (
     ensure_effective_current_views,
     resolve_effective_current_collection,
 )
-from .display_resolver import PlaceholderStreamClassifier
+from .display_resolver import PlaceholderStreamClassifier, placeholder_prefix_may_match
 from .parser import RAW_MESSAGE_NOT_PARSED, extract_message_content, is_generated_non_text_placeholder, normalize_display_text, recover_message_display_text
 from .schema_contract import (
     DISPLAY_TEXT_RESOLVER_VERSION,
     NORMALIZATION_INDEX_FORMAT_VERSION,
     OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+    STABLE_OPTIONAL_ADDRESS_VERSION,
     parse_nonnegative_integer,
 )
 from .sqlite_errors import is_optional_search_capability_missing
@@ -70,10 +71,12 @@ SEARCH_STREAM_OVERLAP_CHARS = 2048
 SEARCH_CANDIDATE_LIMIT = 100_000
 SEARCH_VM_PROGRESS_INTERVAL = 1_000
 SEARCH_WALL_DEADLINE_SECONDS = 30.0
-SEARCH_CONTINUATION_VERSION = 1
-SEARCH_BUDGET_CONTRACT_VERSION = 1
+SEARCH_CONTINUATION_VERSION = 2
+SEARCH_BUDGET_CONTRACT_VERSION = 2
 MAX_SEARCH_CONTINUATION_LENGTH = 4096
 MAX_SEARCH_CONTINUATION_ID_CHARS = 16 * 1024
+SEARCH_CONTINUATION_SESSION_TTL_SECONDS = 15 * 60
+SEARCH_CONTINUATION_SESSION_LIMIT = 128
 SEARCH_RAW_EXACT_MAX_BYTES = 1024 * 1024
 SEARCH_RAW_EXACT_MAX_CHARS = 800_000
 SEARCH_RAW_CONTINUATION_TIERS = (5 * 1024 * 1024, 20 * 1024 * 1024)
@@ -82,12 +85,17 @@ MAX_API_ROLE_CHARS = 256
 MAX_API_AUTHOR_CHARS = 4096
 MAX_API_CONTENT_TYPE_CHARS = 256
 MAX_DISPLAY_CURSOR_LENGTH = 1024
+DISPLAY_CURSOR_VERSION = 3
 MAX_LEGACY_DISPLAY_OFFSET = 1_048_576
 MAX_SQLITE_CURSOR_OFFSET = 9_223_372_036_854_775_807
 _DISPLAY_REVISION_CACHE_LIMIT = 128
 _DISPLAY_REVISION_CACHE: OrderedDict[tuple[Any, ...], str] = OrderedDict()
 _DISPLAY_REVISION_CACHE_LOCK = threading.Lock()
 _SEARCH_CONTINUATION_SECRET = secrets.token_bytes(32)
+_SEARCH_CONTINUATION_SESSIONS: OrderedDict[
+    str, tuple[float, dict[str, Any]]
+] = OrderedDict()
+_SEARCH_CONTINUATION_SESSIONS_LOCK = threading.Lock()
 
 
 def _bounded_scalar_projection(expression: str, alias: str, limit: int) -> str:
@@ -134,38 +142,88 @@ def _display_cursor_identity(conversation_id: str, node_id: str) -> str:
     return digest.hexdigest()
 
 
-def _encode_display_cursor(identity: str, revision: str, byte_offset: int, char_offset: int) -> str:
-    payload = json.dumps([2, identity, revision, byte_offset, char_offset], separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+def _database_token_identity(conn: sqlite3.Connection) -> str:
+    return str(_search_database_contract(conn)["database_identity"])
 
 
-def _decode_display_cursor(value: str) -> tuple[str, str, int, int]:
+def _encode_display_cursor(
+    database_identity: str,
+    identity: str,
+    revision: str,
+    byte_offset: int,
+    char_offset: int,
+    *,
+    source: str = "canonical",
+) -> str:
+    payload = json.dumps(
+        [
+            DISPLAY_CURSOR_VERSION,
+            database_identity,
+            identity,
+            revision,
+            source,
+            byte_offset,
+            char_offset,
+        ],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(_SEARCH_CONTINUATION_SECRET, b"display\0" + payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(payload + signature).rstrip(b"=").decode("ascii")
+
+
+def _decode_display_cursor(
+    database_identity_expected: str,
+    value: str,
+) -> tuple[str, str, str, int, int]:
     if not value or len(value) > MAX_DISPLAY_CURSOR_LENGTH:
         raise DisplayCursorError("invalid_display_cursor")
     try:
-        raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+        packed = base64.b64decode(
+            value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
+        )
+        try:
+            legacy = json.loads(packed)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            legacy = None
+        if isinstance(legacy, list) and len(legacy) == 4:
+            # Unsigned v1/v2 cursors are never accepted, but they are a
+            # recognizable predecessor rather than malformed input.
+            raise DisplayCursorError("display_cursor_stale")
+        if len(packed) <= 32:
+            raise ValueError("short cursor")
+        raw, signature = packed[:-32], packed[-32:]
+        expected = hmac.new(
+            _SEARCH_CONTINUATION_SECRET, b"display\0" + raw, hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("bad cursor signature")
         payload = json.loads(raw)
-        if isinstance(payload, list) and len(payload) == 5 and payload[0] == 2:
-            _version, identity, revision, byte_offset, char_offset = payload
-        elif isinstance(payload, list) and len(payload) == 4:
-            legacy_rowid, revision, byte_offset, char_offset = payload
-            if isinstance(legacy_rowid, bool) or not isinstance(legacy_rowid, int) or legacy_rowid < 1:
-                raise ValueError("invalid legacy rowid")
-            identity = f"legacy-rowid:{legacy_rowid}"
-        else:
+        if (
+            not isinstance(payload, list)
+            or len(payload) != 7
+            or payload[0] != DISPLAY_CURSOR_VERSION
+        ):
             raise ValueError("invalid cursor shape")
+        _version, database_identity, identity, revision, source, byte_offset, char_offset = payload
+    except DisplayCursorError:
+        raise
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         raise DisplayCursorError("invalid_display_cursor") from exc
     if (
+        not isinstance(database_identity, str) or len(database_identity) != 64
+        or
         not isinstance(identity, str) or len(identity) > 128
         or not isinstance(revision, str) or len(revision) > 256
+        or source not in {"canonical"}
         or isinstance(byte_offset, bool) or not isinstance(byte_offset, int)
         or byte_offset < 0 or byte_offset > MAX_SQLITE_CURSOR_OFFSET
         or isinstance(char_offset, bool) or not isinstance(char_offset, int)
         or char_offset < 0 or char_offset > MAX_SQLITE_CURSOR_OFFSET
     ):
         raise DisplayCursorError("invalid_display_cursor")
-    return identity, revision, byte_offset, char_offset
+    if database_identity != database_identity_expected:
+        raise DisplayCursorError("display_cursor_stale")
+    return identity, revision, source, byte_offset, char_offset
 
 
 def _read_utf8_blob_chunk(blob: sqlite3.Blob, byte_offset: int, char_limit: int) -> tuple[str, int, bool, bool]:
@@ -319,17 +377,38 @@ def _search_database_contract(conn: sqlite3.Connection) -> dict[str, Any]:
     }
     optional_format = None
     try:
-        optional_row = conn.execute(
-            "SELECT value FROM web_index_metadata WHERE key = 'format_version'"
-        ).fetchone()
-        optional_format = str(optional_row[0]) if optional_row is not None else None
+        optional_metadata = {
+            str(row[0]): str(row[1])
+            for row in conn.execute(
+                "SELECT key, value FROM web_index_metadata "
+                "WHERE key IN ('web_index_format_version', "
+                "'stable_optional_address_version', "
+                "'stable_optional_address_identity', "
+                "'normalization_index_format_version', "
+                "'display_text_resolver_version')"
+            )
+        }
+        optional_format = optional_metadata.get("web_index_format_version")
     except sqlite3.OperationalError as exc:
         if not is_optional_search_capability_missing(exc):
             raise
+        optional_metadata = {}
     return {
         "database_identity": identity,
         "schema_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
         "optional_index_format": optional_format,
+        "stable_optional_address_version": optional_metadata.get(
+            "stable_optional_address_version"
+        ),
+        "stable_optional_address_identity": optional_metadata.get(
+            "stable_optional_address_identity"
+        ),
+        "normalization_index_format_version": optional_metadata.get(
+            "normalization_index_format_version"
+        ),
+        "display_text_resolver_version": optional_metadata.get(
+            "display_text_resolver_version"
+        ),
         "generations": generations,
     }
 
@@ -375,7 +454,26 @@ def _search_query_contract(
 
 
 def _encode_search_continuation(payload: Mapping[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    session_id = secrets.token_hex(16)
+    now = time.monotonic()
+    with _SEARCH_CONTINUATION_SESSIONS_LOCK:
+        expired = [
+            key
+            for key, (expires_at, _payload) in _SEARCH_CONTINUATION_SESSIONS.items()
+            if expires_at <= now
+        ]
+        for key in expired:
+            _SEARCH_CONTINUATION_SESSIONS.pop(key, None)
+        _SEARCH_CONTINUATION_SESSIONS[session_id] = (
+            now + SEARCH_CONTINUATION_SESSION_TTL_SECONDS,
+            dict(payload),
+        )
+        while len(_SEARCH_CONTINUATION_SESSIONS) > SEARCH_CONTINUATION_SESSION_LIMIT:
+            _SEARCH_CONTINUATION_SESSIONS.popitem(last=False)
+    raw = json.dumps(
+        [SEARCH_CONTINUATION_VERSION, session_id],
+        separators=(",", ":"),
+    ).encode("ascii")
     signature = hmac.new(_SEARCH_CONTINUATION_SECRET, raw, hashlib.sha256).digest()
     token = base64.urlsafe_b64encode(raw + signature).rstrip(b"=").decode("ascii")
     if len(token) > MAX_SEARCH_CONTINUATION_LENGTH:
@@ -396,12 +494,25 @@ def _decode_search_continuation(value: str) -> dict[str, Any]:
         expected = hmac.new(_SEARCH_CONTINUATION_SECRET, raw, hashlib.sha256).digest()
         if not hmac.compare_digest(signature, expected):
             raise ValueError("bad signature")
-        payload = json.loads(raw)
+        envelope = json.loads(raw)
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         raise SearchContinuationError("invalid_search_continuation") from exc
-    if not isinstance(payload, dict) or payload.get("version") != SEARCH_CONTINUATION_VERSION:
+    if (
+        not isinstance(envelope, list)
+        or len(envelope) != 2
+        or envelope[0] != SEARCH_CONTINUATION_VERSION
+        or not isinstance(envelope[1], str)
+        or len(envelope[1]) != 32
+    ):
         raise SearchContinuationError("invalid_search_continuation")
-    return payload
+    now = time.monotonic()
+    with _SEARCH_CONTINUATION_SESSIONS_LOCK:
+        session = _SEARCH_CONTINUATION_SESSIONS.get(envelope[1])
+        if session is None or session[0] <= now:
+            _SEARCH_CONTINUATION_SESSIONS.pop(envelope[1], None)
+            raise SearchContinuationError("search_continuation_stale")
+        _SEARCH_CONTINUATION_SESSIONS.move_to_end(envelope[1])
+        return dict(session[1])
 
 
 def normalize_search_text(value: str | None) -> str:
@@ -506,6 +617,10 @@ def _ensure_search_functions(
         raw_tiers.append((verify_chars, verify_bytes))
     raw_tier_index = max(0, min(int(raw_tier_index), len(raw_tiers) - 1))
     raw_verify_chars, raw_verify_bytes = raw_tiers[raw_tier_index]
+    try:
+        temp_pages_before = int(conn.execute("PRAGMA temp.page_count").fetchone()[0])
+    except sqlite3.Error:
+        temp_pages_before = 0
     state: dict[str, Any] = {
         "exact_verify_limit_exceeded": False,
         "verify_chars": verify_chars,
@@ -514,6 +629,8 @@ def _ensure_search_functions(
         "last_resolved_text": None,
         "request_verified_bytes": 0,
         "request_verified_chars": 0,
+        "max_observed_verified_bytes_per_candidate": 0,
+        "max_observed_verified_chars_per_candidate": 0,
         "request_verify_bytes_limit": SEARCH_REQUEST_VERIFY_BYTES,
         "request_verify_chars_limit": SEARCH_REQUEST_VERIFY_CHARS,
         "streamed_candidates": 0,
@@ -532,6 +649,7 @@ def _ensure_search_functions(
         "decoded_chars": 0,
         "normalization_units": 0,
         "sqlite_vm_steps": 0,
+        "temp_pages_before": temp_pages_before,
         "budget_exhausted": False,
         "budget_reason": None,
         "started_monotonic": time.monotonic(),
@@ -577,6 +695,9 @@ def _ensure_search_functions(
                 mark_pending(storage_rowid, "candidate_row_limit")
                 return "", 0, False
             state["request_verified_bytes"] += size
+            state["max_observed_verified_bytes_per_candidate"] = max(
+                state["max_observed_verified_bytes_per_candidate"], size
+            )
             if state["request_verified_bytes"] > SEARCH_REQUEST_VERIFY_BYTES:
                 mark_pending(storage_rowid, "request_aggregate_limit")
                 return "", 0, False
@@ -587,6 +708,9 @@ def _ensure_search_functions(
                 state["decoded_chars"] += len(value)
                 state["normalization_units"] += len(value)
                 state["request_verified_chars"] += len(value)
+                state["max_observed_verified_chars_per_candidate"] = max(
+                    state["max_observed_verified_chars_per_candidate"], len(value)
+                )
                 if state["request_verified_chars"] > SEARCH_REQUEST_VERIFY_CHARS:
                     mark_pending(storage_rowid, "request_aggregate_limit")
                     return "", len(value), False
@@ -716,6 +840,9 @@ def _ensure_search_functions(
                             scan_chars=len(scan),
                         )
         state["request_verified_chars"] += total_chars
+        state["max_observed_verified_chars_per_candidate"] = max(
+            state["max_observed_verified_chars_per_candidate"], total_chars
+        )
         if state["request_verified_chars"] > SEARCH_REQUEST_VERIFY_CHARS:
             mark_pending(storage_rowid, "request_aggregate_limit")
             return "", total_chars, False
@@ -733,6 +860,7 @@ def _ensure_search_functions(
                 "match_length": (best_match[1] - best_match[0]) if best_match else None,
                 "matched_term": best_match[2] if best_match else None,
                 "source_byte_offset": best_match[3] if best_match else None,
+                "source_kind": "canonical",
             }
         return proxy, total_chars, placeholder_exact
 
@@ -778,6 +906,9 @@ def _ensure_search_functions(
                     mark_pending(storage_rowid, "raw_fallback_limit")
                 else:
                     state["request_verified_bytes"] += raw_size
+                    state["max_observed_verified_bytes_per_candidate"] = max(
+                        state["max_observed_verified_bytes_per_candidate"], raw_size
+                    )
                     if state["request_verified_bytes"] > SEARCH_REQUEST_VERIFY_BYTES:
                         mark_pending(storage_rowid, "request_aggregate_limit")
                     else:
@@ -791,6 +922,9 @@ def _ensure_search_functions(
                         state["decoded_chars"] += len(raw)
                         state["normalization_units"] += len(raw)
                         state["request_verified_chars"] += len(raw)
+                        state["max_observed_verified_chars_per_candidate"] = max(
+                            state["max_observed_verified_chars_per_candidate"], len(raw)
+                        )
                         if (
                             more
                             or len(raw) > min(verify_chars, raw_verify_chars)
@@ -833,6 +967,7 @@ def _ensure_search_functions(
                         if source_span
                         else None
                     ),
+                    "source_kind": "raw_fallback",
                 }
         state["last_storage_rowid"] = storage_rowid
         state["last_resolved_text"] = resolved
@@ -1261,6 +1396,11 @@ def list_conversations(
         total,
         limit,
         offset,
+        extra={
+            "order_exact": True,
+            "scan_complete": True,
+            "provisional_order": False,
+        },
         selected_in_results=selected_in_results,
         selected_item=(
             _conversation_summary_with_counts(selected_row, counts.get(selected_id, {}))
@@ -1299,12 +1439,14 @@ def search_messages(
         count_total=count_total,
     )
     database_contract = _search_database_contract(conn)
-    resume_after_rowid = 0
+    resume_after_conversation_id = ""
+    resume_after_node_id = ""
     confirmed_hits_before = 0
     pending_candidates_before = 0
     pending_reasons_before: set[str] = set()
     raw_tier_index = 0
     retry_pending_candidate = False
+    resume_candidate_offset = 0
     if continuation:
         continuation_payload = _decode_search_continuation(continuation)
         if (
@@ -1314,14 +1456,19 @@ def search_messages(
             != SEARCH_BUDGET_CONTRACT_VERSION
         ):
             raise SearchContinuationError("search_continuation_stale")
-        resume_value = continuation_payload.get("candidate_cursor")
+        resume_conversation_value = continuation_payload.get(
+            "candidate_conversation_cursor", ""
+        )
+        resume_node_value = continuation_payload.get("candidate_node_cursor", "")
         if (
-            isinstance(resume_value, bool)
-            or not isinstance(resume_value, int)
-            or resume_value < 0
+            not isinstance(resume_conversation_value, str)
+            or len(resume_conversation_value) > MAX_SEARCH_CONTINUATION_ID_CHARS
+            or not isinstance(resume_node_value, str)
+            or len(resume_node_value) > MAX_SEARCH_CONTINUATION_ID_CHARS
         ):
             raise SearchContinuationError("invalid_search_continuation")
-        resume_after_rowid = resume_value
+        resume_after_conversation_id = resume_conversation_value
+        resume_after_node_id = resume_node_value
         confirmed_value = continuation_payload.get("confirmed_hits_before", 0)
         if (
             isinstance(confirmed_value, bool)
@@ -1355,6 +1502,15 @@ def search_messages(
             raise SearchContinuationError("invalid_search_continuation")
         raw_tier_index = raw_tier_value
         retry_pending_candidate = retry_pending_value
+        candidate_offset_value = continuation_payload.get("candidate_offset", 0)
+        if (
+            isinstance(candidate_offset_value, bool)
+            or not isinstance(candidate_offset_value, int)
+            or candidate_offset_value < 0
+            or candidate_offset_value > MAX_SQLITE_CURSOR_OFFSET
+        ):
+            raise SearchContinuationError("invalid_search_continuation")
+        resume_candidate_offset = candidate_offset_value
         if retry_pending_candidate:
             pending_candidates_before = max(0, pending_candidates_before - 1)
         search_state = _ensure_search_functions(
@@ -1378,14 +1534,17 @@ def search_messages(
             # below instead of resolving those rows a second time.
             scan_parsed = replace(parsed, path="all")
     try:
-        last_candidate_rowid, candidate_budget_exhausted, _ = _scan_verified_message_candidates(
+        last_candidate_node_id, candidate_budget_exhausted, last_candidate_conversation_id, next_candidate_offset = _scan_verified_message_candidates(
             conn,
             scan_parsed,
             conversation_id,
             search_state,
             use_trigram=True,
-            resume_after_rowid=resume_after_rowid,
+            resume_after_conversation_id=resume_after_conversation_id,
+            resume_after_node_id=resume_after_node_id,
             max_verified_results=max_verified_results,
+            display_order=bool(order == "display" and conversation_id),
+            resume_candidate_offset=resume_candidate_offset,
         )
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=True)
     except sqlite3.OperationalError as exc:
@@ -1395,14 +1554,17 @@ def search_messages(
         search_state = _ensure_search_functions(
             conn, parsed, raw_tier_index=raw_tier_index
         )
-        last_candidate_rowid, candidate_budget_exhausted, _ = _scan_verified_message_candidates(
+        last_candidate_node_id, candidate_budget_exhausted, last_candidate_conversation_id, next_candidate_offset = _scan_verified_message_candidates(
             conn,
             scan_parsed,
             conversation_id,
             search_state,
             use_trigram=False,
-            resume_after_rowid=resume_after_rowid,
+            resume_after_conversation_id=resume_after_conversation_id,
+            resume_after_node_id=resume_after_node_id,
             max_verified_results=max_verified_results,
+            display_order=bool(order == "display" and conversation_id),
+            resume_candidate_offset=resume_candidate_offset,
         )
         diagnostics = _message_search_diagnostics(conn, parsed, used_trigram=False)
     if parsed.path == "current" and not conversation_id:
@@ -1501,7 +1663,9 @@ def search_messages(
                 "budget_contract_version": SEARCH_BUDGET_CONTRACT_VERSION,
                 "database_contract": database_contract,
                 "query_contract": query_contract,
-                "candidate_cursor": last_candidate_rowid,
+                "candidate_conversation_cursor": last_candidate_conversation_id,
+                "candidate_node_cursor": last_candidate_node_id,
+                "candidate_offset": next_candidate_offset,
                 "confirmed_hits_before": cumulative_total,
                 "pending_candidates_before": pending_count,
                 "pending_reasons_before": sorted(cumulative_pending_reasons),
@@ -1518,7 +1682,17 @@ def search_messages(
             retry_available
             or (
                 not retry_pending
-                and last_candidate_rowid > resume_after_rowid
+                and (
+                    next_candidate_offset > resume_candidate_offset
+                    if order == "display" and conversation_id
+                    else (
+                        last_candidate_conversation_id > resume_after_conversation_id
+                        or (
+                            last_candidate_conversation_id == resume_after_conversation_id
+                            and last_candidate_node_id > resume_after_node_id
+                        )
+                    )
+                )
             )
         )
         else None
@@ -1526,6 +1700,9 @@ def search_messages(
     diagnostics.update(
         {
             "resource_contract": "streamed_message_search_v2",
+            "configured_candidate_scan_char_limit": SEARCH_CANDIDATE_SCAN_CHARS,
+            "configured_verified_char_limit_per_candidate": int(search_state["verify_chars"]),
+            "configured_verified_byte_limit_per_candidate": int(search_state["verify_bytes"]),
             "candidate_scan_chars_per_row": SEARCH_CANDIDATE_SCAN_CHARS,
             "hit_preview_chars": SEARCH_HIT_PREVIEW_CHARS,
             "snippet_scan_chars": SEARCH_SNIPPET_SCAN_CHARS,
@@ -1545,6 +1722,12 @@ def search_messages(
             ),
             "verified_chars_per_candidate": int(search_state["verify_chars"]),
             "verified_bytes_per_candidate": int(search_state["verify_bytes"]),
+            "max_observed_verified_chars_per_candidate": int(
+                search_state["max_observed_verified_chars_per_candidate"]
+            ),
+            "max_observed_verified_bytes_per_candidate": int(
+                search_state["max_observed_verified_bytes_per_candidate"]
+            ),
             "request_verified_bytes": int(search_state["request_verified_bytes"]),
             "request_verified_chars": int(search_state["request_verified_chars"]),
             "request_verify_bytes_limit": int(search_state["request_verify_bytes_limit"]),
@@ -1561,11 +1744,24 @@ def search_messages(
             ),
             "oversized_candidates_pending": pending_count,
             "candidate_count": int(search_state["candidate_count"]),
+            "candidate_sql_rows": int(search_state["candidate_count"]),
+            "candidates_seen": int(search_state["candidate_count"]),
+            "candidates_verified": max(
+                0, int(search_state["candidate_count"]) - pending_count
+            ),
             "candidate_limit": SEARCH_CANDIDATE_LIMIT,
             "resolver_calls": int(search_state["resolver_calls"]),
             "blob_reads": int(search_state["blob_reads"]),
             "candidate_blob_bytes": int(search_state["candidate_blob_bytes"]),
             "raw_blob_bytes": int(search_state["raw_blob_bytes"]),
+            "blob_read_bytes": int(
+                search_state["candidate_blob_bytes"] + search_state["raw_blob_bytes"]
+            ),
+            "temp_page_delta": max(
+                0,
+                int(conn.execute("PRAGMA temp.page_count").fetchone()[0])
+                - int(search_state["temp_pages_before"]),
+            ),
             "decoded_chars": int(search_state["decoded_chars"]),
             "normalization_units": int(search_state["normalization_units"]),
             "sqlite_vm_steps": int(search_state["sqlite_vm_steps"]),
@@ -1577,14 +1773,20 @@ def search_messages(
             "completion_state": "partial" if partial else "complete",
         }
     )
-    if continuation:
+    result.update(
+        {
+            "order_exact": not partial,
+            "scan_complete": not partial,
+            "provisional_order": partial,
+        }
+    )
+    if continuation or continuation_token is not None:
         # Continuation pages are candidate-cursor segments, not numeric-offset
         # pages over a materialized global result set.
         result["has_more"] = continuation_token is not None
         result["next_offset"] = None
-    elif continuation_token is not None:
-        result["has_more"] = True
-        result["next_offset"] = effective_page_offset + len(items)
+        if continuation_token is not None:
+            result["has_more"] = True
     result["diagnostics"] = diagnostics
     return _bounded_search_response(result)
 
@@ -1622,7 +1824,7 @@ def search_conversations(
         count_total=False,
     )
     database_contract = _search_database_contract(conn)
-    resume_after_rowid = 0
+    resume_after_node_id = ""
     resume_after_conversation_id = ""
     last_confirmed_conversation_id = ""
     confirmed_hits_before = 0
@@ -1642,7 +1844,7 @@ def search_conversations(
             or continuation_payload.get("result_kind") != "conversation"
         ):
             raise SearchContinuationError("search_continuation_stale")
-        resume_value = continuation_payload.get("candidate_cursor")
+        resume_node_value = continuation_payload.get("candidate_node_cursor", "")
         resume_conversation_value = continuation_payload.get(
             "candidate_conversation_cursor", ""
         )
@@ -1655,9 +1857,8 @@ def search_conversations(
         raw_tier_value = continuation_payload.get("raw_tier_index", 0)
         retry_value = continuation_payload.get("retry_pending_candidate", False)
         if (
-            isinstance(resume_value, bool)
-            or not isinstance(resume_value, int)
-            or resume_value < 0
+            not isinstance(resume_node_value, str)
+            or len(resume_node_value) > MAX_SEARCH_CONTINUATION_ID_CHARS
             or not isinstance(resume_conversation_value, str)
             or len(resume_conversation_value) > MAX_SEARCH_CONTINUATION_ID_CHARS
             or not isinstance(last_confirmed_value, str)
@@ -1676,7 +1877,7 @@ def search_conversations(
             or not isinstance(retry_value, bool)
         ):
             raise SearchContinuationError("invalid_search_continuation")
-        resume_after_rowid = resume_value
+        resume_after_node_id = resume_node_value
         resume_after_conversation_id = resume_conversation_value
         last_confirmed_conversation_id = last_confirmed_value
         confirmed_hits_before = confirmed_value
@@ -1691,13 +1892,13 @@ def search_conversations(
         )
 
     candidate_budget_exhausted = False
-    last_candidate_rowid = resume_after_rowid
+    last_candidate_node_id = resume_after_node_id
     last_candidate_conversation_id = resume_after_conversation_id
     verified_messages = False
     effective_offset = 0 if continuation else offset
 
     def execute_page(use_trigram: bool) -> tuple[list[dict[str, Any]], int]:
-        nonlocal search_state, candidate_budget_exhausted, last_candidate_rowid
+        nonlocal search_state, candidate_budget_exhausted, last_candidate_node_id
         nonlocal last_candidate_conversation_id, verified_messages
         if body_positive:
             _prepare_verified_message_table(conn)
@@ -1706,16 +1907,17 @@ def search_conversations(
             )
             scan_parsed = replace(parsed, path="all") if parsed.path == "current" else parsed
             (
-                last_candidate_rowid,
+                last_candidate_node_id,
                 candidate_budget_exhausted,
                 last_candidate_conversation_id,
+                _unused_candidate_offset,
             ) = _scan_verified_message_candidates(
                 conn,
                 scan_parsed,
                 None,
                 search_state,
                 use_trigram=use_trigram,
-                resume_after_rowid=resume_after_rowid,
+                resume_after_node_id=resume_after_node_id,
                 max_verified_results=SEARCH_CANDIDATE_LIMIT + 1,
                 conversation_grouped=True,
                 resume_after_conversation_id=resume_after_conversation_id,
@@ -1863,7 +2065,7 @@ def search_conversations(
                 "budget_contract_version": SEARCH_BUDGET_CONTRACT_VERSION,
                 "database_contract": database_contract,
                 "query_contract": query_contract,
-                "candidate_cursor": last_candidate_rowid,
+                "candidate_node_cursor": last_candidate_node_id,
                 "candidate_conversation_cursor": last_candidate_conversation_id,
                 "last_confirmed_conversation_id": next_last_confirmed_conversation_id,
                 "confirmed_hits_before": cumulative_total,
@@ -1888,7 +2090,7 @@ def search_conversations(
                     or (
                         last_candidate_conversation_id
                         == resume_after_conversation_id
-                        and last_candidate_rowid > resume_after_rowid
+                        and last_candidate_node_id > resume_after_node_id
                     )
                 )
             )
@@ -1897,6 +2099,15 @@ def search_conversations(
     )
     diagnostics.update({
         "resource_contract": "streamed_conversation_search_v2",
+        "configured_candidate_scan_char_limit": SEARCH_CANDIDATE_SCAN_CHARS,
+        "configured_verified_char_limit_per_candidate": int(search_state["verify_chars"]),
+        "configured_verified_byte_limit_per_candidate": int(search_state["verify_bytes"]),
+        "max_observed_verified_chars_per_candidate": int(
+            search_state["max_observed_verified_chars_per_candidate"]
+        ),
+        "max_observed_verified_bytes_per_candidate": int(
+            search_state["max_observed_verified_bytes_per_candidate"]
+        ),
         "partial_due_to_oversized_input": pending_count > 0,
         "partial": partial,
         "partial_reason": (
@@ -1917,11 +2128,24 @@ def search_conversations(
         ),
         "oversized_candidates_pending": pending_count,
         "candidate_count": int(search_state["candidate_count"]),
+        "candidate_sql_rows": int(search_state["candidate_count"]),
+        "candidates_seen": int(search_state["candidate_count"]),
+        "candidates_verified": max(
+            0, int(search_state["candidate_count"]) - pending_count
+        ),
         "candidate_limit": SEARCH_CANDIDATE_LIMIT,
         "resolver_calls": int(search_state["resolver_calls"]),
         "blob_reads": int(search_state["blob_reads"]),
         "candidate_blob_bytes": int(search_state["candidate_blob_bytes"]),
         "raw_blob_bytes": int(search_state["raw_blob_bytes"]),
+        "blob_read_bytes": int(
+            search_state["candidate_blob_bytes"] + search_state["raw_blob_bytes"]
+        ),
+        "temp_page_delta": max(
+            0,
+            int(conn.execute("PRAGMA temp.page_count").fetchone()[0])
+            - int(search_state["temp_pages_before"]),
+        ),
         "decoded_chars": int(search_state["decoded_chars"]),
         "normalization_units": int(search_state["normalization_units"]),
         "sqlite_vm_steps": int(search_state["sqlite_vm_steps"]),
@@ -1932,12 +2156,16 @@ def search_conversations(
         "continuation_token": continuation_token,
         "completion_state": "partial" if partial else "complete",
     })
-    if continuation:
+    result.update(
+        {
+            "order_exact": not partial,
+            "scan_complete": not partial,
+            "provisional_order": partial,
+        }
+    )
+    if continuation or continuation_token is not None:
         result["has_more"] = continuation_token is not None
         result["next_offset"] = None
-    elif continuation_token is not None:
-        result["has_more"] = True
-        result["next_offset"] = effective_offset + len(items)
     result["diagnostics"] = diagnostics
     return _bounded_search_response(result)
 
@@ -2273,6 +2501,7 @@ def get_message_display_chunk(
     if row is None:
         return None
     storage_rowid = int(row["storage_rowid"])
+    database_token_identity = _database_token_identity(conn)
     prefix_bytes = b""
     try:
         with conn.blobopen("conversation_nodes", "content_text", storage_rowid, readonly=True) as prefix_blob:
@@ -2287,11 +2516,18 @@ def get_message_display_chunk(
     content_prefix = normalize_display_text(prefix_bytes.decode("utf-8", errors="replace"))
     revision = _display_revision_from_values(row)
     if cursor:
-        cursor_identity, cursor_revision, byte_offset, char_offset = _decode_display_cursor(cursor)
+        (
+            cursor_identity,
+            cursor_revision,
+            cursor_source,
+            byte_offset,
+            char_offset,
+        ) = _decode_display_cursor(database_token_identity, cursor)
         if (
             cursor_identity != _display_cursor_identity(conversation_id, node_id)
             or cursor_revision != revision
             or char_offset != offset
+            or cursor_source != "canonical"
         ):
             raise DisplayCursorError("display_cursor_stale")
     resolver_input_truncated = False
@@ -2299,7 +2535,10 @@ def get_message_display_chunk(
     canonical_has_more = False
     content_storage_bytes = int(row["content_storage_bytes"] or 0)
     placeholder_exact: bool | None = False
-    if content_prefix.lstrip().startswith(("[non-text content:", "[non-text part:")):
+    if placeholder_prefix_may_match(
+        content_prefix,
+        truncated=content_storage_bytes > len(prefix_bytes),
+    ):
         placeholder_exact = _blob_placeholder_exact(
             conn,
             storage_rowid,
@@ -2332,6 +2571,7 @@ def get_message_display_chunk(
         total_exact = not has_more
         if has_more and not invalid_utf8:
             next_cursor = _encode_display_cursor(
+                database_token_identity,
                 _display_cursor_identity(conversation_id, node_id),
                 revision,
                 next_byte,
@@ -2359,7 +2599,9 @@ def get_message_display_chunk(
         raw_bounded = normalize_display_text(raw_bounded_bytes.decode("utf-8", errors="replace"))
         resolver_input_truncated = raw_bytes > len(raw_bounded_bytes) or len(raw_bounded) > 200_000
         canonical = (
-            "[non-text content: streamed-placeholder]"
+            content_prefix
+            if placeholder_exact and content_storage_bytes <= len(prefix_bytes)
+            else "[non-text content: streamed-placeholder]"
             if placeholder_exact
             else content_prefix
         )
@@ -2476,10 +2718,7 @@ def _hydrate_reader_rows(
         )
         placeholder_classification_exact = True
         placeholder_exact = False
-        if (
-            content_truncated
-            and content.lstrip().startswith(("[non-text content:", "[non-text part:"))
-        ):
+        if placeholder_prefix_may_match(content, truncated=content_truncated):
             content_storage_bytes = int(text_row["content_storage_bytes"] or 0)
             classification = _blob_placeholder_exact(
                 conn,
@@ -2494,7 +2733,7 @@ def _hydrate_reader_rows(
                     0, placeholder_budget_remaining - content_storage_bytes
                 )
                 placeholder_exact = classification
-                if placeholder_exact:
+                if placeholder_exact and content_truncated:
                     content = "[non-text content: streamed-placeholder]"
         row["content_text"] = content
         row["content_text_total_chars"] = content_total
@@ -3048,35 +3287,62 @@ def _scan_verified_message_candidates(
     search_state: dict[str, Any],
     *,
     use_trigram: bool,
-    resume_after_rowid: int,
+    resume_after_node_id: str,
     max_verified_results: int,
     conversation_grouped: bool = False,
     resume_after_conversation_id: str = "",
-) -> tuple[int, bool, str]:
-    """Verify one deterministic rowid segment into a connection-local TEMP table."""
+    display_order: bool = False,
+    resume_candidate_offset: int = 0,
+) -> tuple[str, bool, str, int]:
+    """Verify one deterministic logical-ID segment into a TEMP artifact."""
 
     source_sql, source_params, score_expr, reason = _message_match_source(
         conn, parsed, use_trigram=use_trigram
     )
     where, params = _node_filters(parsed, conversation_id)
-    if conversation_grouped:
+    if display_order:
+        resume_clause = ""
+        resume_params: list[Any] = []
+        if parsed.path == "current":
+            display_join = """
+                JOIN effective_current_nodes effective_candidate
+                  ON effective_candidate.conversation_id = n.conversation_id
+                 AND effective_candidate.node_id = n.node_id
+            """
+            candidate_order = """
+                CASE WHEN effective_candidate.source = 'fallback_all' THEN 1 ELSE 0 END,
+                CASE WHEN effective_candidate.source <> 'fallback_all'
+                     THEN effective_candidate.depth END DESC,
+                CASE WHEN effective_candidate.source = 'fallback_all'
+                     THEN n.create_time IS NULL END,
+                CASE WHEN effective_candidate.source = 'fallback_all'
+                     THEN COALESCE(n.create_time, n.update_time, 0) END,
+                n.node_id
+            """
+        else:
+            display_join = ""
+            candidate_order = (
+                "n.create_time IS NULL, "
+                "COALESCE(n.create_time, n.update_time, 0), n.node_id"
+            )
+        offset_sql = " OFFSET ?"
+    else:
         resume_clause = (
             "AND (c.conversation_id > ? OR "
-            "(c.conversation_id = ? AND n.rowid > ?))"
+            "(c.conversation_id = ? AND n.node_id > ?))"
         )
-        resume_params: list[Any] = [
+        resume_params = [
             resume_after_conversation_id,
             resume_after_conversation_id,
-            resume_after_rowid,
+            resume_after_node_id,
         ]
-        candidate_order = "c.conversation_id, n.rowid"
-    else:
-        resume_clause = "AND n.rowid > ?"
-        resume_params = [resume_after_rowid]
-        candidate_order = "n.rowid"
+        display_join = ""
+        candidate_order = "c.conversation_id, n.node_id"
+        offset_sql = ""
     sql = f"""
         SELECT n.rowid AS storage_rowid,
                c.conversation_id AS candidate_conversation_id,
+               n.node_id AS candidate_node_id,
                n.content_text IS NULL AS content_is_null,
                n.raw_message_json IS NULL AS raw_is_null,
                n.content_type,
@@ -3084,16 +3350,20 @@ def _scan_verified_message_candidates(
                {score_expr} AS candidate_score
         FROM {source_sql}
         JOIN conversations c ON c.conversation_id = n.conversation_id
+        {display_join}
         WHERE 1 = 1 {resume_clause} {where}
         ORDER BY {candidate_order}
-        LIMIT ?
+        LIMIT ?{offset_sql}
     """
     query_params = source_params + resume_params + params + [SEARCH_CANDIDATE_LIMIT + 1]
+    if display_order:
+        query_params.append(resume_candidate_offset)
     pending_inserts: list[tuple[int, str, float | None, str]] = []
-    last_processed = resume_after_rowid
+    last_processed = resume_after_node_id
     last_processed_conversation_id = resume_after_conversation_id
     interrupted = False
     verified_results = 0
+    processed_candidates = 0
     deadline = time.monotonic() + SEARCH_WALL_DEADLINE_SECONDS
 
     def progress() -> int:
@@ -3116,9 +3386,10 @@ def _scan_verified_message_candidates(
                 break
             storage_rowid = int(row["storage_rowid"])
             candidate_conversation_id = str(row["candidate_conversation_id"])
+            candidate_node_id = str(row["candidate_node_id"])
             previous_processed = last_processed
             previous_processed_conversation_id = last_processed_conversation_id
-            last_processed = storage_rowid
+            last_processed = candidate_node_id
             last_processed_conversation_id = candidate_conversation_id
             text = str(row["resolved_text"] or "")
             if storage_rowid in search_state["pending_rowids"]:
@@ -3136,6 +3407,7 @@ def _scan_verified_message_candidates(
                     )[0]
                 interrupted = True
                 break
+            processed_candidates += 1
             if _resolved_message_matches(parsed, text, row["content_type"]):
                 verified_results += 1
                 pending_inserts.append(
@@ -3177,6 +3449,9 @@ def _scan_verified_message_candidates(
         last_processed,
         interrupted or bool(search_state["budget_exhausted"]),
         last_processed_conversation_id,
+        resume_candidate_offset + processed_candidates
+        if display_order
+        else resume_candidate_offset,
     )
 
 
@@ -3341,6 +3616,32 @@ def _message_match_source(conn: sqlite3.Connection, parsed: ParsedQuery, *, use_
                 ) mk
                 JOIN conversation_nodes n
                   ON n.conversation_id = mk.conversation_id AND n.node_id = mk.node_id
+                """,
+                [trigram_query],
+                "mk.fts_rank",
+                "exact phrase" if (parsed.phrases or parsed.required_phrases) else "substring",
+            )
+        if _table_has_columns(conn, "web_message_norm", {"stable_id"}):
+            return (
+                """
+                (
+                    SELECT normalized.conversation_id,
+                           normalized.node_id,
+                           trigram.rank AS fts_rank
+                    FROM web_message_trigram AS trigram
+                    JOIN web_message_norm AS normalized
+                      ON normalized.stable_id = trigram.rowid
+                    WHERE web_message_trigram MATCH ?
+                    UNION ALL
+                    SELECT oversized.conversation_id,
+                           oversized.node_id,
+                           NULL AS fts_rank
+                    FROM web_index_oversized AS oversized
+                    WHERE oversized.kind = 'message'
+                ) mk
+                JOIN conversation_nodes n
+                  ON n.conversation_id = mk.conversation_id
+                 AND n.node_id = mk.node_id
                 """,
                 [trigram_query],
                 "mk.fts_rank",
@@ -3910,6 +4211,20 @@ def _title_conversation_select(conn: sqlite3.Connection, parsed: ParsedQuery, *,
                 ) tk
                 JOIN conversations c ON c.conversation_id = tk.conversation_id
             """
+        elif _table_has_columns(conn, "web_title_norm", {"stable_id"}):
+            source_sql = """
+                (
+                    SELECT normalized.conversation_id, trigram.rank AS title_rank
+                    FROM web_title_trigram AS trigram
+                    JOIN web_title_norm AS normalized
+                      ON normalized.stable_id = trigram.rowid
+                    WHERE web_title_trigram MATCH ?
+                    UNION ALL
+                    SELECT conversation_id, NULL AS title_rank
+                    FROM web_index_oversized WHERE kind = 'title'
+                ) tk
+                JOIN conversations c ON c.conversation_id = tk.conversation_id
+            """
         else:
             source_sql = """
                 (
@@ -4368,6 +4683,21 @@ def _message_trigram_clause(conn: sqlite3.Connection, parsed: ParsedQuery, use_t
         or not _has_normalized_message_trigram(conn)
     ):
         return "", []
+    if _table_has_columns(conn, "web_message_norm", {"stable_id"}):
+        return (
+            """
+            AND EXISTS (
+                SELECT 1
+                FROM web_message_trigram AS trigram
+                JOIN web_message_norm AS normalized
+                  ON normalized.stable_id = trigram.rowid
+                WHERE normalized.conversation_id = n.conversation_id
+                  AND normalized.node_id = n.node_id
+                  AND web_message_trigram MATCH ?
+            )
+            """,
+            [query],
+        )
     if not _table_has_columns(conn, "web_message_trigram", {"conversation_id", "node_id"}):
         return (
             """
@@ -4404,6 +4734,20 @@ def _title_trigram_clause(conn: sqlite3.Connection, parsed: ParsedQuery, use_tri
         or not _has_normalized_title_trigram(conn)
     ):
         return "", []
+    if _table_has_columns(conn, "web_title_norm", {"stable_id"}):
+        return (
+            """
+            EXISTS (
+                SELECT 1
+                FROM web_title_trigram AS trigram
+                JOIN web_title_norm AS normalized
+                  ON normalized.stable_id = trigram.rowid
+                WHERE normalized.conversation_id = c.conversation_id
+                  AND web_title_trigram MATCH ?
+            )
+            """,
+            [query],
+        )
     if _table_has_columns(conn, "web_title_trigram", {"conversation_id"}):
         return (
             """
@@ -4604,6 +4948,7 @@ def _message_search_payload(
         match_length = verified_artifact["match_length"]
         matched_term = verified_artifact["matched_term"]
         source_byte_offset = verified_artifact["source_byte_offset"]
+        source_kind = str(verified_artifact.get("source_kind") or "canonical")
         preview_truncated = total_chars > len(text)
     elif storage_bytes > SEARCH_CANDIDATE_SCAN_CHARS:
         (
@@ -4619,6 +4964,7 @@ def _message_search_payload(
             parsed,
         )
         source_byte_offset = None
+        source_kind = "canonical"
         preview_truncated = total_chars > len(text)
     else:
         text = resolved_text[:SEARCH_HIT_PREVIEW_CHARS]
@@ -4644,6 +4990,7 @@ def _message_search_payload(
             match_length = None
             matched_term = None
             source_byte_offset = None
+        source_kind = "canonical"
     reasons = {reason}
     score = 10.0
     effective_visible = (
@@ -4671,12 +5018,17 @@ def _message_search_payload(
     display_anchor_revision = _display_revision_from_values(row)
     display_anchor_cursor = (
         _encode_display_cursor(
+            _database_token_identity(conn),
             _display_cursor_identity(str(row["conversation_id"]), str(row["node_id"])),
             display_anchor_revision,
             int(source_byte_offset),
             int(match_char_offset),
         )
-        if source_byte_offset is not None and match_char_offset is not None
+        if (
+            source_kind == "canonical"
+            and source_byte_offset is not None
+            and match_char_offset is not None
+        )
         else None
     )
     return {
@@ -5579,6 +5931,8 @@ def _derived_generation_is_current(conn: sqlite3.Connection, name: str) -> bool:
         _web_index_metadata_value(conn, "web_index_format_version") != OPTIONAL_WEB_INDEX_FORMAT_VERSION
         or _web_index_metadata_value(conn, "display_text_resolver_version") != DISPLAY_TEXT_RESOLVER_VERSION
         or _web_index_metadata_value(conn, "normalization_index_format_version") != NORMALIZATION_INDEX_FORMAT_VERSION
+        or _web_index_metadata_value(conn, "stable_optional_address_version") != STABLE_OPTIONAL_ADDRESS_VERSION
+        or len(_web_index_metadata_value(conn, "stable_optional_address_identity") or "") != 32
         or _web_index_metadata_value(conn, "oversized_fallback") != "required"
         or not _table_exists(conn, "web_index_oversized")
     ):

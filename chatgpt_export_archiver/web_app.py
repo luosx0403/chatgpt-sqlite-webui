@@ -19,6 +19,7 @@ from .sqlite_errors import sqlite_runtime_error_code
 from .current_path import EffectiveCurrentResourceLimitError
 from .exporter import ExportResourceLimitError
 from .json_safety import JsonSafetyLimitError, sanitize_json_value
+from .schema_contract import API_SCHEMA_VERSION, OPTIONAL_WEB_INDEX_FORMAT_VERSION
 
 
 class _UploadBodyTooLarge(Exception):
@@ -522,6 +523,111 @@ def create_app(
                 }
             },
         }
+        search_truth_properties = {
+            "total_exact": {
+                "type": "boolean",
+                "description": "Whether total is exact; independent of ordering exactness.",
+            },
+            "order_exact": {
+                "type": "boolean",
+                "description": "Whether items belong to the final globally ordered result.",
+            },
+            "scan_complete": {
+                "type": "boolean",
+                "description": "Whether bounded candidate verification reached its terminal state.",
+            },
+            "provisional_order": {
+                "type": "boolean",
+                "description": "Whether this segment is explicitly provisional.",
+            },
+            "next_offset": {
+                "anyOf": [{"type": "integer"}, {"type": "null"}],
+                "description": "Null whenever signed continuation is present because numeric offset is not equivalent.",
+            },
+        }
+        import_job_schema = {
+            "type": "object",
+            "properties": {
+                "completion_outcome": {
+                    "type": "string",
+                    "enum": [
+                        "queued", "running", "success", "success_with_warnings",
+                        "partial_success", "failed_before_commit",
+                        "failed_after_canonical_commit", "cleanup_warning", "cancelled",
+                    ],
+                },
+                "canonical_import_outcome": {
+                    "type": "string",
+                    "enum": [
+                        "queued", "running", "success", "success_with_warnings",
+                        "partial_success", "failed_before_commit",
+                    ],
+                },
+                "canonical_commit_succeeded": {"type": "boolean"},
+                "summary": {
+                    "type": ["object", "null"],
+                    "description": "Safe aggregate counts, warnings_by_type, and JSON resource profile; never exported content or IDs.",
+                },
+            },
+            "required": [
+                "completion_outcome",
+                "canonical_import_outcome",
+                "canonical_commit_succeeded",
+            ],
+        }
+        schema.setdefault("components", {}).setdefault("schemas", {}).update(
+            {
+                "SearchTruthContract": {
+                    "type": "object",
+                    "properties": search_truth_properties,
+                    "required": [
+                        "total_exact", "order_exact", "scan_complete",
+                        "provisional_order", "next_offset",
+                    ],
+                },
+                "ImportJobOutcomeContract": import_job_schema,
+            }
+        )
+        schema["x-chatgpt-archive-contract"] = {
+            "api_schema_version": API_SCHEMA_VERSION,
+            "optional_web_index_format_version": OPTIONAL_WEB_INDEX_FORMAT_VERSION,
+            "search_continuation_scope": "server-instance",
+            "search_truth_fields": list(search_truth_properties),
+            "import_outcome_fields": [
+                "completion_outcome", "canonical_import_outcome",
+                "canonical_commit_succeeded",
+            ],
+        }
+        message_search = schema.get("paths", {}).get("/api/search/messages", {}).get("get")
+        if isinstance(message_search, dict):
+            message_search["x-search-truth-contract"] = {
+                "total_exact": True,
+                "order_exact": True,
+                "scan_complete": True,
+                "provisional_order": True,
+                "continuation_requires_null_next_offset": True,
+            }
+        conversations = schema.get("paths", {}).get("/api/conversations", {}).get("get")
+        if isinstance(conversations, dict):
+            conversations["x-search-order-contract"] = {
+                "order_exact": True,
+                "scan_complete": True,
+                "provisional_order": True,
+                "continuation_requires_null_next_offset": True,
+            }
+        for path in (
+            "/api/import/upload",
+            "/api/import/jobs",
+            "/api/import/jobs/{job_id}",
+        ):
+            path_item = schema.get("paths", {}).get(path, {})
+            for operation in path_item.values():
+                if isinstance(operation, dict):
+                    operation["x-import-job-outcome-contract"] = {
+                        "completion_outcome": True,
+                        "canonical_import_outcome": True,
+                        "canonical_commit_succeeded": True,
+                    }
         for path_item in schema.get("paths", {}).values():
             for operation in path_item.values():
                 if not isinstance(operation, dict):

@@ -25,7 +25,13 @@ from .utils import classify_file
 SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
 MAX_JSON_INTEGER_DIGITS = 1000
 JSON_STREAM_CHUNK_BYTES = 64 * 1024
-MAX_CONVERSATION_JSON_SCALARS = 1_000_000
+MAX_JSON_STRING_PRIMITIVE_TOKENS = 2_500_000
+MAX_JSON_MAPPING_ENTRIES = 1_250_000
+MAX_JSON_ARRAY_ITEMS = 1_000_000
+MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES = 384 * 1024 * 1024
+# Backward-compatible public name. The profile now independently accounts for
+# mapping entries, array items, nesting, decoded heap, bytes, and characters.
+MAX_CONVERSATION_JSON_SCALARS = MAX_JSON_STRING_PRIMITIVE_TOKENS
 _JSON_OUTSIDE_SPECIAL_RE = re.compile(
     r'"(?:\\[\s\S]|[^"\\])*"|["\[\]{}\ufeff]'
 )
@@ -68,6 +74,10 @@ class ConversationJsonObject(dict[str, Any]):
 
     input_utf8_bytes: int
     decoded_chars: int
+    json_scalar_count: int
+    json_mapping_entries: int
+    json_array_items: int
+    estimated_decoded_heap_bytes: int
 
 
 class EncryptedZipMemberError(ValueError):
@@ -85,13 +95,29 @@ class SourceChangedDuringReadError(ValueError):
 class DeleteInputRecoveryRequired(ValueError):
     """A private staged entry could not be safely restored or removed."""
 
+    def __init__(self, code: str, *, recovery_token: str | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.recovery_token = (
+            recovery_token
+            if isinstance(recovery_token, str)
+            and len(recovery_token) == 32
+            and all(character in "0123456789abcdef" for character in recovery_token)
+            else None
+        )
+        self.journal_format_version = DELETE_INPUT_RECOVERY_FORMAT_VERSION
+
 
 def delete_input_secure_identity_supported() -> bool:
-    """Return whether descriptor-relative identity/delete primitives are usable."""
+    """Return whether strict irreversible deletion can exclude pre-open writers.
 
-    if os.name == "nt":
-        return False
-    return _DELETE_DIR_FD_SUPPORTED
+    The supported Python/OS primitives provide pathname identity and advisory
+    locks, but no mandatory ownership guarantee against a non-cooperating
+    descriptor opened before staging. Strict delete therefore fails closed on
+    every currently supported platform before creating a journal or renaming.
+    """
+
+    return False
 
 
 def _delete_identity_record(identity: FileIdentity) -> dict[str, Any]:
@@ -614,7 +640,10 @@ def delete_input_if_unchanged(
             staged_digest = None
         if staged_digest is None or not secrets.compare_digest(staged_digest, source_digest):
             if original_exists():
-                raise DeleteInputRecoveryRequired("delete_input_recovery_required")
+                raise DeleteInputRecoveryRequired(
+                    "delete_input_recovery_required",
+                    recovery_token=recovery_token,
+                )
             restore_staged()
             _remove_delete_recovery_record(parent_fd, journal_name)
             journal_written = False
@@ -628,7 +657,10 @@ def delete_input_if_unchanged(
             # created a new entry at the original name; never overwrite a
             # replacement merely to hide the cleanup failure.
             if original_exists():
-                raise DeleteInputRecoveryRequired("delete_input_recovery_required")
+                raise DeleteInputRecoveryRequired(
+                    "delete_input_recovery_required",
+                    recovery_token=recovery_token,
+                )
             restore_staged()
             _remove_delete_recovery_record(parent_fd, journal_name)
             journal_written = False
@@ -652,7 +684,7 @@ def delete_input_if_unchanged(
 def recover_delete_input(directory: Path, owner_token: str) -> str:
     """Restore a crash-left staged input using its durable recovery token."""
 
-    if not delete_input_secure_identity_supported() or os.link not in os.supports_dir_fd:
+    if not _DELETE_DIR_FD_SUPPORTED or os.link not in os.supports_dir_fd:
         raise DeleteInputRecoveryRequired("delete_input_secure_identity_unsupported")
     if len(owner_token) != 32 or any(ch not in "0123456789abcdef" for ch in owner_token):
         raise DeleteInputRecoveryRequired("delete_input_recovery_token_invalid")
@@ -1236,41 +1268,72 @@ def _iter_utf8_chunks(stream: BinaryIO) -> Iterator[str]:
 class _MeasuredJsonObject(dict[str, Any]):
     json_scalar_count: int
     json_depth: int
+    json_mapping_entries: int
+    json_array_items: int
 
 
-def _measure_decoded_json(value: Any) -> tuple[int, int]:
+def _measure_decoded_json(value: Any) -> tuple[int, int, int, int]:
     if isinstance(value, _MeasuredJsonObject):
-        return value.json_scalar_count, value.json_depth
+        return (
+            value.json_scalar_count,
+            value.json_depth,
+            value.json_mapping_entries,
+            value.json_array_items,
+        )
     if isinstance(value, list):
         scalar_count = 0
+        mapping_entries = 0
+        array_items = len(value)
         child_depth = 0
         for child in value:
-            child_scalars, depth = _measure_decoded_json(child)
+            child_scalars, depth, child_mappings, child_arrays = _measure_decoded_json(child)
             scalar_count += child_scalars
+            mapping_entries += child_mappings
+            array_items += child_arrays
             child_depth = max(child_depth, depth)
             if scalar_count > MAX_CONVERSATION_JSON_SCALARS:
                 raise JsonSafetyLimitError(
                     "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
+                )
+            if mapping_entries > MAX_JSON_MAPPING_ENTRIES:
+                raise JsonSafetyLimitError(
+                    "json_mapping_entry_limit_exceeded", limit=MAX_JSON_MAPPING_ENTRIES
+                )
+            if array_items > MAX_JSON_ARRAY_ITEMS:
+                raise JsonSafetyLimitError(
+                    "json_array_item_limit_exceeded", limit=MAX_JSON_ARRAY_ITEMS
                 )
         depth = child_depth + 1
         if depth > MAX_JSON_NESTING_DEPTH:
             raise JsonSafetyLimitError(
                 "json_nesting_limit_exceeded", limit=MAX_JSON_NESTING_DEPTH
             )
-        return scalar_count, depth
-    return 1, 0
+        return scalar_count, depth, mapping_entries, array_items
+    return 1, 0, 0, 0
 
 
 def _measured_object_pairs(pairs: list[tuple[str, Any]]) -> _MeasuredJsonObject:
     scalar_count = len(pairs)  # Every object key is a JSON string scalar.
+    mapping_entries = len(pairs)
+    array_items = 0
     child_depth = 0
     for _key, value in pairs:
-        child_scalars, depth = _measure_decoded_json(value)
+        child_scalars, depth, child_mappings, child_arrays = _measure_decoded_json(value)
         scalar_count += child_scalars
+        mapping_entries += child_mappings
+        array_items += child_arrays
         child_depth = max(child_depth, depth)
         if scalar_count > MAX_CONVERSATION_JSON_SCALARS:
             raise JsonSafetyLimitError(
                 "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
+            )
+        if mapping_entries > MAX_JSON_MAPPING_ENTRIES:
+            raise JsonSafetyLimitError(
+                "json_mapping_entry_limit_exceeded", limit=MAX_JSON_MAPPING_ENTRIES
+            )
+        if array_items > MAX_JSON_ARRAY_ITEMS:
+            raise JsonSafetyLimitError(
+                "json_array_item_limit_exceeded", limit=MAX_JSON_ARRAY_ITEMS
             )
     depth = child_depth + 1
     if depth > MAX_JSON_NESTING_DEPTH:
@@ -1280,10 +1343,12 @@ def _measured_object_pairs(pairs: list[tuple[str, Any]]) -> _MeasuredJsonObject:
     value = _MeasuredJsonObject(pairs)
     value.json_scalar_count = scalar_count
     value.json_depth = depth
+    value.json_mapping_entries = mapping_entries
+    value.json_array_items = array_items
     return value
 
 
-def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
+def _iter_json_array_retained_tail(chunks: Iterable[str]) -> Iterator[Any]:
     """Decode retained top-level tails with the C JSON decoder.
 
     Input is still consumed incrementally and only one decoded array element
@@ -1391,6 +1456,7 @@ def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
 
 def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
     decoder = json.JSONDecoder(
+        object_pairs_hook=_measured_object_pairs,
         parse_constant=_reject_non_finite_json_number,
         parse_float=_parse_finite_json_float,
         parse_int=_parse_bounded_json_int,
@@ -1423,10 +1489,26 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
     def finish_element() -> Any:
         nonlocal parts, element_chars, element_bytes, scalar_count, scalar_token
         value = decoder.decode("".join(parts))
+        measured_scalars, _depth, measured_mappings, measured_arrays = _measure_decoded_json(value)
+        estimated_heap = (
+            element_bytes
+            + measured_scalars * 48
+            + measured_mappings * 72
+            + measured_arrays * 16
+        )
+        if estimated_heap > MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES:
+            raise JsonSafetyLimitError(
+                "json_estimated_heap_limit_exceeded",
+                limit=MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES,
+            )
         if isinstance(value, dict):
             measured = ConversationJsonObject(value)
             measured.input_utf8_bytes = element_bytes
             measured.decoded_chars = element_chars
+            measured.json_scalar_count = measured_scalars
+            measured.json_mapping_entries = measured_mappings
+            measured.json_array_items = measured_arrays
+            measured.estimated_decoded_heap_bytes = estimated_heap
             value = measured
         parts = []
         element_chars = 0
@@ -1624,6 +1706,12 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
 
     if phase != "done":
         raise json.JSONDecodeError("Expecting value", "", 0)
+
+
+def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
+    """Frame each top-level element once, then invoke the C decoder once."""
+
+    yield from _iter_json_array_framed(chunks)
 
 
 def _is_link_or_reparse(path: Path) -> bool:

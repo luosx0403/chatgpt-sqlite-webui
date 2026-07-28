@@ -78,6 +78,8 @@ class ImportJob:
     error_code: str | None = None
     error_type: str | None = None
     outcome: str = "queued"
+    completion_outcome: str = "queued"
+    canonical_import_outcome: str = "queued"
     canonical_commit_succeeded: bool = False
     cleanup_warning: str | None = None
     cleanup_warnings: list[dict[str, str]] = field(default_factory=list)
@@ -93,6 +95,8 @@ class ImportJob:
                 "status": self.status,
                 "stage": self.stage,
                 "outcome": self.outcome,
+                "completion_outcome": self.completion_outcome,
+                "canonical_import_outcome": self.canonical_import_outcome,
                 "canonical_commit_succeeded": self.canonical_commit_succeeded,
                 "filename": safe_filename_part(self.filename, 120),
                 "size": self.size,
@@ -301,6 +305,20 @@ class ImportJobManager:
             job.error = error_code
             job.error_type = error_type
 
+    @staticmethod
+    def _set_completion_outcome(job: ImportJob, value: str) -> None:
+        with job._lock:
+            job.completion_outcome = value
+
+    @staticmethod
+    def _successful_completion_outcome(job: ImportJob) -> str:
+        summary = job.summary or {}
+        if int(summary.get("skipped_invalid_elements") or 0) > 0:
+            return "partial_success"
+        if int(summary.get("warnings") or 0) > 0:
+            return "success_with_warnings"
+        return "success"
+
     def _run_job(self, job: ImportJob) -> None:
         """Protect the complete worker entry, including initial state/log setup."""
 
@@ -313,6 +331,8 @@ class ImportJobManager:
                 job.status = "failed"
                 job.stage = "job_setup"
                 job.outcome = "import_job_start_failed"
+                job.completion_outcome = "failed_before_commit"
+                job.canonical_import_outcome = "failed_before_commit"
                 job.error_code = "import_job_start_failed"
                 job.error = "import_job_start_failed"
                 job.error_type = type(exc).__name__
@@ -326,6 +346,8 @@ class ImportJobManager:
         with job._lock:
             job.status = "running"
             job.outcome = "import_running"
+            job.completion_outcome = "running"
+            job.canonical_import_outcome = "running"
             job.started_at = time.time()
         self._set_stage(job, "import")
         try:
@@ -346,6 +368,7 @@ class ImportJobManager:
                 job.summary = dict(result["summary"])
                 job.canonical_commit_succeeded = True
                 job.outcome = "canonical_commit_succeeded"
+                job.canonical_import_outcome = self._successful_completion_outcome(job)
             if result.get("summary_update_after_commit_failed"):
                 _add_cleanup_warning(job, "summary_update_after_commit_failed", error_type=str(result["summary_update_after_commit_failed"]), path_kind="import_summary")
                 self._log(job, "warning", f"summary_update_after_commit_failed {result['summary_update_after_commit_failed']}")
@@ -480,6 +503,7 @@ class ImportJobManager:
                     self._set_stage(job, "web_index_failed")
                     return
             self._set_outcome(job, status="succeeded", outcome="succeeded")
+            self._set_completion_outcome(job, self._successful_completion_outcome(job))
             self._set_stage(job, "succeeded")
         except ImportPipelineError as exc:
             outcome_by_stage = {
@@ -499,6 +523,9 @@ class ImportJobManager:
                 outcome=outcome_by_stage.get(exc.stage, "import_transaction_failed"),
                 error_code=exc.code,
             )
+            self._set_completion_outcome(job, "failed_before_commit")
+            with job._lock:
+                job.canonical_import_outcome = "failed_before_commit"
             self._set_stage(job, exc.stage)
             self._log(job, "error", f"import_failed code={exc.code} stage={exc.stage}")
         except Exception as exc:
@@ -509,6 +536,9 @@ class ImportJobManager:
                 error_code="import_transaction_failed",
                 error_type=type(exc).__name__,
             )
+            self._set_completion_outcome(job, "failed_before_commit")
+            with job._lock:
+                job.canonical_import_outcome = "failed_before_commit"
             self._set_stage(job, "transaction")
             self._log(job, "error", f"import_failed error_type={type(exc).__name__}")
         finally:
@@ -553,6 +583,11 @@ class ImportJobManager:
                 except Exception:
                     pass
         finally:
+            with job._lock:
+                if job.cleanup_warnings and job.status == "succeeded":
+                    job.completion_outcome = "cleanup_warning"
+                elif job.status == "postcheck_failed" and job.canonical_commit_succeeded:
+                    job.completion_outcome = "failed_after_canonical_commit"
             with self._lock:
                 if self._running_job_id == job.job_id:
                     self._running_job_id = None
@@ -580,6 +615,7 @@ class ImportJobManager:
             outcome="web_index_cancelled",
             error_code="web_index_cancelled" if postcheck_failed else None,
         )
+        self._set_completion_outcome(job, "cancelled")
         self._set_stage(job, "web_index_cancelled")
 
 
