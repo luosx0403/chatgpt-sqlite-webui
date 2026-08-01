@@ -22,10 +22,6 @@ ChatGPT Export Archiver importa ZIP oficiales de OpenAI / ChatGPT directamente e
 
 Captura segura pendiente. Las capturas deben usar conversaciones synthetic, no títulos reales, snippets, raw JSON, emails ni rutas locales.
 
-## Mediciones De Rendimiento
-
-Este README no promete tiempos sin contexto. Usa `tools/benchmark_round11.py` para mediciones synthetic del parser/import y el harness content-safe con opt-in `tools/acceptance_real_pipeline.py` para varias ejecuciones HTTP de producción sobre un ZIP real autorizado y de solo lectura. El harness registra máquina/runtime, todas las ejecuciones, median, worst y recursos agregados, sin mostrar títulos, mensajes, IDs, nombres de archivo ni rutas.
-
 ## Qué Hace Este Proyecto
 
 - Importa `conversations.json` y shards `conversations-*.json` desde un ZIP exportado por OpenAI / ChatGPT, un archivo `conversations.json` suelto o un directorio ya extraído.
@@ -241,8 +237,6 @@ El diseño de lectura por defecto es `chat`: los mensajes user se alinean a la d
 
 Todas las rutas comparten la misma regla effective-current para `path=current`: un `current_node` válido que pertenece a la conversación y su cadena de padres tiene prioridad incluso si todos los raw flags son cero; después se elige de forma determinista una cadena hoja utilizable con `is_on_current_path=1`; solo si ninguna existe esa conversación cae a all. La respuesta conserva el significado raw e incluye `current_node_exists`, `current_collection_source`, `current_path_fallback_to_all`, `effective_path` y visibilidad efectiva por nodo. Padres rotos y ciclos terminan con diagnósticos deterministas.
 
-La búsqueda global de current path obtiene primero candidatos de conversación independientes del path mediante índices normalizados de mensajes/títulos y predicados seguros de source/date/role; después materializa effective-current solo para esos candidatos. Las consultas solo de exclusión que no se pueden reducir usan un fallback explícito de base completa. La navegación de hits del reader carga una sola página compacta al inicio y añade páginas al acercarse al límite cargado. El SQL de búsqueda y Web-index usa una forma portable que evita flattening, sin exigir `AS MATERIALIZED`, y resuelve cada candidato legacy raw como máximo una vez por etapa lógica.
-
 Las acciones de copiar y exportar del lector siguen el contrato visible del lector. `Copiar conversación de la ruta actual` usa el stream dedicado de texto completo para la ruta actual del reader y respeta la opción Show internal messages, pero ignora los filtros de búsqueda actuales. No acumula páginas del reader en el navegador. `Copiar visibles` copia solo los mensajes visibles ya cargados. Los enlaces de descarga usan la misma ruta actual y la misma opción Show internal. El acceso raw por mensaje es una vista previa raw ampliada con límite; las respuestas truncadas deben renderizar `raw_text` como texto plano de vista previa y la UI solo muestra esa capped preview.
 
 Cuando el reader salta a un hit con `around_node_id`, usa la misma colección paginada que el reader: visible-only rows si Show internal está desactivado, la node collection completa si Show internal está activado y la effective all-node collection para conversaciones dañadas sin current-path node.
@@ -332,19 +326,6 @@ python chatgpt_archive.py web --host 0.0.0.0 --port 8787
 
 Define límites más altos solo para archivos locales de confianza. Valores más altos aumentan el riesgo de ZIP bomb, presión de disco y uso de CPU/memoria.
 
-
-## Checklist de aceptación de la Web UI
-
-Usa esta lista cuando cambies la ruta Web o prepares una entrega runnable:
-
-- Arranca la Web UI sin base de datos y confirma que sirve el contrato de estado vacío.
-- Importa desde el navegador un ZIP pequeño de ChatGPT y confirma que el job termina.
-- Confirma que el backend ejecuta `verify`, `stats` y `web-index` después de la importación subida.
-- Recarga la página y confirma que las conversaciones se pueden listar y abrir.
-- Reimporta un ZIP más reciente y confirma que la ruta incremental sigue funcionando.
-
-La ruta Web de una entrega runnable no debería necesitar `webui/node_modules`, porque los assets React ya construidos se sirven desde `webui/dist`.
-
 ## Sintaxis de búsqueda
 
 La búsqueda CLI usa sintaxis segura. Los términos normales son substring `contains` normalizado y usan AND; `OR` en mayúsculas crea alternativas. Las comillas conservan frases y `-term`/`-"frase"` excluyen. `word` aplica límites solo a letras ASCII, números y guion bajo; CJK conserva prudentemente `normalized contains`. Los modificadores raw `path:`/`scope:` de la consulta prevalecen sobre los selectores UI.
@@ -403,11 +384,7 @@ python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_Z
 
 Mantén los logs JSON en ubicaciones ignoradas como `logs/`. Los archivos `*.jsonl` son artefactos locales de log y delivery clean los rechaza.
 
-Los campos de tiempo de importación incluyen `source_scan_seconds`, `parse_and_upsert_seconds`, `fts_rebuild_seconds`, `finalize_commit_seconds`, `close_seconds`, `legacy_pre_commit_seconds`, `wall_total_seconds` y `total_import_seconds`. `total_import_seconds` es el wall time de extremo a extremo, incluido commit final y close.
-
-Después de que la transacción de importación haya terminado correctamente, las actualizaciones posteriores del summary son best-effort. `summary_update_after_commit_failed`, `import_connection_close_failed` y `summary_update_after_close_failed` son advertencias, no motivos para marcar como fallida una importación correcta.
-
-## Desarrollo y comprobaciones de aceptación
+## Construir desde las fuentes
 
 Ejecuta las comprobaciones de Python y limpia artefactos seguros antes del primer delivery clean:
 
@@ -442,26 +419,11 @@ Para comprobar un ZIP de entrega:
 python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 ```
 
-## Notas de entrega
+## Contenido del paquete
 
-Una entrega runnable debe incluir las fuentes Python, tests, documentación, `requirements-web.txt`, `constraints-web-py312.txt`, el código fuente y tests frontend bajo `webui/src` y `webui/tests`, los archivos de configuración/package frontend y los assets construidos bajo `webui/dist`. No debe incluir `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, directorios de caché o bytecode de Python, cachés de coverage/typecheck, `.DS_Store`, archivos AppleDouble `._*`, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, logs temporales, logs locales de aceptación, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, ningún `*.zip`, `conversations*.json`, bases de datos reales como `*.db`, `*.sqlite` y `*.sqlite3`, ni sidecars de SQLite como `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm` y `*.sqlite3-journal`. La comprobación de directorio permite el `.git` propio de la raíz objetivo para que un Git clone normal pueda verificarse, pero rechaza `.git` anidados; en un ZIP de entrega cualquier entrada `.git` falla.
+Una entrega runnable debe incluir las fuentes Python, tests, documentación, `requirements-web.txt`, `constraints-web-py312.txt`, el código fuente y tests frontend bajo `webui/src`, `webui/tests` y `webui/scripts`, los archivos de configuración/package frontend y los assets construidos bajo `webui/dist`. No debe incluir `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, directorios de caché o bytecode de Python, cachés de coverage/typecheck, `.DS_Store`, archivos AppleDouble `._*`, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, logs temporales, logs locales de aceptación, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, ningún `*.zip`, `conversations*.json`, bases de datos reales como `*.db`, `*.sqlite` y `*.sqlite3`, ni sidecars de SQLite como `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm` y `*.sqlite3-journal`. La comprobación de directorio permite el `.git` propio de la raíz objetivo para que un Git clone normal pueda verificarse, pero rechaza `.git` anidados; en un ZIP de entrega cualquier entrada `.git` falla.
 
 Una entrega source-only puede omitir `webui/dist`, pero entonces habrá que reconstruir el frontend antes de servir la React UI completa.
-
-## Guía del árbol de código
-
-```text
-chatgpt_archive.py                 CLI entry point
-chatgpt_export_archiver/cli.py     CLI commands and reusable import pipeline
-chatgpt_export_archiver/db.py      SQLite schema, import helpers, verify, stats, FTS helpers
-chatgpt_export_archiver/web_app.py FastAPI app factory and static UI serving
-chatgpt_export_archiver/web_api.py Web API routes
-chatgpt_export_archiver/web_db.py  Web query helpers and optional trigram index builder
-chatgpt_export_archiver/web_jobs.py Web ZIP import job manager
-webui/                             React frontend source and built dist files
-tests/                             Python unit and integration tests
-tools/                             Delivery and support scripts
-```
 
 ## Resumen de la base de datos
 
@@ -470,28 +432,6 @@ La base principal almacena conversaciones, mapping nodes, import runs y warnings
 La base canónica usa `PRAGMA user_version` (versión actual 6): v3 añadió identidades `NOT NULL`, v4 revisiones durables address/graph, v5 revisiones display por fila y compatibility state, y v6 la generación durable `query` para cambios de source y tiempos de conversation/node. Migration hace un preflight rápido fuera del lock y, dentro de `BEGIN IMMEDIATE` antes de la primera mutación, vuelve a calcular el recuento, tamaño, sidecars y espacio libre autoritativos. Revierte cancelación, interrupción, ENOSPC o error SQLite. Repetir migrate sobre una base current y limpia es un true no-op y devuelve falsos los cuatro campos changed. Las rutas readonly no ejecutan DDL y una base compatible antigua devuelve `database_migration_required`.
 
 Health y `verify` distinguen entre `message_fts` opcional ausente y dañado. El daño informa `optional_message_fts_error` con una indicación `--rebuild-fts`; los fallos generales malformed, locked, readonly, I/O y SQL runtime no se ocultan como capacidad ausente y usan `database_malformed`, `database_locked`, `database_readonly`, `database_io_error` o `database_runtime_failure`.
-
-## Contratos Round 10 de recursos, propiedad y recuperación
-
-Los objetos managed FTS, Web-index, staging, metadata, generation y shadow solo se modifican después de validar propiedad exacta. El Web index opcional formato 6 usa direcciones enteras estables propias ligadas a identidades lógicas conversation/node; ningún objeto durable o entre requests depende del rowid implícito canónico. Address-map, versiones resolver/normalization, generations y ownership determinan currentness. El classifier placeholder recorre en stream cualquier whitespace inicial ASCII/Unicode y el marker completo entre chunks BLOB, sin un prefijo fijo.
-
-Los cursores de texto largo se vinculan a una revisión durable guardada directamente en la fila message objetivo. Triggers managed de insert/update incrementan la revisión en toda escritura que afecte al texto mostrado, incluso si un writer SQLite externo no actualiza `content_hash`; las filas no relacionadas no invalidan el cursor. Una base anterior a version 5 queda bajo el gate migration-required y la migración writer explícita rellena sus revisiones. El cursor también vincula un digest estable de identidad, impidiendo que reutilizar un rowid reactive un cursor antiguo.
-
-La búsqueda exacta lee BLOB canónico en chunks de 64 KiB y reutiliza un artefacto TEMP local a la conexión. Un continuation firmado de tamaño fijo referencia una sesión acotada de la instancia y no contiene IDs largos. Reinicio, expiración, cambio de secret, routing multi-worker sin affinity, cambio de index/metadata/generation o reemplazo de DB devuelve invalid/stale. Con continuation, `next_offset=null`. `total_exact` describe solo el recuento; `order_exact`, `scan_complete` y `provisional_order` describen por separado orden global y scan, y la UI no presenta segmentos provisionales como finales.
-
-Cada conversation element nuevo debe cumplir conjuntamente: 32 MiB UTF-8, 32 MiB decodificados, 2.500.000 tokens string/primitive, 1.250.000 mapping entries, 1.000.000 array items, depth 256, enteros de 1.000 dígitos, 384 MiB de heap estimado, 5.000 mapping nodes y materialización batch acotada. Si supera una dimensión se omite con warning estructurado y continúan elementos válidos posteriores. El framer encuentra una vez el límite y llama una vez al decoder C.
-
-El bulk import del proyecto sustituye temporalmente triggers generation exactos y propios dentro de la misma transacción con write lock, incrementa una vez cada dominio dirty y restaura/valida los triggers. Rollback o crash restaura DDL/data; writers externos conservan triggers por statement. Los scopes finite effective-current, incluso una conversación legacy de 100.000 nodes, se comparan en relaciones SQLite TEMP; los ciclos raw-flag usan arrays enteros compactos en vez de duplicar grafos de strings Python. La exportación completa guarda plan y nodes en SQLite temporal y usa keyset streaming, sin un grafo Python de todo el archivo.
-
-Strict `--delete-input-on-success` se rechaza antes de staging en todas las plataformas soportadas: identity checks y advisory locks no bloquean un writer pre-open. Los journals históricos se recuperan con token acotado sin sobrescribir replacements. Las constraints Web portables siguen siendo un residual multiplataforma sin hashes; el lock separado CPython 3.12/macOS arm64 verifica wheel artifacts para ese target exacto.
-
-## Contratos Round 11 de identidad estable, outcomes y rendimiento
-
-El process lock de writer vive en un registro privado por usuario; sus records propios tienen magic/version e identidad DB pero no rutas. Una DB existente bloquea ruta normalizada y entidad de archivo, por lo que real/relative/`..`, symlinks de archivo/padre y hardlinks compiten antes de lease, staging o escritura. Una DB nueva liga su entidad justo después de crearla y la revalida antes de publish. Objetos desconocidos fallan cerrados sin modificación ni borrado.
-
-Un reimport idéntico no reescribe nodes, no avanza generations, no invalida el index opcional y no genera WAL significativo. `completion_outcome`/`canonical_import_outcome` distinguen success, warnings/partial, fallo antes/después de commit, cleanup warning y cancel; la UI muestra de forma segura conversations/nodes committed, elementos omitidos, warnings agregados, commit canónico e index opcional.
-
-`tools/benchmark_round11.py` es un harness synthetic opt-in que emite JSON con entorno/hash de fixture, wall/CPU/RSS y contadores aplicables DB/WAL/TEMP/index, SQL/VM, BLOB, decoder, resolver, normalizer, lock y cleanup. Los runs grandes deben repetirse en subprocess independientes y comparar mediana y peor valor.
 
 ## Límites conocidos
 
@@ -519,10 +459,6 @@ Los JSON no estándar `NaN`/`Infinity`, incluidos números estándar desbordados
 
 “Copiar URL” siempre serializa `match_mode`, `layout`, `show_internal` y el estado compartible de búsqueda/lector. Los valores explícitos de URL tienen prioridad sobre `localStorage`; solo los ausentes usan ajustes locales. Esta versión usa `replaceState` y no restaura el historial paso a paso de búsquedas o selecciones con Atrás/Adelante.
 
-El Release ZIP usa metadata fija para bytes reproducibles, verifica el manifest SHA-256 y los members, y solo después sustituye atómicamente el destino. Un fallo conserva intacto el release anterior.
-
-El resumen de rollback separa `attempted_*` de `committed_*` en cero. Un run fallido se persiste con una conexión nueva y se informa cualquier fallo secundario. Un fallo de limpieza pre-job conserva el error HTTP principal y añade `cleanup_warning`/`cleanup_error_type` seguros. Los ID de job solo aceptan 32 caracteres hexadecimales en minúscula.
-
 JSON rechaza `NaN`/`Infinity` y desbordamientos como `1e9999`. Un timestamp inválido se guarda como `NULL` con warning que contiene solo campo y tipo. Las lecturas CLI/Web ordinarias y `/api/health` por defecto usan una puerta de schema acotada y no ejecutan `foreign_key_check`; `verify` y `/api/health?deep=true` procesan en stream la comprobación completa. El total es exacto, la sample en memoria está acotada y los campos de modo, tiempo de terminación, generation y stale declaran el contrato; el coste de CPU/VM crece con la base. Los contadores effective-current mantienen sus unidades documentadas.
 
 El texto largo usa un cursor opaco ligado a la revisión y lecturas incrementales BLOB de SQLite; el offset numérico de compatibilidad se limita a 1.048.576 caracteres y después se exige el cursor. Raw preview usa una consulta BLOB acotada segura para NUL e informa tamaño en bytes y si es exacto. NUL visibles y surrogates aislados se representan siempre como U+FFFD, mientras el raw JSON sigue escapado. Los escalares de resultados tienen presupuestos explícitos y metadata de truncamiento/longitud; los ID no se truncan.
@@ -540,18 +476,3 @@ La validación devuelve como máximo 16 elementos seguros con solo `location`, `
 Python `zipfile` y el pipeline de importación admiten estructuras ZIP64, con una regresión de member ZIP64 forzado pequeño; la aceptación habitual no genera un ZIP físico superior a 4 GiB. Siguen aplicándose todos los límites de members, bytes, ratio de compresión, disco y CPU.
 
 Una exportación CLI/Web larga mantiene deliberadamente un único SQLite read snapshot hasta terminar, fallar o desconectarse el cliente. En modo WAL, un reader largo puede retrasar el checkpoint y permitir que el WAL crezca con writers concurrentes; duración, CPU/VM, WAL y disco temporal siguen siendo proporcionales a los datos elegidos. No se debe romper la consistencia del snapshot para adelantar el checkpoint.
-
-`npm run build` usa `webui/scripts/build.mjs`, hace typecheck, construye en un staging directory hermano, valida todos los assets citados por el `index.html` staged, publica primero los assets y reemplaza atómicamente `dist/index.html` al final. Su self-test de fallo inyectado verifica que un build fallido conserva utilizables el entry point y los assets anteriores.
-
-Los candidatos se verifican exactamente mediante BLOB incremental con límites predeterminados independientes de 32 Mi caracteres y 32 MiB UTF-8. Las pruebas locales de confianza pueden usar `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` hasta 100 Mi caracteres; ese opt-in explícito también permite la capacidad UTF-8 válida correspondiente. Al agotar el presupuesto de candidatos se devuelven partial/pending y un continuation firmado cuando está disponible; un legacy que supera el límite duro por fila queda pending, nunca false-exact. El cursor largo liga revisión e identidad de la fila objetivo y el anchor de búsqueda guarda directamente el byte offset UTF-8.
-
-## Contratos Round 12 de writer y parser
-
-- Tras normalizar trusted Host/proxy, una política default-deny cubre todos los métodos HTTP unsafe. Una escritura remota exige un único `Origin` válido y same-origin; Origin o `Sec-Fetch-Site` duplicado/malformado y cross-site se rechazan. Los controles de bytes, `Content-Length`, multipart y slot siguen siendo exclusivos de upload.
-- `init`, `migrate`, import CLI, admission/job Web y build del índice opcional comparten un process writer lock alias-aware; admission lo obtiene antes del spool. El registry privado por usuario queda acotado a 64 shard files owned; una colisión solo serializa. Windows devuelve `writer_process_lock_unsupported` antes de registry, spool, creación DB, lease o staging.
-- JSON usa un fast probe acotado del decoder C para elements comunes completos y un framer persistente single-pass para los que abarcan chunks o son inciertos. Siguen los límites de depth, scalar/token, mapping, array, integer, UTF-8/caracteres, decoded heap y 5.000 nodes; los límites estructurales rechazan antes de materializar un objeto enorme.
-- IDs nuevos y parámetros identifier de API rechazan controles Unicode Cc y isolated surrogates. Filename y `Content-Disposition` sustituyen controles con seguridad; Unicode ordinario y noncharacters siguen permitidos.
-- Los diagnósticos de disco enumeran source/spool, ZIP del pipeline, crecimiento DB, WAL/journal, core FTS, índices optional old/live/staging, SQLite TEMP, reservas cleanup y emergency, con guards runtime. Timing CLI cubre writer lock, summary post-commit, cierre, flush y retorno; un job Web solo es terminal tras cleanup y liberar el lock.
-- Search continuation liga las cinco generations, incluida `query`; cambios de source o tiempos conversation/node vuelven stale una sesión. Display copy descarta el partial stale, reinicia una sola vez desde offset 0 y no escribe clipboard tras un segundo fallo. Strict delete-input no puede reactivarse con un Boolean: siempre devuelve `delete_input_secure_identity_unsupported`; solo se recuperan journals históricos exact-owned ya existentes.
-
-Ejecute las matrices synthetic en procesos frescos con `python tools/acceptance_scale_round12.py --scenario <many-small|single-element-mib|mapping-predecode|metadata-density|registry-lifecycle> --runs 3`. El workload físico de archivos lógicos de 1/5/10 GiB requiere opt-in explícito: `python tools/acceptance_scale_round12.py --scenario logical-archive-gib --runs 3 --confirm-huge`. Solo crea ZIP synthetic temporales, usa la ruta production import/verify/Web-index, informa honestamente cualquier rechazo de capacidad y puede requerir mucho tiempo y espacio libre.

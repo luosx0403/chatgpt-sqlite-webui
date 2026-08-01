@@ -22,10 +22,6 @@ ChatGPT Export Archiver imports OpenAI / ChatGPT export ZIP files directly into 
 
 Safe screenshot coming soon. Screenshots should use synthetic conversations only, not real chat titles, snippets, raw JSON, emails, or local paths.
 
-## Performance measurements
-
-This README does not publish context-free elapsed-time promises. Use `tools/benchmark_round11.py` for synthetic parser/import measurements and the opt-in, content-safe `tools/acceptance_real_pipeline.py` for repeated production HTTP runs against an authorized read-only ZIP. The harness reports machine/runtime context, all run values, median and worst resource metrics, and aggregate counts without titles, messages, IDs, filenames, or paths.
-
 ## What This Project Does
 
 - Imports `conversations.json` and sharded `conversations-*.json` files from an OpenAI / ChatGPT export ZIP, a standalone `conversations.json` file, or an extracted export directory into SQLite.
@@ -241,8 +237,6 @@ The default reader layout is `chat`: user messages align right, assistant messag
 
 `path=current` uses one shared effective-current rule everywhere: a valid conversation-owned `current_node` and its parent chain win even when all raw flags are zero; otherwise a deterministic usable `is_on_current_path=1` leaf chain is selected; only when neither exists does that conversation fall back to all nodes. Responses keep the raw flag unchanged and expose `current_node_exists`, `current_collection_source`, `current_path_fallback_to_all`, `effective_path`, and per-node effective visibility. Broken parents and cycles terminate with deterministic diagnostics rather than recursive queries hanging.
 
-Global current-path search first derives a path-independent conversation candidate set from normalized text/title indexes and safe source/date/role predicates, then builds effective-current membership only for those candidates. Exclusion-only queries that cannot be narrowed use an explicit full-database fallback. Reader hit navigation fetches one compact page initially and appends more hits only as navigation approaches the loaded boundary. Search and Web-index SQL use a portable non-flattening query shape instead of requiring SQLite's `AS MATERIALIZED` syntax, while resolving each legacy raw candidate at most once per logical stage.
-
 Reader copy and export actions follow the visible reader contract. `Copy current path conversation` uses the dedicated complete-text stream for the current reader path and respects the Show internal messages toggle, while ignoring the current search filters. It does not accumulate reader pages in the browser. `Copy visible` copies only the already loaded visible messages. Download links use the same current path and Show internal setting. Raw message access is a bounded larger raw preview through the per-message endpoint; truncated responses must render `raw_text` as plain preview text and the UI only shows that capped preview.
 
 Reader jump-to-hit requests with `around_node_id` use the same pagination collection as the reader: visible-only rows when Show internal is off, the full node collection when Show internal is on, and the effective all-node collection for damaged conversations with no current-path nodes.
@@ -332,19 +326,6 @@ python chatgpt_archive.py web --host 0.0.0.0 --port 8787
 
 Set higher limits only for local files you trust. Larger values raise ZIP bomb, disk-pressure, and CPU/memory risk.
 
-
-## Web UI acceptance checklist
-
-Use this checklist when changing the Web path or preparing a runnable delivery:
-
-- Start the Web UI with no database and confirm that it serves the empty-state contract.
-- Import a small ChatGPT export ZIP from the browser and confirm that the job finishes.
-- Confirm that the backend runs `verify`, `stats`, and `web-index` after the upload import.
-- Refresh the page and confirm that conversations can be listed and opened.
-- Re-import a newer ZIP and confirm that the incremental path still works.
-
-The Web path should not require `webui/node_modules` in a runnable delivery because the built React assets are served from `webui/dist`.
-
 ## Search syntax
 
 CLI search uses the project's safe query syntax, not raw SQLite query text. Plain terms use normalized substring `contains` matching and are ANDed; uppercase `OR` creates alternatives. Quoted phrases stay intact and `-term`/`-"quoted phrase"` exclude. `word` mode applies ASCII letter/digit/underscore boundaries; CJK text conservatively remains normalized contains matching. Filters include `role:user`, `source:zip`, `path:current`, `path:all`, `scope:title`, and `scope:message`; raw `path:` and `scope:` modifiers override matching UI selectors. It prints conversation IDs, node IDs, and roles, not snippets.
@@ -403,11 +384,7 @@ python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_Z
 
 Keep JSON logs in ignored locations such as `logs/`. Files ending in `*.jsonl` are local log artifacts and are rejected by delivery clean.
 
-Import timing fields include `source_scan_seconds`, `parse_and_upsert_seconds`, `fts_rebuild_seconds`, `finalize_commit_seconds`, `close_seconds`, `legacy_pre_commit_seconds`, `wall_total_seconds`, and `total_import_seconds`. `total_import_seconds` is the end-to-end wall time, including final commit and close.
-
-After the import transaction has successfully finished, later summary updates are best-effort. `summary_update_after_commit_failed`, `import_connection_close_failed`, and `summary_update_after_close_failed` are warnings, not reasons to mark a successful import as failed.
-
-## Development and acceptance checks
+## Build from source
 
 Run the Python checks and clean safe generated artifacts before the first delivery check:
 
@@ -442,26 +419,11 @@ When checking a ZIP delivery:
 python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 ```
 
-## Delivery notes
+## Package contents
 
-A runnable delivery should include the Python sources, tests, docs, `requirements-web.txt`, `constraints-web-py312.txt`, frontend source and tests under `webui/src` and `webui/tests`, frontend config/package files, and built assets under `webui/dist`. It should not include `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, Python cache directories or bytecode, coverage/typecheck caches, `.DS_Store`, AppleDouble `._*` files, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, temporary logs, local acceptance logs, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, any `*.zip`, `conversations*.json`, real databases such as `*.db`, `*.sqlite`, and `*.sqlite3`, or SQLite sidecars such as `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm`, and `*.sqlite3-journal`. Directory checks allow the target root's own `.git` directory so a normal Git clone can be checked, but nested `.git` directories are forbidden; ZIP delivery checks forbid any `.git` entry.
+A runnable delivery should include the Python sources, tests, docs, `requirements-web.txt`, `constraints-web-py312.txt`, frontend source and tests under `webui/src`, `webui/tests`, and `webui/scripts`, frontend config/package files, and built assets under `webui/dist`. It should not include `webui/node_modules`, `webui/tsconfig.tsbuildinfo`, Python cache directories or bytecode, coverage/typecheck caches, `.DS_Store`, AppleDouble `._*` files, `__MACOSX`, `Thumbs.db`, `Desktop.ini`, `.gitignore.md`, temporary logs, local acceptance logs, `*.log`, `*.ndjson`, `*.jsonl`, `archive/`, `exports/`, any `*.zip`, `conversations*.json`, real databases such as `*.db`, `*.sqlite`, and `*.sqlite3`, or SQLite sidecars such as `*.db-journal`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.sqlite3-wal`, `*.sqlite3-shm`, and `*.sqlite3-journal`. Directory checks allow the target root's own `.git` directory so a normal Git clone can be checked, but nested `.git` directories are forbidden; ZIP delivery checks forbid any `.git` entry.
 
 A source-only delivery may omit `webui/dist`, but then the frontend must be rebuilt before serving the full React UI.
-
-## Source tree guide
-
-```text
-chatgpt_archive.py                 CLI entry point
-chatgpt_export_archiver/cli.py     CLI commands and reusable import pipeline
-chatgpt_export_archiver/db.py      SQLite schema, import helpers, verify, stats, FTS helpers
-chatgpt_export_archiver/web_app.py FastAPI app factory and static UI serving
-chatgpt_export_archiver/web_api.py Web API routes
-chatgpt_export_archiver/web_db.py  Web query helpers and optional trigram index builder
-chatgpt_export_archiver/web_jobs.py Web ZIP import job manager
-webui/                             React frontend source and built dist files
-tests/                             Python unit and integration tests
-tools/                             Delivery and support scripts
-```
 
 ## Database overview
 
@@ -470,30 +432,6 @@ The main database stores conversations, mapping nodes, import runs, and warnings
 The canonical database schema is versioned with `PRAGMA user_version` (current version 6). Version 3 made canonical TEXT identities explicitly `NOT NULL`; version 4 added durable address/graph revisions; version 5 added durable row-local display revisions and compatibility state; version 6 adds the durable `query` generation for source and conversation/node time changes. Migration performs a fast outer DB/WAL/journal/TEMP capacity check, then recomputes authoritative count, size, sidecars, and free space under `BEGIN IMMEDIATE` before its first mutation. It reports content-free progress and rolls back on cancellation, interruption, ENOSPC, or SQLite failure. Repeating migration on a current clean database is a true no-op and reports `schema_changed`, `compatibility_refreshed`, `compatibility_changed`, and `migration_changed` as false. Read-only commands and Web requests never run migration DDL; older compatible databases return `database_migration_required`. Create and verify an external backup, then run `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`.
 
 Health and `verify` distinguish a missing optional `message_fts` from a damaged one. A damaged table reports `optional_message_fts_error` with a `--rebuild-fts` recovery hint; generic malformed, locked, readonly, I/O, and SQL runtime failures are not silently treated as a missing capability and use the stable codes `database_malformed`, `database_locked`, `database_readonly`, `database_io_error`, or `database_runtime_failure`.
-
-## Round 10 resource, ownership, and recovery contracts
-
-Managed FTS, optional Web-index, staging, metadata, generation, and shadow objects are destructively changed only after exact type/table/SQL/fingerprint ownership validation. Collisions are refused with `core_fts_name_collision`, `optional_index_name_collision`, or `staging_name_collision`; user objects are never treated as disposable because their names resemble managed objects. Optional Web index format 6 uses project-owned stable integer addresses keyed by logical conversation/node identities; canonical implicit rowids are never durable cross-request addresses. The address-map version, resolver/normalization versions, generations, and exact family ownership are metadata-currentness inputs. Placeholder classification streams arbitrary leading ASCII/Unicode whitespace and the complete marker across BLOB chunks, so no fixed-prefix boundary can split reader, search, index, copy, or export behavior.
-
-Long-display cursors bind to a durable revision stored directly on the target message row. Managed insert/update triggers advance that revision for every display-affecting write, including direct external SQLite writers that do not refresh `content_hash`; unrelated rows do not invalidate the cursor. Existing pre-version-5 databases are gated as migration-required and the explicit writer migration backfills revisions. The cursor also binds a stable row identity digest, so rowid reuse cannot revive an old cursor.
-
-Exact message search and positive-body conversation search stream canonical BLOBs in 64 KiB chunks with overlap and store verified results in one connection-local TEMP artifact reused by counting, paging, conversation aggregation/enrichment, snippets, spans, and anchors. The normal per-row ceilings remain 32 MiB of decoded characters and 32 MiB of UTF-8 input, trusted local opt-in through `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` can raise the character ceiling to 100 MiB, and one request has independent aggregate and candidate budgets. Raw-only fallback starts at 1 MiB/800,000 characters and a fixed-size signed continuation session can retry unresolved work without embedding long IDs. Sessions are server-instance-scoped and bounded: restart, expiry, secret rotation, cross-worker routing without affinity, index/metadata/generation change, or database replacement returns an invalid/stale continuation response. When a continuation is present, `next_offset` is `null`. Message pages separate count and order truth: `total_exact` concerns the count, while `order_exact`, `scan_complete`, and `provisional_order` disclose whether the segment has final global ordering. Provisional segments remain visibly provisional through completion rather than being silently relabelled final. Late matches include a signed revision-bound UTF-8 byte anchor; hit navigation passes that opaque cursor to incremental BLOB reads.
-
-One imported conversation element must satisfy a joint profile: 32 MiB UTF-8 input, 32 MiB decoded characters, 2,500,000 string/primitive tokens, 1,250,000 mapping entries, 1,000,000 array items, nesting depth 256, 1,000 integer digits, 384 MiB estimated decoded heap, 5,000 mapping nodes, and bounded import-batch materialization. Crossing any dimension skips that element with a structured warning while later valid elements continue. The separate legacy/API sanitizer remains capped at 250,000 scalar values. The 100,000-node reader, effective-current, and export ceilings exist only for compatible legacy or externally written databases. One ZIP read session is reused across selected shards, and the single-pass framer finds each element boundary once before exactly one C decoder call; it does not repeatedly decode a growing retained prefix.
-
-Bulk project imports temporarily replace exact project-owned generation triggers inside the same write-lock transaction and advance each dirty field domain once before restoring and validating those triggers. Rollback or process failure restores the old trigger/data state; external writers continue to use normal per-statement triggers. Finite effective-current scopes, including one 100,000-node legacy conversation, are staged and compared with SQLite TEMP relations; raw-flag cycle traversal uses compact integer arrays instead of duplicate Python string graphs. Archive export spools its plan and nodes to temporary SQLite and keyset-streams conversations/nodes; it does not retain an archive-wide Python node graph.
-
-Strict `--delete-input-on-success` is refused before staging on all currently supported platforms because pathname identity checks and advisory locks do not prevent a pre-open non-cooperating writer. Historical identity-bound recovery journals remain recoverable with the bounded token printed by the CLI; recovery validates format/ownership and never overwrites a replacement. Portable Web constraints remain a cross-platform unhashed residual; the separate CPython 3.12/macOS arm64 lock verifies wheel artifacts for that exact target.
-
-## Round 11 stable identity, outcomes, and performance contracts
-
-The process-wide writer lock uses a private per-user registry whose owned records contain magic/version and database identity but no pathname. Existing databases lock normalized path and file-entity identities, so real paths, relative paths, `..`, file or parent symlinks, and hardlink aliases contend before lease, staging, or writes. A new database is entity-bound immediately after creation and identity is rechecked before publication. Unknown registry files, links, directories, devices, or ownership collisions fail closed and are not modified or removed. The registry is outside the project tree, persistent by design, and never unlinked while held.
-
-A fully identical reimport performs no node rewrite, generation advance, optional-index invalidation, or meaningful WAL work. Title, message/display source, address, and graph changes mark only their actual durable dirty domains; the live optional index remains readable until canonical commit and becomes stale only when a relevant source/address domain changed. Project imports insert display revisions directly, avoiding the old per-row repair update; external writers that omit a valid revision are still repaired by exact managed triggers.
-
-Web import jobs expose `completion_outcome` and `canonical_import_outcome` in addition to the detailed legacy `outcome`. Public states distinguish `success`, `success_with_warnings`, `partial_success`, `failed_before_commit`, `failed_after_canonical_commit`, `cleanup_warning`, and `cancelled`. The terminal UI shows canonical commit state, committed conversation/node counts, skipped element count, warning total and localized safe by-code aggregates, cleanup warnings, and optional-index result. It never displays an exported title, message, raw payload, identifier, path, or OS error.
-
-`tools/benchmark_round11.py` is an opt-in synthetic harness. It emits JSON containing environment and fixture hashes plus wall/CPU/RSS and applicable database/WAL/TEMP/index, SQL/VM, BLOB, decoder, resolver, normalizer, lock, and cleanup counters. Large runs are intentionally not part of ordinary startup; use repeated subprocess runs and compare median plus worst values. The 32 MiB element ceiling, 5,000-node joint profile, migration capacity estimate, and request/search/export budgets remain hard safety boundaries, not a promise that every archive will fit available RAM or disk.
 
 ## Known limits
 
@@ -505,11 +443,11 @@ Web import jobs expose `completion_outcome` and `canonical_import_outcome` in ad
 
 ## Security and response contracts
 
+Import and upload failures use stable, content-safe codes such as `upload_preflight_failed`, `source_read_failed`, `invalid_conversation_encoding`, and `json_integer_too_large`.
+
 Upload ingress accepts at most one `Origin`, `Content-Length`, and `Sec-Fetch-Site` header. Origin must be exactly one HTTP(S) origin without userinfo, path, query, fragment, controls, or comma chains. Content length must be a canonical nonnegative ASCII decimal integer; duplicate or malformed security headers are rejected before multipart parsing. Invalid or non-finite compression-ratio configuration falls back to the finite safe profile default.
 
 Loopback Web access accepts only `localhost`, `127.0.0.1`, `::1`, the explicit loopback bind host, and explicitly configured hosts. Non-loopback binds additionally require `CHATGPT_ARCHIVE_ALLOWED_HOSTS` (or `--allowed-hosts`) with the actual browser hostname or LAN IP; `*` is rejected. `CHATGPT_ARCHIVE_TRUSTED_PROXIES` (or `--trusted-proxies`) uses a strict single-edge model: forwarded headers are ignored from untrusted peers, while a trusted direct edge must overwrite client values. Repeated Host/Forwarded headers, comma-separated proxy chains, malformed syntax, and conflicts between `Forwarded` and `X-Forwarded-Host/Proto` are rejected. Every request, including static UI and GET APIs, must have an allowed Host. Remote writes require a same-origin `Origin`; missing Origin is compatible only in the trusted loopback profile. Upload writes always reject `Sec-Fetch-Site: cross-site`.
-
-Import failures use stable preflight, source-scan, source-read, JSON-decode, top-level-contract, and transaction stages. Stable codes include `upload_preflight_failed`, `input_source_open_failed`, `input_source_not_regular_file`, `source_read_failed`, `source_changed_during_read`, `invalid_conversation_encoding`, and `json_integer_too_large`. Rollback summaries separate `attempted_*` work from zero `committed_*` counts. Failed-run persistence uses a fresh connection and reports any secondary persistence failure. Cleanup diagnostics use a structured `cleanup_warnings` array; the deprecated `cleanup_warning` scalar is its first item. No temporary path is returned. A successful canonical commit is not described as unimported if later verify, stats, optional Web-index, or cleanup work fails.
 
 Upload, canonical import, schema migration, and optional Web-index rebuild perform filesystem-capacity preflights and retain a 256 MiB emergency reserve. These are conservative estimates, not guarantees: quotas, concurrent writers, WAL, temporary pages, and real SQLite amplification can still exhaust space. Runtime checks and ENOSPC handling return `upload_disk_space_insufficient`, `import_disk_space_insufficient`, `migration_disk_space_insufficient`, or `web_index_disk_space_insufficient`; partial uploads are cleaned, canonical import/migration rolls back, and a failed private Web-index build leaves the previous published index readable.
 
@@ -529,23 +467,6 @@ Legacy canonical text that is empty or a legacy placeholder may recover bounded 
 
 “Copy URL” always serializes explicit `match_mode`, `layout`, and `show_internal` values plus one already-applied search/list/selection context; text still waiting for debounce is not mixed with an older selected conversation. Explicit URL values win over `localStorage`; omitted values may use local settings. This release uses `replaceState` and intentionally does not restore step-by-step search or selection history with browser Back/Forward. Japanese and Spanish are visibly labelled as partial translations; English, Simplified Chinese, and Traditional Chinese have compile-time key parity.
 
-Release ZIP members use fixed metadata and deterministic ordering, so identical payloads built with the same Python/ZIP implementation are byte-for-byte reproducible. The builder still verifies the authoritative required-file set, every payload SHA-256, the internal manifest, built assets, and atomic replacement.
-
 Request-validation responses contain at most 16 safe items with only allowlisted `location`, `field`, and stable public `code`; they never echo submitted bodies, path/query values, or framework validation types. Raw APIs distinguish exact UTF-8 byte counts from character counts. Message-search candidate verification, late-position snippets, enrichment, and serialized responses are bounded. Confirmed matches are never discarded merely because later candidates exhaust a request budget: the response marks partial/pending work and offers a bound continuation when scanning can resume; candidates that exceed a hard per-row verifier limit remain explicitly pending rather than becoming false-exact misses. Web-index byte accounting covers bytes actually read, normalized, and bound to FTS. Release payloads are hashed, written, and verified in streaming chunks rather than whole-file buffers.
 
 Long CLI/Web streaming exports intentionally retain one consistent SQLite read snapshot until completion, failure, or client disconnect. On a WAL database, that long reader can delay checkpoints and allow WAL growth while concurrent writers continue; duration, CPU/VM work, WAL size, and temporary disk remain proportional to the selected data. Do not break snapshot consistency to force an early checkpoint.
-
-`npm run build` uses `webui/scripts/build.mjs` to typecheck, build into a same-parent staging directory, validate every asset referenced by the staged `index.html`, publish assets first, and atomically replace `dist/index.html` last. Its injected-failure self-test verifies that a failed build leaves the previous entry point and referenced assets usable.
-
-Release ZIP publication validates an authoritative required-source list independent of collector output, writes a temporary file in the target directory, verifies a sorted size/SHA-256 manifest for every payload file, the exact member set and built assets, runs the delivery check, and only then atomically replaces the destination. Missing required source/config/docs hard-fail, and failure leaves the previous release unchanged.
-
-## Round 12 writer, parser, and public-contract notes
-
-- Every unsafe HTTP method is covered by one default-deny write policy after trusted Host/proxy normalization. Remote requests require one valid same-origin `Origin`; duplicate/malformed Origin or `Sec-Fetch-Site`, and cross-site requests, are rejected. Upload byte, `Content-Length`, multipart, and slot controls remain upload-only.
-- `init`, `migrate`, CLI import, Web import admission/job, and optional-index build share one alias-aware process writer lock. Upload admission takes it before spooling. The private per-user registry has exactly 64 fixed owned shard files; collisions only serialize. On Windows writer commands and uploads currently fail before any registry, spool, DB creation, lease, or staging with `writer_process_lock_unsupported`.
-- Conversation JSON uses a bounded C-decoder fast probe for complete ordinary elements and a persistent single-pass framer for spanning/uncertain elements. Depth, scalar/token, mapping-entry, array-item, integer, UTF-8/character, decoded-heap, and 5,000-node budgets remain enforced; the structural budgets reject before materializing an oversized object.
-- New IDs and API identifier parameters reject Unicode category Cc controls and isolated surrogates. Filenames and `Content-Disposition` replace unsafe controls; ordinary Unicode and noncharacters remain allowed.
-- Disk diagnostics enumerate source/spool, pipeline ZIP, canonical DB growth, WAL/journal, core FTS, old/live/staging optional indexes, SQLite TEMP, cleanup reserve, and emergency reserve. Runtime free-space guards remain active. CLI import timing covers lock acquisition through post-commit summary persistence, connection close, output flush, and controlled return; Web jobs become terminal only after cleanup and lock release.
-- Search continuation binds all five durable generations, including `query`; source and conversation/node time changes stale old sessions. Display copy discards a partial stale revision, restarts once at offset zero, and never writes the clipboard after a second cursor failure. Strict delete-input cannot be re-enabled by a Boolean: production always returns `delete_input_secure_identity_unsupported`; only already-existing exact historical journals are recoverable.
-
-Run fresh-process synthetic scale matrices with `python tools/acceptance_scale_round12.py --scenario <many-small|single-element-mib|mapping-predecode|metadata-density|registry-lifecycle> --runs 3`. The physical 1/5/10 GiB logical-archive workload is deliberately opt-in: `python tools/acceptance_scale_round12.py --scenario logical-archive-gib --runs 3 --confirm-huge`. It creates only temporary synthetic ZIPs, uses the production import/verify/Web-index path, reports capacity rejection honestly, and can require substantial time and free disk.

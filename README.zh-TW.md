@@ -22,10 +22,6 @@ ChatGPT Export Archiver 可以直接匯入 OpenAI / ChatGPT 官方 export ZIP，
 
 安全截圖待補。截圖應使用 synthetic 假資料，不能包含真實聊天標題、snippet、raw JSON、Email 或本機路徑。
 
-## 效能測量
-
-本文不提供缺少上下文的耗時承諾。合成 parser/import 測量使用 `tools/benchmark_round11.py`；對已授權、唯讀真實 ZIP 的多輪 production HTTP 測量使用明確 opt-in、內容安全的 `tools/acceptance_real_pipeline.py`。harness 會記錄機器/執行環境、每次 run、median、worst 與彙總資源指標，但不會輸出標題、訊息、ID、檔名或路徑。
-
 ## 專案功能
 
 - 從 OpenAI / ChatGPT 匯出的 ZIP、單一 `conversations.json` 檔案或解壓縮後的匯出目錄匯入 `conversations.json` 和 sharded `conversations-*.json`。
@@ -241,8 +237,6 @@ python chatgpt_archive.py web --port 8787
 
 所有入口共用同一套 `path=current` effective-current 規則：有效且屬於該對話的 `current_node` 與其父鏈優先，即使所有 raw flag 都為 0；否則選擇確定且可用的 `is_on_current_path=1` 葉鏈；兩者皆不存在時，該對話才 fallback 到 all。回應保留 raw flag 原義，並提供 `current_node_exists`、`current_collection_source`、`current_path_fallback_to_all`、`effective_path` 與逐節點 effective visibility。斷裂父鏈和 cycle 會有限且確定地診斷，不會讓遞迴查詢掛起。
 
-全域 current-path 搜尋會先透過正規化內文/標題索引及安全的 source/date/role 條件取得不依賴路徑的對話候選，再只為這些候選建立 effective-current membership；只有無法縮小的僅排除查詢才明確回退到全資料庫。Reader 命中導覽初始只取一個精簡頁面，接近已載入邊界時才繼續追加。搜尋與 Web 索引 SQL 使用可攜式的防扁平化查詢結構，不要求 SQLite 支援 `AS MATERIALIZED`，並保證每個 legacy raw 候選在每個邏輯階段最多解析一次。
-
 閱讀器複製與匯出動作遵守可見閱讀器契約。`複製目前路徑整段對話` 使用專用的完整文字串流處理目前 reader 路徑，遵守「顯示內部訊息」開關並忽略目前搜尋篩選，不會在瀏覽器中累積 reader 分頁。`複製目前可見` 只複製已載入的可見訊息。下載連結使用同樣的目前路徑與「顯示內部訊息」設定。Raw 訊息存取只透過單則訊息 endpoint 提供有上限的較大 raw 預覽；截斷回應必須把 `raw_text` 當作純文字預覽渲染，UI 只顯示這個 capped preview。
 
 reader 使用 `around_node_id` 跳轉到命中時，會使用與 reader 相同的分頁集合：Show internal 關閉時使用 visible-only rows，Show internal 開啟時使用完整 node collection；對沒有 current-path node 的損壞 conversation，使用 effective all-node collection。
@@ -332,19 +326,6 @@ python chatgpt_archive.py web --host 0.0.0.0 --port 8787
 
 僅對你信任的本機檔案設定更高限制。更大的值會提高 ZIP bomb、磁碟壓力和 CPU/記憶體風險。
 
-
-## Web UI 驗收清單
-
-修改 Web 路徑或準備 runnable 交付包時，可以用這份清單檢查：
-
-- 在沒有資料庫的情況下啟動 Web UI，並確認頁面能提供空狀態契約。
-- 從瀏覽器匯入一個小型 ChatGPT 匯出 ZIP，並確認 job 正常完成。
-- 確認上傳匯入後，後端會執行 `verify`、`stats` 與 `web-index`。
-- 重新整理頁面，確認對話可以列出並開啟。
-- 再匯入一個較新的 ZIP，確認增量路徑仍可使用。
-
-runnable 交付包中的 Web 路徑不應依賴 `webui/node_modules`，因為建置好的 React assets 已由 `webui/dist` 提供。
-
 ## 搜尋語法
 
 CLI 搜尋使用安全查詢語法，不直接使用 SQLite 查詢文字。一般詞使用 normalized substring `contains` 並預設 AND；大寫 `OR` 建立替代分支。引號保留片語，`-term`/`-"quoted phrase"` 表示排除。`word` 僅對 ASCII 字母、數字與底線套用邊界；CJK 無斷詞時保守維持 normalized contains。查詢中的 raw `path:`/`scope:` 會覆寫 UI 選擇器。
@@ -403,11 +384,7 @@ python chatgpt_archive.py import --db archive/chatgpt_archive.db --input "$NEW_Z
 
 請把 JSON logs 放在 `logs/` 這類已忽略位置。`*.jsonl` 是本機紀錄檔產物，delivery clean 會拒絕它們。
 
-匯入計時欄位包括 `source_scan_seconds`、`parse_and_upsert_seconds`、`fts_rebuild_seconds`、`finalize_commit_seconds`、`close_seconds`、`legacy_pre_commit_seconds`、`wall_total_seconds` 與 `total_import_seconds`。`total_import_seconds` 是端到端 wall time，包含最終 commit 與 close。
-
-匯入交易成功完成後，後續 summary update 都是 best-effort。`summary_update_after_commit_failed`、`import_connection_close_failed` 與 `summary_update_after_close_failed` 是警告，不會把已成功的匯入標記為失敗。
-
-## 開發與驗收檢查
+## 從原始碼建置
 
 執行 Python 檢查，並在第一次 delivery clean 前清理安全的產生物：
 
@@ -442,26 +419,11 @@ Windows PowerShell 或 cmd 使用者在 search query 包含空格時請使用雙
 python tools/check_delivery_clean.py --mode runnable path/to/delivery.zip
 ```
 
-## 交付說明
+## 套件內容
 
-runnable delivery 應包含 Python 原始碼、測試、文件、`requirements-web.txt`、`constraints-web-py312.txt`、`webui/src` 與 `webui/tests` 下的前端原始碼與測試、前端設定/package 檔，以及 `webui/dist` 下的建置產物。不應包含 `webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python 快取目錄或 bytecode、coverage/typecheck 快取、`.DS_Store`、AppleDouble `._*` 檔、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、暫存紀錄檔、本機驗收紀錄檔、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任何 `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` 等真實資料庫檔，或 `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` 等 SQLite sidecar。目錄檢查允許目標根目錄自己的 `.git`，因此一般 Git clone 可以直接檢查；巢狀 `.git` 會失敗，ZIP delivery 中任何 `.git` 都會失敗。
+runnable delivery 應包含 Python 原始碼、測試、文件、`requirements-web.txt`、`constraints-web-py312.txt`、`webui/src`、`webui/tests` 與 `webui/scripts` 下的前端原始碼與測試、前端設定/package 檔，以及 `webui/dist` 下的建置產物。不應包含 `webui/node_modules`、`webui/tsconfig.tsbuildinfo`、Python 快取目錄或 bytecode、coverage/typecheck 快取、`.DS_Store`、AppleDouble `._*` 檔、`__MACOSX`、`Thumbs.db`、`Desktop.ini`、`.gitignore.md`、暫存紀錄檔、本機驗收紀錄檔、`*.log`、`*.ndjson`、`*.jsonl`、`archive/`、`exports/`、任何 `*.zip`、`conversations*.json`、`*.db`、`*.sqlite`、`*.sqlite3` 等真實資料庫檔，或 `*.db-journal`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal`、`*.sqlite3-wal`、`*.sqlite3-shm`、`*.sqlite3-journal` 等 SQLite sidecar。目錄檢查允許目標根目錄自己的 `.git`，因此一般 Git clone 可以直接檢查；巢狀 `.git` 會失敗，ZIP delivery 中任何 `.git` 都會失敗。
 
 source-only delivery 可以省略 `webui/dist`，但之後需要先重新建置前端，才能提供完整 React UI。
-
-## 原始碼樹說明
-
-```text
-chatgpt_archive.py                 CLI 進入點
-chatgpt_export_archiver/cli.py     CLI 指令與可重用 import pipeline
-chatgpt_export_archiver/db.py      SQLite schema、匯入 helper、verify、stats、FTS helper
-chatgpt_export_archiver/web_app.py FastAPI app factory 與靜態 UI 服務
-chatgpt_export_archiver/web_api.py Web API routes
-chatgpt_export_archiver/web_db.py  Web 查詢 helper 與可選 trigram index builder
-chatgpt_export_archiver/web_jobs.py Web ZIP 匯入 job manager
-webui/                             React 前端原始碼與建置後的 dist 檔案
-tests/                             Python 單元測試與整合測試
-tools/                             交付檢查與輔助腳本
-```
 
 ## 資料庫概覽
 
@@ -470,28 +432,6 @@ tools/                             交付檢查與輔助腳本
 canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 6）。版本 3 加入 `NOT NULL` identity、版本 4 加入持久 address/graph revision、版本 5 加入逐列 display revision 與 compatibility state、版本 6 加入涵蓋 source 與 conversation/node 時間變更的持久 `query` generation。Migration 先在 write lock 外快速預檢 DB/WAL/journal/TEMP，再於 `BEGIN IMMEDIATE` 內、首次變更之前重新計算權威 row count、size、sidecar 與 free space。取消、中斷、ENOSPC 或 SQLite 失敗會完整回滾。對 current 且乾淨的資料庫重複 migrate 是真正 no-op，並將 `schema_changed`、`compatibility_refreshed`、`compatibility_changed`、`migration_changed` 全部回報為 false。唯讀路徑不執行 migration DDL；舊相容資料庫回傳 `database_migration_required`。
 
 Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回報 `optional_message_fts_error` 和 `--rebuild-fts` 復原提示；一般 malformed、locked、readonly、I/O 與 SQL 執行期錯誤不會被當成能力缺失，並使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
-
-## Round 10 資源、所有權與復原契約
-
-managed FTS、可選 Web 索引、staging、metadata、generation 與 shadow 物件只有在精確核對所有權後才能執行破壞性 DDL。可選 Web 索引格式 6 使用依邏輯 conversation/node identity 建立的專案自有穩定整數位址，任何持久或跨 request 物件都不依賴 canonical implicit rowid；address-map、resolver/normalization、generation 與 family ownership 共同決定 currentness。placeholder 分類會跨 BLOB chunk 串流略過任意 ASCII/Unicode 前導空白並讀取完整 marker，不再依賴固定前綴。
-
-長正文 cursor 會綁定目標 message row 直接保存的持久逐列 revision。受管 insert/update trigger 會為每次影響顯示文字的寫入遞增 revision，即使直接外部 SQLite writer 未更新 `content_hash`；無關資料列不會使 cursor 失效。version 5 之前的資料庫會進入 migration-required gate，由明確 writer migration 回填 revision。cursor 也綁定穩定的 row identity 摘要，避免 rowid 重用讓舊 cursor 復活。
-
-精確訊息與含正向正文詞的對話搜尋以 64 KiB 分塊讀取 canonical BLOB，並重用連線本地 TEMP artifact。固定小尺寸簽名 continuation 參照有界 server-instance session，不嵌入長 ID；重啟、過期、secret 變更、沒有 affinity 的跨 worker 路由、index/metadata/generation 變更或資料庫替換都回傳 invalid/stale。存在 continuation 時 `next_offset=null`。`total_exact` 只說明總數；`order_exact`、`scan_complete`、`provisional_order` 分別說明全域排序與掃描狀態，UI 不會把 provisional segment 靜默當成最終有序結果。
-
-單一新匯入對話元素必須同時符合聯合 profile：32 MiB UTF-8、32 MiB 解碼字元、2,500,000 string/primitive token、1,250,000 mapping entry、1,000,000 array item、深度 256、整數 1,000 digits、384 MiB 估算 decoded heap、5,000 mapping node 與有界 import-batch 物化。任一維度超限都以結構化 warning 略過該元素並繼續後續有效元素。單遍 framer 先找到一次元素邊界，再只呼叫一次 C decoder。
-
-專案批次匯入在同一寫入鎖 transaction 內暫時替換精確的專案自有 generation trigger，每個 dirty 欄位 domain 只推進一次，再復原並驗證 trigger；rollback 或 crash 會復原原 DDL/資料，外部 writer 仍使用一般逐 statement trigger。有限 effective-current scope（包括單一 100,000-node legacy 對話）透過 SQLite TEMP relation 精確比較；raw-flag cycle 遍歷使用緊湊整數陣列，不再複製多份 Python 字串圖。全庫匯出把 plan 與 node spool 到暫存 SQLite，並以 keyset 串流讀取，不在 Python 保存全 archive node graph。
-
-strict `--delete-input-on-success` 目前在所有平台都於 staging 前拒絕，因為 pathname identity 檢查與 advisory lock 無法阻止預先開啟的不合作 writer。歷史 identity-bound journal 仍可用 CLI 列印的有界 token 復原，且絕不覆蓋 replacement。portable Web constraints 仍是跨平台無 hash residual；獨立 CPython 3.12/macOS arm64 lock 會為該精確目標驗證 wheel artifact。
-
-## Round 11 穩定位址、結果與效能契約
-
-writer process lock 位於私有 per-user registry，owned record 含 magic/version 與資料庫 identity，但不含路徑。已有資料庫同時鎖定規範路徑與檔案實體，因此 real/relative/`..`、檔案或父目錄 symlink、hardlink alias 會在 lease、staging 或寫入前爭用；新資料庫建立後立即綁定實體，發佈前再次驗證。未知 registry 物件 fail closed 且不修改或刪除；registry 位於專案樹外並持久存在，持鎖時絕不 unlink。
-
-完全相同的重新匯入不重寫 node、不推進 generation、不使 optional index 失效，也不產生有意義 WAL；各欄位只標記實際 dirty domain。Web import job 的 `completion_outcome`/`canonical_import_outcome` 區分 success、warning/partial、commit 前後失敗、cleanup warning 與 cancel；UI 安全顯示 committed conversation/node、skipped element、warning 總數/按 code 聚合、canonical commit 與 optional-index 結果，不顯示真實內容或 ID。
-
-`tools/benchmark_round11.py` 是 opt-in synthetic JSON benchmark，輸出環境/fixture hash、wall/CPU/RSS，以及適用的 DB/WAL/TEMP/index、SQL/VM、BLOB、decoder、resolver、normalizer、lock 與 cleanup counter。大型執行應用獨立 subprocess 重複測量 median 和 worst；公開 resource limit 仍是安全邊界。
 
 ## 已知限制
 
@@ -519,12 +459,6 @@ Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bi
 
 「複製 URL」永遠明確寫入 `match_mode`、`layout`、`show_internal` 與可分享的搜尋/reader 狀態。URL 明確值優先於 `localStorage`，缺少值才可回退本機設定。本版本使用 `replaceState`，瀏覽器上一頁/下一頁不會還原逐步搜尋或選擇歷程。
 
-Release ZIP 使用固定 member metadata 產生可重現 bytes，並先寫入目標目錄暫存檔，核對每個 payload 的 size/SHA-256 manifest、精確 member 集合與 dist asset，再原子替換；任何失敗都保留舊 release。
-
-rollback summary 以 `attempted_*` 與歸零的 `committed_*` 區分已嘗試和已提交工作；失敗 run 使用新連線持久化並明確報告次要持久化失敗。pre-job 暫存清理失敗保留主要 HTTP 錯誤，另回傳安全的 `cleanup_warning`/`cleanup_error_type`。job 查詢只接受 32 位小寫十六進位 ID。
-
-JSON 會拒絕 `NaN`/`Infinity` 與 `1e9999` 等溢位數；無效 timestamp 寫入 `NULL` 並產生只含欄位和值類型的 warning。一般 CLI/Web 讀取與預設 `/api/health` 僅執行有界 schema gate，不執行 `foreign_key_check`；`verify` 與 `/api/health?deep=true` 才會串流執行完整全庫檢查。總數精確，記憶體只保留有界 sample，完整性模式、完成時間、generation 與 stale 欄位會說明結果；CPU 與 SQLite VM 工作量仍隨資料庫大小成長。parent-cycle node 與 component 數維持分開。effective-current verify counter 以對話為單位，獨立回報 selected-chain 與 raw-flag topology 的 cycle/missing/cross/partial，aggregate counter 不再誤標為 selected-chain 問題。
-
 長訊息正文使用綁定內容 revision 的 opaque cursor 與 SQLite 增量 BLOB 讀取分頁；數字 offset 相容掃描最多 1,048,576 字元，之後必須使用 cursor。raw preview 使用一次可處理 NUL 的有界 BLOB 查詢，並回報位元組大小與精確狀態。可見文字中的 NUL 與孤立 surrogate 一致替換為 U+FFFD，raw JSON 維持安全跳脫。搜尋結果標量有明確顯示預算及截斷/原長度 metadata，ID 不會截斷。
 
 CLI 與 Web 對話匯出在物化前採用固定總邊界：每個對話最多 100,000 個 node、單 node canonical/raw 輸入最多 32 MiB、對話輸入合計最多 128 MiB，串流輸出最多 256 MiB；effective-current 線上物化同樣限制每對話 100,000 node 與 128 MiB 圖 ID 輸入。CLI 在目標目錄分塊寫入暫存檔，同時計算 hash 並串流比較舊檔，只原子替換變更內容。瀏覽器複製以 `ReadableStream` 讀取，超過 16 MiB UTF-8 或 8 Mi 字元會在寫入剪貼簿前取消並提示改用下載，不會寫入 partial text。
@@ -535,23 +469,6 @@ message search page 一律含 `total_exact`；掃描完成時即使 `count_total
 
 僅篩選和僅排除可篩選 conversation；只有正向訊息正文詞會產生 message hit、reader 醒目提示與 hit navigation。「複製 URL」使用同一個已套用的 search/list/selected context，不會混入 debounce 中的新輸入。日文與西班牙文在選擇器明確標為部分翻譯。release 收集前會驗證獨立的權威必要檔案清單，缺少任何必要 source/config/doc 都會失敗且不覆蓋舊 ZIP。
 
-request validation 回應最多包含 16 個安全項目，每項只有白名單化的 `location`、`field` 與穩定公開 `code`，絕不回顯 body、path/query 原值或框架驗證類型。Raw API 分開回報精確 UTF-8 byte 與 character 單位。message search 的 candidate 精確驗證、晚位置 snippet、enrichment 與序列化回應都有界；後續候選耗盡 request budget 時不會丟棄已確認命中，回應會標示 partial/pending，並在可續掃時提供綁定 continuation。超過硬性逐列 verifier 上限的候選保持明確 pending，不會成為 false-exact miss。Web index 計量實際讀取、正規化與 FTS bind 的 byte。Release payload 採分塊串流 hash、寫入與驗證。
-
 Python `zipfile` 與本專案匯入管線支援 ZIP64 結構，並有小型強制 ZIP64 member 回歸測試；一般驗收未建立實體大小超過 4 GiB 的 ZIP。所有 member、byte、壓縮比、磁碟與 CPU 限制仍然適用。
 
 長時間 CLI/Web 串流匯出會刻意保持同一個 SQLite read snapshot，直到完成、失敗或用戶端中斷。在 WAL 模式下，長 reader 可能延遲 checkpoint，並在並行寫入時造成 WAL 增長；持續時間、CPU/VM 工作、WAL 與暫存磁碟仍隨所選資料規模增長，不能藉由破壞 snapshot 一致性來提早 checkpoint。
-
-`npm run build` 使用 `webui/scripts/build.mjs`，先 typecheck，再建置到同層 staging 目錄，驗證 staged `index.html` 引用的所有資源，先發布資源，最後原子取代 `dist/index.html`。注入失敗自我測試保證失敗建置仍保留舊入口及其引用資源可用。
-
-搜尋 candidate 預設分別遵守 32 Mi 字元與 32 MiB UTF-8 上限，並透過增量 BLOB 讀取精確驗證；可信本機測試可用 `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` opt in，最多 100 Mi 字元，該明確 opt-in 也會允許相應的合法 UTF-8 位元組容量。候選預算耗盡時回傳 partial/pending 與可用的簽名 continuation；超過硬性逐列限制的 legacy candidate 保持 pending，不會偽裝成 exact 空結果。長文字 cursor 綁定目標 row revision 與 identity，搜尋 anchor 直接記錄 UTF-8 byte offset。
-
-## Round 12 寫入、parser 與公開契約
-
-- trusted Host/proxy 正規化後，default-deny policy 覆蓋所有 unsafe HTTP method。遠端寫入必須只有一個合法同源 `Origin`；重複/畸形 Origin、重複/畸形 `Sec-Fetch-Site` 與 cross-site request 都會被拒絕。upload byte、`Content-Length`、multipart 與 slot 控制仍僅套用於 upload。
-- `init`、`migrate`、CLI import、Web upload admission/job 與 optional-index build 共用 alias-aware process writer lock；admission 在 spool 前取得鎖。每位使用者的 private registry 固定最多 64 個 owned shard file，collision 僅保守序列化。Windows 目前在任何 registry、spool、DB create、lease 或 staging 前回傳 `writer_process_lock_unsupported`。
-- JSON 對完整一般 element 使用 bounded C decoder fast probe，對跨 chunk/不確定 element 使用一次 persistent single-pass framer。depth、scalar/token、mapping-entry、array-item、integer、UTF-8/字元、decoded heap 與 5,000 node 限制全部保留，並在超大 object materialize 前拒絕結構預算超限。
-- 新 ID 與 API identifier parameter 拒絕 Unicode Cc control 與 isolated surrogate；filename 和 `Content-Disposition` 安全取代 control，普通 Unicode 與 noncharacter 仍允許。
-- disk diagnostics 列出 source/spool、pipeline ZIP、canonical DB growth、WAL/journal、core FTS、old/live/staging optional index、SQLite TEMP、cleanup reserve 與 emergency reserve，執行期間仍檢查 free space。CLI timing 涵蓋 writer lock、post-commit summary、connection close、output flush 與返回；Web job 只在 cleanup 與 lock release 後進入 terminal。
-- search continuation 綁定包含 `query` 的五個 durable generation，source 與 conversation/node time 變更會讓舊 session stale。display copy 遇到 stale revision 會捨棄舊 partial、從 offset 0 僅重試一次，第二次失敗不寫 clipboard。strict delete-input 無法由 Boolean 重新啟用，production 永遠回傳 `delete_input_secure_identity_unsupported`；僅能復原已存在且精確 owned 的歷史 journal。
-
-使用 `python tools/acceptance_scale_round12.py --scenario <many-small|single-element-mib|mapping-predecode|metadata-density|registry-lifecycle> --runs 3` 執行 fresh-process 合成規模矩陣。實際產生的 1/5/10 GiB logical-archive workload 必須明確 opt-in：`python tools/acceptance_scale_round12.py --scenario logical-archive-gib --runs 3 --confirm-huge`。它只建立暫時合成 ZIP，走 production import/verify/Web-index 路徑，如實回報容量拒絕，並可能需要大量時間與可用磁碟。
