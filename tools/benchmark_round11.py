@@ -84,8 +84,17 @@ def _base_metrics(scenario: str, fixture_sha256: str) -> dict[str, Any]:
             "source_chunks": 0,
             "source_utf8_bytes": 0,
             "elements": 0,
-            "calls": 0,
-            "cumulative_input_chars": 0,
+            "decode_calls": 0,
+            "decode_input_chars": 0,
+            "decode_input_bytes": 0,
+            "decode_failed_calls": 0,
+            "raw_decode_calls": 0,
+            "raw_decode_available_chars": 0,
+            "raw_decode_available_bytes": 0,
+            "raw_decode_failed_probes": 0,
+            "raw_decode_success_consumed_chars": 0,
+            "raw_decode_input_length_counts": {},
+            "output_decoded_chars": 0,
         },
         "resolver": {"calls": 0, "input_bytes": 0},
         "normalizer": {"calls": 0, "input_chars": 0},
@@ -148,14 +157,67 @@ def _json_worker(size_mib: int, chunk_kib: int, variant: str) -> dict[str, Any]:
     started_cpu = time.process_time()
     values: list[Any] = []
     observed_error: str | None = None
-    decoder_calls = 0
+    decoder_metrics: dict[str, Any] = {
+        "decode_calls": 0,
+        "decode_input_chars": 0,
+        "decode_input_bytes": 0,
+        "decode_failed_calls": 0,
+        "raw_decode_calls": 0,
+        "raw_decode_available_chars": 0,
+        "raw_decode_available_bytes": 0,
+        "raw_decode_failed_probes": 0,
+        "raw_decode_success_consumed_chars": 0,
+        "raw_decode_input_length_counts": {},
+    }
     original_decoder = json.JSONDecoder
 
     class CountingDecoder(original_decoder):
-        def decode(self, *args: Any, **kwargs: Any) -> Any:
-            nonlocal decoder_calls
-            decoder_calls += 1
-            return super().decode(*args, **kwargs)
+        _benchmark_inside_decode = False
+
+        def decode(self, value: str, *args: Any, **kwargs: Any) -> Any:
+            decoder_metrics["decode_calls"] += 1
+            decoder_metrics["decode_input_chars"] += len(value)
+            decoder_metrics["decode_input_bytes"] += len(value.encode("utf-8"))
+            self._benchmark_inside_decode = True
+            try:
+                return super().decode(value, *args, **kwargs)
+            except BaseException:
+                decoder_metrics["decode_failed_calls"] += 1
+                raise
+            finally:
+                self._benchmark_inside_decode = False
+
+        def raw_decode(
+            self, value: str, idx: int = 0, *args: Any, **kwargs: Any
+        ) -> Any:
+            available = value[idx:]
+            available_chars = len(available)
+            available_bytes = len(available.encode("utf-8"))
+            decoder_metrics["raw_decode_calls"] += 1
+            decoder_metrics["raw_decode_available_chars"] += available_chars
+            decoder_metrics["raw_decode_available_bytes"] += available_bytes
+            counts = decoder_metrics["raw_decode_input_length_counts"]
+            length_key = str(available_chars)
+            counts[length_key] = int(counts.get(length_key, 0)) + 1
+            try:
+                result = super().raw_decode(value, idx, *args, **kwargs)
+            except BaseException:
+                decoder_metrics["raw_decode_failed_probes"] += 1
+                raise
+            decoder_metrics["raw_decode_success_consumed_chars"] += int(result[1]) - idx
+            # The hybrid parser calls raw_decode() directly once a bounded
+            # boundary/resource proof succeeds.  Count that as the same
+            # logical element decode represented by decode_calls, while
+            # avoiding a double count when JSONDecoder.decode() delegates to
+            # this method internally.
+            if not self._benchmark_inside_decode:
+                consumed = value[idx : int(result[1])]
+                decoder_metrics["decode_calls"] += 1
+                decoder_metrics["decode_input_chars"] += len(consumed)
+                decoder_metrics["decode_input_bytes"] += len(
+                    consumed.encode("utf-8")
+                )
+            return result
 
     json.JSONDecoder = CountingDecoder
     try:
@@ -177,8 +239,8 @@ def _json_worker(size_mib: int, chunk_kib: int, variant: str) -> dict[str, Any]:
             "source_chunks": source_chunks,
             "source_utf8_bytes": len(payload_bytes),
             "elements": len(values),
-            "calls": decoder_calls,
-            "cumulative_input_chars": sum(
+            **decoder_metrics,
+            "output_decoded_chars": sum(
                 int(getattr(value, "decoded_chars", 0)) for value in values
             ),
             "variant": variant,
@@ -187,6 +249,30 @@ def _json_worker(size_mib: int, chunk_kib: int, variant: str) -> dict[str, Any]:
         }
     )
     return metrics
+
+
+def _decoder_counter_negative_self_test() -> dict[str, Any]:
+    """Prove that repeated growing raw-decode probes cannot look linear."""
+
+    decoder = json.JSONDecoder()
+    payload = '{"synthetic":"' + ("x" * 4096) + '"}'
+    failed = 0
+    available_chars = 0
+    for stop in (64, 128, 256, 512, 1024, 2048, 4096):
+        probe = payload[:stop]
+        available_chars += len(probe)
+        try:
+            decoder.raw_decode(probe)
+        except json.JSONDecodeError:
+            failed += 1
+    if failed <= 1 or available_chars <= len(payload):
+        raise RuntimeError("decoder_counter_negative_self_test_failed")
+    return {
+        "repeated_failed_probes": failed,
+        "repeated_available_chars": available_chars,
+        "source_chars": len(payload),
+        "detected": True,
+    }
 
 
 def _prepare_v4_database(path: Path, rows: int) -> None:
@@ -517,8 +603,17 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=100_000)
     parser.add_argument("--journal-mode", choices=("WAL", "DELETE"), default="WAL")
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--counter-self-test", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.counter_self_test:
+        print(json.dumps(
+            _decoder_counter_negative_self_test(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
+        return 0
 
     if args.worker:
         if args.scenario == "json-framing":
@@ -558,7 +653,7 @@ def main() -> int:
         )
         samples.append(json.loads(completed.stdout))
     output = {
-        "schema": "chatgpt-sqlite-webui-round11-benchmark-v1",
+        "schema": "chatgpt-sqlite-webui-round12-benchmark-v2",
         "scenario": args.scenario,
         "runs": len(samples),
         "aggregate": _aggregate(samples),

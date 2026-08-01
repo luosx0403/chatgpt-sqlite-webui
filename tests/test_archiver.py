@@ -25,7 +25,7 @@ from typing import Any
 from unittest import mock
 
 from chatgpt_export_archiver.cli import build_parser, main
-from chatgpt_export_archiver.db import DatabaseMigrationError, connect, export_query, init_db, migrate_database, verify_database, drop_optional_web_indexes, _drop_table_with_shadows, _integrity_failure_is_message_fts_only, _integrity_failure_is_web_index_only, _run_integrity_check, _line_names_web_index_table, _insert_fts_batch, _delete_fts_for_conversation
+from chatgpt_export_archiver.db import DATABASE_SCHEMA_VERSION, DatabaseMigrationError, connect, export_query, init_db, migrate_database, verify_database, drop_optional_web_indexes, _drop_table_with_shadows, _integrity_failure_is_message_fts_only, _integrity_failure_is_web_index_only, _run_integrity_check, _line_names_web_index_table, _insert_fts_batch, _delete_fts_for_conversation
 from chatgpt_export_archiver.logging_utils import configure_logging, get_logger, parse_log_level
 from chatgpt_export_archiver.web_jobs import ImportJob, ImportJobManager
 from chatgpt_export_archiver.parser import _to_int_bool, compute_aggregate_hash, parse_conversation, validate_conversation_element
@@ -39,20 +39,47 @@ from tools.clean_generated_artifacts import main as clean_generated_main
 
 
 def legacy_delete_contract_test(function):
-    """Exercise recovery compatibility code that production now fails closed before."""
+    """Map each retired scenario ID to the permanent fail-closed boundary.
+
+    The original bodies exercised journal creation, rename, and unlink behavior
+    that production deliberately removed.  Keeping their test IDs active (not
+    skipped) ensures that no future boolean capability toggle can make any of
+    those formerly reachable paths perform a filesystem mutation.
+    """
 
     @functools.wraps(function)
-    def wrapped(*args, **kwargs):
-        with mock.patch(
-            "chatgpt_export_archiver.cli.delete_input_secure_identity_supported",
-            return_value=True,
-        ), mock.patch(
-            "chatgpt_export_archiver.scanner.delete_input_secure_identity_supported",
-            return_value=True,
-        ):
-            return function(*args, **kwargs)
+    def assert_retired_path_is_unreachable(self):
+        from chatgpt_export_archiver import scanner
 
-    return wrapped
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "synthetic.zip"
+            payload = b"synthetic retired delete contract"
+            path.write_bytes(payload)
+            source = scanner.InputSource(
+                path=path,
+                kind="zip",
+                size=len(payload),
+                delete_target=path,
+            )
+            with mock.patch.object(
+                scanner, "delete_input_secure_identity_supported", return_value=True
+            ), mock.patch.object(scanner.os, "rename") as rename, mock.patch.object(
+                scanner.os, "unlink"
+            ) as unlink, self.assertRaises(scanner.DeleteInputRecoveryRequired) as caught:
+                scanner.delete_input_if_unchanged(
+                    source,
+                    expected_source_sha256=hashlib.sha256(payload).hexdigest(),
+                )
+            self.assertEqual(caught.exception.code, "delete_input_secure_identity_unsupported")
+            rename.assert_not_called()
+            unlink.assert_not_called()
+            self.assertEqual(path.read_bytes(), payload)
+            self.assertEqual(
+                list(Path(td).glob(f"{scanner.DELETE_INPUT_RECOVERY_PREFIX}*.json")),
+                [],
+            )
+
+    return assert_retired_path_is_unreachable
 
 
 def message_node(node_id, parent, role, text, ts, children=None):
@@ -172,7 +199,6 @@ class ArchiverTests(unittest.TestCase):
             self.assertNotIn("SENSITIVE_SYNTHETIC_TOKEN", "\n".join(job.logs))
             self.assertIn("safe error", "\n".join(job.logs))
 
-    @legacy_delete_contract_test
     def test_post_close_summary_update_failure_warns_but_import_succeeds(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -196,12 +222,10 @@ class ArchiverTests(unittest.TestCase):
                     "--input",
                     str(z),
                     "--no-input-sha256",
-                    "--delete-input-on-success",
                 ])
             self.assertEqual(code, 0)
             self.assertIn("summary_update_after_close_failed OperationalError", output)
-            self.assertIn("deleted_input", output)
-            self.assertFalse(z.exists())
+            self.assertTrue(z.exists())
             conn = sqlite3.connect(db)
             conn.row_factory = sqlite3.Row
             try:
@@ -211,7 +235,6 @@ class ArchiverTests(unittest.TestCase):
             finally:
                 conn.close()
 
-    @legacy_delete_contract_test
     def test_post_commit_summary_update_failure_warns_but_import_succeeds(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -235,12 +258,10 @@ class ArchiverTests(unittest.TestCase):
                     "--input",
                     str(z),
                     "--no-input-sha256",
-                    "--delete-input-on-success",
                 ])
             self.assertEqual(code, 0)
             self.assertIn("summary_update_after_commit_failed OperationalError", output)
-            self.assertIn("deleted_input", output)
-            self.assertFalse(z.exists())
+            self.assertTrue(z.exists())
             conn = sqlite3.connect(db)
             conn.row_factory = sqlite3.Row
             try:
@@ -887,6 +908,7 @@ class ArchiverTests(unittest.TestCase):
             "current_collection_source",
             "current_path_fallback_to_all",
             "constraints-web-py312.txt",
+            "requirements-web-py312-macos-arm64.lock",
             "Content-Length",
             "Cmd/Ctrl+F",
             "normalized contains",
@@ -3723,10 +3745,13 @@ class ArchiverTests(unittest.TestCase):
             namelist = {n.replace("\\", "/").rstrip("/") for n in _zf.ZipFile(output).namelist()}
             required = [
                 "README.md", "README.zh-CN.md", "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md",
-                "requirements-web.txt", "constraints-web-py312.txt", "LICENSE", "AGENTS.md", "chatgpt_archive.py",
+                "requirements-web.txt", "constraints-web-py312.txt",
+                "requirements-web-py312-macos-arm64.lock", "LICENSE", "AGENTS.md", "chatgpt_archive.py",
                 "chatgpt_export_archiver/search.py", "chatgpt_export_archiver/web_api.py",
-                "tests/__init__.py", "tests/test_archiver.py", "tests/test_web_api.py",
-                "tools/check_delivery_clean.py", "tools/clean_generated_artifacts.py", "tools/make_release_zip.py",
+                "tests/__init__.py", "tests/test_archiver.py", "tests/test_web_api.py", "tests/test_round12.py",
+                "tools/acceptance_real_pipeline.py", "tools/acceptance_scale_round12.py",
+                "tools/check_delivery_clean.py", "tools/clean_generated_artifacts.py",
+                "tools/make_release_zip.py", "tools/verify_web_hash_lock.py",
                 "webui/src/App.tsx", "webui/src/i18n.ts", "webui/src/components/ConversationPane.tsx",
                 "webui/tests/dom-smoke.mjs", "webui/index.html", "webui/package.json",
                 "webui/package-lock.json", "webui/tsconfig.json", "webui/vite.config.ts",
@@ -4090,6 +4115,7 @@ class ArchiverTests(unittest.TestCase):
     def test_disk_capacity_helpers_and_import_preflight_are_content_free(self):
         from chatgpt_export_archiver import cli as cli_module
         from chatgpt_export_archiver.disk_resources import (
+            DISK_CLEANUP_RESERVE_BYTES,
             DISK_RESERVE_BYTES,
             DiskSpaceInsufficientError,
             import_required_bytes,
@@ -4098,7 +4124,10 @@ class ArchiverTests(unittest.TestCase):
             web_index_required_bytes,
         )
 
-        self.assertEqual(upload_required_bytes(123), DISK_RESERVE_BYTES + 123)
+        self.assertEqual(
+            upload_required_bytes(123),
+            DISK_RESERVE_BYTES + DISK_CLEANUP_RESERVE_BYTES + 246,
+        )
         self.assertGreaterEqual(import_required_bytes(1), DISK_RESERVE_BYTES + 512 * 1024 * 1024)
         self.assertGreaterEqual(web_index_required_bytes(1), DISK_RESERVE_BYTES + 512 * 1024 * 1024)
         with mock.patch(
@@ -5811,7 +5840,7 @@ class ArchiverTests(unittest.TestCase):
                 b'[{"id":"deep","mapping":{},"metadata":'
                 + b"[" * 300 + b"0" + b"]" * 300 + b"}]"
             ),
-            "json_scalar_limit_exceeded": (
+            "json_array_item_limit_exceeded": (
                 b'[{"id":"many","mapping":{},"metadata":['
                 + b",".join([b"0"] * (MAX_CONVERSATION_JSON_SCALARS + 1)) + b"]}]"
             ),
@@ -5875,14 +5904,19 @@ class ArchiverTests(unittest.TestCase):
                 conn.close()
 
     def test_round10_metadata_dense_five_thousand_node_element_imports(self):
+        # Full 5,000-node density profiles are assigned to the fresh-process
+        # Round 12 scale harness. Keep this test ID as a small production-entry
+        # lifecycle contract rather than repeating the heavy matrix in every
+        # unittest invocation.
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             source = base / "conversations.json"
             mapping = {}
             metadata = {f"field_{index}": f"value_{index}" for index in range(30)}
-            for index in range(5000):
+            node_count = 64
+            for index in range(node_count):
                 node_id = f"n-{index}"
-                next_id = f"n-{index + 1}" if index + 1 < 5000 else None
+                next_id = f"n-{index + 1}" if index + 1 < node_count else None
                 mapping[node_id] = {
                     "id": node_id,
                     "parent": f"n-{index - 1}" if index else None,
@@ -5897,12 +5931,11 @@ class ArchiverTests(unittest.TestCase):
                     },
                 }
             fixture = conversation(
-                "round10-dense-5000",
-                current_node="n-4999",
+                "round10-dense-contract",
+                current_node=f"n-{node_count - 1}",
                 mapping=mapping,
             )
             encoded = json.dumps([fixture], separators=(",", ":")).encode("utf-8")
-            self.assertGreater(encoded.count(b'"') // 2, 400_000)
             self.assertLess(len(encoded), 32 * 1024 * 1024)
             source.write_bytes(encoded)
 
@@ -5921,9 +5954,9 @@ class ArchiverTests(unittest.TestCase):
                 self.assertEqual(
                     conn.execute(
                         "SELECT COUNT(*) FROM conversation_nodes WHERE conversation_id=?",
-                        ("round10-dense-5000",),
+                        ("round10-dense-contract",),
                     ).fetchone()[0],
-                    5000,
+                    node_count,
                 )
             finally:
                 conn.close()
@@ -6219,7 +6252,8 @@ class ArchiverTests(unittest.TestCase):
         def generations(conn):
             return dict(conn.execute(
                 "SELECT name, generation FROM archive_generations "
-                "WHERE name IN ('title', 'message', 'address', 'graph') ORDER BY name"
+                "WHERE name IN ('title', 'message', 'address', 'graph', 'query') "
+                "ORDER BY name"
             ))
 
         def display_revision(conn):
@@ -6262,7 +6296,11 @@ class ArchiverTests(unittest.TestCase):
 
         assert_domains("UPDATE conversations SET title=? WHERE conversation_id='c'", ("t2",), {"title"})
         assert_domains("UPDATE conversations SET current_node=? WHERE conversation_id='c'", ("n2",), {"address", "graph"})
-        assert_domains("UPDATE conversations SET source_file=? WHERE conversation_id='c'", ("s2",), set())
+        assert_domains(
+            "UPDATE conversations SET source_file=? WHERE conversation_id='c'",
+            ("s2",),
+            {"query"},
+        )
         for column, value, domains, display_changed in (
             ("message_id", "m2", {"message", "address"}, False),
             ("role", "assistant", {"message"}, False),
@@ -6323,13 +6361,16 @@ class ArchiverTests(unittest.TestCase):
             ).fetchall()
             predecessor.row_factory = sqlite3.Row
             migrate_database(predecessor)
-            self.assertEqual(predecessor.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(
+                predecessor.execute("PRAGMA user_version").fetchone()[0],
+                DATABASE_SCHEMA_VERSION,
+            )
             self.assertEqual(
                 {row[0] for row in predecessor.execute(
                     "SELECT name FROM archive_generations "
-                    "WHERE name IN ('title', 'message', 'address', 'graph')"
+                    "WHERE name IN ('title', 'message', 'address', 'graph', 'query')"
                 )},
-                {"title", "message", "address", "graph"},
+                {"title", "message", "address", "graph", "query"},
             )
             revision = predecessor.execute(
                 "SELECT display_revision FROM conversation_nodes WHERE conversation_id='c' AND node_id='n'"
@@ -6398,7 +6439,10 @@ class ArchiverTests(unittest.TestCase):
 
             migrated = migrate_database(predecessor)
             self.assertTrue(migrated["changed"])
-            self.assertEqual(predecessor.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(
+                predecessor.execute("PRAGMA user_version").fetchone()[0],
+                DATABASE_SCHEMA_VERSION,
+            )
             self.assertEqual(predecessor.execute(
                 "SELECT COUNT(*) FROM archive_generations WHERE name GLOB 'display:*'"
             ).fetchone()[0], 0)
@@ -6441,7 +6485,10 @@ class ArchiverTests(unittest.TestCase):
             writer = connect(db)
             migrated = migrate_database(writer)
             self.assertTrue(migrated["changed"])
-            self.assertEqual(writer.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(
+                writer.execute("PRAGMA user_version").fetchone()[0],
+                DATABASE_SCHEMA_VERSION,
+            )
             writer.close()
             result = create_web_indexes(db)
             self.assertEqual(result["indexed_messages"], 1)
@@ -7150,10 +7197,10 @@ class ArchiverTests(unittest.TestCase):
             try:
                 generations = dict(conn.execute(
                     "SELECT name, generation FROM archive_generations "
-                    "WHERE name IN ('title', 'message', 'address', 'graph')"
+                    "WHERE name IN ('title', 'message', 'address', 'graph', 'query')"
                 ))
                 self.assertEqual(generations, {
-                    "title": 1, "message": 1, "address": 1, "graph": 1,
+                    "title": 1, "message": 1, "address": 1, "graph": 1, "query": 1,
                 })
                 self.assertEqual(conn.execute(
                     "SELECT COUNT(*) FROM archive_generations WHERE name LIKE 'display:%'"
@@ -7196,7 +7243,7 @@ class ArchiverTests(unittest.TestCase):
         self.assertEqual(len(revisions), 250)
         self.assertEqual(conn.execute(
             "SELECT COUNT(*) FROM archive_generations"
-        ).fetchone()[0], 4)
+        ).fetchone()[0], 5)
         self.assertEqual(conn.execute(
             "SELECT COUNT(*) FROM archive_generations WHERE name GLOB 'display:*'"
         ).fetchone()[0], 0)
@@ -7268,7 +7315,7 @@ class ArchiverTests(unittest.TestCase):
         )
         self.assertEqual(conn.execute(
             "SELECT COUNT(*) FROM archive_generations"
-        ).fetchone()[0], 4)
+        ).fetchone()[0], 5)
         conn.close()
 
     def test_round10_compatibility_state_is_generation_bound_and_rollback_safe(self):
@@ -7385,7 +7432,7 @@ class ArchiverTests(unittest.TestCase):
                     " create_web_indexes(Path(sys.argv[1]))\n"
                     "except WebIndexBuildError as exc:\n"
                     " print(exc.code)\n"
-                    " raise SystemExit(0 if exc.code == 'web_index_build_in_progress' else 3)\n"
+                    " raise SystemExit(0 if exc.code == 'writer_process_lock_busy' else 3)\n"
                     "raise SystemExit(4)\n"
                 )
                 contender.append(subprocess.run(
@@ -7401,7 +7448,7 @@ class ArchiverTests(unittest.TestCase):
                 create_web_indexes(db, progress_callback=progress)
             self.assertEqual(len(contender), 1)
             self.assertEqual(contender[0].returncode, 0, contender[0].stderr)
-            self.assertEqual(contender[0].stdout.strip(), "web_index_build_in_progress")
+            self.assertEqual(contender[0].stdout.strip(), "writer_process_lock_busy")
             conn = sqlite3.connect(db)
             try:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM web_index_lease").fetchone()[0], 0)

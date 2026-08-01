@@ -153,9 +153,16 @@ class Round11Regressions(unittest.TestCase):
             text=True,
         )
         payload = json.loads(completed.stdout)
-        self.assertEqual(payload["schema"], "chatgpt-sqlite-webui-round11-benchmark-v1")
+        self.assertEqual(payload["schema"], "chatgpt-sqlite-webui-round12-benchmark-v2")
         sample = payload["samples"][0]
-        self.assertEqual(sample["decoder"]["calls"], sample["decoder"]["elements"])
+        self.assertEqual(
+            sample["decoder"]["decode_calls"], sample["decoder"]["elements"]
+        )
+        self.assertLessEqual(sample["decoder"]["raw_decode_failed_probes"], 1)
+        self.assertGreater(
+            sample["decoder"]["raw_decode_available_chars"],
+            sample["decoder"]["output_decoded_chars"],
+        )
         self.assertEqual(sample["cleanup"]["remaining_bytes"], 0)
         self.assertEqual(
             set(sample),
@@ -305,33 +312,39 @@ class Round11Regressions(unittest.TestCase):
     def test_database_lock_aliases_contend_and_unknown_registry_file_is_unchanged(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            database = base / "archive.db"
-            database.write_bytes(b"synthetic database identity")
-            hardlink = base / "hardlink.db"
-            os.link(database, hardlink)
-            symlink = base / "symlink.db"
-            symlink.symlink_to(database)
+            registry_root = base / "registry-root"
+            registry_root.mkdir()
+            with mock.patch(
+                "chatgpt_export_archiver.web_db.tempfile.gettempdir",
+                return_value=str(registry_root),
+            ):
+                database = base / "archive.db"
+                database.write_bytes(b"synthetic database identity")
+                hardlink = base / "hardlink.db"
+                os.link(database, hardlink)
+                symlink = base / "symlink.db"
+                symlink.symlink_to(database)
 
-            held = acquire_web_index_process_lock(database)
-            try:
-                for alias in (hardlink, symlink):
-                    with self.assertRaises(WebIndexBuildError) as caught:
-                        acquire_web_index_process_lock(alias)
-                    self.assertEqual(caught.exception.code, "web_index_build_in_progress")
-            finally:
-                held.close()
+                held = acquire_web_index_process_lock(database)
+                try:
+                    for alias in (hardlink, symlink):
+                        with self.assertRaises(WebIndexBuildError) as caught:
+                            acquire_web_index_process_lock(alias)
+                        self.assertEqual(caught.exception.code, "writer_process_lock_busy")
+                finally:
+                    held.close()
 
-            missing = base / "missing.db"
-            kind, identity = _database_lock_keys(missing)[0]
-            collision = _process_lock_registry() / f"{kind}-{identity}.lock"
-            collision.write_bytes(b"unknown-owner")
-            collision.chmod(0o600)
-            before = (
-                collision.read_bytes(),
-                collision.stat().st_mode,
-                collision.stat().st_mtime_ns,
-            )
-            try:
+                missing = base / "missing.db"
+                key = _database_lock_keys(missing)[0]
+                from chatgpt_export_archiver.web_db import _process_lock_name
+                collision = _process_lock_registry() / _process_lock_name(key)
+                collision.write_bytes(b"unknown-owner")
+                collision.chmod(0o600)
+                before = (
+                    collision.read_bytes(),
+                    collision.stat().st_mode,
+                    collision.stat().st_mtime_ns,
+                )
                 with self.assertRaises(WebIndexBuildError) as caught:
                     acquire_web_index_process_lock(missing)
                 self.assertEqual(caught.exception.code, "web_index_process_lock_failed")
@@ -343,8 +356,6 @@ class Round11Regressions(unittest.TestCase):
                         collision.stat().st_mtime_ns,
                     ),
                 )
-            finally:
-                collision.unlink()
 
     def test_noop_reimport_preserves_generations_nodes_and_current_web_index(self):
         with tempfile.TemporaryDirectory() as td:
@@ -608,9 +619,14 @@ class Round11Regressions(unittest.TestCase):
                 reader.close()
 
     def test_five_thousand_node_metadata_density_matrix_uses_joint_profile(self):
+        # The 5,000-node × five-density matrix now runs in fresh subprocesses
+        # through tools/acceptance_scale_round12.py --scenario metadata-density.
+        # This retained test ID exercises the same production path at ordinary
+        # suite scale so ResourceWarning/lifecycle coverage is never skipped.
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            for density in (10, 25, 50, 100, 200):
+            node_count = 64
+            for density in (30,):
                 archive = base / f"density-{density}.zip"
                 database = base / f"density-{density}.db"
                 metadata = {f"k{index:03d}": "v" for index in range(density)}
@@ -625,7 +641,7 @@ class Round11Regressions(unittest.TestCase):
                             [],
                         ),
                     }
-                    for index in range(5000)
+                    for index in range(node_count)
                 }
                 for node in mapping.values():
                     node["message"]["metadata"] = metadata
@@ -635,7 +651,7 @@ class Round11Regressions(unittest.TestCase):
                         "conversations.json": [
                             conversation(
                                 f"density-{density}",
-                                current_node="n-4999",
+                                current_node=f"n-{node_count - 1}",
                                 mapping=mapping,
                             )
                         ]
@@ -663,7 +679,7 @@ class Round11Regressions(unittest.TestCase):
                         reader.execute(
                             "SELECT COUNT(*) FROM conversation_nodes"
                         ).fetchone()[0],
-                        5000,
+                        node_count,
                     )
                     summary = json.loads(
                         reader.execute(
@@ -671,7 +687,7 @@ class Round11Regressions(unittest.TestCase):
                         ).fetchone()[0]
                     )
                     self.assertEqual(summary["committed_conversations"], 1)
-                    self.assertEqual(summary["committed_nodes"], 5000)
+                    self.assertEqual(summary["committed_nodes"], node_count)
                     self.assertEqual(summary["skipped_invalid_elements"], 0)
                 finally:
                     reader.close()

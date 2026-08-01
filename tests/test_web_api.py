@@ -383,7 +383,7 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("indexed_messages", first_job["web_index"])
         self.assertEqual(
             set(first_job["stage_timings"]),
-            {"upload", "import", "verify", "stats", "web_index"},
+            {"upload", "import", "verify", "stats", "web_index", "cleanup"},
         )
         self.assertTrue(all(value >= 0 for value in first_job["stage_timings"].values()))
         self.assertEqual(client.get("/api/conversations?limit=10").json()["total"], 2)
@@ -3621,7 +3621,9 @@ class WebApiTests(unittest.TestCase):
                 manager._jobs[job_id] = job
                 manager._running_job_id = job_id
 
-            def cancel_during_build(_path, *, progress_callback, cancel_check):
+            def cancel_during_build(
+                _path, *, progress_callback, cancel_check, _writer_lock=None
+            ):
                 progress_callback("scan_normalize_messages", {"processed": 1, "total": 2, "complete": False})
                 self.assertFalse(cancel_check())
                 requested, accepted = manager.request_web_index_cancel(job_id)
@@ -4090,8 +4092,8 @@ class WebApiTests(unittest.TestCase):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
         schema = client.get("/api/schema").json()
-        self.assertEqual(schema["version"], 7)
-        self.assertEqual(schema["versions"]["required_database_schema_version"], 5)
+        self.assertEqual(schema["version"], 8)
+        self.assertEqual(schema["versions"]["required_database_schema_version"], 6)
         self.assertEqual(schema["versions"]["optional_web_index_format_version"], "6")
         self.assertIn("include_internal", json.dumps(schema))
         self.assertIn("hidden_counts", json.dumps(schema))
@@ -4759,7 +4761,10 @@ class WebApiTests(unittest.TestCase):
 
     def test_upload_ingress_rejects_before_multipart_and_caps_chunked_body(self):
         from chatgpt_export_archiver.web_api import _get_web_trust_policy
-        from chatgpt_export_archiver.web_app import UploadIngressMiddleware
+        from chatgpt_export_archiver.web_app import (
+            UploadIngressMiddleware,
+            WriteAccessMiddleware,
+        )
         from chatgpt_export_archiver.web_jobs import ImportJobManager
 
         td = tempfile.TemporaryDirectory()
@@ -4800,6 +4805,7 @@ class WebApiTests(unittest.TestCase):
                 body_limit=10,
                 trust_policy=policy,
             )
+            middleware = WriteAccessMiddleware(middleware, policy=policy)
             scope = {
                 "type": "http",
                 "method": "POST",
