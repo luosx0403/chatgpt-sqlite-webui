@@ -22,14 +22,9 @@ ChatGPT Export Archiver 可以直接匯入 OpenAI / ChatGPT 官方 export ZIP，
 
 安全截圖待補。截圖應使用 synthetic 假資料，不能包含真實聊天標題、snippet、raw JSON、Email 或本機路徑。
 
-## 本機 Smoke 觀察
+## 效能測量
 
-以下只是某台本機機器上的範例觀察，不是通用效能承諾：
-
-- 約 2.25 GB 的真實匯出 ZIP 使用大型封存路徑匯入約 98 秒。
-- 該封存的 `verify` 約 4 秒完成。
-- 較大增量封存後的可選 Web 索引重建約 106 秒完成。
-- 本機 Uvicorn Web 應用程式上的高命中訊息搜尋約 0.3 秒返回。
+本文不提供缺少上下文的耗時承諾。合成 parser/import 測量使用 `tools/benchmark_round11.py`；對已授權、唯讀真實 ZIP 的多輪 production HTTP 測量使用明確 opt-in、內容安全的 `tools/acceptance_real_pipeline.py`。harness 會記錄機器/執行環境、每次 run、median、worst 與彙總資源指標，但不會輸出標題、訊息、ID、檔名或路徑。
 
 ## 專案功能
 
@@ -87,7 +82,7 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
-Python 3.12 constraints 檔案會固定所有已解析 Web 相依套件的版本，但它不是跨平台 hash lock。後續發布流程應為支援的 Python/OS 矩陣產生並驗證各平台 hash；在此之前，只應從可信套件索引安裝，並把 npm lockfile 與 audit 檢查作為獨立的前端控制。
+Python 3.12 constraints 是跨平台 resolved-version profile，本身仍沒有 artifact hash。獨立的 `requirements-web-py312-macos-arm64.lock` 僅針對 CPython 3.12/macOS arm64 提供 wheel hash lock；使用 `--require-hashes --only-binary=:all:` 安裝，並執行 `python tools/verify_web_hash_lock.py`。其他 Python/OS 在其 wheel matrix lock 發布前仍應從可信 index 使用 portable profile，不能把 macOS lock 當成跨平台 lock。
 
 ## 快速開始
 
@@ -472,7 +467,7 @@ tools/                             交付檢查與輔助腳本
 
 主資料庫保存 conversations、mapping nodes、import runs 與 warnings。message object 的 raw JSON 欄位按完整物件保留；conversation 與 mapping-node object 會正規化，不做逐位元組保存。輸入 ZIP SHA-256 可選，`source_files`/`file_index` 的逐 entry SHA 欄位目前保留但不填入。CLI FTS 表是 `message_fts`。可選 Web 搜尋輔助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 5）。版本 3 加入 `NOT NULL` identity、版本 4 加入 address/graph revision、版本 5 加入持久逐列 display revision 與 compatibility state。Migration 在取得 write lock 前保守預檢 DB/WAL/journal/TEMP 容量，接著在同一 transaction 安裝 row 與 managed trigger，輸出不含內容的進度，並在取消、中斷、ENOSPC 或 SQLite 失敗時完整回滾。唯讀路徑不執行 migration DDL；舊相容資料庫回傳 `database_migration_required`。
+canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 6）。版本 3 加入 `NOT NULL` identity、版本 4 加入持久 address/graph revision、版本 5 加入逐列 display revision 與 compatibility state、版本 6 加入涵蓋 source 與 conversation/node 時間變更的持久 `query` generation。Migration 先在 write lock 外快速預檢 DB/WAL/journal/TEMP，再於 `BEGIN IMMEDIATE` 內、首次變更之前重新計算權威 row count、size、sidecar 與 free space。取消、中斷、ENOSPC 或 SQLite 失敗會完整回滾。對 current 且乾淨的資料庫重複 migrate 是真正 no-op，並將 `schema_changed`、`compatibility_refreshed`、`compatibility_changed`、`migration_changed` 全部回報為 false。唯讀路徑不執行 migration DDL；舊相容資料庫回傳 `database_migration_required`。
 
 Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回報 `optional_message_fts_error` 和 `--rebuild-fts` 復原提示；一般 malformed、locked、readonly、I/O 與 SQL 執行期錯誤不會被當成能力缺失，並使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
@@ -488,7 +483,7 @@ managed FTS、可選 Web 索引、staging、metadata、generation 與 shadow 物
 
 專案批次匯入在同一寫入鎖 transaction 內暫時替換精確的專案自有 generation trigger，每個 dirty 欄位 domain 只推進一次，再復原並驗證 trigger；rollback 或 crash 會復原原 DDL/資料，外部 writer 仍使用一般逐 statement trigger。有限 effective-current scope（包括單一 100,000-node legacy 對話）透過 SQLite TEMP relation 精確比較；raw-flag cycle 遍歷使用緊湊整數陣列，不再複製多份 Python 字串圖。全庫匯出把 plan 與 node spool 到暫存 SQLite，並以 keyset 串流讀取，不在 Python 保存全 archive node graph。
 
-strict `--delete-input-on-success` 目前在所有平台都於 staging 前拒絕，因為 pathname identity 檢查與 advisory lock 無法阻止預先開啟的不合作 writer。歷史 identity-bound journal 仍可用 CLI 列印的有界 token 復原，且絕不覆蓋 replacement。Web Python constraints 包含 Starlette 1.0.1 等 resolved pin，但仍不是跨平台 hash lock。
+strict `--delete-input-on-success` 目前在所有平台都於 staging 前拒絕，因為 pathname identity 檢查與 advisory lock 無法阻止預先開啟的不合作 writer。歷史 identity-bound journal 仍可用 CLI 列印的有界 token 復原，且絕不覆蓋 replacement。portable Web constraints 仍是跨平台無 hash residual；獨立 CPython 3.12/macOS arm64 lock 會為該精確目標驗證 wheel artifact。
 
 ## Round 11 穩定位址、結果與效能契約
 
@@ -549,3 +544,14 @@ Python `zipfile` 與本專案匯入管線支援 ZIP64 結構，並有小型強�
 `npm run build` 使用 `webui/scripts/build.mjs`，先 typecheck，再建置到同層 staging 目錄，驗證 staged `index.html` 引用的所有資源，先發布資源，最後原子取代 `dist/index.html`。注入失敗自我測試保證失敗建置仍保留舊入口及其引用資源可用。
 
 搜尋 candidate 預設分別遵守 32 Mi 字元與 32 MiB UTF-8 上限，並透過增量 BLOB 讀取精確驗證；可信本機測試可用 `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` opt in，最多 100 Mi 字元，該明確 opt-in 也會允許相應的合法 UTF-8 位元組容量。候選預算耗盡時回傳 partial/pending 與可用的簽名 continuation；超過硬性逐列限制的 legacy candidate 保持 pending，不會偽裝成 exact 空結果。長文字 cursor 綁定目標 row revision 與 identity，搜尋 anchor 直接記錄 UTF-8 byte offset。
+
+## Round 12 寫入、parser 與公開契約
+
+- trusted Host/proxy 正規化後，default-deny policy 覆蓋所有 unsafe HTTP method。遠端寫入必須只有一個合法同源 `Origin`；重複/畸形 Origin、重複/畸形 `Sec-Fetch-Site` 與 cross-site request 都會被拒絕。upload byte、`Content-Length`、multipart 與 slot 控制仍僅套用於 upload。
+- `init`、`migrate`、CLI import、Web upload admission/job 與 optional-index build 共用 alias-aware process writer lock；admission 在 spool 前取得鎖。每位使用者的 private registry 固定最多 64 個 owned shard file，collision 僅保守序列化。Windows 目前在任何 registry、spool、DB create、lease 或 staging 前回傳 `writer_process_lock_unsupported`。
+- JSON 對完整一般 element 使用 bounded C decoder fast probe，對跨 chunk/不確定 element 使用一次 persistent single-pass framer。depth、scalar/token、mapping-entry、array-item、integer、UTF-8/字元、decoded heap 與 5,000 node 限制全部保留，並在超大 object materialize 前拒絕結構預算超限。
+- 新 ID 與 API identifier parameter 拒絕 Unicode Cc control 與 isolated surrogate；filename 和 `Content-Disposition` 安全取代 control，普通 Unicode 與 noncharacter 仍允許。
+- disk diagnostics 列出 source/spool、pipeline ZIP、canonical DB growth、WAL/journal、core FTS、old/live/staging optional index、SQLite TEMP、cleanup reserve 與 emergency reserve，執行期間仍檢查 free space。CLI timing 涵蓋 writer lock、post-commit summary、connection close、output flush 與返回；Web job 只在 cleanup 與 lock release 後進入 terminal。
+- search continuation 綁定包含 `query` 的五個 durable generation，source 與 conversation/node time 變更會讓舊 session stale。display copy 遇到 stale revision 會捨棄舊 partial、從 offset 0 僅重試一次，第二次失敗不寫 clipboard。strict delete-input 無法由 Boolean 重新啟用，production 永遠回傳 `delete_input_secure_identity_unsupported`；僅能復原已存在且精確 owned 的歷史 journal。
+
+使用 `python tools/acceptance_scale_round12.py --scenario <many-small|single-element-mib|mapping-predecode|metadata-density|registry-lifecycle> --runs 3` 執行 fresh-process 合成規模矩陣。實際產生的 1/5/10 GiB logical-archive workload 必須明確 opt-in：`python tools/acceptance_scale_round12.py --scenario logical-archive-gib --runs 3 --confirm-huge`。它只建立暫時合成 ZIP，走 production import/verify/Web-index 路徑，如實回報容量拒絕，並可能需要大量時間與可用磁碟。

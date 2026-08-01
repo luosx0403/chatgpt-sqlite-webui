@@ -21,6 +21,7 @@ INCLUDE_PATHS = [
     "webui/package-lock.json", "README.md", "README.zh-CN.md",
     "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md", "LICENSE",
     "AGENTS.md", ".gitignore", "requirements-web.txt", "constraints-web-py312.txt",
+    "requirements-web-py312-macos-arm64.lock",
 ]
 
 AUTHORITATIVE_REQUIRED_FILES = (
@@ -47,9 +48,12 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "chatgpt_export_archiver/web_jobs.py",
     "tools/benchmark_effective_current.py",
     "tools/benchmark_round11.py",
+    "tools/acceptance_real_pipeline.py",
+    "tools/acceptance_scale_round12.py",
     "tools/check_delivery_clean.py",
     "tools/clean_generated_artifacts.py",
     "tools/make_release_zip.py",
+    "tools/verify_web_hash_lock.py",
     "webui/index.html",
     "webui/tsconfig.json",
     "webui/vite.config.ts",
@@ -73,6 +77,7 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "tests/test_archiver.py",
     "tests/test_web_api.py",
     "tests/test_round11.py",
+    "tests/test_round12.py",
     "tests/fixtures/legacy-fa37b3d.sql",
     "tests/fixtures/legacy-fa37b3d.json",
     "webui/tests/dom-smoke.mjs",
@@ -81,6 +86,7 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "webui/package-lock.json",
     "requirements-web.txt",
     "constraints-web-py312.txt",
+    "requirements-web-py312-macos-arm64.lock",
     "README.md", "README.zh-CN.md", "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md",
     "AGENTS.md",
     "LICENSE",

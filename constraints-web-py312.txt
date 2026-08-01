@@ -1,7 +1,11 @@
-# Tested transitive lock for CPython 3.12. Runtime code remains portable;
+# Portable resolved-version profile for CPython 3.12; this is not an artifact
+# hash lock. Runtime code remains portable;
 # users on another supported Python version may install requirements-web.txt
-# without this platform-specific tested constraints file.
+# without this Python-version-specific resolved constraints file.
+# The exact macOS arm64 wheel artifacts are separately hash-locked in
+# requirements-web-py312-macos-arm64.lock.
 annotated-doc==0.0.4
+annotated-types==0.8.0
 anyio==4.13.0
 certifi==2026.2.25
 click==8.3.3

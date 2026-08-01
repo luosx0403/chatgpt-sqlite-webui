@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ConversationSummary, MatchMode, MessageItem, PathMode, SearchFilters, SearchMessageHit } from "../types";
-import { CopyLimitError, IncompleteDisplayRecoveryError, MAX_BROWSER_COPY_BYTES, MAX_BROWSER_COPY_CHARS, assertBrowserCopyLimit, exportUrl, getConversationCopyText, getMessageDisplayChunk, getMessageHits, getMessages } from "../api/client";
+import { CopyLimitError, IncompleteDisplayRecoveryError, MAX_BROWSER_COPY_BYTES, MAX_BROWSER_COPY_CHARS, assertBrowserCopyLimit, exportUrl, getConversationCopyText, getMessageDisplayChunk, getMessageHits, getMessages, isRecoverableDisplayCursorError } from "../api/client";
 import { formatDate } from "../utils/format";
 import { analyzeQuerySyntax } from "../utils/querySyntax";
 import MessageBlock from "./MessageBlock";
@@ -541,24 +541,34 @@ export default function ConversationPane({ conversation, query, filters, matchMo
   const completeMessageText = async (message: MessageItem, signal: AbortSignal): Promise<string> => {
     if (message.display_text_resolver_input_truncated) throw new IncompleteDisplayRecoveryError();
     if (!message.display_text_truncated) return messageText(message);
-    let offset = 0;
-    let cursor: string | null = null;
-    let complete = "";
-    let completeBytes = 0;
-    for (;;) {
-      const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 1048576, signal, cursor);
-      if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
-        throw new IncompleteDisplayRecoveryError();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let offset = 0;
+      let cursor: string | null = null;
+      let complete = "";
+      let completeBytes = 0;
+      try {
+        for (;;) {
+          const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 1048576, signal, cursor);
+          if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
+            throw new IncompleteDisplayRecoveryError();
+          }
+          completeBytes += new TextEncoder().encode(chunk.display_text).byteLength;
+          if (complete.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || completeBytes > MAX_BROWSER_COPY_BYTES) {
+            throw new CopyLimitError();
+          }
+          complete += chunk.display_text;
+          if (!chunk.has_more || chunk.next_offset === null) return complete;
+          offset = chunk.next_offset;
+          cursor = chunk.next_cursor;
+        }
+      } catch (error) {
+        if (attempt === 0 && isRecoverableDisplayCursorError(error)) {
+          continue;
+        }
+        throw error;
       }
-      completeBytes += new TextEncoder().encode(chunk.display_text).byteLength;
-      if (complete.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || completeBytes > MAX_BROWSER_COPY_BYTES) {
-        throw new CopyLimitError();
-      }
-      complete += chunk.display_text;
-      if (!chunk.has_more || chunk.next_offset === null) return complete;
-      offset = chunk.next_offset;
-      cursor = chunk.next_cursor;
     }
+    throw new Error("display_cursor_retry_exhausted");
   };
   const formatMessagesForCopy = async (items: MessageItem[], signal: AbortSignal): Promise<string> => {
     const parts: string[] = [];

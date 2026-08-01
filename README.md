@@ -22,14 +22,9 @@ ChatGPT Export Archiver imports OpenAI / ChatGPT export ZIP files directly into 
 
 Safe screenshot coming soon. Screenshots should use synthetic conversations only, not real chat titles, snippets, raw JSON, emails, or local paths.
 
-## Local Smoke Observations
+## Performance measurements
 
-These are example observations from one local machine, not a universal guarantee:
-
-- A roughly 2.25 GB real export ZIP imported in about 98 seconds with the large-archive path.
-- `verify` on that archive completed in about 4 seconds.
-- An optional Web index rebuild after a larger incremental archive completed in about 106 seconds.
-- A high-hit Web message search over the local Uvicorn app returned in about 0.3 seconds.
+This README does not publish context-free elapsed-time promises. Use `tools/benchmark_round11.py` for synthetic parser/import measurements and the opt-in, content-safe `tools/acceptance_real_pipeline.py` for repeated production HTTP runs against an authorized read-only ZIP. The harness reports machine/runtime context, all run values, median and worst resource metrics, and aggregate counts without titles, messages, IDs, filenames, or paths.
 
 ## What This Project Does
 
@@ -87,7 +82,7 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
-The Python 3.12 constraints file pins every resolved Web dependency version, but it is not a cross-platform hash lock. A future release workflow should generate and verify platform-specific hashes for the supported Python/OS matrix; until then, install only from a trusted package index and retain the npm lockfile and audit checks as separate frontend controls.
+The Python 3.12 constraints file is the portable resolved-version profile and remains unhashed across platforms. The separately audited `requirements-web-py312-macos-arm64.lock` is a wheel-artifact hash lock only for CPython 3.12 on macOS arm64; install it with `--require-hashes --only-binary=:all:` and validate it with `python tools/verify_web_hash_lock.py`. Other Python/OS targets must use the portable profile from a trusted index until their own generated wheel matrix lock is shipped; do not treat the macOS lock as cross-platform.
 
 ## Quick start
 
@@ -472,7 +467,7 @@ tools/                             Delivery and support scripts
 
 The main database stores conversations, mapping nodes, import runs, and warnings. Complete raw JSON is retained for message objects only; conversation and mapping-node objects are normalized rather than preserved byte-for-byte. Input ZIP SHA-256 is optional, while per-entry SHA columns in `source_files`/`file_index` are reserved and currently unset. The CLI FTS table is `message_fts`. Optional Web search helper tables include `web_message_norm`, `web_title_norm`, `web_message_trigram`, and `web_title_trigram` plus SQLite FTS5 shadow tables.
 
-The canonical database schema is versioned with `PRAGMA user_version` (current version 5). Version 3 made canonical TEXT identities explicitly `NOT NULL`; version 4 added durable, field-scoped address and graph revisions; version 5 adds durable row-local display revisions and compatibility state so fresh read connections cannot reuse stale display cursors or compatibility/effective-current decisions. Migration performs a conservative DB/WAL/journal/TEMP capacity preflight before taking the write lock, then installs rows and managed triggers in one transaction, reports content-free progress, and rolls back on cancellation, interruption, ENOSPC, or SQLite failure. Read-only commands and Web requests never run migration DDL; older compatible databases return `database_migration_required`. Create and verify an external backup, then run `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`.
+The canonical database schema is versioned with `PRAGMA user_version` (current version 6). Version 3 made canonical TEXT identities explicitly `NOT NULL`; version 4 added durable address/graph revisions; version 5 added durable row-local display revisions and compatibility state; version 6 adds the durable `query` generation for source and conversation/node time changes. Migration performs a fast outer DB/WAL/journal/TEMP capacity check, then recomputes authoritative count, size, sidecars, and free space under `BEGIN IMMEDIATE` before its first mutation. It reports content-free progress and rolls back on cancellation, interruption, ENOSPC, or SQLite failure. Repeating migration on a current clean database is a true no-op and reports `schema_changed`, `compatibility_refreshed`, `compatibility_changed`, and `migration_changed` as false. Read-only commands and Web requests never run migration DDL; older compatible databases return `database_migration_required`. Create and verify an external backup, then run `python chatgpt_archive.py migrate --db archive/chatgpt_archive.db`.
 
 Health and `verify` distinguish a missing optional `message_fts` from a damaged one. A damaged table reports `optional_message_fts_error` with a `--rebuild-fts` recovery hint; generic malformed, locked, readonly, I/O, and SQL runtime failures are not silently treated as a missing capability and use the stable codes `database_malformed`, `database_locked`, `database_readonly`, `database_io_error`, or `database_runtime_failure`.
 
@@ -488,7 +483,7 @@ One imported conversation element must satisfy a joint profile: 32 MiB UTF-8 inp
 
 Bulk project imports temporarily replace exact project-owned generation triggers inside the same write-lock transaction and advance each dirty field domain once before restoring and validating those triggers. Rollback or process failure restores the old trigger/data state; external writers continue to use normal per-statement triggers. Finite effective-current scopes, including one 100,000-node legacy conversation, are staged and compared with SQLite TEMP relations; raw-flag cycle traversal uses compact integer arrays instead of duplicate Python string graphs. Archive export spools its plan and nodes to temporary SQLite and keyset-streams conversations/nodes; it does not retain an archive-wide Python node graph.
 
-Strict `--delete-input-on-success` is refused before staging on all currently supported platforms because pathname identity checks and advisory locks do not prevent a pre-open non-cooperating writer. Historical identity-bound recovery journals remain recoverable with the bounded token printed by the CLI; recovery validates format/ownership and never overwrites a replacement. The Web Python constraints pin resolved versions, including Starlette 1.0.1, but remain a cross-platform unhashed supply-chain residual; use a trusted package index.
+Strict `--delete-input-on-success` is refused before staging on all currently supported platforms because pathname identity checks and advisory locks do not prevent a pre-open non-cooperating writer. Historical identity-bound recovery journals remain recoverable with the bounded token printed by the CLI; recovery validates format/ownership and never overwrites a replacement. Portable Web constraints remain a cross-platform unhashed residual; the separate CPython 3.12/macOS arm64 lock verifies wheel artifacts for that exact target.
 
 ## Round 11 stable identity, outcomes, and performance contracts
 
@@ -543,3 +538,14 @@ Long CLI/Web streaming exports intentionally retain one consistent SQLite read s
 `npm run build` uses `webui/scripts/build.mjs` to typecheck, build into a same-parent staging directory, validate every asset referenced by the staged `index.html`, publish assets first, and atomically replace `dist/index.html` last. Its injected-failure self-test verifies that a failed build leaves the previous entry point and referenced assets usable.
 
 Release ZIP publication validates an authoritative required-source list independent of collector output, writes a temporary file in the target directory, verifies a sorted size/SHA-256 manifest for every payload file, the exact member set and built assets, runs the delivery check, and only then atomically replaces the destination. Missing required source/config/docs hard-fail, and failure leaves the previous release unchanged.
+
+## Round 12 writer, parser, and public-contract notes
+
+- Every unsafe HTTP method is covered by one default-deny write policy after trusted Host/proxy normalization. Remote requests require one valid same-origin `Origin`; duplicate/malformed Origin or `Sec-Fetch-Site`, and cross-site requests, are rejected. Upload byte, `Content-Length`, multipart, and slot controls remain upload-only.
+- `init`, `migrate`, CLI import, Web import admission/job, and optional-index build share one alias-aware process writer lock. Upload admission takes it before spooling. The private per-user registry has exactly 64 fixed owned shard files; collisions only serialize. On Windows writer commands and uploads currently fail before any registry, spool, DB creation, lease, or staging with `writer_process_lock_unsupported`.
+- Conversation JSON uses a bounded C-decoder fast probe for complete ordinary elements and a persistent single-pass framer for spanning/uncertain elements. Depth, scalar/token, mapping-entry, array-item, integer, UTF-8/character, decoded-heap, and 5,000-node budgets remain enforced; the structural budgets reject before materializing an oversized object.
+- New IDs and API identifier parameters reject Unicode category Cc controls and isolated surrogates. Filenames and `Content-Disposition` replace unsafe controls; ordinary Unicode and noncharacters remain allowed.
+- Disk diagnostics enumerate source/spool, pipeline ZIP, canonical DB growth, WAL/journal, core FTS, old/live/staging optional indexes, SQLite TEMP, cleanup reserve, and emergency reserve. Runtime free-space guards remain active. CLI import timing covers lock acquisition through post-commit summary persistence, connection close, output flush, and controlled return; Web jobs become terminal only after cleanup and lock release.
+- Search continuation binds all five durable generations, including `query`; source and conversation/node time changes stale old sessions. Display copy discards a partial stale revision, restarts once at offset zero, and never writes the clipboard after a second cursor failure. Strict delete-input cannot be re-enabled by a Boolean: production always returns `delete_input_secure_identity_unsupported`; only already-existing exact historical journals are recoverable.
+
+Run fresh-process synthetic scale matrices with `python tools/acceptance_scale_round12.py --scenario <many-small|single-element-mib|mapping-predecode|metadata-density|registry-lifecycle> --runs 3`. The physical 1/5/10 GiB logical-archive workload is deliberately opt-in: `python tools/acceptance_scale_round12.py --scenario logical-archive-gib --runs 3 --confirm-huge`. It creates only temporary synthetic ZIPs, uses the production import/verify/Web-index path, reports capacity rejection honestly, and can require substantial time and free disk.

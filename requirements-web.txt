@@ -1,6 +1,10 @@
 # Minimal local Web runtime plus FastAPI's test client dependency.
-# Tested on Python 3.12. For a fully repeatable tested install, use:
+# Portable exact top-level versions. For the resolved portable Python 3.12
+# profile use:
 # python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
+# For artifact-hash enforcement on the tested CPython 3.12/macOS arm64 target:
+# python -m pip install --require-hashes --only-binary=:all: \
+#   -r requirements-web-py312-macos-arm64.lock
 fastapi==0.136.1
 httpx==0.28.1
 python-multipart==0.0.28

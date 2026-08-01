@@ -22,14 +22,9 @@ ChatGPT Export Archiver importa ZIP oficiales de OpenAI / ChatGPT directamente e
 
 Captura segura pendiente. Las capturas deben usar conversaciones synthetic, no títulos reales, snippets, raw JSON, emails ni rutas locales.
 
-## Observaciones Locales De Smoke
+## Mediciones De Rendimiento
 
-Estas son observaciones de ejemplo en una sola máquina local, no una garantía universal:
-
-- Un ZIP real exportado de unos 2.25 GB se importó en unos 98 segundos con la ruta para archivos grandes.
-- `verify` sobre ese archivo terminó en unos 4 segundos.
-- La reconstrucción del índice Web opcional tras un archivo incremental mayor terminó en unos 106 segundos.
-- Una búsqueda Web de mensajes con muchos resultados en la app local Uvicorn respondió en unos 0.3 segundos.
+Este README no promete tiempos sin contexto. Usa `tools/benchmark_round11.py` para mediciones synthetic del parser/import y el harness content-safe con opt-in `tools/acceptance_real_pipeline.py` para varias ejecuciones HTTP de producción sobre un ZIP real autorizado y de solo lectura. El harness registra máquina/runtime, todas las ejecuciones, median, worst y recursos agregados, sin mostrar títulos, mensajes, IDs, nombres de archivo ni rutas.
 
 ## Qué Hace Este Proyecto
 
@@ -87,7 +82,7 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
-El archivo de constraints para Python 3.12 fija todas las versiones resueltas de las dependencias Web, pero no es un hash lock multiplataforma. Un flujo de publicación futuro debería generar y verificar hashes específicos para la matriz Python/SO admitida; hasta entonces, instala solo desde un índice de paquetes de confianza y conserva el lockfile de npm y las auditorías como controles independientes del frontend.
+El archivo constraints de Python 3.12 es el perfil portable de versiones resueltas y no incluye hashes de artifacts. `requirements-web-py312-macos-arm64.lock` es un wheel hash lock separado solo para CPython 3.12/macOS arm64; instálalo con `--require-hashes --only-binary=:all:` y valídalo con `python tools/verify_web_hash_lock.py`. Otros targets Python/SO deben usar el perfil portable desde un index confiable hasta disponer de su propio wheel matrix lock; el lock de macOS no es multiplataforma.
 
 ## Inicio rápido
 
@@ -472,7 +467,7 @@ tools/                             Delivery and support scripts
 
 La base principal almacena conversaciones, mapping nodes, import runs y warnings. Solo los objetos message conservan el objeto JSON raw del mensaje; conversation y mapping-node se normalizan, no se guardan byte por byte. El SHA-256 del ZIP de entrada es opcional y las columnas SHA por entry de `source_files`/`file_index` están reservadas y sin rellenar. La tabla FTS de CLI es `message_fts`. Las tablas auxiliares opcionales para búsqueda Web incluyen `web_message_norm`, `web_title_norm`, `web_message_trigram` y `web_title_trigram`, además de las shadow tables de SQLite FTS5.
 
-La base canónica usa `PRAGMA user_version` (versión actual 5): v3 añadió identidades `NOT NULL`, v4 revisiones address/graph y v5 revisiones display por fila y compatibility state. Migration hace un preflight conservador de DB/WAL/journal/TEMP antes del write lock, instala filas/triggers en una transacción, informa progreso sin contenido y revierte cancelación, interrupción, ENOSPC o error SQLite. Las rutas readonly no ejecutan DDL y una base compatible antigua devuelve `database_migration_required`.
+La base canónica usa `PRAGMA user_version` (versión actual 6): v3 añadió identidades `NOT NULL`, v4 revisiones durables address/graph, v5 revisiones display por fila y compatibility state, y v6 la generación durable `query` para cambios de source y tiempos de conversation/node. Migration hace un preflight rápido fuera del lock y, dentro de `BEGIN IMMEDIATE` antes de la primera mutación, vuelve a calcular el recuento, tamaño, sidecars y espacio libre autoritativos. Revierte cancelación, interrupción, ENOSPC o error SQLite. Repetir migrate sobre una base current y limpia es un true no-op y devuelve falsos los cuatro campos changed. Las rutas readonly no ejecutan DDL y una base compatible antigua devuelve `database_migration_required`.
 
 Health y `verify` distinguen entre `message_fts` opcional ausente y dañado. El daño informa `optional_message_fts_error` con una indicación `--rebuild-fts`; los fallos generales malformed, locked, readonly, I/O y SQL runtime no se ocultan como capacidad ausente y usan `database_malformed`, `database_locked`, `database_readonly`, `database_io_error` o `database_runtime_failure`.
 
@@ -488,7 +483,7 @@ Cada conversation element nuevo debe cumplir conjuntamente: 32 MiB UTF-8, 32 MiB
 
 El bulk import del proyecto sustituye temporalmente triggers generation exactos y propios dentro de la misma transacción con write lock, incrementa una vez cada dominio dirty y restaura/valida los triggers. Rollback o crash restaura DDL/data; writers externos conservan triggers por statement. Los scopes finite effective-current, incluso una conversación legacy de 100.000 nodes, se comparan en relaciones SQLite TEMP; los ciclos raw-flag usan arrays enteros compactos en vez de duplicar grafos de strings Python. La exportación completa guarda plan y nodes en SQLite temporal y usa keyset streaming, sin un grafo Python de todo el archivo.
 
-Strict `--delete-input-on-success` se rechaza antes de staging en todas las plataformas soportadas: identity checks y advisory locks no bloquean un writer pre-open. Los journals históricos se recuperan con token acotado sin sobrescribir replacements. Las constraints Web fijan Starlette 1.0.1 y otras versiones resueltas, pero no son un hash lock multiplataforma.
+Strict `--delete-input-on-success` se rechaza antes de staging en todas las plataformas soportadas: identity checks y advisory locks no bloquean un writer pre-open. Los journals históricos se recuperan con token acotado sin sobrescribir replacements. Las constraints Web portables siguen siendo un residual multiplataforma sin hashes; el lock separado CPython 3.12/macOS arm64 verifica wheel artifacts para ese target exacto.
 
 ## Contratos Round 11 de identidad estable, outcomes y rendimiento
 
@@ -549,3 +544,14 @@ Una exportación CLI/Web larga mantiene deliberadamente un único SQLite read sn
 `npm run build` usa `webui/scripts/build.mjs`, hace typecheck, construye en un staging directory hermano, valida todos los assets citados por el `index.html` staged, publica primero los assets y reemplaza atómicamente `dist/index.html` al final. Su self-test de fallo inyectado verifica que un build fallido conserva utilizables el entry point y los assets anteriores.
 
 Los candidatos se verifican exactamente mediante BLOB incremental con límites predeterminados independientes de 32 Mi caracteres y 32 MiB UTF-8. Las pruebas locales de confianza pueden usar `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` hasta 100 Mi caracteres; ese opt-in explícito también permite la capacidad UTF-8 válida correspondiente. Al agotar el presupuesto de candidatos se devuelven partial/pending y un continuation firmado cuando está disponible; un legacy que supera el límite duro por fila queda pending, nunca false-exact. El cursor largo liga revisión e identidad de la fila objetivo y el anchor de búsqueda guarda directamente el byte offset UTF-8.
+
+## Contratos Round 12 de writer y parser
+
+- Tras normalizar trusted Host/proxy, una política default-deny cubre todos los métodos HTTP unsafe. Una escritura remota exige un único `Origin` válido y same-origin; Origin o `Sec-Fetch-Site` duplicado/malformado y cross-site se rechazan. Los controles de bytes, `Content-Length`, multipart y slot siguen siendo exclusivos de upload.
+- `init`, `migrate`, import CLI, admission/job Web y build del índice opcional comparten un process writer lock alias-aware; admission lo obtiene antes del spool. El registry privado por usuario queda acotado a 64 shard files owned; una colisión solo serializa. Windows devuelve `writer_process_lock_unsupported` antes de registry, spool, creación DB, lease o staging.
+- JSON usa un fast probe acotado del decoder C para elements comunes completos y un framer persistente single-pass para los que abarcan chunks o son inciertos. Siguen los límites de depth, scalar/token, mapping, array, integer, UTF-8/caracteres, decoded heap y 5.000 nodes; los límites estructurales rechazan antes de materializar un objeto enorme.
+- IDs nuevos y parámetros identifier de API rechazan controles Unicode Cc y isolated surrogates. Filename y `Content-Disposition` sustituyen controles con seguridad; Unicode ordinario y noncharacters siguen permitidos.
+- Los diagnósticos de disco enumeran source/spool, ZIP del pipeline, crecimiento DB, WAL/journal, core FTS, índices optional old/live/staging, SQLite TEMP, reservas cleanup y emergency, con guards runtime. Timing CLI cubre writer lock, summary post-commit, cierre, flush y retorno; un job Web solo es terminal tras cleanup y liberar el lock.
+- Search continuation liga las cinco generations, incluida `query`; cambios de source o tiempos conversation/node vuelven stale una sesión. Display copy descarta el partial stale, reinicia una sola vez desde offset 0 y no escribe clipboard tras un segundo fallo. Strict delete-input no puede reactivarse con un Boolean: siempre devuelve `delete_input_secure_identity_unsupported`; solo se recuperan journals históricos exact-owned ya existentes.
+
+Ejecute las matrices synthetic en procesos frescos con `python tools/acceptance_scale_round12.py --scenario <many-small|single-element-mib|mapping-predecode|metadata-density|registry-lifecycle> --runs 3`. El workload físico de archivos lógicos de 1/5/10 GiB requiere opt-in explícito: `python tools/acceptance_scale_round12.py --scenario logical-archive-gib --runs 3 --confirm-huge`. Solo crea ZIP synthetic temporales, usa la ruta production import/verify/Web-index, informa honestamente cualquier rechazo de capacidad y puede requerir mucho tiempo y espacio libre.

@@ -220,6 +220,13 @@ export class IncompleteDisplayRecoveryError extends Error {
   }
 }
 
+export function isRecoverableDisplayCursorError(error: unknown): boolean {
+  return error instanceof ApiError && (
+    error.code === "invalid_display_cursor" ||
+    error.code === "display_cursor_stale"
+  );
+}
+
 export function assertBrowserCopyLimit(text: string): void {
   if (text.length > MAX_BROWSER_COPY_CHARS || new TextEncoder().encode(text).byteLength > MAX_BROWSER_COPY_BYTES) {
     throw new CopyLimitError();

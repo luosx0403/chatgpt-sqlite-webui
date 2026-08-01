@@ -22,14 +22,9 @@ ChatGPT Export Archiver は、OpenAI / ChatGPT の公式 export ZIP を直接 SQ
 
 安全なスクリーンショットは準備中です。スクリーンショットには synthetic な会話だけを使い、実際のタイトル、snippet、raw JSON、メールアドレス、ローカルパスを含めないでください。
 
-## ローカル Smoke 観測
+## パフォーマンス測定
 
-以下は 1 台のローカルマシンでの例であり、一般的な保証ではありません。
-
-- 約 2.25 GB の実エクスポート ZIP は、大規模アーカイブ経路で約 98 秒でインポートされました。
-- そのアーカイブの `verify` は約 4 秒で完了しました。
-- より大きな増分アーカイブ後の任意 Web インデックス再構築は約 106 秒で完了しました。
-- ローカル Uvicorn Web アプリでの高ヒットメッセージ検索は約 0.3 秒で返りました。
+この README は、実行環境の説明がない経過時間を保証しません。synthetic parser/import 測定には `tools/benchmark_round11.py`、許可された読み取り専用の実 ZIP に対する複数回の production HTTP 測定には明示的 opt-in の content-safe `tools/acceptance_real_pipeline.py` を使用します。harness は machine/runtime、全 run、median、worst、集計 resource を記録し、title、message、ID、filename、path は出力しません。
 
 ## このプロジェクトでできること
 
@@ -87,7 +82,7 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
-Python 3.12 constraints ファイルは解決済み Web 依存関係の全バージョンを固定しますが、クロスプラットフォームの hash lock ではありません。将来のリリース手順では、対応する Python/OS マトリクスごとの hash を生成・検証する必要があります。それまでは信頼できる package index のみを利用し、npm lockfile と audit を別個のフロントエンド制御として維持してください。
+Python 3.12 constraints は cross-platform resolved-version profile で、artifact hash はありません。別の `requirements-web-py312-macos-arm64.lock` は CPython 3.12/macOS arm64 専用 wheel hash lock です。`--require-hashes --only-binary=:all:` で install し、`python tools/verify_web_hash_lock.py` で検証します。他の Python/OS は各 wheel matrix lock が出るまで trusted index の portable profile を使用し、macOS lock を cross-platform と扱ってはいけません。
 
 ## クイックスタート
 
@@ -472,7 +467,7 @@ tools/                             Delivery and support scripts
 
 メインデータベースは conversations、mapping nodes、import runs、warnings を保存します。message object だけが raw message JSON object を保持し、conversation と mapping-node object は正規化され、byte-for-byte 保存ではありません。入力 ZIP SHA-256 は任意で、`source_files`/`file_index` の entry SHA 列は予約済みですが現在は未設定です。CLI FTS テーブルは `message_fts` です。任意 Web 検索用の補助テーブルには `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram` と SQLite FTS5 shadow tables が含まれます。
 
-canonical DB は `PRAGMA user_version` の version 5 です。version 3 は `NOT NULL` identity、version 4 は field-scoped address/graph revision、version 5 は durable row-local display revision と compatibility state を追加します。Migration は write lock 前に DB/WAL/journal/TEMP 容量を保守的に preflight し、同じ transaction で row/trigger を導入して content-free progress を報告します。cancel、interrupt、ENOSPC、SQLite failure は完全 rollback します。readonly path は migration DDL を実行せず、旧 compatible DB は `database_migration_required` を返します。
+canonical DB は `PRAGMA user_version` の version 6 です。version 3 は `NOT NULL` identity、version 4 は durable address/graph revision、version 5 は row-local display revision と compatibility state、version 6 は source と conversation/node time 変更を覆う durable `query` generation を追加します。Migration は write lock 外で高速 preflight を行い、`BEGIN IMMEDIATE` 内の最初の mutation 前に authoritative row count、size、sidecar、free space を再計算します。cancel、interrupt、ENOSPC、SQLite failure は完全 rollback します。current clean DB での反復 migrate は true no-op で、4 つの changed field はすべて false です。readonly path は migration DDL を実行せず、旧 compatible DB は `database_migration_required` を返します。
 
 Health と `verify` は任意の `message_fts` の欠落と破損を区別します。破損時は `optional_message_fts_error` と `--rebuild-fts` の復旧ヒントを返します。一般的な malformed、locked、readonly、I/O、SQL runtime failure は能力欠落として扱わず、`database_malformed`、`database_locked`、`database_readonly`、`database_io_error`、`database_runtime_failure` を使います。
 
@@ -488,7 +483,7 @@ exact search は canonical BLOB を 64 KiB chunk で読み、connection-local TE
 
 project bulk import は同じ write-lock transaction 内で完全一致する project-owned generation trigger を一時置換し、dirty field domain ごとに 1 回だけ generation を進めて trigger を復元・検証します。rollback/crash は旧 DDL/data を復元し、external writer は通常の statement trigger を使います。単一 100,000-node legacy conversation を含む finite effective-current scope は SQLite TEMP relation で正確に比較し、raw-flag cycle traversal は重複した Python string graph ではなく compact integer array を使います。archive export は plan と node を temporary SQLite に spool し、conversation/node を keyset stream するため、archive 全体の Python node graph を保持しません。
 
-strict `--delete-input-on-success` は全 supported platform で staging 前に拒否されます。path identity と advisory lock は pre-open writer を止められません。過去の identity-bound journal は CLI の bounded token で回復でき、replacement を上書きしません。Web constraints は Starlette 1.0.1 など resolved version を固定しますが cross-platform hash lock ではありません。
+strict `--delete-input-on-success` は全 supported platform で staging 前に拒否されます。path identity と advisory lock は pre-open writer を止められません。過去の identity-bound journal は CLI の bounded token で回復でき、replacement を上書きしません。portable Web constraints は cross-platform unhashed residual で、別の CPython 3.12/macOS arm64 lock がその exact target の wheel artifact を検証します。
 
 ## Round 11 の stable identity・outcome・performance 契約
 
@@ -549,3 +544,14 @@ Python `zipfile` と本プロジェクトの import pipeline は ZIP64 構造を
 `npm run build` は `webui/scripts/build.mjs` を使い、typecheck 後に同階層の staging directory へ build し、staged `index.html` が参照する全 asset を検証して、asset を先に公開し、最後に `dist/index.html` を atomic replace します。failure injection self-test は失敗時にも旧 entry point とその asset が使用可能なことを確認します。
 
 Search candidate は既定の 32 Mi-character と 32 MiB UTF-8 上限内で incremental BLOB read により exact verify されます。trusted local test は `CHATGPT_ARCHIVE_SEARCH_EXACT_VERIFY_CHARS` で最大 100 Mi characters まで opt in でき、この明示的 opt-in は対応する有効な UTF-8 byte capacity も許可します。candidate budget 枯渇時は partial/pending と利用可能な signed continuation を返し、hard per-row limit 超過 legacy candidate は false-exact な空結果ではなく pending のままです。long display cursor は target row revision と identity に bind し、search anchor は UTF-8 byte offset を直接記録します。
+
+## Round 12 writer、parser、公開 contract
+
+- trusted Host/proxy normalization 後の default-deny policy は全 unsafe HTTP method を対象にします。remote write は単一の有効な same-origin `Origin` が必要で、duplicate/malformed Origin、duplicate/malformed `Sec-Fetch-Site`、cross-site request は拒否されます。upload byte、`Content-Length`、multipart、slot 制御は upload 専用です。
+- `init`、`migrate`、CLI import、Web upload admission/job、optional-index build は alias-aware process writer lock を共有し、admission は spool 前に lock を取得します。per-user private registry は固定 64 owned shard file 以下で、collision は保守的に serialize するだけです。Windows は registry、spool、DB create、lease、staging 前に `writer_process_lock_unsupported` を返します。
+- JSON は complete small element に bounded C-decoder fast probe、spanning/uncertain element に persistent single-pass framer を使います。depth、scalar/token、mapping-entry、array-item、integer、UTF-8/character、decoded-heap、5,000-node budget は保持され、oversized object materialization 前に structural limit を拒否します。
+- 新 ID と API identifier parameter は Unicode Cc control と isolated surrogate を拒否します。filename と `Content-Disposition` は control を安全に置換し、通常 Unicode と noncharacter は許可します。
+- disk diagnostics は source/spool、pipeline ZIP、canonical DB growth、WAL/journal、core FTS、old/live/staging optional index、SQLite TEMP、cleanup reserve、emergency reserve を列挙し、runtime free-space guard も維持します。CLI timing は writer lock から post-commit summary、connection close、output flush、return まで、Web job terminal は cleanup/lock release 後です。
+- search continuation は `query` を含む 5 durable generation に bind し、source または conversation/node time 変更で stale になります。display copy は stale partial を破棄して offset 0 から一度だけ再試行し、2 回目失敗では clipboard を変更しません。strict delete-input は Boolean で再有効化できず常に `delete_input_secure_identity_unsupported`、既存の exact-owned historical journal のみ recovery できます。
+
+fresh-process synthetic scale matrix は `python tools/acceptance_scale_round12.py --scenario <many-small|single-element-mib|mapping-predecode|metadata-density|registry-lifecycle> --runs 3` で実行します。実際に生成する 1/5/10 GiB logical-archive workload は明示的 opt-in です: `python tools/acceptance_scale_round12.py --scenario logical-archive-gib --runs 3 --confirm-huge`。temporary synthetic ZIP のみを作成し、production import/verify/Web-index path を通し、capacity rejection をそのまま報告します。大きな時間と空き disk を必要とする場合があります。

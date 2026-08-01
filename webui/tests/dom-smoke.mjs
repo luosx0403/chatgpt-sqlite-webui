@@ -1005,7 +1005,15 @@ async function main() {
       await route.continue();
     });
     await lifecyclePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
-    await lifecyclePage.waitForSelector(".app-shell", { timeout: 20_000 });
+    // This lifecycle probe needs DOM mount, not layout stability.  Chromium
+    // can keep waitForSelector(state="visible") polling across rapid React
+    // commits even after its trace reports a visible match, especially while
+    // the deliberately delayed stats request is still pending.
+    await lifecyclePage.waitForFunction(
+      () => document.querySelector(".app-shell") !== null,
+      undefined,
+      { timeout: 20_000 },
+    );
     const abortsBeforeUnmount = Number(await lifecyclePage.evaluate(() => window.name));
     await lifecyclePage.evaluate(() => window.dispatchEvent(new Event("chatgpt-archive:teardown")));
     await lifecyclePage.waitForFunction(() => !document.querySelector(".app-shell"), undefined, { timeout: 20_000 });
@@ -1569,6 +1577,67 @@ async function main() {
     await page.locator('[data-node-id="long-body"]').getByRole("button", { name: "Copy", exact: true }).click();
     await page.waitForFunction(() => String(window.__copiedText || "").includes("DOM-LONG-BODY-END"), undefined, { timeout: 20_000 });
 
+    const staleCopyRequests = [];
+    let staleCopyFailureInjected = false;
+    const staleCopyRoute = async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("node_id") !== "long-body") {
+        await route.continue();
+        return;
+      }
+      staleCopyRequests.push({
+        offset: url.searchParams.get("offset"),
+        cursor: url.searchParams.get("cursor"),
+      });
+      if (url.searchParams.get("cursor") && !staleCopyFailureInjected) {
+        staleCopyFailureInjected = true;
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: '{"detail":"display_cursor_stale","code":"display_cursor_stale"}',
+        });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/api/by-id/display?**", staleCopyRoute);
+    await page.evaluate(() => { window.__copiedText = "stale-copy-sentinel"; });
+    await page.locator('[data-node-id="long-body"]').getByRole("button", { name: "Copy", exact: true }).click();
+    await page.waitForFunction(() => String(window.__copiedText || "").includes("DOM-LONG-BODY-END"), undefined, { timeout: 20_000 });
+    assert.ok(staleCopyFailureInjected, "single-message copy should exercise a stale continuation");
+    assert.ok(
+      staleCopyRequests.filter((request) => request.offset === "0" && request.cursor === null).length >= 2,
+      "stale display continuation must discard partial text and restart from offset zero exactly once",
+    );
+    assert.equal(
+      await page.evaluate(() => window.__copiedText.length),
+      1_100_000 + 1 + "DOM-LONG-BODY-END".length,
+      "the restarted copy must not retain a prefix from the stale revision",
+    );
+    await page.unroute("**/api/by-id/display?**", staleCopyRoute);
+
+    let repeatedStaleFailures = 0;
+    const repeatedStaleRoute = async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("node_id") === "long-body" && url.searchParams.get("cursor")) {
+        repeatedStaleFailures += 1;
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: '{"detail":"invalid_display_cursor","code":"invalid_display_cursor"}',
+        });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/api/by-id/display?**", repeatedStaleRoute);
+    await page.evaluate(() => { window.__copiedText = "repeated-stale-sentinel"; });
+    await page.locator('[data-node-id="long-body"]').getByRole("button", { name: "Copy", exact: true }).click();
+    await page.getByText("The complete message body could not be loaded.", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    assert.equal(repeatedStaleFailures, 2, "copy should stop after one clean restart");
+    assert.equal(await page.evaluate(() => window.__copiedText), "repeated-stale-sentinel", "a second cursor failure must not write partial clipboard text");
+    await page.unroute("**/api/by-id/display?**", repeatedStaleRoute);
+
     const incompleteDisplayRoute = async (route) => {
       const url = new URL(route.request().url());
       if (url.searchParams.get("node_id") !== "long-body") {
@@ -2062,20 +2131,39 @@ async function main() {
     await activateHitNode(page, "long-hit");
     await waitForActiveHighlightVisible(page);
 
-    await page.goto(`${baseUrl}?conversation=dom-hit-sequence`, { waitUntil: "networkidle" });
+	    await page.goto(`${baseUrl}?conversation=dom-hit-sequence&match_mode=contains&path=current&scope=all`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
-    let initialHitNavigationRequests = 0;
-    const countInitialHitNavigation = (request) => {
+	    let initialHitNavigationRequests = 0;
+	    const initialHitResponses = [];
+	    const countInitialHitNavigation = (request) => {
       const url = new URL(request.url());
       if (url.pathname === "/api/search/messages" && url.searchParams.get("conversation_id") === "dom-hit-sequence") {
         initialHitNavigationRequests += 1;
       }
-    };
-    page.on("request", countInitialHitNavigation);
-    await page.locator("#global-search").fill("sequence-target");
-    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 100"), undefined, { timeout: 20_000 });
-    await page.waitForTimeout(350);
-    page.off("request", countInitialHitNavigation);
+	    };
+	    const captureInitialHitResponse = async (response) => {
+	      const url = new URL(response.url());
+	      if (url.pathname === "/api/search/messages" && url.searchParams.get("conversation_id") === "dom-hit-sequence") {
+	        const body = await response.json().catch(() => ({}));
+	        initialHitResponses.push({
+	          status: response.status(),
+	          itemCount: Array.isArray(body.items) ? body.items.length : null,
+	          total: body.total ?? null,
+	          detail: body.detail ?? null,
+	        });
+	      }
+	    };
+	    page.on("request", countInitialHitNavigation);
+	    page.on("response", captureInitialHitResponse);
+	    await page.locator("#global-search").fill("sequence-target");
+	    try {
+	      await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 100"), undefined, { timeout: 20_000 });
+	    } catch (error) {
+	      throw new Error(`initial sequence segment missing: counter=${await page.locator(".hit-counter").textContent()} ui_error=${await page.locator(".error-box").allTextContents()} responses=${JSON.stringify(initialHitResponses)} cause=${error instanceof Error ? error.message : String(error)}`);
+	    }
+	    await page.waitForTimeout(350);
+	    page.off("request", countInitialHitNavigation);
+	    page.off("response", captureInitialHitResponse);
     assert.equal(initialHitNavigationRequests, 1, "initial reader hit navigation should issue exactly one request");
     const expectedSequence = expectedSequenceHitIds();
     for (let idx = 0; idx <= 155; idx += 1) {

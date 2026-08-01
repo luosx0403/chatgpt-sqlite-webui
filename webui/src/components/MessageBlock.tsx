@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { HighlightRange, MessageItem } from "../types";
 import { formatDate, roleLabel } from "../utils/format";
-import { CopyLimitError, IncompleteDisplayRecoveryError, MAX_BROWSER_COPY_BYTES, MAX_BROWSER_COPY_CHARS, getMessageDisplayChunk, getRawMessage } from "../api/client";
+import { CopyLimitError, IncompleteDisplayRecoveryError, MAX_BROWSER_COPY_BYTES, MAX_BROWSER_COPY_CHARS, getMessageDisplayChunk, getRawMessage, isRecoverableDisplayCursorError } from "../api/client";
 import type { MessageLayout } from "../settings";
 
 interface Props {
@@ -180,25 +180,39 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
     setDisplayError("");
     setActiveWindowRange(null);
     try {
-      let offset = 0;
-      let cursor: string | null = null;
       let complete = "";
-      let completeBytes = 0;
-      while (true) {
-        const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 1048576, controller.signal, cursor);
-        if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
-        if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
-          setDisplayRecoveryIncomplete(true);
-          throw new IncompleteDisplayRecoveryError();
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        let offset = 0;
+        let cursor: string | null = null;
+        let candidate = "";
+        let candidateBytes = 0;
+        try {
+          while (true) {
+            const chunk = await getMessageDisplayChunk(conversationId, message.node_id, offset, 1048576, controller.signal, cursor);
+            if (requestId !== displayRequestIdRef.current || requestIdentity !== messageIdentityRef.current) return;
+            if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
+              setDisplayRecoveryIncomplete(true);
+              throw new IncompleteDisplayRecoveryError();
+            }
+            candidateBytes += new TextEncoder().encode(chunk.display_text).byteLength;
+            if (candidate.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || candidateBytes > MAX_BROWSER_COPY_BYTES) {
+              throw new CopyLimitError();
+            }
+            candidate += chunk.display_text;
+            if (!chunk.has_more || chunk.next_offset === null) break;
+            offset = chunk.next_offset;
+            cursor = chunk.next_cursor;
+          }
+          complete = candidate;
+          break;
+        } catch (error) {
+          if (attempt === 0 && isRecoverableDisplayCursorError(error)) {
+            // Discard every byte from the old instance/revision. The retry
+            // starts at offset zero and may itself fail only once.
+            continue;
+          }
+          throw error;
         }
-        completeBytes += new TextEncoder().encode(chunk.display_text).byteLength;
-        if (complete.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || completeBytes > MAX_BROWSER_COPY_BYTES) {
-          throw new CopyLimitError();
-        }
-        complete += chunk.display_text;
-        if (!chunk.has_more || chunk.next_offset === null) break;
-        offset = chunk.next_offset;
-        cursor = chunk.next_cursor;
       }
       setExpandedText(complete);
       setDisplayNextOffset(null);
