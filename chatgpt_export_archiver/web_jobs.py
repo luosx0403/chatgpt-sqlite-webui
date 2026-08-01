@@ -16,7 +16,12 @@ from .cli import ImportPipelineError, run_import_pipeline
 from .db import connect, get_stats, verify_database
 from .logging_utils import get_logger, parse_log_level
 from .utils import safe_filename_part
-from .web_db import WebIndexBuildCancelled, WebIndexBuildError, create_web_indexes
+from .web_db import (
+    WebIndexBuildCancelled,
+    WebIndexBuildError,
+    acquire_writer_process_lock,
+    create_web_indexes,
+)
 
 LOGGER = get_logger("web_jobs")
 
@@ -31,6 +36,7 @@ class WebIndexBuilder(Protocol):
         batch_size: int = ...,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = ...,
         cancel_check: Callable[[], bool] | None = ...,
+        _writer_lock: Any | None = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -85,6 +91,8 @@ class ImportJob:
     cleanup_warnings: list[dict[str, str]] = field(default_factory=list)
     stage_timings: dict[str, float] = field(default_factory=dict)
     _web_index_cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    _writer_lock: Any | None = field(default=None, repr=False, compare=False)
+    _terminal_status: str | None = field(default=None, repr=False, compare=False)
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=1000))
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -183,6 +191,7 @@ class ImportJobManager:
         self._lock = threading.Lock()
         self._jobs: dict[str, ImportJob] = {}
         self._running_job_id: str | None = None
+        self._pending_writer_lock: Any | None = None
 
     def has_running_job(self) -> bool:
         with self._lock:
@@ -199,12 +208,33 @@ class ImportJobManager:
             if self._running_job_id is not None:
                 return False
             self._running_job_id = "__pending_upload__"
-            return True
+        try:
+            writer_lock = acquire_writer_process_lock(self.db_path)
+        except WebIndexBuildError as exc:
+            with self._lock:
+                if self._running_job_id == "__pending_upload__":
+                    self._running_job_id = None
+            if exc.code == "writer_process_lock_busy":
+                return False
+            raise
+        with self._lock:
+            if self._running_job_id != "__pending_upload__":
+                writer_lock.close()
+                return False
+            self._pending_writer_lock = writer_lock
+        return True
 
     def release_pending_upload_slot(self) -> None:
+        writer_lock = None
         with self._lock:
             if self._running_job_id == "__pending_upload__":
                 self._running_job_id = None
+                writer_lock, self._pending_writer_lock = (
+                    self._pending_writer_lock,
+                    None,
+                )
+        if writer_lock is not None:
+            writer_lock.close()
 
     def start_import(
         self,
@@ -214,12 +244,40 @@ class ImportJobManager:
         size: int,
         upload_seconds: float = 0.0,
     ) -> ImportJob:
+        needs_lock = False
         with self._lock:
             self._prune_jobs_locked()
             if self._running_job_id is not None and self._running_job_id != "__pending_upload__":
                 raise RuntimeError("an import job is already running")
+            if self._running_job_id is None:
+                self._running_job_id = "__pending_upload__"
+                needs_lock = True
+        if needs_lock:
+            try:
+                writer_lock = acquire_writer_process_lock(self.db_path)
+            except Exception:
+                with self._lock:
+                    if self._running_job_id == "__pending_upload__":
+                        self._running_job_id = None
+                raise
+            with self._lock:
+                self._pending_writer_lock = writer_lock
+        with self._lock:
+            if self._running_job_id != "__pending_upload__":
+                raise RuntimeError("an import job is already running")
             job_id = uuid.uuid4().hex
-            job = ImportJob(job_id=job_id, db_path=self.db_path, upload_path=upload_path, filename=filename, size=size)
+            writer_lock, self._pending_writer_lock = self._pending_writer_lock, None
+            if writer_lock is None:
+                self._running_job_id = None
+                raise RuntimeError("writer admission lock missing")
+            job = ImportJob(
+                job_id=job_id,
+                db_path=self.db_path,
+                upload_path=upload_path,
+                filename=filename,
+                size=size,
+                _writer_lock=writer_lock,
+            )
             job.stage_timings["upload"] = round(max(0.0, upload_seconds), 6)
             self._jobs[job_id] = job
             self._running_job_id = job_id
@@ -227,10 +285,15 @@ class ImportJobManager:
             thread = threading.Thread(target=self._run_job, args=(job,), name=f"chatgpt-import-{job_id[:8]}", daemon=True)
             thread.start()
         except Exception as exc:
+            writer_lock = None
             with self._lock:
                 if self._running_job_id == job_id:
                     self._running_job_id = None
-                self._jobs.pop(job_id, None)
+                removed = self._jobs.pop(job_id, None)
+                if removed is not None:
+                    writer_lock, removed._writer_lock = removed._writer_lock, None
+            if writer_lock is not None:
+                writer_lock.close()
             raise ImportJobStartError(type(exc).__name__) from exc
         return job
 
@@ -299,7 +362,11 @@ class ImportJobManager:
         error_type: str | None = None,
     ) -> None:
         with job._lock:
-            job.status = status
+            if status in {"succeeded", "failed", "postcheck_failed"}:
+                job._terminal_status = status
+                job.status = "running"
+            else:
+                job.status = status
             job.outcome = outcome
             job.error_code = error_code
             job.error = error_code
@@ -328,7 +395,8 @@ class ImportJobManager:
             # This guard covers failures before _run_job_body reaches its own
             # pipeline try/finally (for example a patched stage/log setup).
             with job._lock:
-                job.status = "failed"
+                job.status = "running"
+                job._terminal_status = "failed"
                 job.stage = "job_setup"
                 job.outcome = "import_job_start_failed"
                 job.completion_outcome = "failed_before_commit"
@@ -363,6 +431,7 @@ class ImportJobManager:
                     optimize_fts_after_import=False,
                     delete_input_on_success=False,
                     progress_callback=lambda stage, summary: self._progress(job, stage, summary),
+                    writer_lock=job._writer_lock,
                 )
             with job._lock:
                 job.summary = dict(result["summary"])
@@ -409,6 +478,7 @@ class ImportJobManager:
                                 self.db_path,
                                 progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
                                 cancel_check=job._web_index_cancel_event.is_set,
+                                _writer_lock=job._writer_lock,
                             )
                         web_index_result["recovered_optional_web_index"] = True
                         conn = connect(self.db_path)
@@ -478,6 +548,7 @@ class ImportJobManager:
                             self.db_path,
                             progress_callback=lambda stage, progress: self._web_index_progress(job, stage, progress),
                             cancel_check=job._web_index_cancel_event.is_set,
+                            _writer_lock=job._writer_lock,
                         )
                     with job._lock:
                         job.web_index = web_index_result
@@ -547,8 +618,16 @@ class ImportJobManager:
     def _finalize_job(self, job: ImportJob) -> None:
         """Best-effort upload cleanup with unconditional writer-slot release."""
 
+        cleanup_started = time.perf_counter()
         with job._lock:
-            job.finished_at = job.finished_at or time.time()
+            terminal_status = job._terminal_status or (
+                job.status
+                if job.status in {"succeeded", "failed", "postcheck_failed"}
+                else "failed"
+            )
+            terminal_stage = job.stage
+            job.status = "running"
+            job.stage = "cleanup"
         unlink_error: str | None = None
         try:
             try:
@@ -583,11 +662,25 @@ class ImportJobManager:
                 except Exception:
                     pass
         finally:
+            writer_lock = None
             with job._lock:
-                if job.cleanup_warnings and job.status == "succeeded":
+                writer_lock, job._writer_lock = job._writer_lock, None
+                if job.cleanup_warnings and terminal_status == "succeeded":
                     job.completion_outcome = "cleanup_warning"
-                elif job.status == "postcheck_failed" and job.canonical_commit_succeeded:
+                elif terminal_status == "postcheck_failed" and job.canonical_commit_succeeded:
                     job.completion_outcome = "failed_after_canonical_commit"
+            if writer_lock is not None:
+                writer_lock.close()
+            with job._lock:
+                job.stage_timings["cleanup"] = round(
+                    float(job.stage_timings.get("cleanup", 0.0))
+                    + max(0.0, time.perf_counter() - cleanup_started),
+                    6,
+                )
+                job.status = terminal_status
+                job.stage = terminal_stage
+                job._terminal_status = None
+                job.finished_at = time.time()
             with self._lock:
                 if self._running_job_id == job.job_id:
                     self._running_job_id = None

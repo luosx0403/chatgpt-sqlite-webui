@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 DISK_RESERVE_BYTES = 256 * 1024 * 1024
+DISK_CLEANUP_RESERVE_BYTES = 256 * 1024 * 1024
 DISK_RUNTIME_CHECK_BYTES = 256 * 1024 * 1024
 DISK_RUNTIME_CHECK_SECONDS = 5.0
 
@@ -55,20 +56,106 @@ def require_free_space(path: Path, required_bytes: int, code: str) -> dict[str, 
 
 
 def upload_required_bytes(content_length: int) -> int:
-    return max(0, int(content_length)) + DISK_RESERVE_BYTES
+    return int(upload_capacity_plan(content_length)["required_free_bytes"])
+
+
+def upload_capacity_plan(content_length: int) -> dict[str, int]:
+    """Model parser spool and pipeline ZIP coexistence during multipart copy."""
+
+    length = max(0, int(content_length))
+    return {
+        "compressed_http_body_bytes": length,
+        "estimated_multipart_parser_spool_bytes": length,
+        "estimated_pipeline_owned_zip_bytes": length,
+        "cleanup_reserve_bytes": DISK_CLEANUP_RESERVE_BYTES,
+        "filesystem_emergency_reserve_bytes": DISK_RESERVE_BYTES,
+        "required_free_bytes": (
+            length * 2 + DISK_CLEANUP_RESERVE_BYTES + DISK_RESERVE_BYTES
+        ),
+    }
 
 
 def import_required_bytes(selected_json_bytes: int) -> int:
-    # Canonical tables, indexes, rollback journal/WAL and temporary pages can
-    # coexist. This is capacity planning, not a guarantee; runtime ENOSPC is
-    # still handled independently.
-    return max(512 * 1024 * 1024, max(0, int(selected_json_bytes)) * 5) + DISK_RESERVE_BYTES
+    return int(import_capacity_plan(selected_json_bytes)["required_free_bytes"])
 
 
 def web_index_required_bytes(database_bytes: int) -> int:
-    # Old live objects, private staging, FTS shadow objects and WAL may coexist
-    # until atomic publication.
-    return max(512 * 1024 * 1024, max(0, int(database_bytes)) * 2) + DISK_RESERVE_BYTES
+    return int(web_index_capacity_plan(database_bytes)["required_free_bytes"])
+
+
+def import_capacity_plan(
+    selected_json_bytes: int,
+    *,
+    compressed_source_bytes: int = 0,
+    pipeline_owned_zip_bytes: int = 0,
+    multipart_parser_spool_bytes: int = 0,
+    existing_database_bytes: int = 0,
+) -> dict[str, int]:
+    """Return an explicit conservative free-space model for canonical import.
+
+    The selected JSON is already present in the source/spooled ZIP when this
+    check runs, so existing source bytes are reported by higher layers but are
+    not double-counted as newly required free space.
+    """
+
+    selected = max(0, int(selected_json_bytes))
+    canonical_growth = max(256 * 1024 * 1024, selected * 3)
+    wal_or_journal = canonical_growth
+    core_fts_rebuild = max(128 * 1024 * 1024, selected)
+    sqlite_temp = max(128 * 1024 * 1024, selected // 2)
+    required = (
+        canonical_growth
+        + wal_or_journal
+        + core_fts_rebuild
+        + sqlite_temp
+        + DISK_CLEANUP_RESERVE_BYTES
+        + DISK_RESERVE_BYTES
+    )
+    return {
+        "existing_compressed_source_bytes": max(0, int(compressed_source_bytes)),
+        "existing_multipart_parser_spool_bytes": max(
+            0, int(multipart_parser_spool_bytes)
+        ),
+        "existing_pipeline_owned_zip_bytes": max(
+            0, int(pipeline_owned_zip_bytes)
+        ),
+        "existing_canonical_database_bytes": max(
+            0, int(existing_database_bytes)
+        ),
+        "selected_logical_json_bytes": selected,
+        "estimated_canonical_db_growth_bytes": canonical_growth,
+        "estimated_wal_or_journal_bytes": wal_or_journal,
+        "estimated_core_fts_rebuild_bytes": core_fts_rebuild,
+        "estimated_sqlite_temp_bytes": sqlite_temp,
+        "cleanup_reserve_bytes": DISK_CLEANUP_RESERVE_BYTES,
+        "filesystem_emergency_reserve_bytes": DISK_RESERVE_BYTES,
+        "required_free_bytes": required,
+    }
+
+
+def web_index_capacity_plan(database_bytes: int) -> dict[str, int]:
+    """Model old live, private staging, publish WAL and TEMP coexistence."""
+
+    database = max(0, int(database_bytes))
+    staging = max(256 * 1024 * 1024, database)
+    publish_wal = max(128 * 1024 * 1024, database)
+    sqlite_temp = max(128 * 1024 * 1024, database // 2)
+    required = (
+        staging
+        + publish_wal
+        + sqlite_temp
+        + DISK_CLEANUP_RESERVE_BYTES
+        + DISK_RESERVE_BYTES
+    )
+    return {
+        "existing_optional_live_within_database_bytes": database,
+        "estimated_optional_staging_bytes": staging,
+        "estimated_publish_wal_or_journal_bytes": publish_wal,
+        "estimated_sqlite_temp_bytes": sqlite_temp,
+        "cleanup_reserve_bytes": DISK_CLEANUP_RESERVE_BYTES,
+        "filesystem_emergency_reserve_bytes": DISK_RESERVE_BYTES,
+        "required_free_bytes": required,
+    }
 
 
 def migration_required_bytes(database_bytes: int, row_count: int = 0) -> int:

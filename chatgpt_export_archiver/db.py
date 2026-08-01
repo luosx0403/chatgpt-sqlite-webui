@@ -159,6 +159,37 @@ GENERATION_TABLE_DDL = """CREATE TABLE IF NOT EXISTS archive_generations (
 )"""
 
 GENERATION_TRIGGER_DDL = {
+    "archive_query_generation_conversation_insert": """CREATE TRIGGER IF NOT EXISTS archive_query_generation_conversation_insert
+        AFTER INSERT ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'query';
+        END""",
+    "archive_query_generation_conversation_update": """CREATE TRIGGER IF NOT EXISTS archive_query_generation_conversation_update
+        AFTER UPDATE OF source_file, create_time, update_time ON conversations
+        WHEN OLD.source_file IS NOT NEW.source_file
+          OR OLD.create_time IS NOT NEW.create_time
+          OR OLD.update_time IS NOT NEW.update_time
+        BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'query';
+        END""",
+    "archive_query_generation_conversation_delete": """CREATE TRIGGER IF NOT EXISTS archive_query_generation_conversation_delete
+        AFTER DELETE ON conversations BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'query';
+        END""",
+    "archive_query_generation_node_insert": """CREATE TRIGGER IF NOT EXISTS archive_query_generation_node_insert
+        AFTER INSERT ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'query';
+        END""",
+    "archive_query_generation_node_update": """CREATE TRIGGER IF NOT EXISTS archive_query_generation_node_update
+        AFTER UPDATE OF create_time, update_time ON conversation_nodes
+        WHEN OLD.create_time IS NOT NEW.create_time
+          OR OLD.update_time IS NOT NEW.update_time
+        BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'query';
+        END""",
+    "archive_query_generation_node_delete": """CREATE TRIGGER IF NOT EXISTS archive_query_generation_node_delete
+        AFTER DELETE ON conversation_nodes BEGIN
+            UPDATE archive_generations SET generation = generation + 1 WHERE name = 'query';
+        END""",
     "archive_title_generation_insert": """CREATE TRIGGER IF NOT EXISTS archive_title_generation_insert
         AFTER INSERT ON conversations BEGIN
             UPDATE archive_generations SET generation = generation + 1 WHERE name = 'title';
@@ -389,6 +420,34 @@ REQUIRED_INDEX_CONTRACT = {
 }
 
 GENERATION_TRIGGER_CONTRACT = {
+    "archive_query_generation_conversation_insert": (
+        "conversations", "AFTER", "INSERT", (), None, "query"
+    ),
+    "archive_query_generation_conversation_update": (
+        "conversations",
+        "AFTER",
+        "UPDATE",
+        ("source_file", "create_time", "update_time"),
+        "old.source_file is not new.source_file or old.create_time is not new.create_time or old.update_time is not new.update_time",
+        "query",
+    ),
+    "archive_query_generation_conversation_delete": (
+        "conversations", "AFTER", "DELETE", (), None, "query"
+    ),
+    "archive_query_generation_node_insert": (
+        "conversation_nodes", "AFTER", "INSERT", (), None, "query"
+    ),
+    "archive_query_generation_node_update": (
+        "conversation_nodes",
+        "AFTER",
+        "UPDATE",
+        ("create_time", "update_time"),
+        "old.create_time is not new.create_time or old.update_time is not new.update_time",
+        "query",
+    ),
+    "archive_query_generation_node_delete": (
+        "conversation_nodes", "AFTER", "DELETE", (), None, "query"
+    ),
     "archive_title_generation_insert": ("conversations", "AFTER", "INSERT", (), None, "title"),
     "archive_title_generation_update": (
         "conversations", "AFTER", "UPDATE", ("conversation_id", "title"), None, "title"
@@ -421,19 +480,24 @@ GENERATION_TRIGGER_CONTRACT = {
     "archive_graph_generation_node_update": ("conversation_nodes", "AFTER", "UPDATE", ("conversation_id", "node_id", "parent_node_id", "children_json", "is_on_current_path"), None, "graph"),
     "archive_graph_generation_node_delete": ("conversation_nodes", "AFTER", "DELETE", (), None, "graph"),
     "archive_display_revision_node_insert": (
-        "conversation_nodes", "AFTER", "INSERT", (), "present", "display"
+        "conversation_nodes",
+        "AFTER",
+        "INSERT",
+        (),
+        "length(new.display_revision) != 32 or new.display_revision glob '*[^0-9a-f]*'",
+        "display",
     ),
     "archive_display_revision_node_update": (
         "conversation_nodes",
         "AFTER",
         "UPDATE",
         ("content_type", "content_text", "content_hash", "raw_message_json"),
-        "present",
+        "old.content_type is not new.content_type or old.content_text is not new.content_text or old.content_hash is not new.content_hash or old.raw_message_json is not new.raw_message_json",
         "display",
     ),
 }
 
-REQUIRED_GENERATION_ROWS = ("title", "message", "address", "graph")
+REQUIRED_GENERATION_ROWS = ("title", "message", "address", "graph", "query")
 
 
 def begin_bulk_generation_aggregation(conn: sqlite3.Connection) -> None:
@@ -503,14 +567,19 @@ class ReadRequestCapabilities:
     database_identity: tuple[str, int, int] | tuple[str]
     user_version: int
     schema_version: int
-    generation_snapshot: tuple[int, int, int, int]
+    generation_snapshot: tuple[int, int, int, int, int]
     schema_status: dict[str, Any]
     fts5_available: bool
     trigram_available: bool
 
 
 _READ_CAPABILITY_CACHE: dict[
-    tuple[tuple[str, int, int] | tuple[str], int, int, tuple[int, int, int, int]],
+    tuple[
+        tuple[str, int, int] | tuple[str],
+        int,
+        int,
+        tuple[int, int, int, int, int],
+    ],
     tuple[dict[str, Any], bool, bool],
 ] = {}
 _READ_CAPABILITY_CACHE_LOCK = threading.Lock()
@@ -540,7 +609,7 @@ def read_request_capabilities(conn: sqlite3.Connection) -> ReadRequestCapabiliti
             str(row[0]): int(row[1])
             for row in conn.execute(
                 "SELECT name, generation FROM archive_generations "
-                "WHERE name IN ('message', 'title', 'address', 'graph')"
+                "WHERE name IN ('message', 'title', 'address', 'graph', 'query')"
             )
         }
     except sqlite3.Error:
@@ -550,6 +619,7 @@ def read_request_capabilities(conn: sqlite3.Connection) -> ReadRequestCapabiliti
         generations.get("title", -1),
         generations.get("address", -1),
         generations.get("graph", -1),
+        generations.get("query", -1),
     )
     # data_version is connection-relative and cannot identify commits across
     # fresh request connections. Durable generation rows and schema_version do.
@@ -953,6 +1023,7 @@ MIGRATIONS = {
     2: "rebuild_nullable_identity_v3",
     3: "add_durable_revision_domains_v4",
     4: "add_row_local_display_revision_v5",
+    5: "add_query_visible_generation_v6",
 }
 _SUPPORTED_SCHEMA_PREDECESSORS = frozenset(MIGRATIONS)
 
@@ -1317,6 +1388,7 @@ def migrate_database(
             detail={"error_type": type(exc).__name__},
         ) from exc
     migration_capacity: dict[str, int] | None = None
+    outer_migration_capacity: dict[str, int] | None = None
     migration_node_count = 0
     if 0 < preflight_version < DATABASE_SCHEMA_VERSION:
         database_row = conn.execute("PRAGMA database_list").fetchone()
@@ -1336,7 +1408,7 @@ def migrate_database(
                     migration_node_count = 0
             required = migration_required_bytes(database_bytes, migration_node_count)
             try:
-                migration_capacity = require_free_space(
+                outer_migration_capacity = require_free_space(
                     database_path,
                     required,
                     "migration_disk_space_insufficient",
@@ -1411,17 +1483,96 @@ def migrate_database(
             )
         if has_objects and conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise DatabaseMigrationError("database_foreign_key_violation")
+        # The outer estimate is only an early rejection. A writer may commit
+        # between it and BEGIN IMMEDIATE, so every authoritative size/count
+        # used by a migration is recomputed from the locked snapshot before
+        # the first schema or canonical-data mutation.
+        if has_objects and current_version < DATABASE_SCHEMA_VERSION:
+            database_row = conn.execute("PRAGMA database_list").fetchone()
+            database_name = (
+                str(database_row[2]) if database_row and database_row[2] else ""
+            )
+            migration_node_count = (
+                int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM conversation_nodes"
+                    ).fetchone()[0]
+                )
+                if current_version < 5
+                else 0
+            )
+            if database_name:
+                database_path = Path(database_name)
+                page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+                page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+                database_bytes = page_count * page_size
+                for suffix in ("-wal", "-journal"):
+                    sidecar = Path(str(database_path) + suffix)
+                    try:
+                        database_bytes += sidecar.stat().st_size
+                    except OSError:
+                        pass
+                required = migration_required_bytes(
+                    database_bytes, migration_node_count
+                )
+                try:
+                    migration_capacity = require_free_space(
+                        database_path,
+                        required,
+                        "migration_disk_space_insufficient",
+                    )
+                except DiskSpaceInsufficientError as exc:
+                    raise DatabaseMigrationError(
+                        exc.code,
+                        detail={
+                            "required_bytes": exc.required_bytes,
+                            "free_bytes": exc.free_bytes,
+                            "estimated_peak_bytes": required,
+                        },
+                    ) from exc
+                migration_capacity.update(
+                    {
+                        "locked_page_count": page_count,
+                        "locked_page_size": page_size,
+                        "locked_node_count": migration_node_count,
+                    }
+                )
+            if progress_callback:
+                progress_callback(
+                    "locked_preflight",
+                    {"processed": 0, "total": migration_node_count},
+                )
         if locked_status is not None and locked_status["schema_compatible"] and not locked_status["migration_required"]:
             compatibility_refreshed = False
-            if refresh_compatibility:
+            compatibility_changed = False
+            compatibility_before = legacy_compatibility_state(conn)
+            if refresh_compatibility and compatibility_before["state"] == "dirty":
+                rows_before = [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT domain, checked_generation, status, incompatible_count "
+                        "FROM archive_compatibility_state ORDER BY domain"
+                    )
+                ]
                 refresh_legacy_compatibility_state(conn)
                 compatibility_refreshed = True
+                rows_after = [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT domain, checked_generation, status, incompatible_count "
+                        "FROM archive_compatibility_state ORDER BY domain"
+                    )
+                ]
+                compatibility_changed = rows_before != rows_after
             conn.commit()
             invalidate_read_capability_cache()
             return {
-                "changed": compatibility_refreshed,
+                "changed": compatibility_changed,
+                "migration_changed": compatibility_changed,
+                "schema_changed": False,
                 "initialized": False,
                 "compatibility_refreshed": compatibility_refreshed,
+                "compatibility_changed": compatibility_changed,
                 **locked_status,
             }
 
@@ -1554,9 +1705,19 @@ def migrate_database(
     finally:
         if foreign_keys_before and not conn.in_transaction:
             conn.execute("PRAGMA foreign_keys = ON")
-    result = {"changed": True, "initialized": initialized, **after}
+    result = {
+        "changed": True,
+        "migration_changed": True,
+        "schema_changed": True,
+        "initialized": initialized,
+        "compatibility_refreshed": True,
+        "compatibility_changed": True,
+        **after,
+    }
     if migration_capacity is not None:
         result["migration_disk_preflight"] = migration_capacity
+    if outer_migration_capacity is not None:
+        result["migration_outer_disk_preflight"] = outer_migration_capacity
     return result
 
 
@@ -2265,6 +2426,12 @@ def upsert_conversations_batch(
             if existing["title"] != conv.title:
                 dirty_domains.add("title")
             if (
+                existing["source_file"] != conv.source_file
+                or existing["create_time"] != conv.create_time
+                or existing["update_time"] != conv.update_time
+            ):
+                dirty_domains.add("query")
+            if (
                 existing["exported_id"] != conv.exported_id
                 or existing["current_node"] != conv.current_node
             ):
@@ -2405,6 +2572,7 @@ _NODE_MESSAGE_FIELDS = {
 }
 _NODE_ADDRESS_FIELDS = {"parent_node_id", "children_json", "message_id"}
 _NODE_GRAPH_FIELDS = {"parent_node_id", "children_json", "is_on_current_path"}
+_NODE_QUERY_FIELDS = {"create_time", "update_time"}
 _NODE_DISPLAY_FIELDS = {
     "content_type", "content_text", "content_hash", "raw_message_json"
 }
@@ -2454,7 +2622,7 @@ def _synchronize_updated_conversation_nodes(
         removed = sorted(set(existing) - set(incoming))
         added = sorted(set(incoming) - set(existing))
         if removed or added:
-            dirty_domains.update(("message", "address", "graph"))
+            dirty_domains.update(("message", "address", "graph", "query"))
             message_dirty_conversations.add(conversation.conversation_id)
         for node_id in removed:
             conn.execute(
@@ -2479,6 +2647,8 @@ def _synchronize_updated_conversation_nodes(
                 dirty_domains.add("address")
             if changed_fields & _NODE_GRAPH_FIELDS:
                 dirty_domains.add("graph")
+            if changed_fields & _NODE_QUERY_FIELDS:
+                dirty_domains.add("query")
             revision = (
                 secrets.token_hex(16)
                 if changed_fields & _NODE_DISPLAY_FIELDS
@@ -2823,7 +2993,7 @@ _TRIGGER_HEADER_RE = re.compile(
     r"(BEFORE|AFTER|INSTEAD\s+OF)\s+"
     r"(INSERT|DELETE|UPDATE)(?:\s+OF\s+(.+?))?\s+ON\s+"
     r"([`\"\[]?[^\s`\"\]]+[`\"\]]?)\s*"
-    r"(?:(WHEN)\s+.+?\s+)?BEGIN\s+(.+)\s+END\s*$",
+    r"(?:(WHEN)\s+(.+?)\s+)?BEGIN\s+(.+)\s+END\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -2841,7 +3011,7 @@ def _trigger_definition(sql: str | None) -> dict[str, Any] | None:
     match = _TRIGGER_HEADER_RE.match(sql)
     if match is None:
         return None
-    timing, event, update_of, table, when_token, body = match.groups()
+    timing, event, update_of, table, when_token, when_expression, body = match.groups()
     columns = ()
     if update_of:
         columns = tuple(_unquote_identifier(value) for value in update_of.split(","))
@@ -2873,7 +3043,11 @@ def _trigger_definition(sql: str | None) -> dict[str, Any] | None:
         "timing": re.sub(r"\s+", " ", timing.upper()),
         "event": event.upper(),
         "update_of": columns,
-        "when": None if when_token is None else "present",
+        "when": (
+            None
+            if when_token is None
+            else re.sub(r"\s+", " ", str(when_expression).strip()).casefold()
+        ),
         "generation_name": body_match.group(1) if body_match else (
             "display" if legacy_display_match or row_display_match else None
         ),
@@ -3088,7 +3262,7 @@ def database_schema_status(conn: sqlite3.Connection) -> dict[str, Any]:
         try:
             for row in conn.execute(
                 "SELECT name, generation, typeof(generation) FROM archive_generations "
-                "WHERE name IN ('title', 'message', 'address', 'graph')"
+                "WHERE name IN ('title', 'message', 'address', 'graph', 'query')"
             ):
                 name = str(row[0])
                 generation_rows.add(name)

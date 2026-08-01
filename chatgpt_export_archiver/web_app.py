@@ -4,6 +4,7 @@ import ipaddress
 import json
 import re
 import sqlite3
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -20,6 +21,7 @@ from .current_path import EffectiveCurrentResourceLimitError
 from .exporter import ExportResourceLimitError
 from .json_safety import JsonSafetyLimitError, sanitize_json_value
 from .schema_contract import API_SCHEMA_VERSION, OPTIONAL_WEB_INDEX_FORMAT_VERSION
+from .web_db import WebIndexBuildError
 
 
 class _UploadBodyTooLarge(Exception):
@@ -98,7 +100,11 @@ def _host_name(value: str) -> str | None:
 
 
 def _normalized_authority(value: str, scheme: str) -> str | None:
-    if not value or value != value.strip() or any(ord(char) < 32 for char in value):
+    if (
+        not value
+        or value != value.strip()
+        or any(unicodedata.category(char) == "Cc" for char in value)
+    ):
         return None
     try:
         parsed = urlsplit("//" + value)
@@ -281,43 +287,6 @@ class UploadIngressMiddleware:
             result.setdefault(key.decode("latin-1").lower(), []).append(value.decode("latin-1"))
         return result
 
-    def _origin_allowed(self, headers: dict[str, list[str]], scope) -> tuple[bool, str | None]:
-        sec_fetch_site = headers.get("sec-fetch-site", [])
-        if sec_fetch_site and sec_fetch_site[0].casefold() == "cross-site":
-            return False, "upload_origin_not_allowed"
-        origin_values = headers.get("origin", [])
-        if not origin_values:
-            if self.trust_policy.allow_missing_origin_for_writes:
-                return True, None
-            return False, "upload_origin_required"
-        origin = origin_values[0]
-        if (
-            origin != origin.strip()
-            or not origin
-            or "," in origin
-            or any(ord(char) < 32 or ord(char) == 127 for char in origin)
-        ):
-            return False, "upload_origin_not_allowed"
-        try:
-            parsed = urlsplit(origin)
-        except ValueError:
-            return False, "upload_origin_not_allowed"
-        if parsed.path or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None:
-            return False, "upload_origin_not_allowed"
-        try:
-            origin_hostname = parsed.hostname.casefold() if parsed.hostname else ""
-        except ValueError:
-            return False, "upload_origin_not_allowed"
-        origin_authority = _normalized_authority(parsed.netloc, parsed.scheme)
-        state = scope.get("state", {})
-        allowed = (
-            parsed.scheme in {"http", "https"}
-            and origin_hostname in self.trust_policy.allowed_hosts
-            and origin_authority == state.get("trusted_host", "")
-            and parsed.scheme == state.get("trusted_scheme", scope.get("scheme", "http"))
-        )
-        return allowed, None if allowed else "upload_origin_not_allowed"
-
     @staticmethod
     async def _error(send, status: int, code: str) -> None:
         body = json.dumps({"detail": code, "code": code}, separators=(",", ":")).encode("utf-8")
@@ -335,18 +304,8 @@ class UploadIngressMiddleware:
             await self.app(scope, receive, send)
             return
         headers = self._headers(scope)
-        duplicate_codes = {
-            "origin": "upload_duplicate_origin_header",
-            "content-length": "upload_duplicate_content_length",
-            "sec-fetch-site": "upload_duplicate_sec_fetch_site",
-        }
-        for name, code in duplicate_codes.items():
-            if len(headers.get(name, [])) > 1:
-                await self._error(send, 400, code)
-                return
-        origin_allowed, origin_error = self._origin_allowed(headers, scope)
-        if not origin_allowed:
-            await self._error(send, 403, origin_error or "upload_origin_not_allowed")
+        if len(headers.get("content-length", [])) > 1:
+            await self._error(send, 400, "upload_duplicate_content_length")
             return
         length_values = headers.get("content-length", [])
         raw_length = length_values[0] if length_values else None
@@ -361,7 +320,13 @@ class UploadIngressMiddleware:
             if content_length > self.body_limit:
                 await self._error(send, 413, "upload_multipart_body_too_large")
                 return
-        if not self.manager.acquire_pending_upload_slot():
+        try:
+            admitted = self.manager.acquire_pending_upload_slot()
+        except WebIndexBuildError as exc:
+            status = 501 if exc.code == "writer_process_lock_unsupported" else 409
+            await self._error(send, status, exc.code)
+            return
+        if not admitted:
             await self._error(send, 409, "import_job_active")
             return
         state = scope.setdefault("state", {})
@@ -393,6 +358,97 @@ class UploadIngressMiddleware:
         finally:
             if not state.get("upload_slot_transferred"):
                 self.manager.release_pending_upload_slot()
+
+
+class WriteAccessMiddleware:
+    """Apply one fail-closed Origin/Fetch-Metadata contract to every unsafe method."""
+
+    SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+
+    def __init__(self, app, *, policy: WebTrustPolicy) -> None:
+        self.app = app
+        self.policy = policy
+
+    @staticmethod
+    def _headers(scope) -> dict[str, list[str]]:
+        return TrustedAccessMiddleware._headers(scope)
+
+    @staticmethod
+    def _code(scope, generic: str) -> str:
+        prefix = "upload" if scope.get("path") == "/api/import/upload" else "write"
+        return f"{prefix}_{generic}"
+
+    def _origin_allowed(
+        self, headers: dict[str, list[str]], scope
+    ) -> tuple[bool, str | None]:
+        sec_fetch_site = headers.get("sec-fetch-site", [])
+        if sec_fetch_site:
+            raw_fetch_site = sec_fetch_site[0]
+            normalized_fetch_site = raw_fetch_site.casefold()
+            if (
+                raw_fetch_site != raw_fetch_site.strip()
+                or normalized_fetch_site
+                not in {"same-origin", "same-site", "none", "cross-site"}
+                or normalized_fetch_site == "cross-site"
+            ):
+                return False, self._code(scope, "origin_not_allowed")
+        origin_values = headers.get("origin", [])
+        if not origin_values:
+            if self.policy.allow_missing_origin_for_writes:
+                return True, None
+            return False, self._code(scope, "origin_required")
+        origin = origin_values[0]
+        if (
+            origin != origin.strip()
+            or not origin
+            or "," in origin
+            or any(unicodedata.category(char) == "Cc" for char in origin)
+        ):
+            return False, self._code(scope, "origin_not_allowed")
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            return False, self._code(scope, "origin_not_allowed")
+        if parsed.path or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None:
+            return False, self._code(scope, "origin_not_allowed")
+        try:
+            origin_hostname = parsed.hostname.casefold() if parsed.hostname else ""
+        except ValueError:
+            return False, self._code(scope, "origin_not_allowed")
+        origin_authority = _normalized_authority(parsed.netloc, parsed.scheme)
+        state = scope.get("state", {})
+        allowed = (
+            parsed.scheme in {"http", "https"}
+            and origin_hostname in self.policy.allowed_hosts
+            and origin_authority == state.get("trusted_host", "")
+            and parsed.scheme == state.get("trusted_scheme", scope.get("scheme", "http"))
+        )
+        return allowed, None if allowed else self._code(scope, "origin_not_allowed")
+
+    async def __call__(self, scope, receive, send) -> None:
+        if (
+            scope.get("type") != "http"
+            or str(scope.get("method", "GET")).upper() in self.SAFE_METHODS
+        ):
+            await self.app(scope, receive, send)
+            return
+        headers = self._headers(scope)
+        duplicate_codes = {"origin": "duplicate_origin_header", "sec-fetch-site": "duplicate_sec_fetch_site"}
+        for name, code in duplicate_codes.items():
+            if len(headers.get(name, [])) > 1:
+                await UploadIngressMiddleware._error(
+                    send, 400, self._code(scope, code)
+                )
+                return
+        origin_allowed, origin_error = self._origin_allowed(headers, scope)
+        if not origin_allowed:
+            await UploadIngressMiddleware._error(
+                send,
+                403,
+                origin_error or self._code(scope, "origin_not_allowed"),
+            )
+            return
+        await self.app(scope, receive, send)
 
 
 def create_app(
@@ -481,7 +537,11 @@ def create_app(
     def safe_openapi():
         if app.openapi_schema is not None:
             return app.openapi_schema
-        schema = get_openapi(title=app.title, version="1", routes=app.routes)
+        schema = get_openapi(
+            title=app.title,
+            version=str(API_SCHEMA_VERSION),
+            routes=app.routes,
+        )
         invalid_request_schema = {
             "type": "object",
             "properties": {
@@ -592,6 +652,18 @@ def create_app(
             "api_schema_version": API_SCHEMA_VERSION,
             "optional_web_index_format_version": OPTIONAL_WEB_INDEX_FORMAT_VERSION,
             "search_continuation_scope": "server-instance",
+            "durable_generations": [
+                "message", "title", "graph", "address", "query"
+            ],
+            "unsafe_method_origin_policy": (
+                "all unsafe methods are default-deny after trusted Host/proxy "
+                "normalization; remote writes require one valid same-origin Origin"
+            ),
+            "writer_process_lock": {
+                "registry_max_files": 64,
+                "windows": "writer_process_lock_unsupported",
+                "upload_admission_before_spool": True,
+            },
             "search_truth_fields": list(search_truth_properties),
             "import_outcome_fields": [
                 "completion_outcome", "canonical_import_outcome",
@@ -629,9 +701,15 @@ def create_app(
                         "canonical_commit_succeeded": True,
                     }
         for path_item in schema.get("paths", {}).values():
-            for operation in path_item.values():
+            for method, operation in path_item.items():
                 if not isinstance(operation, dict):
                     continue
+                if str(method).upper() not in WriteAccessMiddleware.SAFE_METHODS:
+                    operation["x-write-origin-policy"] = {
+                        "remote_same_origin_required": True,
+                        "trusted_loopback_missing_origin_compatible": True,
+                        "single_value_headers": ["Origin", "Sec-Fetch-Site"],
+                    }
                 response = operation.get("responses", {}).get("422")
                 if response is not None:
                     response["content"] = {"application/json": {"schema": invalid_request_schema}}
@@ -647,6 +725,7 @@ def create_app(
         body_limit=upload_body_limit(upload_policy),
         trust_policy=trust_policy,
     )
+    app.add_middleware(WriteAccessMiddleware, policy=trust_policy)
     app.add_middleware(TrustedAccessMiddleware, policy=trust_policy)
 
     build_dir = static_dir or Path(__file__).resolve().parent.parent / "webui" / "dist"

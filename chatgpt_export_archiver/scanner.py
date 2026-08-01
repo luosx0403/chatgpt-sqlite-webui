@@ -33,7 +33,33 @@ MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES = 384 * 1024 * 1024
 # mapping entries, array items, nesting, decoded heap, bytes, and characters.
 MAX_CONVERSATION_JSON_SCALARS = MAX_JSON_STRING_PRIMITIVE_TOKENS
 _JSON_OUTSIDE_SPECIAL_RE = re.compile(
-    r'"(?:\\[\s\S]|[^"\\])*"|["\[\]{}\ufeff]'
+    # Possessive repetition is essential here: a near-limit string without a
+    # closing quote must not retain one backtracking state per character.
+    r'"(?:\\[\s\S]|[^"\\])*+"|["\[\]{}\ufeff]'
+)
+_JSON_FAST_STRING_PATTERN = r'"(?:\\[\s\S]|[^"\\])*+"'
+_JSON_FAST_ATOM_PATTERN = rf"(?:{_JSON_FAST_STRING_PATTERN}|[^\"\[\]{{}}\ufeff]++)"
+_JSON_FAST_FLAT_CONTAINER_PATTERN = (
+    rf"(?:\{{(?:{_JSON_FAST_ATOM_PATTERN})*+\}}"
+    rf"|\[(?:{_JSON_FAST_ATOM_PATTERN})*+\])"
+)
+_JSON_FAST_ONE_LEVEL_CONTAINER_PATTERN = (
+    rf"(?:\{{(?:(?:{_JSON_FAST_ATOM_PATTERN})|"
+    rf"(?:{_JSON_FAST_FLAT_CONTAINER_PATTERN}))*+\}}"
+    rf"|\[(?:(?:{_JSON_FAST_ATOM_PATTERN})|"
+    rf"(?:{_JSON_FAST_FLAT_CONTAINER_PATTERN}))*+\])"
+)
+_JSON_NEXT_STRUCTURAL_RE = re.compile(
+    # Entire flat child containers are balanced and can be skipped in C.
+    # Everything else advances to the next structural character. A bare
+    # quote is returned only when its string is incomplete in this window.
+    rf"(?:(?:{_JSON_FAST_ATOM_PATTERN})|(?:{_JSON_FAST_FLAT_CONTAINER_PATTERN}))*+"
+    rf"([\"\[\]{{}}\ufeff])"
+)
+_JSON_NEXT_STRUCTURAL_LEVEL1_RE = re.compile(
+    rf"(?:(?:{_JSON_FAST_ATOM_PATTERN})|"
+    rf"(?:{_JSON_FAST_ONE_LEVEL_CONTAINER_PATTERN}))*+"
+    rf"([\"\[\]{{}}\ufeff])"
 )
 _JSON_STRING_SPECIAL_RE = re.compile(r'["\\]')
 _JSON_SCALAR_END_RE = re.compile(r'[,\]]')
@@ -44,6 +70,16 @@ _JSON_NON_STRING_SCALAR_RE = re.compile(r'[^\s,\]:{}\[\]"]+')
 MAX_JSON_ELEMENT_BYTES = 32 * 1024 * 1024
 MAX_JSON_ELEMENT_CHARS = 32 * 1024 * 1024
 JSON_RAW_DECODE_WINDOW_CHARS = 4 * 1024 * 1024
+# The tiny common-case probe avoids Python token callbacks for ordinary compact
+# elements.  A failed probe is followed by one extended boundary/depth proof;
+# it is never retried for every source chunk.
+JSON_HYBRID_FAST_PROBE_CHARS = 256
+JSON_HYBRID_MEDIUM_PROBE_CHARS = 256 * 1024
+JSON_HYBRID_EXTENDED_PROBE_CHARS = MAX_JSON_ELEMENT_CHARS
+# Source decoding remains in 64 KiB byte chunks.  Coalescing already-decoded
+# text into a bounded window lets ordinary cross-chunk elements use the safe C
+# decoder path without changing source reads or buffering an entire shard.
+JSON_HYBRID_COALESCE_CHARS = 32 * 1024 * 1024
 MAX_SOURCE_TOTAL_MEMBERS = 100_000
 MAX_SOURCE_DIRECTORY_DEPTH = 256
 MAX_SOURCE_RELATIVE_PATH_BYTES = 32 * 1024
@@ -539,146 +575,17 @@ def delete_input_if_unchanged(
     *,
     expected_source_sha256: str | None = None,
 ) -> bool:
-    """Atomically stage, revalidate, and delete only the captured entry.
+    """Fail closed before any journal, rename, staging, or unlink operation.
 
-    The rename closes the check-to-unlink window: a replacement racing before
-    the rename is moved aside, detected, and restored rather than unlinked.
-    ``False`` means continuity could not be proven and nothing was deleted.
+    The historical recovery reader remains available for journals produced by
+    older supported releases, but ordinary production code has no capability
+    that can activate irreversible deletion.  In particular, monkeypatching
+    :func:`delete_input_secure_identity_supported` cannot resurrect the retired
+    implementation.
     """
 
-    if not delete_input_secure_identity_supported():
-        raise DeleteInputRecoveryRequired("delete_input_secure_identity_unsupported")
-    path = input_source.delete_target
-    expected_entry = input_source.delete_entry_identity
-    expected_target = input_source.delete_target_identity
-    expected_parent = input_source.delete_parent_identity
-    if path is None or expected_entry is None or expected_target is None or expected_parent is None:
-        return False
-    if expected_entry.nlink != 1 or expected_target.nlink != 1:
-        return False
-    if not delete_input_identity_is_current(input_source):
-        return False
-    if expected_source_sha256 is None:
-        try:
-            source_digest = sha256_input_source(input_source)
-        except SourceChangedDuringReadError:
-            return False
-    else:
-        if (
-            len(expected_source_sha256) != 64
-            or any(ch not in "0123456789abcdef" for ch in expected_source_sha256)
-        ):
-            raise ValueError("delete_input_source_sha256_invalid")
-        source_digest = expected_source_sha256
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    parent_fd = os.open(path.parent, directory_flags)
-    recovery_token = secrets.token_hex(16)
-    staged_name = f".chatgpt-archive-delete-{recovery_token}"
-    journal_name = f"{DELETE_INPUT_RECOVERY_PREFIX}{recovery_token}.json"
-    staged = False
-    journal_written = False
-    record: dict[str, Any] | None = None
-
-    def write_state(state: str) -> None:
-        if record is None:
-            raise RuntimeError("delete recovery record not initialized")
-        record["state"] = state
-        _write_delete_recovery_record(parent_fd, journal_name, record)
-
-    def original_exists() -> bool:
-        try:
-            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-            return True
-        except FileNotFoundError:
-            return False
-
-    def restore_staged() -> None:
-        nonlocal staged
-        write_state("restore_pending")
-        os.link(
-            staged_name,
-            path.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        os.unlink(staged_name, dir_fd=parent_fd)
-        staged = False
-        os.fsync(parent_fd)
-        write_state("restored")
-    try:
-        if not _parent_matches_descriptor(parent_fd, expected_parent):
-            return False
-        if not delete_input_identity_is_current(input_source):
-            return False
-        record = {
-            "format_version": DELETE_INPUT_RECOVERY_FORMAT_VERSION,
-            "owner_token": recovery_token,
-            "state": "prepared",
-            "original_name": path.name,
-            "staged_name": staged_name,
-            "source_sha256": source_digest,
-            "entry_identity": _delete_identity_record(expected_entry),
-            "target_identity": _delete_identity_record(expected_target),
-            "parent_identity": _delete_identity_record(expected_parent),
-        }
-        _write_delete_recovery_record(parent_fd, journal_name, record)
-        journal_written = True
-        write_state("rename_pending")
-        os.rename(path.name, staged_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        staged = True
-        os.fsync(parent_fd)
-        write_state("staged")
-        try:
-            staged_digest = _sha256_verified_dir_entry(
-                parent_fd,
-                staged_name,
-                expected_entry=expected_entry,
-                expected_target=expected_target,
-            )
-        except (OSError, SourceChangedDuringReadError):
-            staged_digest = None
-        if staged_digest is None or not secrets.compare_digest(staged_digest, source_digest):
-            if original_exists():
-                raise DeleteInputRecoveryRequired(
-                    "delete_input_recovery_required",
-                    recovery_token=recovery_token,
-                )
-            restore_staged()
-            _remove_delete_recovery_record(parent_fd, journal_name)
-            journal_written = False
-            return False
-        write_state("delete_pending")
-        try:
-            os.unlink(staged_name, dir_fd=parent_fd)
-        except OSError:
-            # A failed unlink must not make the caller's input disappear under
-            # our private staging name.  Restore only when no racer has
-            # created a new entry at the original name; never overwrite a
-            # replacement merely to hide the cleanup failure.
-            if original_exists():
-                raise DeleteInputRecoveryRequired(
-                    "delete_input_recovery_required",
-                    recovery_token=recovery_token,
-                )
-            restore_staged()
-            _remove_delete_recovery_record(parent_fd, journal_name)
-            journal_written = False
-            raise
-        staged = False
-        os.fsync(parent_fd)
-        write_state("deleted")
-        _remove_delete_recovery_record(parent_fd, journal_name)
-        journal_written = False
-        return True
-    except NotImplementedError as exc:
-        raise DeleteInputRecoveryRequired(
-            "delete_input_secure_identity_unsupported"
-        ) from exc
-    finally:
-        # A durable record is intentionally retained for every interrupted or
-        # ambiguous transition.  Only an explicitly completed path removes it.
-        os.close(parent_fd)
+    del input_source, expected_source_sha256
+    raise DeleteInputRecoveryRequired("delete_input_secure_identity_unsupported")
 
 
 def recover_delete_input(directory: Path, owner_token: str) -> str:
@@ -1471,7 +1378,32 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
     escaped = False
     scalar_count = 0
     scalar_token = False
+    mapping_entries = 0
+    array_items = 0
+    container_stack: list[dict[str, Any]] = []
     saw_element = False
+
+    def check_predecode_limits(*, pending_bytes: int = 0) -> None:
+        if mapping_entries > MAX_JSON_MAPPING_ENTRIES:
+            raise JsonSafetyLimitError(
+                "json_mapping_entry_limit_exceeded", limit=MAX_JSON_MAPPING_ENTRIES
+            )
+        if array_items > MAX_JSON_ARRAY_ITEMS:
+            raise JsonSafetyLimitError(
+                "json_array_item_limit_exceeded", limit=MAX_JSON_ARRAY_ITEMS
+            )
+        estimated_heap = (
+            element_bytes
+            + pending_bytes
+            + scalar_count * 48
+            + mapping_entries * 72
+            + array_items * 16
+        )
+        if estimated_heap > MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES:
+            raise JsonSafetyLimitError(
+                "json_estimated_heap_limit_exceeded",
+                limit=MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES,
+            )
 
     def append_part(value: str) -> None:
         nonlocal element_chars, element_bytes
@@ -1484,14 +1416,13 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
             or element_bytes > MAX_JSON_ELEMENT_BYTES
         ):
             raise ConversationJsonElementTooLargeError("conversation_json_element_too_large")
+        check_predecode_limits()
         parts.append(value)
 
-    def finish_element() -> Any:
-        nonlocal parts, element_chars, element_bytes, scalar_count, scalar_token
-        value = decoder.decode("".join(parts))
+    def decorate_value(value: Any, *, decoded_chars: int, input_bytes: int) -> Any:
         measured_scalars, _depth, measured_mappings, measured_arrays = _measure_decoded_json(value)
         estimated_heap = (
-            element_bytes
+            input_bytes
             + measured_scalars * 48
             + measured_mappings * 72
             + measured_arrays * 16
@@ -1503,19 +1434,38 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
             )
         if isinstance(value, dict):
             measured = ConversationJsonObject(value)
-            measured.input_utf8_bytes = element_bytes
-            measured.decoded_chars = element_chars
+            measured.input_utf8_bytes = input_bytes
+            measured.decoded_chars = decoded_chars
             measured.json_scalar_count = measured_scalars
             measured.json_mapping_entries = measured_mappings
             measured.json_array_items = measured_arrays
             measured.estimated_decoded_heap_bytes = estimated_heap
             value = measured
+        return value
+
+    def finish_element() -> Any:
+        nonlocal parts, element_chars, element_bytes, scalar_count, scalar_token
+        nonlocal mapping_entries, array_items, container_stack
+        value = decorate_value(
+            decoder.decode("".join(parts)),
+            decoded_chars=element_chars,
+            input_bytes=element_bytes,
+        )
         parts = []
         element_chars = 0
         element_bytes = 0
         scalar_count = 0
         scalar_token = False
+        mapping_entries = 0
+        array_items = 0
+        container_stack = []
         return value
+
+    def mark_array_value() -> None:
+        nonlocal array_items
+        if container_stack and container_stack[-1]["kind"] == "array":
+            array_items += 1
+            check_predecode_limits()
 
     def finish_scalar_token() -> None:
         nonlocal scalar_count, scalar_token
@@ -1527,6 +1477,7 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
             raise JsonSafetyLimitError(
                 "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
             )
+        check_predecode_limits()
 
     def count_string_scalar() -> None:
         nonlocal scalar_count
@@ -1535,6 +1486,7 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
             raise JsonSafetyLimitError(
                 "json_scalar_limit_exceeded", limit=MAX_CONVERSATION_JSON_SCALARS
             )
+        check_predecode_limits()
 
     def scan_outside_segment(value: str) -> None:
         """Count non-string tokens while C regex skips punctuation runs.
@@ -1545,7 +1497,9 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
         returning only for the much rarer scalar token spans.
         """
 
-        nonlocal scalar_token
+        nonlocal scalar_token, mapping_entries
+        mapping_entries += value.count(":")
+        check_predecode_limits(pending_bytes=len(value.encode("utf-8")))
         position = 0
         for match in _JSON_NON_STRING_SCALAR_RE.finditer(value):
             if match.start() > position:
@@ -1553,12 +1507,129 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
             if not scalar_token:
                 # A token may continue from the preceding chunk; in that case
                 # scalar_token is already true and must be counted only once.
+                mark_array_value()
                 scalar_token = True
             position = match.end()
         if position < len(value):
             finish_scalar_token()
 
-    for chunk in chunks:
+    def probe_is_resource_safe(probe: str) -> bool:
+        """Conservatively clear a bounded C-decoder probe before allocation."""
+
+        # For a probe no longer than every independent count/depth ceiling,
+        # its worst possible UTF-8 width and per-character structural cost are
+        # already below the heap ceiling. This is a proof from lengths alone
+        # and removes four complete scans from the ordinary tiny-element path.
+        worst_utf8_bytes = len(probe) * 4
+        if (
+            len(probe) <= MAX_CONVERSATION_JSON_SCALARS
+            and len(probe) <= MAX_JSON_MAPPING_ENTRIES
+            and len(probe) <= MAX_JSON_ARRAY_ITEMS
+            and len(probe) <= MAX_JSON_NESTING_DEPTH
+            and worst_utf8_bytes + len(probe) * (48 + 72 + 16)
+            <= MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES
+        ):
+            return True
+        probe_bytes = len(probe.encode("utf-8"))
+        conservative_heap = probe_bytes + len(probe) * (48 + 72 + 16)
+        return (
+            len(probe) <= MAX_CONVERSATION_JSON_SCALARS
+            and len(probe) <= MAX_JSON_MAPPING_ENTRIES
+            and len(probe) <= MAX_JSON_ARRAY_ITEMS
+            and probe.count("[") + probe.count("{") <= MAX_JSON_NESTING_DEPTH
+            and conservative_heap <= MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES
+        )
+
+    def fast_element_proof(
+        data: str,
+        start: int,
+    ) -> tuple[int, int, int, int] | None:
+        """Return boundary plus conservative pre-decode resource upper bounds."""
+
+        limit = min(len(data), start + JSON_HYBRID_EXTENDED_PROBE_CHARS)
+        first = data[start]
+        if first == '"':
+            match = _JSON_OUTSIDE_SPECIAL_RE.match(data, start, limit)
+            if match is None or match.end() - match.start() <= 1:
+                return None
+            candidate = data[start : match.end()]
+            quote_upper = candidate.count('"')
+            mapping_upper = candidate.count(":")
+            array_upper = candidate.count(",")
+            return match.end(), quote_upper + mapping_upper + array_upper + 1, mapping_upper, array_upper
+        if first not in "[{":
+            match = _JSON_SCALAR_END_RE.search(data, start, limit)
+            return (match.start(), 1, 0, 0) if match is not None else None
+
+        # Consume the top-level opener explicitly. Allowing the balanced-child
+        # regex to swallow it would lose the element boundary and could walk
+        # across the surrounding array comma into the next element.
+        fast_depth = 1
+        position = start + 1
+        while position < limit:
+            structural_re = (
+                _JSON_NEXT_STRUCTURAL_LEVEL1_RE
+                if fast_depth <= MAX_JSON_NESTING_DEPTH - 2
+                else _JSON_NEXT_STRUCTURAL_RE
+            )
+            match = structural_re.match(data, position, limit)
+            if match is None:
+                return None
+            skipped_end = match.start(1)
+            if (
+                fast_depth >= MAX_JSON_NESTING_DEPTH
+                and (
+                    data.find("{", position, skipped_end) >= 0
+                    or data.find("[", position, skipped_end) >= 0
+                )
+            ):
+                raise JsonSafetyLimitError(
+                    "json_nesting_limit_exceeded",
+                    limit=MAX_JSON_NESTING_DEPTH,
+                )
+            char = match.group(1)
+            if char == '"':
+                # The bounded window ended inside a string.
+                return None
+            if char == "\ufeff":
+                raise InvalidConversationEncodingError("invalid_conversation_encoding")
+            if char in "[{":
+                fast_depth += 1
+                if fast_depth > MAX_JSON_NESTING_DEPTH:
+                    raise JsonSafetyLimitError(
+                        "json_nesting_limit_exceeded",
+                        limit=MAX_JSON_NESTING_DEPTH,
+                    )
+            else:
+                fast_depth -= 1
+                if fast_depth == 0:
+                    candidate_end = match.end()
+                    candidate = data[start:candidate_end]
+                    quote_upper = candidate.count('"')
+                    mapping_upper = candidate.count(":")
+                    comma_upper = candidate.count(",")
+                    container_upper = (
+                        candidate.count("[") + candidate.count("{")
+                    )
+                    scalar_upper = (
+                        quote_upper
+                        + mapping_upper
+                        + comma_upper
+                        + container_upper
+                        + 1
+                    )
+                    array_upper = comma_upper + container_upper
+                    return (
+                        candidate_end,
+                        scalar_upper,
+                        mapping_upper,
+                        array_upper,
+                    )
+            position = match.end()
+        return None
+
+    chunk_iterator = iter(chunks)
+    for chunk in chunk_iterator:
         i = 0
         while i < len(chunk):
             if phase != "element":
@@ -1589,12 +1660,165 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
                         continue
                     if char == "]":
                         raise json.JSONDecodeError("Expecting value", chunk, i)
+                    compact_probe = chunk[
+                        i : i + JSON_HYBRID_FAST_PROBE_CHARS
+                    ]
+                    compact_consumed = False
+                    if probe_is_resource_safe(compact_probe):
+                        try:
+                            compact_value, compact_end = decoder.raw_decode(
+                                compact_probe
+                            )
+                        except (json.JSONDecodeError, RecursionError):
+                            pass
+                        else:
+                            compact_boundary_proven = (
+                                compact_end < len(compact_probe)
+                                and compact_probe[compact_end] in " \t\r\n,]"
+                            ) or (
+                                compact_end == len(compact_probe)
+                                and char in "[{\""
+                            )
+                            if compact_boundary_proven:
+                                compact_chars = compact_end
+                                compact_bytes = len(
+                                    compact_probe[:compact_end].encode("utf-8")
+                                )
+                                if (
+                                    compact_chars > MAX_JSON_ELEMENT_CHARS
+                                    or compact_bytes > MAX_JSON_ELEMENT_BYTES
+                                ):
+                                    raise ConversationJsonElementTooLargeError(
+                                        "conversation_json_element_too_large"
+                                    )
+                                yield decorate_value(
+                                    compact_value,
+                                    decoded_chars=compact_chars,
+                                    input_bytes=compact_bytes,
+                                )
+                                saw_element = True
+                                phase = "after"
+                                i += compact_end
+                                compact_consumed = True
+                    if compact_consumed:
+                        continue
+                    fast_proof = fast_element_proof(chunk, i)
+                    if (
+                        fast_proof is None
+                        and len(chunk) - i < JSON_HYBRID_EXTENDED_PROBE_CHARS
+                    ):
+                        try:
+                            next_window = next(chunk_iterator)
+                        except StopIteration:
+                            next_window = ""
+                        if next_window:
+                            # Preserve only the unconsumed suffix.  This
+                            # realigns a bounded window around an ordinary
+                            # element crossing a coalescing boundary without
+                            # retaining the shard or rescanning prior elements.
+                            chunk = chunk[i:] + next_window
+                            i = 0
+                            char = chunk[0]
+                            fast_proof = fast_element_proof(chunk, i)
+                    fast_candidate_end = fast_proof[0] if fast_proof is not None else None
+                    fast_candidate_chars = (
+                        fast_candidate_end - i
+                        if fast_candidate_end is not None
+                        else 0
+                    )
+                    fast_candidate_text = (
+                        chunk[i:fast_candidate_end]
+                        if fast_candidate_end is not None
+                        else ""
+                    )
+                    probe_bytes = len(fast_candidate_text.encode("utf-8"))
+                    max_candidate_scalars = fast_proof[1] if fast_proof is not None else 0
+                    measured_mappings = fast_proof[2] if fast_proof is not None else 0
+                    max_candidate_array_items = fast_proof[3] if fast_proof is not None else 0
+                    conservative_heap = (
+                        probe_bytes
+                        + max_candidate_scalars * 48
+                        + measured_mappings * 72
+                        + max_candidate_array_items * 16
+                    )
+                    if (
+                        fast_candidate_end is not None
+                        and max_candidate_scalars <= MAX_CONVERSATION_JSON_SCALARS
+                        and measured_mappings <= MAX_JSON_MAPPING_ENTRIES
+                        and max_candidate_array_items <= MAX_JSON_ARRAY_ITEMS
+                        and conservative_heap <= MAX_JSON_ESTIMATED_DECODED_HEAP_BYTES
+                    ):
+                        try:
+                            fast_value, fast_end = decoder.raw_decode(chunk, i)
+                        except (json.JSONDecodeError, RecursionError):
+                            pass
+                        else:
+                            # raw_decode() accepts a valid numeric prefix
+                            # (for example ``1`` in ``1e2``).  A scalar at the
+                            # end of this bounded probe therefore has no
+                            # proven token boundary yet.  Composite/string
+                            # closure is self-delimiting; every other success
+                            # must expose a surrounding-array delimiter or
+                            # whitespace inside the current probe.
+                            fast_boundary_proven = (
+                                fast_end < len(chunk)
+                                and chunk[fast_end] in " \t\r\n,]"
+                            ) or (
+                                fast_end == len(chunk)
+                                and char in "[{\""
+                            )
+                            fast_boundary_proven = (
+                                fast_boundary_proven
+                                and fast_end == fast_candidate_end
+                            )
+                            if not fast_boundary_proven:
+                                fast_value = None
+                                fast_end = 0
+                            if fast_end == 0:
+                                kind = (
+                                    "composite"
+                                    if char in "[{"
+                                    else "string"
+                                    if char == '"'
+                                    else "scalar"
+                                )
+                                depth = 0
+                                in_string = False
+                                escaped = False
+                                scalar_count = 0
+                                scalar_token = False
+                                mapping_entries = 0
+                                array_items = 0
+                                container_stack = []
+                                phase = "element"
+                                continue
+                            fast_chars = fast_end - i
+                            fast_bytes = probe_bytes
+                            if (
+                                fast_chars > MAX_JSON_ELEMENT_CHARS
+                                or fast_bytes > MAX_JSON_ELEMENT_BYTES
+                            ):
+                                raise ConversationJsonElementTooLargeError(
+                                    "conversation_json_element_too_large"
+                                )
+                            yield decorate_value(
+                                fast_value,
+                                decoded_chars=fast_chars,
+                                input_bytes=fast_bytes,
+                            )
+                            saw_element = True
+                            phase = "after"
+                            i = fast_end
+                            continue
                     kind = "composite" if char in "[{" else "string" if char == '"' else "scalar"
                     depth = 0
                     in_string = False
                     escaped = False
                     scalar_count = 0
                     scalar_token = False
+                    mapping_entries = 0
+                    array_items = 0
+                    container_stack = []
                     phase = "element"
                 elif phase == "after":
                     if char == ",":
@@ -1665,6 +1889,7 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
                     raise InvalidConversationEncodingError("invalid_conversation_encoding")
                 if char == '"':
                     finish_scalar_token()
+                    mark_array_value()
                     if match.end() - match.start() > 1:
                         # A complete JSON string is recognized in the C regex
                         # engine.  Only strings split across chunks fall back
@@ -1678,15 +1903,21 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
                     in_string = True
                 elif char in "[{":
                     finish_scalar_token()
+                    mark_array_value()
                     depth += 1
                     if depth > MAX_JSON_NESTING_DEPTH:
                         raise JsonSafetyLimitError(
                             "json_nesting_limit_exceeded",
                             limit=MAX_JSON_NESTING_DEPTH,
                         )
+                    container_stack.append(
+                        {"kind": "array" if char == "[" else "object"}
+                    )
                 elif char in "]}":
                     finish_scalar_token()
                     depth -= 1
+                    if container_stack:
+                        container_stack.pop()
                     if depth == 0:
                         completed_at = i + 1
                         break
@@ -1708,10 +1939,28 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
         raise json.JSONDecodeError("Expecting value", "", 0)
 
 
+def _coalesce_json_text_chunks(chunks: Iterable[str]) -> Iterator[str]:
+    """Yield bounded decoded-text windows without changing source reads."""
+
+    parts: list[str] = []
+    chars = 0
+    for chunk in chunks:
+        if not chunk:
+            continue
+        parts.append(chunk)
+        chars += len(chunk)
+        if chars >= JSON_HYBRID_COALESCE_CHARS:
+            yield "".join(parts)
+            parts = []
+            chars = 0
+    if parts:
+        yield "".join(parts)
+
+
 def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
     """Frame each top-level element once, then invoke the C decoder once."""
 
-    yield from _iter_json_array_framed(chunks)
+    yield from _iter_json_array_framed(_coalesce_json_text_chunks(chunks))
 
 
 def _is_link_or_reparse(path: Path) -> bool:

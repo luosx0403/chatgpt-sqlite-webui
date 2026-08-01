@@ -46,6 +46,7 @@ from .exporter import export_conversations
 from .disk_resources import (
     DiskSpaceGuard,
     DiskSpaceInsufficientError,
+    import_capacity_plan,
     import_required_bytes,
     is_disk_full_error,
     require_free_space,
@@ -105,10 +106,10 @@ from .scanner import (
 )
 from .sqlite_errors import sqlite_runtime_error_code
 from .utils import compact_json, epoch_to_display, sha256_text
-from .web_db import WebIndexBuildError, acquire_web_index_process_lock, create_web_indexes
+from .web_db import WebIndexBuildError, acquire_writer_process_lock, create_web_indexes
 
 LOGGER = get_logger("cli")
-REQUIRED_IMPORT_GENERATION_DOMAINS = ("title", "message", "address", "graph")
+REQUIRED_IMPORT_GENERATION_DOMAINS = ("title", "message", "address", "graph", "query")
 
 
 class ImportPipelineError(ValueError):
@@ -150,10 +151,16 @@ class ImportPipelineError(ValueError):
         return " ".join(parts)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    _process_started: float | None = None,
+) -> int:
     _configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if _process_started is not None:
+        args._process_started = _process_started
     try:
         configure_logging(
             args.log_level,
@@ -351,9 +358,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    conn = connect(Path(args.db))
-    fts = init_db(conn)
-    conn.close()
+    db_path = Path(args.db)
+    writer_lock = acquire_writer_process_lock(db_path)
+    try:
+        conn = connect(db_path)
+        try:
+            writer_lock.bind_database(db_path)
+            writer_lock.revalidate(db_path)
+            fts = init_db(conn)
+        finally:
+            conn.close()
+    finally:
+        writer_lock.close()
     print("initialized_db true")
     print(f"fts5_available {str(fts).lower()}")
     return 0
@@ -367,28 +383,37 @@ def cmd_recover_delete_input(args: argparse.Namespace) -> int:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db)
-    conn = connect_existing(db_path)
+    writer_lock = acquire_writer_process_lock(db_path)
     try:
-        before = database_schema_status(conn)
-        print("WARNING: create and verify an external database backup before migration.", file=sys.stderr)
-        def migration_progress(stage: str, progress: dict[str, int]) -> None:
-            print(
-                f"migration_stage {stage} "
-                f"processed {progress.get('processed', 0)} "
-                f"total {progress.get('total', 0)}",
-                file=sys.stderr,
-            )
+        conn = connect_existing(db_path)
+        try:
+            writer_lock.bind_database(db_path)
+            writer_lock.revalidate(db_path)
+            before = database_schema_status(conn)
+            print("WARNING: create and verify an external database backup before migration.", file=sys.stderr)
+            def migration_progress(stage: str, progress: dict[str, int]) -> None:
+                print(
+                    f"migration_stage {stage} "
+                    f"processed {progress.get('processed', 0)} "
+                    f"total {progress.get('total', 0)}",
+                    file=sys.stderr,
+                )
 
-        result = migrate_database(
-            conn,
-            refresh_compatibility=True,
-            progress_callback=migration_progress,
-        )
+            result = migrate_database(
+                conn,
+                refresh_compatibility=True,
+                progress_callback=migration_progress,
+            )
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        writer_lock.close()
     print(f"current_database_schema_version {before['current_database_schema_version']}")
     print(f"required_database_schema_version {before['required_database_schema_version']}")
-    print(f"migration_changed {str(result['changed']).lower()}")
+    print(f"schema_changed {str(bool(result['schema_changed'])).lower()}")
+    print(f"compatibility_refreshed {str(bool(result['compatibility_refreshed'])).lower()}")
+    print(f"compatibility_changed {str(bool(result['compatibility_changed'])).lower()}")
+    print(f"migration_changed {str(bool(result['migration_changed'])).lower()}")
     print(f"database_schema_version {result['current_database_schema_version']}")
     if result.get("migration_disk_preflight"):
         print(
@@ -542,6 +567,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_import(args: argparse.Namespace) -> int:
+    cli_started = float(getattr(args, "_process_started", time.perf_counter()))
     result = run_import_pipeline(
         Path(args.db),
         args.input,
@@ -577,6 +603,9 @@ def cmd_import(args: argparse.Namespace) -> int:
         "pragma_optimize_seconds",
         "finalize_commit_seconds",
         "close_seconds",
+        "post_commit_summary_persistence_seconds",
+        "canonical_pipeline_seconds",
+        "pipeline_return_seconds",
         "legacy_pre_commit_seconds",
         "wall_total_seconds",
         "total_import_seconds",
@@ -616,6 +645,13 @@ def cmd_import(args: argparse.Namespace) -> int:
                         "recover-delete-input --directory <original-directory> "
                         f"--token {result['delete_input_recovery_token']}"
                     )
+    output_flush_started = time.perf_counter()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    output_flush_seconds = _elapsed(output_flush_started)
+    print(f"cli_output_flush_seconds {output_flush_seconds}")
+    print(f"cli_controlled_wall_seconds {_elapsed(cli_started)}")
+    sys.stdout.flush()
     return 0
 
 
@@ -630,9 +666,11 @@ def run_import_pipeline(
     optimize_fts_after_import: bool = False,
     delete_input_on_success: bool = False,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    writer_lock: Any | None = None,
 ) -> dict[str, Any]:
     """Serialize canonical import against optional Web-index builders."""
 
+    pipeline_started = time.perf_counter()
     if optimize_fts_after_import and not rebuild_fts:
         raise ValueError("--optimize-fts-after-import requires --rebuild-fts")
     source = resolve_input(input_value, cwd)
@@ -653,14 +691,18 @@ def run_import_pipeline(
             stage="input_preflight",
             detail={"error_type": type(exc).__name__},
         ) from None
-    try:
-        writer_lock = acquire_web_index_process_lock(db_path)
-    except WebIndexBuildError as exc:
-        raise ImportPipelineError(exc.code, stage="input_preflight") from None
+    owns_writer_lock = writer_lock is None
+    if writer_lock is None:
+        try:
+            writer_lock = acquire_writer_process_lock(db_path)
+        except WebIndexBuildError as exc:
+            raise ImportPipelineError(exc.code, stage="input_preflight") from None
+    result: dict[str, Any] | None = None
+    caught_error: BaseException | None = None
     try:
         writer_lock.bind_database(db_path)
         writer_lock.revalidate(db_path)
-        return _run_import_pipeline_locked(
+        result = _run_import_pipeline_locked(
             db_path,
             input_value,
             cwd=cwd,
@@ -673,8 +715,25 @@ def run_import_pipeline(
             _resolved_source=source,
             _writer_lock=writer_lock,
         )
+    except BaseException as exc:
+        caught_error = exc
     finally:
-        writer_lock.close()
+        if owns_writer_lock:
+            writer_lock.close()
+    pipeline_seconds = _elapsed(pipeline_started)
+    if caught_error is not None:
+        if isinstance(caught_error, ImportPipelineError):
+            caught_error.summary["pipeline_return_seconds"] = pipeline_seconds
+            caught_error.summary["wall_total_seconds"] = pipeline_seconds
+            caught_error.summary["total_import_seconds"] = pipeline_seconds
+        raise caught_error
+    if result is None:
+        raise RuntimeError("import pipeline returned no result")
+    summary = result["summary"]
+    summary["pipeline_return_seconds"] = pipeline_seconds
+    summary["wall_total_seconds"] = pipeline_seconds
+    summary["total_import_seconds"] = pipeline_seconds
+    return result
 
 
 def _run_import_pipeline_locked(
@@ -756,6 +815,9 @@ def _run_import_pipeline_locked(
         "pragma_optimize_seconds": 0.0,
         "finalize_commit_seconds": 0.0,
         "close_seconds": 0.0,
+        "post_commit_summary_persistence_seconds": 0.0,
+        "canonical_pipeline_seconds": 0.0,
+        "pipeline_return_seconds": 0.0,
         "legacy_pre_commit_seconds": 0.0,
         "wall_total_seconds": 0.0,
         "total_import_seconds": 0.0,
@@ -855,6 +917,20 @@ def _run_import_pipeline_locked(
         record_source_entries(conn, run_id, entries)
         summary["source_scan_seconds"] = _elapsed(source_scan_started)
         selected_json_bytes = sum(max(0, int(entry.size)) for entry in selected)
+        try:
+            existing_database_bytes = db_path.stat().st_size
+        except OSError:
+            existing_database_bytes = 0
+        summary["disk_capacity_plan"] = import_capacity_plan(
+            selected_json_bytes,
+            compressed_source_bytes=source.size,
+            pipeline_owned_zip_bytes=(
+                source.size
+                if source.path.parent.name.startswith("chatgpt-archive-upload-")
+                else 0
+            ),
+            existing_database_bytes=existing_database_bytes,
+        )
         try:
             capacity = require_free_space(
                 db_path,
@@ -1182,8 +1258,15 @@ def _run_import_pipeline_locked(
         summary["wall_total_seconds"] = _elapsed(import_started)
         summary["total_import_seconds"] = summary["wall_total_seconds"]
         try:
+            summary_persistence_started = time.perf_counter()
             update_import_run_summary(conn, run_id, summary)
+            summary["post_commit_summary_persistence_seconds"] += _elapsed(
+                summary_persistence_started
+            )
         except (sqlite3.Error, OSError) as exc:
+            summary["post_commit_summary_persistence_seconds"] += _elapsed(
+                summary_persistence_started
+            )
             message = type(exc).__name__
             result["summary_update_after_commit_failed"] = message
             LOGGER.warning("summary_update_after_commit_failed %s", message)
@@ -1198,12 +1281,19 @@ def _run_import_pipeline_locked(
         summary["wall_total_seconds"] = _elapsed(import_started)
         summary["total_import_seconds"] = summary["wall_total_seconds"]
         try:
+            summary_persistence_started = time.perf_counter()
             summary_conn = connect(db_path)
             try:
                 update_import_run_summary(summary_conn, run_id, summary)
             finally:
                 summary_conn.close()
+            summary["post_commit_summary_persistence_seconds"] += _elapsed(
+                summary_persistence_started
+            )
         except (sqlite3.Error, OSError) as exc:
+            summary["post_commit_summary_persistence_seconds"] += _elapsed(
+                summary_persistence_started
+            )
             message = type(exc).__name__
             result["summary_update_after_close_failed"] = message
             LOGGER.warning("summary_update_after_close_failed %s", message)
@@ -1341,6 +1431,9 @@ def _run_import_pipeline_locked(
         summary["unchanged_conversations"],
         summary["wall_total_seconds"],
     )
+    summary["canonical_pipeline_seconds"] = _elapsed(import_started)
+    summary["wall_total_seconds"] = summary["canonical_pipeline_seconds"]
+    summary["total_import_seconds"] = summary["wall_total_seconds"]
     return result
 
 

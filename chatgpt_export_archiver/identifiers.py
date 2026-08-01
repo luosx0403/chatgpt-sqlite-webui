@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 
 MAX_CANONICAL_ID_LENGTH = 512
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_UNSAFE_IDENTIFIER_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 def unicode_scalar_text(value: str, *, replace_invalid: bool = False) -> tuple[str | None, bool]:
     """Combine valid surrogate pairs and reject or replace non-scalars."""
 
+    # UTF-8-decoded identifiers overwhelmingly contain no surrogate escapes.
+    # Keep that path allocation-free; the explicit slow path below preserves
+    # support for JSON ``\uD83D\uDE00`` pairs and isolated-surrogate policy.
+    if _SURROGATE_RE.search(value) is None:
+        return value, False
     result: list[str] = []
     changed = False
     index = 0
@@ -68,12 +76,9 @@ def identifier_text_is_safe(
 
     if not isinstance(value, str) or len(value) > limit or (not value and not allow_empty):
         return False
-    return not any(
-        ord(character) <= 0x1F
-        or ord(character) == 0x7F
-        or 0xD800 <= ord(character) <= 0xDFFF
-        for character in value
-    )
+    # Unicode Cc consists of C0, DEL, and C1. A single C regex search avoids
+    # two Python callbacks per code point on ordinary long legacy IDs.
+    return _UNSAFE_IDENTIFIER_RE.search(value) is None
 
 
 def canonical_id_length(value: Any, *, strip: bool = False) -> int | None:

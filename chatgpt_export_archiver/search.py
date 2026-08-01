@@ -181,6 +181,11 @@ def _decode_display_cursor(
         packed = base64.b64decode(
             value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
         )
+        if (
+            base64.urlsafe_b64encode(packed).rstrip(b"=").decode("ascii")
+            != value
+        ):
+            raise ValueError("non-canonical cursor encoding")
         try:
             legacy = json.loads(packed)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -372,7 +377,7 @@ def _search_database_contract(conn: sqlite3.Connection) -> dict[str, Any]:
         str(row[0]): int(row[1])
         for row in conn.execute(
             "SELECT name, generation FROM archive_generations "
-            "WHERE name IN ('message', 'title', 'address', 'graph') ORDER BY name"
+            "WHERE name IN ('message', 'title', 'address', 'graph', 'query') ORDER BY name"
         )
     }
     optional_format = None

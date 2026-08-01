@@ -36,6 +36,7 @@ from .disk_resources import (
     DiskSpaceInsufficientError,
     is_disk_full_error,
     require_free_space,
+    web_index_capacity_plan,
     web_index_required_bytes,
 )
 from .display_resolver import PlaceholderStreamClassifier, placeholder_prefix_may_match
@@ -95,12 +96,18 @@ class WebIndexBuildError(ValueError):
         self.cleanup_warnings = list(cleanup_warnings or [])
 
 
-class _WebIndexProcessLock:
-    """Kernel-owned cross-process proof held for one complete index build."""
+class _WriterProcessLock:
+    """Kernel-owned cross-process proof held for one complete writer workflow."""
 
-    def __init__(self, fds: list[int], keys: set[tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        fds: list[int],
+        keys: set[tuple[str, str]],
+        lock_names: set[str],
+    ) -> None:
         self.fds = fds
         self.keys = set(keys)
+        self.lock_names = set(lock_names)
 
     def bind_database(self, db_path: Path) -> None:
         """Acquire any newly-created entity lock before database work begins."""
@@ -109,7 +116,10 @@ class _WebIndexProcessLock:
         for key in _database_lock_keys(db_path):
             if key in self.keys:
                 continue
-            self.fds.append(_acquire_process_lock_key(registry, key))
+            lock_name = _process_lock_name(key)
+            if lock_name not in self.lock_names:
+                self.fds.append(_acquire_process_lock_key(registry, key))
+                self.lock_names.add(lock_name)
             self.keys.add(key)
 
     def revalidate(self, db_path: Path) -> None:
@@ -137,7 +147,8 @@ class _WebIndexProcessLock:
 
 
 _PROCESS_LOCK_MAGIC = "chatgpt-sqlite-webui-process-lock"
-_PROCESS_LOCK_FORMAT = 2
+_PROCESS_LOCK_FORMAT = 3
+_PROCESS_LOCK_SHARDS = 64
 
 
 def _process_lock_registry() -> Path:
@@ -156,6 +167,19 @@ def _process_lock_registry() -> Path:
     except OSError:
         raise WebIndexBuildError("web_index_process_lock_failed") from None
     return directory
+
+
+def _process_lock_name(key: tuple[str, str]) -> str:
+    """Map a full identity to one fixed registry shard.
+
+    A hash/shard collision conservatively serializes unrelated writers; it
+    never creates a second lock domain or permits concurrent access to one
+    database. The registry therefore has a hard upper bound of 64 files.
+    """
+
+    kind, identity = key
+    digest = hashlib.sha256(f"{kind}\0{identity}".encode("ascii")).digest()
+    return f"writer-shard-{digest[0] % _PROCESS_LOCK_SHARDS:02x}.lock"
 
 
 def _database_lock_keys(db_path: Path) -> list[tuple[str, str]]:
@@ -180,19 +204,20 @@ def _database_lock_keys(db_path: Path) -> list[tuple[str, str]]:
 
 
 def _acquire_process_lock_key(registry: Path, key: tuple[str, str]) -> int:
-    kind, identity = key
-    name = f"{kind}-{identity}.lock"
+    name = _process_lock_name(key)
+    shard = int(name.removeprefix("writer-shard-").removesuffix(".lock"), 16)
     payload = json.dumps(
         {
-            "database_identity": identity,
             "format_version": _PROCESS_LOCK_FORMAT,
-            "kind": kind,
             "magic": _PROCESS_LOCK_MAGIC,
+            "shard": shard,
+            "shard_count": _PROCESS_LOCK_SHARDS,
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")
     fd: int | None = None
+    created = False
     try:
         directory_fd = os.open(
             registry,
@@ -202,8 +227,7 @@ def _acquire_process_lock_key(registry: Path, key: tuple[str, str]) -> int:
             flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             try:
                 fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory_fd)
-                os.write(fd, payload)
-                os.fsync(fd)
+                created = True
             except FileExistsError:
                 fd = os.open(name, flags, dir_fd=directory_fd)
         finally:
@@ -213,46 +237,66 @@ def _acquire_process_lock_key(registry: Path, key: tuple[str, str]) -> int:
             not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
             or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_size != len(payload)
         ):
             raise OSError("unsafe_lock_identity")
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if created:
+            os.ftruncate(fd, 0)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short_lock_payload_write")
+                view = view[written:]
+            os.fsync(fd)
+        info = os.fstat(fd)
+        if info.st_size != len(payload):
+            raise OSError("unknown_lock_payload")
         os.lseek(fd, 0, os.SEEK_SET)
         if os.read(fd, len(payload) + 1) != payload:
             raise OSError("unknown_lock_payload")
         os.lseek(fd, 0, os.SEEK_SET)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fd
     except (BlockingIOError, PermissionError):
         if fd is not None:
             os.close(fd)
-        raise WebIndexBuildError("web_index_build_in_progress") from None
+        raise WebIndexBuildError("writer_process_lock_busy") from None
     except OSError:
         if fd is not None:
             os.close(fd)
         raise WebIndexBuildError("web_index_process_lock_failed") from None
 
 
-def acquire_web_index_process_lock(db_path: Path) -> _WebIndexProcessLock:
-    """Acquire a nonblocking OS lock; its lifetime, not wall time, proves liveness."""
+def acquire_writer_process_lock(db_path: Path) -> _WriterProcessLock:
+    """Acquire the generic writer lock before any filesystem or database write."""
 
+    if os.name == "nt":
+        # The Unix dirfd/no-follow proof below has no safe pathname fallback on
+        # Windows. Fail before registry creation, upload spool, database create,
+        # lease, or staging until a File-ID/ACL/reparse-safe backend exists.
+        raise WebIndexBuildError("writer_process_lock_unsupported")
     registry = _process_lock_registry()
     keys = _database_lock_keys(db_path)
-    lock = _WebIndexProcessLock([], set())
+    lock = _WriterProcessLock([], set(), set())
     try:
         for key in keys:
-            lock.fds.append(_acquire_process_lock_key(registry, key))
+            lock_name = _process_lock_name(key)
+            if lock_name not in lock.lock_names:
+                lock.fds.append(_acquire_process_lock_key(registry, key))
+                lock.lock_names.add(lock_name)
             lock.keys.add(key)
         return lock
     except Exception:
         lock.close()
         raise
+
+
+# Compatibility aliases for callers and predecessor tests. New production code
+# uses the writer-oriented names.
+_WebIndexProcessLock = _WriterProcessLock
+acquire_web_index_process_lock = acquire_writer_process_lock
 
 
 _LEASE_TABLE_DDL = f"""CREATE TABLE {WEB_INDEX_BUILD_LEASE_TABLE}(
@@ -849,6 +893,7 @@ def create_web_indexes(
     batch_size: int = WEB_INDEX_BATCH_SIZE,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    _writer_lock: _WriterProcessLock | None = None,
 ) -> dict[str, Any]:
     """Build bounded staging indexes, then publish in a short transaction.
 
@@ -858,13 +903,15 @@ def create_web_indexes(
     """
 
     batch_size = max(1, min(10_000, int(batch_size)))
-    process_lock = acquire_web_index_process_lock(db_path)
+    owns_process_lock = _writer_lock is None
+    process_lock = _writer_lock or acquire_writer_process_lock(db_path)
     try:
         conn = connect_writable(db_path)
         process_lock.bind_database(db_path)
         process_lock.revalidate(db_path)
     except Exception:
-        process_lock.close()
+        if owns_process_lock:
+            process_lock.close()
         raise
     build_id = secrets.token_hex(16)
     owner_token = secrets.token_hex(32)
@@ -946,6 +993,9 @@ def create_web_indexes(
             path.stat().st_size
             for path in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm"))
             if path.exists()
+        )
+        resource_progress["disk_capacity_plan"] = web_index_capacity_plan(
+            database_bytes
         )
         capacity = require_free_space(
             db_path,
@@ -1517,6 +1567,7 @@ def create_web_indexes(
             "peak_batch_derived_bytes": resource_progress["peak_batch_derived_bytes"],
             "disk_preflight_required_bytes": resource_progress["disk_preflight_required_bytes"],
             "disk_preflight_free_bytes": resource_progress["disk_preflight_free_bytes"],
+            "disk_capacity_plan": resource_progress["disk_capacity_plan"],
             "max_input_bytes": WEB_INDEX_MAX_INPUT_BYTES,
             "max_normalized_bytes": WEB_INDEX_MAX_NORMALIZED_BYTES,
             "max_derived_bytes": WEB_INDEX_MAX_DERIVED_BYTES,
@@ -1579,4 +1630,5 @@ def create_web_indexes(
             conn.set_progress_handler(None, 0)
             conn.close()
         finally:
-            process_lock.close()
+            if owns_process_lock:
+                process_lock.close()

@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .identifiers import unicode_scalar_text
+
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 WINDOWS_RESERVED_BASENAMES = {
@@ -184,8 +186,15 @@ def classify_file(path: str | Path) -> str:
 
 
 def safe_filename_part(text: str | None, max_len: int = 80) -> str:
-    text = unicodedata.normalize("NFC", (text or "untitled")).strip() or "untitled"
-    text = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]+", "_", text)
+    scalar_text, _changed = unicode_scalar_text(
+        text or "untitled", replace_invalid=True
+    )
+    text = unicodedata.normalize("NFC", scalar_text or "untitled").strip() or "untitled"
+    text = "".join(
+        "_" if unicodedata.category(character) == "Cc" else character
+        for character in text
+    )
+    text = re.sub(r"[/\\:*?\"<>|]+", "_", text)
     text = re.sub(r"\s+", "_", text)
     text = text.strip("._ ")
     if not text:
