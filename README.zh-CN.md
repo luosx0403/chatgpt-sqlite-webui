@@ -78,7 +78,7 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
-Python 3.12 constraints 是跨平台的 resolved-version profile，本身仍无 artifact hash。独立的 `requirements-web-py312-macos-arm64.lock` 只针对 CPython 3.12/macOS arm64 提供 wheel hash lock；使用 `--require-hashes --only-binary=:all:` 安装，并运行 `python tools/verify_web_hash_lock.py` 校验。其他 Python/OS 目标在其 wheel matrix lock 发布前仍应从可信 index 使用 portable profile，不能把 macOS lock 当成跨平台 lock。
+Python 3.12 constraints 是跨平台 resolved-version profile，本身没有 artifact hash。`requirements-web-py312-macos-arm64.lock` 只适用于 CPython 3.12/macOS arm64；用 `pip --require-hashes --only-binary=:all:` 安装时才会核验下载 wheel 的真实字节。`python tools/verify_web_hash_lock.py` 只检查 lock 的结构、目标、版本与 hash 语法。其他平台应使用可信 index 的 portable profile。
 
 ## 快速开始
 
@@ -237,7 +237,7 @@ python chatgpt_archive.py web --port 8787
 
 所有入口共用同一套 `path=current` effective-current 规则：有效且属于该会话的 `current_node` 及其父链优先，即使所有 raw flag 都为 0；否则选择确定的可用 `is_on_current_path=1` 叶链；只有两者都不存在时，该会话才 fallback 到 all。响应保持 raw flag 原义，并提供 `current_node_exists`、`current_collection_source`、`current_path_fallback_to_all`、`effective_path` 和逐节点 effective visibility。断裂父链和 cycle 会有限、确定地诊断，不会让递归查询挂起。
 
-阅读器复制和导出动作遵守可见阅读器契约。`复制当前路径整段对话` 使用专用的完整文本流处理当前 reader 路径，遵守「显示内部消息」开关并忽略当前搜索筛选，不会在浏览器中累积 reader 分页。`复制当前可见` 只复制已经加载的可见消息。下载链接使用同样的当前路径和「显示内部消息」设置。Raw 消息访问只通过单条消息 endpoint 提供有上限的较大 raw 预览；截断响应必须把 `raw_text` 当作纯文本预览渲染，UI 只显示这个 capped preview。
+阅读器复制和导出遵守可见性设置。`复制当前路径整段对话` 使用有界完整文本流，遵守当前 reader 路径和「显示内部消息」。`复制当前可见` 只提交已加载可见消息的 ID，由服务端在同一个 SQLite 读快照中流式返回，避免混合两次写入前后的内容。下载链接使用同样的路径和内部消息设置；消息 raw 入口是有上限的较大 raw 预览，截断时以纯文本 `raw_text` 显示。
 
 reader 使用 `around_node_id` 跳转到命中时，会使用与 reader 相同的分页集合：Show internal 关闭时使用 visible-only rows，Show internal 开启时使用完整 node collection；对没有 current-path node 的损坏 conversation，使用 effective all-node collection。
 
@@ -271,7 +271,7 @@ Web 上传会在读取文件前先保留 pending slot，因此大型上传不能
 
 **远程绑定策略。** 绑定非 loopback 地址（如 `0.0.0.0`、`::` 或局域网 IP）时，必须通过 `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` 或 `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` 明确 opt-in，否则启动会被拒绝。remote-safe 默认值为 128 MiB 压缩 ZIP、256 MiB 每 JSON member、512 MiB 总未压缩、200.0 压缩比、200 个 JSON member和 10,000 个 ZIP 总 member；可信 loopback/local 默认压缩比为 1000.0。`ALLOW_REMOTE_UPLOADS` 只放宽显式设置的限制，未设置项仍 remote-safe；`REMOTE_UPLOAD_PROFILE=local` 会把全部未设置限制恢复为本机大默认值，只适合可信 LAN。
 
-`/api/schema` 会报告当前有效上传策略，包括 multipart body 上限（ZIP byte 上限加有界 overhead）及 remote profile。writer slot 和 receive-level body cap 在 multipart 解析前生效。multipart parser 可能写 spool，之后 import pipeline 还会拥有服务端临时 ZIP，因此临时磁盘应预留接近两份压缩副本再加数据库增长。ZIP 检查先执行，但 JSON 解码、SQLite 写入和 `web-index` 仍按解码后数据消耗内存、磁盘和 CPU。远程上传必须提供有效 `Content-Length`；loopback chunked 上传仍按流式上限限制。超大归档优先使用可信 loopback 和 CLI import。
+`/api/schema` 会报告当前有效上传策略。所有上传都必须提供有效 `Content-Length`。服务器会在第一次接收 body 前检查 multipart parser 所用临时文件系统；解析后再分别检查项目上传目录和数据库文件系统，它们可能不是同一磁盘。应为 parser spool、服务端 ZIP、数据库、WAL/TEMP 和索引预留空间。ZIP 检查先执行，但 JSON 解码、SQLite 写入和 `web-index` 的资源消耗仍与解码后数据量相关。
 
 如需为合法的大型归档提高本机限制，在启动 Web UI 前设置相应变量：
 
@@ -429,7 +429,7 @@ source-only delivery 可以省略 `webui/dist`，但之后需要先重新构建�
 
 主数据库保存 conversations、mapping nodes、import runs 和 warnings。message object 的 raw JSON 字段按完整对象保留；conversation 和 mapping-node object 会规范化，不做逐字节原样保存。输入 ZIP SHA-256 是可选项，`source_files`/`file_index` 的逐 entry SHA 列为保留字段，目前不填充。CLI FTS 表是 `message_fts`。可选 Web 搜索辅助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-canonical 数据库使用 `PRAGMA user_version` 版本化（当前版本 6）。版本 3 增加 `NOT NULL` identity；版本 4 增加持久 address/graph revision；版本 5 增加逐行 display revision 与 compatibility state；版本 6 增加覆盖 source 与会话/节点时间变化的持久 `query` generation。Migration 先在写锁外快速预检 DB/WAL/journal/TEMP，再于 `BEGIN IMMEDIATE` 内、首次变更之前重新计算权威 row count、size、sidecar 与 free space。取消、中断、ENOSPC 或 SQLite 失败会完整回滚。对当前且干净的数据库重复 migrate 是真正 no-op，并把 `schema_changed`、`compatibility_refreshed`、`compatibility_changed`、`migration_changed` 全部报告为 false。只读路径不执行 migration DDL；旧兼容数据库返回 `database_migration_required`。升级前先创建并验证外部备份。
+canonical 数据库使用 `PRAGMA user_version`（当前版本 6）；旧数据库的只读入口会返回 `database_migration_required`。Migration 按实际 predecessor step 估算容量：表重写/回填保留 rewrite 与 journal 空间，v5 的 metadata/query-generation 升级不再假定重写全部节点。`BEGIN IMMEDIATE` 内会在首次变更前重新核对 size、row、sidecar、计划步骤和 free space。compatibility scan 精确、分批、可取消；取消、中断、ENOSPC 或 SQLite 失败会完整回滚。当前干净数据库重复 migrate 是真正 no-op；只读路径不会迁移。升级前先验证外部备份。
 
 Health 与 `verify` 会区分可选 `message_fts` 缺失和损坏。损坏时报告 `optional_message_fts_error` 与 `--rebuild-fts` 恢复提示；通用的 malformed、locked、readonly、I/O 和 SQL 运行时错误不会被伪装成能力缺失，并使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
@@ -445,13 +445,13 @@ Health 与 `verify` 会区分可选 `message_fts` 缺失和损坏。损坏时报
 
 上传入口对 `Origin`、`Content-Length` 和 `Sec-Fetch-Site` 各只接受一个值。Origin 必须是没有用户信息、路径、查询、片段、控制字符或逗号链的单一 HTTP(S) origin；Content-Length 必须是规范的非负 ASCII 十进制整数。重复或畸形的安全标头会在 multipart 解析前拒绝；无效或非有限的压缩比配置会回退到有限的安全 profile 默认值。
 
-Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、显式 loopback bind host 和明确配置的 host。非 loopback bind 还必须用 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定实际浏览器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）采用严格单 edge 模型：未受信直连的 forwarded header 会被忽略，受信直连代理必须覆盖客户端值；重复 Host/Forwarded、逗号代理链、非法语法以及 `Forwarded` 与 `X-Forwarded-Host/Proto` 冲突会被拒绝。静态 UI、GET API 和全部请求都校验 Host。远程写入必须有同源 `Origin`；只有可信 loopback profile 兼容无 Origin 客户端。上传始终拒绝 `Sec-Fetch-Site: cross-site`。
+Web 会校验所有请求的 Host；非 loopback bind 必须配置 `CHATGPT_ARCHIVE_ALLOWED_HOSTS` 或 CLI `--allowed-hosts`，禁止 `*`；trusted proxy 采用严格单 edge 合同，通过 `CHATGPT_ARCHIVE_TRUSTED_PROXIES` 或 `--trusted-proxies` 配置。远程写入必须有同源 `Origin`，重复或畸形 Fetch Metadata 会被拒绝。除浅层 `/api/health` 外，API 读取也拒绝 `Sec-Fetch-Site: cross-site`；静态 UI、直接导航的 `none` 以及不发送该标头的命令行客户端保持兼容。
 
 导入失败使用稳定的输入预检、source scan、source read、JSON decode、顶层契约和事务阶段。新增稳定 code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding` 和 `json_integer_too_large`。清理诊断使用结构化 `cleanup_warnings` 数组；旧 `cleanup_warning` 标量仅代表首项。任何响应都不泄漏临时路径。
 
-上传、canonical import、schema migration 与可选 Web index rebuild 都会预检文件系统容量，并保留 256 MiB 应急空间。运行中检查与 ENOSPC 分别返回 `upload_disk_space_insufficient`、`import_disk_space_insufficient`、`migration_disk_space_insufficient` 或 `web_index_disk_space_insufficient`；失败会清理部分上传、回滚 import/migration，并让旧的已发布 Web 索引继续可读。
+上传会在接收前检查 parser spool 文件系统，并在解析后检查服务端 ZIP 与数据库文件系统。Import、migration 和可选 Web index 也会做容量预检并保留应急空间。ENOSPC 返回稳定的 `*_disk_space_insufficient` 错误；事务回滚，旧 Web index 继续可读。
 
-独立 JSON、目录成员和 ZIP 成员使用同一个 single-pass 顶层数组 framer 与单一导入事务。framer 一次扫描到元素边界后调用一次 C decoder；每个元素必须满足上述联合 byte/character/token/mapping/array/depth/integer/heap/node/batch profile。主要 query-based `/api/by-id/*` 最多接受 16 Ki 字符 legacy ID，固定小尺寸 search continuation 不嵌入这些 ID。
+独立 JSON、目录成员和 ZIP 成员共用有界 hybrid 顶层数组解析器与单一导入事务。普通完整元素通常一次 C decoder 即成功；不确定或跨 chunk 的元素可能先有一次有界失败 fast probe，再由持久 lexical framer 处理，不会重复解码不断增长的前缀。每个元素仍受联合 byte/character/token/mapping/array/depth/integer/heap/node/batch 限制。
 
 文件通过 descriptor-bound stat/hash/read 校验身份；strict delete 在 staging 前拒绝，recovery 只处理历史项目自有 journal。Migration 只接受定义完全匹配的已知 predecessor；任何用户对象以错误类型、目标或定义占用 managed trigger/index 名称，都会在 DDL 前拒绝。
 

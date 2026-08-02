@@ -20,11 +20,11 @@ from .current_path import (
 from .identifiers import identifier_text_is_safe
 from .disk_resources import (
     DiskSpaceInsufficientError,
-    migration_required_bytes,
+    migration_capacity_plan,
     require_free_space,
 )
 
-from .parser import ParsedConversation, WarningRecord
+from .parser import ParsedConversation, WarningRecord, recover_message_display_text
 from .scanner import InputSource, SourceEntry
 from .schema_contract import (
     DATABASE_SCHEMA_VERSION,
@@ -515,7 +515,7 @@ def begin_bulk_generation_aggregation(conn: sqlite3.Connection) -> None:
         raise DatabaseMigrationError("bulk_generation_transaction_required")
     if not generation_schema_contract_is_current(conn):
         raise DatabaseMigrationError("bulk_generation_schema_incompatible")
-    for name in GENERATION_TRIGGER_DDL:
+    for name in CANONICAL_TRIGGER_DDL:
         conn.execute(f'DROP TRIGGER "{name}"')
 
 
@@ -532,9 +532,9 @@ def finish_bulk_generation_aggregation(
         raise DatabaseMigrationError("bulk_generation_domain_invalid")
     existing = conn.execute(
         "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name IN ({})".format(
-            ",".join("?" for _ in GENERATION_TRIGGER_DDL)
+            ",".join("?" for _ in CANONICAL_TRIGGER_DDL)
         ),
-        tuple(GENERATION_TRIGGER_DDL),
+        tuple(CANONICAL_TRIGGER_DDL),
     ).fetchall()
     if existing:
         raise DatabaseMigrationError("bulk_generation_trigger_collision")
@@ -544,7 +544,7 @@ def finish_bulk_generation_aggregation(
             "WHERE name IN ({})".format(",".join("?" for _ in domains)),
             domains,
         )
-    for statement in GENERATION_TRIGGER_DDL.values():
+    for statement in CANONICAL_TRIGGER_DDL.values():
         conn.execute(statement)
     if not generation_schema_contract_is_current(conn):
         raise DatabaseMigrationError("bulk_generation_restore_failed")
@@ -820,7 +820,12 @@ def _legacy_compatibility_generations(conn: sqlite3.Connection) -> dict[str, int
     return values
 
 
-def refresh_legacy_compatibility_state(conn: sqlite3.Connection) -> dict[str, int]:
+def refresh_legacy_compatibility_state(
+    conn: sqlite3.Connection,
+    *,
+    progress_callback: Callable[[str, dict[str, int]], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, int]:
     """Deep-scan legacy address/graph data and bind exact results to generations."""
 
     legacy_limit = 16 * 1024
@@ -830,36 +835,99 @@ def refresh_legacy_compatibility_state(conn: sqlite3.Connection) -> dict[str, in
         lambda value: 1 if _legacy_graph_id_is_safe(value, legacy_limit) else 0,
         deterministic=True,
     )
-    address_count = int(conn.execute(
-        """SELECT COUNT(*) FROM (
-               SELECT 1 FROM conversations
-               WHERE archive_legacy_id_safe(CAST(conversation_id AS BLOB)) = 0
-                  OR archive_legacy_id_safe(CAST(exported_id AS BLOB)) = 0
-                  OR archive_legacy_id_safe(CAST(current_node AS BLOB)) = 0
-               UNION ALL
-               SELECT 1 FROM conversation_nodes
-               WHERE archive_legacy_id_safe(CAST(conversation_id AS BLOB)) = 0
-                  OR archive_legacy_id_safe(CAST(node_id AS BLOB)) = 0
-                  OR archive_legacy_id_safe(CAST(parent_node_id AS BLOB)) = 0
-                  OR archive_legacy_id_safe(CAST(message_id AS BLOB)) = 0
-                  OR EXISTS (
-                      SELECT 1 FROM json_each(
-                          CASE WHEN json_valid(children_json) THEN children_json ELSE '[]' END
-                      ) child
-                      WHERE archive_legacy_id_safe(CAST(child.value AS BLOB)) = 0
-                  )
-           )"""
-    ).fetchone()[0])
-    graph_count = int(conn.execute(
-        """SELECT COUNT(*) FROM conversation_nodes
-           WHERE (children_json IS NOT NULL AND json_valid(children_json) = 0)
-              OR EXISTS (
-                  SELECT 1 FROM json_each(
-                      CASE WHEN json_valid(children_json) THEN children_json ELSE '[]' END
-                  ) child
-                  WHERE child.type != 'text'
-              )"""
-    ).fetchone()[0])
+    cancelled_by_handler = False
+
+    def interrupted() -> int:
+        nonlocal cancelled_by_handler
+        cancelled_by_handler = bool(cancel_check and cancel_check())
+        return 1 if cancelled_by_handler else 0
+
+    conn.set_progress_handler(interrupted, 10_000)
+    try:
+        if cancelled_by_handler or (cancel_check and cancel_check()):
+            raise DatabaseMigrationError("database_migration_cancelled")
+        total = int(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
+        total += int(conn.execute("SELECT COUNT(*) FROM conversation_nodes").fetchone()[0])
+        processed = 0
+        address_count = 0
+        graph_count = 0
+        last_rowid = -1
+        while True:
+            if cancel_check and cancel_check():
+                raise DatabaseMigrationError("database_migration_cancelled")
+            rows = conn.execute(
+                """SELECT rowid,
+                          CASE WHEN
+                              archive_legacy_id_safe(CAST(conversation_id AS BLOB)) = 0
+                              OR archive_legacy_id_safe(CAST(exported_id AS BLOB)) = 0
+                              OR archive_legacy_id_safe(CAST(current_node AS BLOB)) = 0
+                          THEN 1 ELSE 0 END
+                   FROM conversations
+                   WHERE rowid > ? ORDER BY rowid LIMIT 5000""",
+                (last_rowid,),
+            ).fetchall()
+            if not rows:
+                break
+            address_count += sum(int(row[1]) for row in rows)
+            processed += len(rows)
+            last_rowid = int(rows[-1][0])
+            if progress_callback:
+                progress_callback(
+                    "compatibility_scan", {"processed": processed, "total": total}
+                )
+        last_rowid = -1
+        while True:
+            if cancel_check and cancel_check():
+                raise DatabaseMigrationError("database_migration_cancelled")
+            rows = conn.execute(
+                """SELECT rowid,
+                          CASE WHEN
+                              archive_legacy_id_safe(CAST(conversation_id AS BLOB)) = 0
+                              OR archive_legacy_id_safe(CAST(node_id AS BLOB)) = 0
+                              OR archive_legacy_id_safe(CAST(parent_node_id AS BLOB)) = 0
+                              OR archive_legacy_id_safe(CAST(message_id AS BLOB)) = 0
+                              OR EXISTS (
+                                  SELECT 1 FROM json_each(
+                                      CASE WHEN json_valid(children_json)
+                                           THEN children_json ELSE '[]' END
+                                  ) child
+                                  WHERE archive_legacy_id_safe(
+                                      CAST(child.value AS BLOB)
+                                  ) = 0
+                              )
+                          THEN 1 ELSE 0 END,
+                          CASE WHEN
+                              (children_json IS NOT NULL AND json_valid(children_json) = 0)
+                              OR EXISTS (
+                                  SELECT 1 FROM json_each(
+                                      CASE WHEN json_valid(children_json)
+                                           THEN children_json ELSE '[]' END
+                                  ) child
+                                  WHERE child.type != 'text'
+                              )
+                          THEN 1 ELSE 0 END
+                   FROM conversation_nodes
+                   WHERE rowid > ? ORDER BY rowid LIMIT 5000""",
+                (last_rowid,),
+            ).fetchall()
+            if not rows:
+                break
+            address_count += sum(int(row[1]) for row in rows)
+            graph_count += sum(int(row[2]) for row in rows)
+            processed += len(rows)
+            last_rowid = int(rows[-1][0])
+            if progress_callback:
+                progress_callback(
+                    "compatibility_scan", {"processed": processed, "total": total}
+                )
+        if cancelled_by_handler or (cancel_check and cancel_check()):
+            raise DatabaseMigrationError("database_migration_cancelled")
+    except sqlite3.OperationalError as exc:
+        if cancelled_by_handler or (cancel_check and cancel_check()):
+            raise DatabaseMigrationError("database_migration_cancelled") from exc
+        raise
+    finally:
+        conn.set_progress_handler(None, 0)
     generations = _legacy_compatibility_generations(conn)
     conn.executemany(
         """INSERT INTO archive_compatibility_state(
@@ -1406,13 +1474,17 @@ def migrate_database(
                     )
                 except sqlite3.Error:
                     migration_node_count = 0
-            required = migration_required_bytes(database_bytes, migration_node_count)
+            capacity_plan = migration_capacity_plan(
+                preflight_version, database_bytes, migration_node_count
+            )
+            required = int(capacity_plan["required_free_bytes"])
             try:
                 outer_migration_capacity = require_free_space(
                     database_path,
                     required,
                     "migration_disk_space_insufficient",
                 )
+                outer_migration_capacity.update(capacity_plan)
             except DiskSpaceInsufficientError as exc:
                 raise DatabaseMigrationError(
                     exc.code,
@@ -1512,9 +1584,10 @@ def migrate_database(
                         database_bytes += sidecar.stat().st_size
                     except OSError:
                         pass
-                required = migration_required_bytes(
-                    database_bytes, migration_node_count
+                capacity_plan = migration_capacity_plan(
+                    current_version, database_bytes, migration_node_count
                 )
+                required = int(capacity_plan["required_free_bytes"])
                 try:
                     migration_capacity = require_free_space(
                         database_path,
@@ -1532,6 +1605,7 @@ def migrate_database(
                     ) from exc
                 migration_capacity.update(
                     {
+                        **capacity_plan,
                         "locked_page_count": page_count,
                         "locked_page_size": page_size,
                         "locked_node_count": migration_node_count,
@@ -1554,7 +1628,11 @@ def migrate_database(
                         "FROM archive_compatibility_state ORDER BY domain"
                     )
                 ]
-                refresh_legacy_compatibility_state(conn)
+                refresh_legacy_compatibility_state(
+                    conn,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                )
                 compatibility_refreshed = True
                 rows_after = [
                     tuple(row)
@@ -1668,7 +1746,11 @@ def migrate_database(
             conn.execute(f'DROP INDEX "{name}"')
         for statement in REQUIRED_INDEX_DDL.values():
             conn.execute(statement)
-        refresh_legacy_compatibility_state(conn)
+        refresh_legacy_compatibility_state(
+            conn,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
         pre_version = database_schema_status(conn)
         if (
             not pre_version["base_schema_compatible"]
@@ -2566,16 +2648,27 @@ _NODE_SYNC_FIELDS = (
     "metadata_json", "is_on_current_path", "raw_message_json",
 )
 _NODE_MESSAGE_FIELDS = {
-    "message_id", "role", "author_name", "create_time", "update_time",
-    "content_type", "content_text", "content_hash", "metadata_json",
-    "raw_message_json",
+    "message_id", "role", "author_name", "content_type", "content_text",
+    "content_hash", "metadata_json",
 }
 _NODE_ADDRESS_FIELDS = {"parent_node_id", "children_json", "message_id"}
 _NODE_GRAPH_FIELDS = {"parent_node_id", "children_json", "is_on_current_path"}
 _NODE_QUERY_FIELDS = {"create_time", "update_time"}
 _NODE_DISPLAY_FIELDS = {
-    "content_type", "content_text", "content_hash", "raw_message_json"
+    "content_type", "content_text", "content_hash"
 }
+
+
+def _raw_display_source_changed(old: sqlite3.Row, values: dict[str, Any]) -> bool:
+    if old["raw_message_json"] == values["raw_message_json"]:
+        return False
+    old_text = recover_message_display_text(
+        old["content_text"], old["raw_message_json"]
+    )
+    new_text = recover_message_display_text(
+        values["content_text"], values["raw_message_json"]
+    )
+    return old_text != new_text
 
 
 def _parsed_node_values(node: Any) -> dict[str, Any]:
@@ -2640,7 +2733,8 @@ def _synchronize_updated_conversation_nodes(
             }
             if not changed_fields:
                 continue
-            if changed_fields & _NODE_MESSAGE_FIELDS:
+            raw_display_changed = _raw_display_source_changed(old, values)
+            if changed_fields & _NODE_MESSAGE_FIELDS or raw_display_changed:
                 dirty_domains.add("message")
                 message_dirty_conversations.add(conversation.conversation_id)
             if changed_fields & _NODE_ADDRESS_FIELDS:
@@ -2651,7 +2745,7 @@ def _synchronize_updated_conversation_nodes(
                 dirty_domains.add("query")
             revision = (
                 secrets.token_hex(16)
-                if changed_fields & _NODE_DISPLAY_FIELDS
+                if changed_fields & _NODE_DISPLAY_FIELDS or raw_display_changed
                 else str(old["display_revision"])
             )
             update_rows.append(

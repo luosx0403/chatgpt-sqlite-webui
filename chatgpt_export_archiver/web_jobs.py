@@ -131,10 +131,16 @@ class ImportJob:
 class ImportJobStartError(RuntimeError):
     """Safe failure raised when a worker thread cannot be constructed/started."""
 
-    def __init__(self, error_type: str) -> None:
+    def __init__(
+        self,
+        error_type: str,
+        *,
+        cleanup_warnings: list[dict[str, str]] | None = None,
+    ) -> None:
         super().__init__("import_job_start_failed")
         self.code = "import_job_start_failed"
         self.error_type = error_type
+        self.cleanup_warnings = [dict(item) for item in cleanup_warnings or []]
 
 
 @contextmanager
@@ -224,7 +230,7 @@ class ImportJobManager:
             self._pending_writer_lock = writer_lock
         return True
 
-    def release_pending_upload_slot(self) -> None:
+    def release_pending_upload_slot(self) -> list[dict[str, str]]:
         writer_lock = None
         with self._lock:
             if self._running_job_id == "__pending_upload__":
@@ -234,7 +240,14 @@ class ImportJobManager:
                     None,
                 )
         if writer_lock is not None:
-            writer_lock.close()
+            try:
+                writer_lock.close()
+            except WebIndexBuildError as exc:
+                # Admission has already been released.  Return safe secondary
+                # diagnostics so the request path can preserve its primary
+                # outcome without silently discarding cleanup evidence.
+                return [dict(item) for item in exc.cleanup_warnings]
+        return []
 
     def start_import(
         self,
@@ -286,6 +299,7 @@ class ImportJobManager:
             thread.start()
         except Exception as exc:
             writer_lock = None
+            cleanup_warnings: list[dict[str, str]] = []
             with self._lock:
                 if self._running_job_id == job_id:
                     self._running_job_id = None
@@ -293,8 +307,15 @@ class ImportJobManager:
                 if removed is not None:
                     writer_lock, removed._writer_lock = removed._writer_lock, None
             if writer_lock is not None:
-                writer_lock.close()
-            raise ImportJobStartError(type(exc).__name__) from exc
+                try:
+                    writer_lock.close()
+                except WebIndexBuildError as cleanup_exc:
+                    cleanup_warnings = [
+                        dict(item) for item in cleanup_exc.cleanup_warnings
+                    ]
+            raise ImportJobStartError(
+                type(exc).__name__, cleanup_warnings=cleanup_warnings
+            ) from exc
         return job
 
     def get(self, job_id: str) -> ImportJob | None:
@@ -670,7 +691,13 @@ class ImportJobManager:
                 elif terminal_status == "postcheck_failed" and job.canonical_commit_succeeded:
                     job.completion_outcome = "failed_after_canonical_commit"
             if writer_lock is not None:
-                writer_lock.close()
+                try:
+                    writer_lock.close()
+                except WebIndexBuildError as exc:
+                    _add_exception_cleanup_warnings(job, exc)
+                    with job._lock:
+                        if terminal_status == "succeeded":
+                            job.completion_outcome = "cleanup_warning"
             with job._lock:
                 job.stage_timings["cleanup"] = round(
                     float(job.stage_timings.get("cleanup", 0.0))

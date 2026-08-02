@@ -72,6 +72,7 @@ function assertStaticFrontendContracts() {
   assert.ok(appSource.includes("void has_internal_hits"), "selected conversation metadata clear must remove stale internal search metadata");
   assert.ok(clientSource.includes("count_total"), "message hit client should expose count_total for fast navigation requests");
   assert.ok(clientSource.includes("getConversationCopyText"), "full conversation copy should use the dedicated server-side text stream");
+  assert.ok(clientSource.includes("getVisibleMessagesCopyText"), "visible copy should use the dedicated selected-row stream");
   assert.ok(clientSource.includes("response.body.getReader()"), "full conversation copy should consume a ReadableStream instead of response.text()");
   assert.equal(clientSource.includes("return response.text()"), false, "full conversation copy must not allocate an unbounded response string");
   assert.ok(clientSource.includes("MAX_BROWSER_COPY_BYTES"), "browser copy must enforce a byte budget");
@@ -87,14 +88,14 @@ function assertStaticFrontendContracts() {
   assert.ok(paneSource.includes("HIT_PREFETCH_THRESHOLD"), "reader hit navigation should lazily append near the loaded boundary");
   assert.ok(messageBlockSource.includes("getMessageDisplayChunk"), "truncated reader messages should have an explicit bounded expansion path");
   assert.ok(messageBlockSource.includes("chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)"), "single-message expansion/copy must distinguish normal intermediate chunks from terminal incomplete raw recovery");
-  assert.ok(paneSource.includes("chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)"), "Copy visible must distinguish normal intermediate chunks from terminal incomplete raw recovery");
+  assert.ok(paneSource.includes("getVisibleMessagesCopyText"), "Copy visible must bind loaded message IDs to one server snapshot");
   assert.ok(messageBlockSource.includes("message.display_text_resolver_input_truncated"), "initial reader metadata must expose resolver incompleteness separately from unknown total length");
-  assert.ok(paneSource.includes("new IncompleteDisplayRecoveryError()"), "Copy visible must reject incomplete recovered text before clipboard mutation");
   assert.ok(i18nSource.includes("displayRecoveryIncomplete"), "incomplete raw recovery should have an accessible localized warning");
   assert.ok(messageBlockSource.includes("JSON.stringify([conversationId, message.node_id"), "message state keys should use collision-free tuple serialization");
   assert.ok(messageBlockSource.includes('hasOwnProperty.call(savedState, "displayNextOffset")'), "terminal next_offset=null must survive remount");
-  assert.ok(paneSource.includes("new CopyLimitError()"), "visible/full copy accumulation must stop at the browser copy budget");
+  assert.ok(clientSource.includes("new CopyLimitError()"), "visible/full copy streams must stop at the browser copy budget");
   assert.ok(paneSource.indexOf("assertBrowserCopyLimit(text)") < paneSource.indexOf("navigator.clipboard.writeText(text)"), "copy limits must be checked before clipboard mutation");
+  assert.ok(paneSource.includes("readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current"), "clipboard mutation must be guarded by the current reader context");
   assert.ok(messageBlockSource.includes("[messageIdentity, showRawDefault]"), "message content state should reset only for data identity/default changes");
   assert.equal(messageBlockSource.includes("[messageIdentity, showRawDefault, layout]"), false, "pure layout changes must preserve message content state");
   assert.ok(paneSource.includes("readerDataContextKey"), "reader requests should use a data-only context key");
@@ -1047,6 +1048,48 @@ async function main() {
       const apiPage = await (await fetch(new URL("/api/conversations?limit=5&sort=newest", baseUrl))).json();
       throw new Error(`initial conversation items did not render; health=${JSON.stringify(health)} api_count=${apiPage.items?.length ?? 0} diagnostics=${browserDiagnostics.join(" | ")}`);
     }
+    let listStaleResponses = 0;
+    const recoverListStale = async (route) => {
+      const url = new URL(route.request().url());
+      if ((Number(url.searchParams.get("offset")) || 0) > 0 && listStaleResponses === 0) {
+        listStaleResponses += 1;
+        await route.fulfill({ status: 409, contentType: "application/json", body: '{"detail":"search_continuation_stale","code":"search_continuation_stale"}' });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/api/conversations?**", recoverListStale);
+    const listStaleObserved = page.waitForResponse((response) => response.status() === 409 && new URL(response.url()).pathname === "/api/conversations");
+    const listRefreshObserved = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.status() === 200 && url.pathname === "/api/conversations" && !url.searchParams.get("continuation");
+    });
+    await page.getByRole("button", { name: "Load more", exact: true }).click();
+    await listStaleObserved;
+    await listRefreshObserved;
+    await page.waitForFunction(() => document.querySelectorAll(".conversation-item").length >= 20 && !document.querySelector(".sidebar .error-box"), undefined, { timeout: 20_000 });
+    assert.equal(listStaleResponses, 1, "stale conversation append should restart page zero once");
+    await page.unroute("**/api/conversations?**", recoverListStale);
+
+    let repeatedListStaleResponses = 0;
+    const rejectListTwice = async (route) => {
+      const url = new URL(route.request().url());
+      const isAppend = Boolean(url.searchParams.get("continuation")) || (Number(url.searchParams.get("offset")) || 0) > 0;
+      if ((repeatedListStaleResponses === 0 && isAppend) || repeatedListStaleResponses === 1) {
+        repeatedListStaleResponses += 1;
+        await route.fulfill({ status: 409, contentType: "application/json", body: '{"detail":"search_continuation_stale","code":"search_continuation_stale"}' });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/api/conversations?**", rejectListTwice);
+    await page.getByRole("button", { name: "Load more", exact: true }).click();
+    await page.getByText("The archive changed while loading. Try again.", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    assert.equal(repeatedListStaleResponses, 2, "a second stale conversation response must stop retrying");
+    assert.equal(await page.locator(".conversation-item").count(), 0, "repeated stale responses must not retain the old list snapshot");
+    await page.unroute("**/api/conversations?**", rejectListTwice);
+    await page.reload({ waitUntil: "networkidle" });
+    await waitForCount(page, ".conversation-item", 20);
     const importButton = page.getByTestId("import-zip-button");
     await importButton.focus();
     assert.equal(await importButton.evaluate((node) => node === document.activeElement), true, "visible Import ZIP button must receive keyboard focus");
@@ -1821,6 +1864,38 @@ async function main() {
     assert.equal(await page.evaluate(() => window.__copiedText), "copy-race-sentinel", "copy response from an old reader context must not write to the clipboard");
     assert.equal((await page.locator(".hit-counter").textContent())?.includes("Copied"), false, "old copy completion must not set success in the new reader context");
     await page.evaluate(() => { window.fetch = window.__nativeFetch; });
+
+    await page.goto(`${baseUrl}?conversation=dom-long`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    await page.evaluate(() => {
+      window.__copiedText = "clipboard-delay-sentinel";
+      window.__clipboardRelease = null;
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: (text) => new Promise((resolve) => {
+            window.__clipboardRelease = () => {
+              window.__copiedText = text;
+              resolve();
+            };
+          }),
+        },
+      });
+    });
+    await page.getByRole("button", { name: "Copy visible" }).click();
+    await page.waitForFunction(() => Boolean(window.__clipboardRelease), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: /DOM Role Class Conversation/ }).click();
+    await page.getByRole("heading", { name: "DOM Role Class Conversation" }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.evaluate(() => window.__clipboardRelease());
+    await page.waitForTimeout(200);
+    assert.equal((await page.locator(".hit-counter").textContent())?.includes("Copied"), false, "a delayed clipboard completion from the old context must never be reported as a valid copy");
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (text) => { window.__copiedText = text; } },
+      });
+    });
+
     await page.goto(`${baseUrl}?conversation=dom-long`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
     await page.evaluate((value) => { window.__copiedText = value; }, copiedBeforeFailure);
@@ -2131,7 +2206,83 @@ async function main() {
     await activateHitNode(page, "long-hit");
     await waitForActiveHighlightVisible(page);
 
-	    await page.goto(`${baseUrl}?conversation=dom-hit-sequence&match_mode=contains&path=current&scope=all`, { waitUntil: "networkidle" });
+    await page.goto(`${baseUrl}?conversation=dom-hit-sequence&match_mode=contains&path=current&scope=all`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    let hitStalePhase = 0;
+    const recoverHitStale = async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("conversation_id") !== "dom-hit-sequence") {
+        await route.continue();
+        return;
+      }
+      if (hitStalePhase === 0) {
+        hitStalePhase = 1;
+        const original = await route.fetch();
+        const body = await original.json();
+        body.items = body.items.slice(0, 1);
+        body.total = 1;
+        body.total_exact = false;
+        body.has_more = true;
+        await route.fulfill({ response: original, body: JSON.stringify(body), contentType: "application/json" });
+        return;
+      }
+      if (url.searchParams.get("continuation") && hitStalePhase === 1) {
+        hitStalePhase = 2;
+        await route.fulfill({ status: 409, contentType: "application/json", body: '{"detail":"search_continuation_stale","code":"search_continuation_stale"}' });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/api/search/messages?**", recoverHitStale);
+    await page.locator("#global-search").fill("sequence-target");
+    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 1"), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: "Next hit" }).click();
+    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 100"), undefined, { timeout: 20_000 });
+    assert.equal(hitStalePhase, 2, "stale message-hit append should replace with a fresh first segment");
+    await page.unroute("**/api/search/messages?**", recoverHitStale);
+
+    await page.goto(`${baseUrl}?conversation=dom-hit-sequence&match_mode=contains&path=current&scope=all`, { waitUntil: "networkidle" });
+    await waitForCount(page, ".message", 1);
+    let repeatedHitPhase = 0;
+    const rejectHitTwice = async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("conversation_id") !== "dom-hit-sequence") {
+        await route.continue();
+        return;
+      }
+      if (repeatedHitPhase === 0) {
+        repeatedHitPhase = 1;
+        const original = await route.fetch();
+        const body = await original.json();
+        body.items = body.items.slice(0, 1);
+        body.total = 1;
+        body.total_exact = false;
+        body.has_more = true;
+        await route.fulfill({ response: original, body: JSON.stringify(body), contentType: "application/json" });
+        return;
+      }
+      repeatedHitPhase += 1;
+      await route.fulfill({ status: 409, contentType: "application/json", body: '{"detail":"search_continuation_stale","code":"search_continuation_stale"}' });
+    };
+    await page.route("**/api/search/messages?**", rejectHitTwice);
+    await page.locator("#global-search").fill("sequence-target");
+    await page.waitForFunction(() => document.querySelector(".hit-counter")?.textContent?.includes("1 / 1"), undefined, { timeout: 20_000 });
+    await page.getByRole("button", { name: "Next hit" }).click();
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 20_000;
+      const poll = () => {
+        if (repeatedHitPhase >= 3) resolve();
+        else if (Date.now() >= deadline) reject(new Error(`message-hit repeated stale phase stopped at ${repeatedHitPhase}`));
+        else setTimeout(poll, 20);
+      };
+      poll();
+    });
+    await page.getByText("The archive changed while loading. Try again.", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    assert.equal(repeatedHitPhase, 3, "message-hit recovery must stop after one failed restart");
+    assert.equal((await page.locator(".hit-counter").textContent())?.includes("1 /"), false, "old hit items must not survive repeated stale responses");
+    await page.unroute("**/api/search/messages?**", rejectHitTwice);
+
+    await page.goto(`${baseUrl}?conversation=dom-hit-sequence&match_mode=contains&path=current&scope=all`, { waitUntil: "networkidle" });
     await waitForCount(page, ".message", 1);
 	    let initialHitNavigationRequests = 0;
 	    const initialHitResponses = [];

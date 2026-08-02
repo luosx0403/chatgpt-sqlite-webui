@@ -59,6 +59,20 @@ def upload_required_bytes(content_length: int) -> int:
     return int(upload_capacity_plan(content_length)["required_free_bytes"])
 
 
+def upload_spool_required_bytes(content_length: int) -> int:
+    """Free bytes required on the multipart parser's temporary filesystem."""
+
+    length = max(0, int(content_length))
+    return length + DISK_CLEANUP_RESERVE_BYTES + DISK_RESERVE_BYTES
+
+
+def upload_pipeline_copy_required_bytes(content_length: int) -> int:
+    """Free bytes required after parser spooling for the owned ZIP copy."""
+
+    length = max(0, int(content_length))
+    return length + DISK_CLEANUP_RESERVE_BYTES + DISK_RESERVE_BYTES
+
+
 def upload_capacity_plan(content_length: int) -> dict[str, int]:
     """Model parser spool and pipeline ZIP coexistence during multipart copy."""
 
@@ -170,6 +184,57 @@ def migration_required_bytes(database_bytes: int, row_count: int = 0) -> int:
     rows = max(0, int(row_count))
     rewritten = max(database, rows * 96)
     return max(512 * 1024 * 1024, database + rewritten) + DISK_RESERVE_BYTES
+
+
+def migration_capacity_plan(
+    current_version: int,
+    database_bytes: int,
+    row_count: int = 0,
+) -> dict[str, int | str | list[str]]:
+    """Model the actual mutation class for each shipped predecessor edge."""
+
+    version = max(0, int(current_version))
+    database = max(0, int(database_bytes))
+    rows = max(0, int(row_count))
+    if version < 3:
+        step = "identity_table_rewrite"
+        planned_steps = [
+            "identity_table_rewrite",
+            "revision_metadata_and_backfill",
+            "query_generation_metadata",
+            "compatibility_scan",
+        ]
+        rewrite = max(database, rows * 96)
+        journal = max(128 * 1024 * 1024, database)
+        reserve = DISK_RESERVE_BYTES
+    elif version < 5:
+        step = "display_revision_backfill" if version == 4 else "revision_metadata_and_backfill"
+        planned_steps = [step, "query_generation_metadata", "compatibility_scan"]
+        rewrite = max(64 * 1024 * 1024, rows * 96)
+        journal = max(64 * 1024 * 1024, min(database, rewrite))
+        reserve = 128 * 1024 * 1024
+    else:
+        step = "query_generation_metadata"
+        planned_steps = ["query_generation_metadata", "compatibility_scan"]
+        rewrite = 8 * 1024 * 1024
+        journal = 8 * 1024 * 1024
+        reserve = 32 * 1024 * 1024
+    required = rewrite + journal + reserve
+    return {
+        "step": step,
+        "migration_from": version,
+        "migration_to": 6,
+        "planned_steps": planned_steps,
+        "estimated_peak_category": (
+            "table_rewrite" if version < 5 else "metadata_and_scan"
+        ),
+        "database_bytes": database,
+        "row_count": rows,
+        "estimated_rewrite_bytes": rewrite,
+        "estimated_journal_bytes": journal,
+        "reserve_bytes": reserve,
+        "required_free_bytes": required,
+    }
 
 
 @dataclass

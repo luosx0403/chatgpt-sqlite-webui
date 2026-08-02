@@ -7,5 +7,5 @@
 #   -r requirements-web-py312-macos-arm64.lock
 fastapi==0.136.1
 httpx==0.28.1
-python-multipart==0.0.28
+python-multipart==0.0.31
 uvicorn==0.46.0

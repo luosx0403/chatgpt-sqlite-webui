@@ -275,6 +275,48 @@ export async function getConversationCopyText(
   }
 }
 
+export async function getVisibleMessagesCopyText(
+  conversationId: string,
+  nodeIds: string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const response = await fetch(`/api/by-id/copy-visible?${params({ conversation_id: conversationId })}`, {
+    method: "POST",
+    signal,
+    headers: { Accept: "text/plain", "Content-Type": "application/json" },
+    body: JSON.stringify({ node_ids: nodeIds }),
+  });
+  if (!response.ok) throw await responseError(response);
+  if (!response.body) throw new CopyLimitError();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let bytes = 0;
+  let chars = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_BROWSER_COPY_BYTES) throw new CopyLimitError();
+      const part = decoder.decode(value, { stream: true });
+      chars += part.length;
+      if (chars > MAX_BROWSER_COPY_CHARS) throw new CopyLimitError();
+      parts.push(part);
+    }
+    const tail = decoder.decode();
+    chars += tail.length;
+    if (chars > MAX_BROWSER_COPY_CHARS) throw new CopyLimitError();
+    parts.push(tail);
+    return parts.join("");
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export function getRawMessage(conversationId: string, nodeId: string, signal?: AbortSignal, maxChars = 50000): Promise<RawMessageResponse> {
   const query = params({ conversation_id: conversationId, node_id: nodeId, max_chars: maxChars });
   return request<RawMessageResponse>(`/api/by-id/raw?${query}`, signal);

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { ConversationSummary, MatchMode, MessageItem, PathMode, SearchFilters, SearchMessageHit } from "../types";
-import { CopyLimitError, IncompleteDisplayRecoveryError, MAX_BROWSER_COPY_BYTES, MAX_BROWSER_COPY_CHARS, assertBrowserCopyLimit, exportUrl, getConversationCopyText, getMessageDisplayChunk, getMessageHits, getMessages, isRecoverableDisplayCursorError } from "../api/client";
+import { ApiError, CopyLimitError, IncompleteDisplayRecoveryError, assertBrowserCopyLimit, exportUrl, getConversationCopyText, getMessageHits, getMessages, getVisibleMessagesCopyText } from "../api/client";
 import { formatDate } from "../utils/format";
 import { analyzeQuerySyntax } from "../utils/querySyntax";
 import MessageBlock from "./MessageBlock";
@@ -351,43 +351,73 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     const requestId = ++hitRequestRef.current;
     const requestedContextKey = readerDataContextKey;
     const remaining = MAX_NAVIGABLE_HIT_MESSAGES - hitItems.length;
-    getMessageHits({
+    const requestPage = (restart: boolean) => getMessageHits({
       q: highlightQuery,
       conversationId: conversation.conversation_id,
       path: effectivePath,
       order: "display",
-      limit: hitContinuation ? HIT_NAVIGATION_PAGE_SIZE : Math.min(HIT_NAVIGATION_PAGE_SIZE, remaining),
-      offset: hitContinuation ? 0 : (hitNextOffset ?? 0),
+      limit: restart || hitContinuation ? HIT_NAVIGATION_PAGE_SIZE : Math.min(HIT_NAVIGATION_PAGE_SIZE, remaining),
+      offset: restart || hitContinuation ? 0 : (hitNextOffset ?? 0),
       filters: effectiveFilters,
       matchMode,
       countTotal: false,
-      continuation: hitContinuation,
+      continuation: restart ? null : hitContinuation,
       signal: controller.signal,
-    })
-      .then((page) => {
-        if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
-        if (!Array.isArray(page.items)) throw new Error("invalid_response");
-        const loadedCount = Math.min(MAX_NAVIGABLE_HIT_MESSAGES, hitItems.length + page.items.length);
-        setHitItems((current) => {
-          const merged = new Map(
-            current.map((item) => [`${item.conversation_id}\u0000${item.node_id}`, item] as const),
-          );
-          page.items.forEach((item) => merged.set(`${item.conversation_id}\u0000${item.node_id}`, item));
-          return Array.from(merged.values()).slice(0, MAX_NAVIGABLE_HIT_MESSAGES);
-        });
-        setHitNextOffset(page.next_offset);
-        setHitContinuation(page.diagnostics?.continuation_token ?? null);
-        setHitSearchPartial(Boolean(page.diagnostics?.partial));
-        const more = Boolean(
-          page.diagnostics?.continuation_available || (page.has_more && page.next_offset !== null)
+    });
+    const applyPage = (page: Awaited<ReturnType<typeof requestPage>>, restart: boolean) => {
+      if (requestId !== hitRequestRef.current || readerDataContextRef.current !== requestedContextKey) return;
+      if (!Array.isArray(page.items)) throw new Error("invalid_response");
+      const loadedCount = restart
+        ? page.items.length
+        : Math.min(MAX_NAVIGABLE_HIT_MESSAGES, hitItems.length + page.items.length);
+      setHitItems((current) => {
+        if (restart) return page.items.slice(0, MAX_NAVIGABLE_HIT_MESSAGES);
+        const merged = new Map(
+          current.map((item) => [`${item.conversation_id}\u0000${item.node_id}`, item] as const),
         );
-        setHitHasMore(Boolean(more && loadedCount < MAX_NAVIGABLE_HIT_MESSAGES));
-        setHitLimitReached(Boolean(more && loadedCount >= MAX_NAVIGABLE_HIT_MESSAGES));
-        if (page.total_exact) setHitExactTotal(page.total);
+        page.items.forEach((item) => merged.set(`${item.conversation_id}\u0000${item.node_id}`, item));
+        return Array.from(merged.values()).slice(0, MAX_NAVIGABLE_HIT_MESSAGES);
+      });
+      setHitNextOffset(page.next_offset);
+      setHitContinuation(page.diagnostics?.continuation_token ?? null);
+      setHitSearchPartial(Boolean(page.diagnostics?.partial));
+      const more = Boolean(
+        page.diagnostics?.continuation_available || (page.has_more && page.next_offset !== null)
+      );
+      setHitHasMore(Boolean(more && loadedCount < MAX_NAVIGABLE_HIT_MESSAGES));
+      setHitLimitReached(Boolean(more && loadedCount >= MAX_NAVIGABLE_HIT_MESSAGES));
+      setHitExactTotal(page.total_exact ? page.total : null);
+      if (restart) setHitIndex(0);
+    };
+    requestPage(false)
+      .then((page) => {
+        applyPage(page, false);
       })
-      .catch((err: Error) => {
+      .catch(async (err: Error) => {
         if (err.name !== "AbortError" && requestId === hitRequestRef.current && readerDataContextRef.current === requestedContextKey) {
-          setHitHasMore(false);
+          if (err instanceof ApiError && err.code === "search_continuation_stale") {
+            setHitItems([]);
+            setHitExactTotal(null);
+            setHitHasMore(false);
+            setHitNextOffset(null);
+            setHitContinuation(null);
+            setHitSearchPartial(false);
+            setHitLimitReached(false);
+            setHitIndex(0);
+            try {
+              applyPage(await requestPage(true), true);
+              return;
+            } catch (retryError) {
+              if (
+                retryError instanceof ApiError
+                && retryError.code === "search_continuation_stale"
+                && requestId === hitRequestRef.current
+                && readerDataContextRef.current === requestedContextKey
+              ) setError(t("dataChangedRetry"));
+              return;
+            }
+          }
+          setError(t("requestFailed"));
         }
       })
       .finally(() => {
@@ -396,7 +426,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
           setHitLoadingMore(false);
         }
       });
-  }, [conversation?.conversation_id, effectiveFiltersKey, effectivePath, highlightQuery, hitContinuation, hitHasMore, hitItems.length, hitNextOffset, matchMode, readerDataContextKey, searchActive]);
+  }, [conversation?.conversation_id, effectiveFiltersKey, effectivePath, highlightQuery, hitContinuation, hitHasMore, hitItems.length, hitNextOffset, matchMode, readerDataContextKey, searchActive, t]);
   const titleOnlyContext = Boolean(
     filters.title ||
     (effectiveScope === "title" && (querySyntax.hasBodyText || querySyntax.hasTitleText || filters.exact)),
@@ -525,6 +555,7 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     try {
       assertBrowserCopyLimit(text);
       if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      if (expectedContextKey && (readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current)) return false;
       await navigator.clipboard.writeText(text);
       if (expectedContextKey && (readerDataContextRef.current !== expectedContextKey || requestId !== copyRequestRef.current)) return false;
       setCopyStatus(t("copied"));
@@ -536,56 +567,6 @@ export default function ConversationPane({ conversation, query, filters, matchMo
       clearCopyStatusLater(1800);
       return false;
     }
-  };
-  const messageText = (m: MessageItem) => m.display_text || "";
-  const completeMessageText = async (message: MessageItem, signal: AbortSignal): Promise<string> => {
-    if (message.display_text_resolver_input_truncated) throw new IncompleteDisplayRecoveryError();
-    if (!message.display_text_truncated) return messageText(message);
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      let offset = 0;
-      let cursor: string | null = null;
-      let complete = "";
-      let completeBytes = 0;
-      try {
-        for (;;) {
-          const chunk = await getMessageDisplayChunk(conversation!.conversation_id, message.node_id, offset, 1048576, signal, cursor);
-          if (chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)) {
-            throw new IncompleteDisplayRecoveryError();
-          }
-          completeBytes += new TextEncoder().encode(chunk.display_text).byteLength;
-          if (complete.length + chunk.display_text.length > MAX_BROWSER_COPY_CHARS || completeBytes > MAX_BROWSER_COPY_BYTES) {
-            throw new CopyLimitError();
-          }
-          complete += chunk.display_text;
-          if (!chunk.has_more || chunk.next_offset === null) return complete;
-          offset = chunk.next_offset;
-          cursor = chunk.next_cursor;
-        }
-      } catch (error) {
-        if (attempt === 0 && isRecoverableDisplayCursorError(error)) {
-          continue;
-        }
-        throw error;
-      }
-    }
-    throw new Error("display_cursor_retry_exhausted");
-  };
-  const formatMessagesForCopy = async (items: MessageItem[], signal: AbortSignal): Promise<string> => {
-    const parts: string[] = [];
-    let chars = 0;
-    let bytes = 0;
-    for (const message of items) {
-      if (message.is_empty_mapping_node) continue;
-      const complete = await completeMessageText(message, signal);
-      if (complete.trim()) {
-        const part = `${message.role || "message"}:\n${complete}`;
-        chars += part.length + (parts.length ? 2 : 0);
-        bytes += new TextEncoder().encode(part).byteLength + (parts.length ? 2 : 0);
-        if (chars > MAX_BROWSER_COPY_CHARS || bytes > MAX_BROWSER_COPY_BYTES) throw new CopyLimitError();
-        parts.push(part);
-      }
-    }
-    return parts.join("\n\n");
   };
   const runCopy = async (mode: "visible" | "conversation") => {
     if (copyBusy) return;
@@ -599,7 +580,11 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     try {
       const copyValue = mode === "conversation"
         ? await getConversationCopyText(conversation!.conversation_id, effectivePath, showInternal, controller.signal)
-        : await formatMessagesForCopy(visibleMessages, controller.signal);
+        : await getVisibleMessagesCopyText(
+          conversation!.conversation_id,
+          visibleMessages.filter((message) => !message.is_empty_mapping_node).map((message) => message.node_id),
+          controller.signal,
+        );
       if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
       await copyText(copyValue, requestedContextKey, requestId);
     } catch (error) {

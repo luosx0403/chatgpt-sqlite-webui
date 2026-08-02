@@ -139,7 +139,7 @@ class Round11Regressions(unittest.TestCase):
         completed = subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).resolve().parents[1] / "tools" / "benchmark_round11.py"),
+                str(Path(__file__).resolve().parents[1] / "tools" / "benchmark_resources.py"),
                 "--scenario",
                 "json-framing",
                 "--size-mib",
@@ -153,7 +153,7 @@ class Round11Regressions(unittest.TestCase):
             text=True,
         )
         payload = json.loads(completed.stdout)
-        self.assertEqual(payload["schema"], "chatgpt-sqlite-webui-round12-benchmark-v2")
+        self.assertEqual(payload["schema"], "chatgpt-sqlite-webui-resource-benchmark-v3")
         sample = payload["samples"][0]
         self.assertEqual(
             sample["decoder"]["decode_calls"], sample["decoder"]["elements"]
@@ -620,7 +620,7 @@ class Round11Regressions(unittest.TestCase):
 
     def test_five_thousand_node_metadata_density_matrix_uses_joint_profile(self):
         # The 5,000-node × five-density matrix now runs in fresh subprocesses
-        # through tools/acceptance_scale_round12.py --scenario metadata-density.
+        # through tools/acceptance_scale.py --scenario metadata-density.
         # This retained test ID exercises the same production path at ordinary
         # suite scale so ResourceWarning/lifecycle coverage is never skipped.
         with tempfile.TemporaryDirectory() as td:

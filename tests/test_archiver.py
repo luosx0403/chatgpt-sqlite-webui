@@ -3749,7 +3749,7 @@ class ArchiverTests(unittest.TestCase):
                 "requirements-web-py312-macos-arm64.lock", "LICENSE", "AGENTS.md", "chatgpt_archive.py",
                 "chatgpt_export_archiver/search.py", "chatgpt_export_archiver/web_api.py",
                 "tests/__init__.py", "tests/test_archiver.py", "tests/test_web_api.py", "tests/test_round12.py",
-                "tools/acceptance_real_pipeline.py", "tools/acceptance_scale_round12.py",
+                "tools/acceptance_real_pipeline.py", "tools/acceptance_scale.py",
                 "tools/check_delivery_clean.py", "tools/clean_generated_artifacts.py",
                 "tools/make_release_zip.py", "tools/verify_web_hash_lock.py",
                 "webui/src/App.tsx", "webui/src/i18n.ts", "webui/src/components/ConversationPane.tsx",

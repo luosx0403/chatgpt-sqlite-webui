@@ -8,7 +8,9 @@ import os
 import secrets
 import sqlite3
 import stat
+import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -101,7 +103,7 @@ class _WriterProcessLock:
 
     def __init__(
         self,
-        fds: list[int],
+        fds: list[tuple[tuple[str, str], int]],
         keys: set[tuple[str, str]],
         lock_names: set[str],
     ) -> None:
@@ -116,10 +118,11 @@ class _WriterProcessLock:
         for key in _database_lock_keys(db_path):
             if key in self.keys:
                 continue
-            lock_name = _process_lock_name(key)
-            if lock_name not in self.lock_names:
+            lock_name, lock_offset = _process_lock_domain(key)
+            domain = f"{lock_name}:{lock_offset}"
+            if domain not in self.lock_names:
                 self.fds.append(_acquire_process_lock_key(registry, key))
-                self.lock_names.add(lock_name)
+                self.lock_names.add(domain)
             self.keys.add(key)
 
     def revalidate(self, db_path: Path) -> None:
@@ -130,25 +133,32 @@ class _WriterProcessLock:
             raise WebIndexBuildError("database_identity_changed")
 
     def close(self) -> None:
-        fds, self.fds = self.fds, []
-        for fd in reversed(fds):
+        failures: list[dict[str, str]] = []
+        remaining: list[tuple[tuple[str, str], int]] = []
+        for handle in reversed(self.fds):
             try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+                _release_process_lock_handle(handle)
+            except Exception as exc:
+                remaining.append(handle)
+                failures.append({
+                    "code": "writer_process_lock_cleanup_failed",
+                    "error_type": type(exc).__name__,
+                    "path_kind": "process_lock",
+                })
+        self.fds = list(reversed(remaining))
+        if failures:
+            raise WebIndexBuildError(
+                "writer_process_lock_cleanup_failed",
+                cleanup_warnings=failures,
+            )
 
 
 _PROCESS_LOCK_MAGIC = "chatgpt-sqlite-webui-process-lock"
 _PROCESS_LOCK_FORMAT = 3
 _PROCESS_LOCK_SHARDS = 64
+_PROCESS_LOCK_POOL_MUTEX = threading.Lock()
+_PROCESS_LOCK_POOL_PID = os.getpid()
+_PROCESS_LOCK_POOL: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _process_lock_registry() -> Path:
@@ -182,6 +192,30 @@ def _process_lock_name(key: tuple[str, str]) -> str:
     return f"writer-shard-{digest[0] % _PROCESS_LOCK_SHARDS:02x}.lock"
 
 
+def _process_lock_domain(key: tuple[str, str]) -> tuple[str, int]:
+    """Map an identity to a fixed shard and a collision-resistant byte range."""
+
+    kind, identity = key
+    digest = hashlib.sha256(f"{kind}\0{identity}".encode("ascii")).digest()
+    # Keep the sparse offset in signed 62-bit range for portable off_t calls.
+    offset = 1 + (int.from_bytes(digest[1:9], "big") & ((1 << 62) - 1))
+    return _process_lock_name(key), offset
+
+
+def _reset_process_lock_pool_after_fork() -> None:
+    global _PROCESS_LOCK_POOL_PID
+    pid = os.getpid()
+    if pid == _PROCESS_LOCK_POOL_PID:
+        return
+    for entry in _PROCESS_LOCK_POOL.values():
+        try:
+            os.close(int(entry["fd"]))
+        except OSError:
+            pass
+    _PROCESS_LOCK_POOL.clear()
+    _PROCESS_LOCK_POOL_PID = pid
+
+
 def _database_lock_keys(db_path: Path) -> list[tuple[str, str]]:
     """Return path and existing-file identity domains without storing paths."""
 
@@ -203,8 +237,10 @@ def _database_lock_keys(db_path: Path) -> list[tuple[str, str]]:
     return sorted(keys)
 
 
-def _acquire_process_lock_key(registry: Path, key: tuple[str, str]) -> int:
-    name = _process_lock_name(key)
+def _acquire_process_lock_key(
+    registry: Path, key: tuple[str, str]
+) -> tuple[tuple[str, str], int]:
+    name, lock_offset = _process_lock_domain(key)
     shard = int(name.removeprefix("writer-shard-").removesuffix(".lock"), 16)
     payload = json.dumps(
         {
@@ -216,57 +252,108 @@ def _acquire_process_lock_key(registry: Path, key: tuple[str, str]) -> int:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")
-    fd: int | None = None
-    created = False
-    try:
-        directory_fd = os.open(
-            registry,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
+    pool_key = (str(registry), name)
+    with _PROCESS_LOCK_POOL_MUTEX:
+        _reset_process_lock_pool_after_fork()
+        entry = _PROCESS_LOCK_POOL.get(pool_key)
+        if entry is not None and lock_offset in entry["offsets"]:
+            raise WebIndexBuildError("writer_process_lock_busy")
+        fd: int | None = int(entry["fd"]) if entry is not None else None
+        created = False
         try:
-            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory_fd)
-                created = True
-            except FileExistsError:
-                fd = os.open(name, flags, dir_fd=directory_fd)
-        finally:
-            os.close(directory_fd)
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise OSError("unsafe_lock_identity")
+            if fd is None:
+                directory_fd = os.open(
+                    registry,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    flags = (
+                        os.O_RDWR
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    try:
+                        fd = os.open(
+                            name,
+                            flags | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=directory_fd,
+                        )
+                        created = True
+                    except FileExistsError:
+                        fd = os.open(name, flags, dir_fd=directory_fd)
+                finally:
+                    os.close(directory_fd)
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                ):
+                    raise OSError("unsafe_lock_identity")
+                if created:
+                    os.ftruncate(fd, 0)
+                    view = memoryview(payload)
+                    while view:
+                        written = os.write(fd, view)
+                        if written <= 0:
+                            raise OSError("short_lock_payload_write")
+                        view = view[written:]
+                    os.fsync(fd)
+                info = os.fstat(fd)
+                if info.st_size != len(payload):
+                    raise OSError("unknown_lock_payload")
+                os.lseek(fd, 0, os.SEEK_SET)
+                if os.read(fd, len(payload) + 1) != payload:
+                    raise OSError("unknown_lock_payload")
+                entry = {"fd": fd, "offsets": set()}
+                _PROCESS_LOCK_POOL[pool_key] = entry
+            import fcntl
+
+            fcntl.lockf(
+                fd,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                1,
+                lock_offset,
+                os.SEEK_SET,
+            )
+            entry["offsets"].add(lock_offset)
+            return pool_key, lock_offset
+        except (BlockingIOError, PermissionError):
+            if entry is not None and not entry["offsets"]:
+                _PROCESS_LOCK_POOL.pop(pool_key, None)
+                os.close(int(entry["fd"]))
+            elif entry is None and fd is not None:
+                os.close(fd)
+            raise WebIndexBuildError("writer_process_lock_busy") from None
+        except OSError:
+            if entry is None and fd is not None:
+                os.close(fd)
+            elif entry is not None and not entry["offsets"]:
+                _PROCESS_LOCK_POOL.pop(pool_key, None)
+                os.close(int(entry["fd"]))
+            raise WebIndexBuildError("web_index_process_lock_failed") from None
+
+
+def _release_process_lock_handle(handle: tuple[tuple[str, str], int]) -> None:
+    pool_key, lock_offset = handle
+    with _PROCESS_LOCK_POOL_MUTEX:
+        _reset_process_lock_pool_after_fork()
+        entry = _PROCESS_LOCK_POOL.get(pool_key)
+        if entry is None or lock_offset not in entry["offsets"]:
+            return
         import fcntl
 
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if created:
-            os.ftruncate(fd, 0)
-            view = memoryview(payload)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise OSError("short_lock_payload_write")
-                view = view[written:]
-            os.fsync(fd)
-        info = os.fstat(fd)
-        if info.st_size != len(payload):
-            raise OSError("unknown_lock_payload")
-        os.lseek(fd, 0, os.SEEK_SET)
-        if os.read(fd, len(payload) + 1) != payload:
-            raise OSError("unknown_lock_payload")
-        os.lseek(fd, 0, os.SEEK_SET)
-        return fd
-    except (BlockingIOError, PermissionError):
-        if fd is not None:
+        fd = int(entry["fd"])
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1, lock_offset, os.SEEK_SET)
+        if len(entry["offsets"]) == 1:
             os.close(fd)
-        raise WebIndexBuildError("writer_process_lock_busy") from None
-    except OSError:
-        if fd is not None:
-            os.close(fd)
-        raise WebIndexBuildError("web_index_process_lock_failed") from None
+            entry["offsets"].remove(lock_offset)
+            _PROCESS_LOCK_POOL.pop(pool_key, None)
+        else:
+            entry["offsets"].remove(lock_offset)
 
 
 def acquire_writer_process_lock(db_path: Path) -> _WriterProcessLock:
@@ -282,14 +369,23 @@ def acquire_writer_process_lock(db_path: Path) -> _WriterProcessLock:
     lock = _WriterProcessLock([], set(), set())
     try:
         for key in keys:
-            lock_name = _process_lock_name(key)
-            if lock_name not in lock.lock_names:
+            lock_name, lock_offset = _process_lock_domain(key)
+            domain = f"{lock_name}:{lock_offset}"
+            if domain not in lock.lock_names:
                 lock.fds.append(_acquire_process_lock_key(registry, key))
-                lock.lock_names.add(lock_name)
+                lock.lock_names.add(domain)
             lock.keys.add(key)
         return lock
-    except Exception:
-        lock.close()
+    except Exception as exc:
+        try:
+            lock.close()
+        except WebIndexBuildError as cleanup_exc:
+            existing = list(getattr(exc, "cleanup_warnings", []))
+            setattr(
+                exc,
+                "cleanup_warnings",
+                [*existing, *cleanup_exc.cleanup_warnings],
+            )
         raise
 
 
@@ -905,13 +1001,22 @@ def create_web_indexes(
     batch_size = max(1, min(10_000, int(batch_size)))
     owns_process_lock = _writer_lock is None
     process_lock = _writer_lock or acquire_writer_process_lock(db_path)
+    published_result: dict[str, Any] | None = None
     try:
         conn = connect_writable(db_path)
         process_lock.bind_database(db_path)
         process_lock.revalidate(db_path)
-    except Exception:
+    except Exception as exc:
         if owns_process_lock:
-            process_lock.close()
+            try:
+                process_lock.close()
+            except WebIndexBuildError as cleanup_exc:
+                existing = list(getattr(exc, "cleanup_warnings", []))
+                setattr(
+                    exc,
+                    "cleanup_warnings",
+                    [*existing, *cleanup_exc.cleanup_warnings],
+                )
         raise
     build_id = secrets.token_hex(16)
     owner_token = secrets.token_hex(32)
@@ -1552,7 +1657,7 @@ def create_web_indexes(
                 # Publication already committed. Observer failure cannot make a
                 # valid current index look like a failed build.
                 pass
-        return {
+        published_result = {
             "trigram_available": trigram_available,
             "indexed_messages": indexed_messages,
             "indexed_titles": indexed_titles,
@@ -1581,6 +1686,7 @@ def create_web_indexes(
             "drop_failures_count": 0,
             "drop_failures": [],
         }
+        return published_result
     except sqlite3.OperationalError as exc:
         if conn.in_transaction:
             conn.rollback()
@@ -1631,4 +1737,20 @@ def create_web_indexes(
             conn.close()
         finally:
             if owns_process_lock:
-                process_lock.close()
+                active_error = sys.exception()
+                try:
+                    process_lock.close()
+                except WebIndexBuildError as cleanup_exc:
+                    if published_result is not None:
+                        published_result["cleanup_warnings"] = [
+                            dict(item) for item in cleanup_exc.cleanup_warnings
+                        ]
+                    elif active_error is not None:
+                        existing = list(
+                            getattr(active_error, "cleanup_warnings", [])
+                        )
+                        setattr(
+                            active_error,
+                            "cleanup_warnings",
+                            [*existing, *cleanup_exc.cleanup_warnings],
+                        )

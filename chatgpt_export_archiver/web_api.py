@@ -11,7 +11,7 @@ import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Mapping
+from typing import Annotated, Iterator, Mapping
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, Request, Response, UploadFile
@@ -54,7 +54,7 @@ from .disk_resources import (
     DiskSpaceInsufficientError,
     is_disk_full_error,
     require_free_space,
-    upload_required_bytes,
+    upload_pipeline_copy_required_bytes,
 )
 from .logging_utils import get_logger
 from .identifiers import (
@@ -123,6 +123,10 @@ ALLOWED_PATHS = {"current", "all"}
 ALLOWED_MESSAGE_ORDERS = {"relevance", "display"}
 ALLOWED_MATCH_MODES = {"contains", "word"}
 MAX_DATE_PARAM_LENGTH = 64
+MAX_VISIBLE_COPY_NODES = 1_000
+MAX_VISIBLE_COPY_REQUEST_BYTES = 1024 * 1024
+MAX_VISIBLE_COPY_IDENTIFIER_BYTES = 1024 * 1024
+VISIBLE_COPY_QUERY_BATCH = 200
 MAX_ID_PARAM_LENGTH = MAX_CANONICAL_ID_LENGTH
 MAX_LEGACY_ID_PARAM_LENGTH = 16 * 1024
 MAX_SQLITE_OFFSET = (1 << 63) - 1
@@ -739,7 +743,7 @@ def create_api_router(
                 "primary": "query-based by-id endpoints; URLSearchParams encoding is reversible and unambiguous for slash, percent, question mark, hash, colon, and Unicode IDs",
                 "legacy_id_max_chars": MAX_LEGACY_ID_PARAM_LENGTH,
                 "new_import_id_max_chars": MAX_CANONICAL_ID_LENGTH,
-                "endpoints": ["/api/by-id/conversation", "/api/by-id/messages", "/api/by-id/raw", "/api/by-id/display", "/api/by-id/copy", "/api/by-id/export"],
+                "endpoints": ["/api/by-id/conversation", "/api/by-id/messages", "/api/by-id/raw", "/api/by-id/display", "/api/by-id/copy", "/api/by-id/copy-visible", "/api/by-id/export"],
                 "legacy_path_routes": "retained only for route-safe IDs up to the new-import limit",
                 "incompatible_legacy_data": "IDs above the bounded by-id limit make health/readiness fail with database_data_incompatible; unusable rows are never listed as ready",
             },
@@ -803,7 +807,8 @@ def create_api_router(
                 "path": ["current", "all"],
                 "include_internal": "boolean; default false, matching CLI export and the visible reader; true includes internal/technical nodes",
                 "copy_endpoint": "/api/by-id/copy?conversation_id=...",
-                "streaming": "export and full-conversation copy use complete canonical display text from bounded server-side node batches and never accumulate reader page payloads",
+                "visible_copy_endpoint": "/api/by-id/copy-visible?conversation_id=...",
+                "streaming": "export and full-conversation copy use complete canonical display text from bounded server-side node batches and never accumulate reader page payloads. Copy visible submits at most 1000 already-loaded node IDs in a 1 MiB request and streams them from one SQLite read snapshot, so a writer cannot mix row revisions within one clipboard value.",
                 "snapshot": {
                     "consistency": "one SQLite read snapshot is held from schema/capability checks through the final streamed byte and is released on completion, error, or client disconnect",
                     "wal_operational_limit": "a long reader can delay WAL checkpoint progress; WAL size, CPU, VM work, temporary disk, and duration remain proportional to the selected data",
@@ -836,7 +841,7 @@ def create_api_router(
                 "bounded": {"row_keyset": True, "max_input_bytes": WEB_INDEX_MAX_INPUT_BYTES, "max_normalized_bytes": WEB_INDEX_MAX_NORMALIZED_BYTES, "max_derived_bytes": WEB_INDEX_MAX_DERIVED_BYTES, "fts_bind_batch_bytes": WEB_INDEX_FTS_BIND_BATCH_BYTES, "oversized_recall": "web_index_oversized rows are unioned into candidates and verified against canonical text"},
                 "publication": "per-build uniquely named staging objects are built in bounded committed batches; a short BEGIN IMMEDIATE transaction rechecks canonical generations and exact object ownership, replaces the previous optional index by atomic renames, validates metadata, and commits; publication failure rolls back the rename transaction and retains the previous index",
                 "cancellation": "a running import job exposes POST /api/import/jobs/{job_id}/web-index/cancel; the internal callback and SQLite progress handler remove private staging objects and retain the previous optional index",
-                "locking": "all writer entry points share one process lock. A private per-user registry contains exactly 64 fixed project-owned shard records and no database pathname; hash collisions conservatively serialize rather than creating a second identity domain. Path and existing file-entity identities are both kernel-locked, a newly created database is entity-bound before work, and identity is revalidated before publication. Upload admission acquires this lock before multipart spooling. A durable owner-token lease provides the database-local second layer. Windows fails closed before registry, spool, database creation, lease, or staging until an equivalent File-ID/reparse-safe backend exists.",
+                "locking": "all writer entry points share one process lock. A private per-user registry contains at most 64 fixed project-owned shard files and no database pathname; each database identity uses a deterministic sparse byte-range lock, so unrelated identities that choose the same shard file do not falsely contend. Path and existing file-entity aliases still share their identity ranges, a newly created database is entity-bound before work, and identity is revalidated before publication. Upload admission acquires this lock before multipart spooling. A durable owner-token lease provides the database-local second layer. Windows fails closed before registry, spool, database creation, lease, or staging until an equivalent File-ID/reparse-safe backend exists.",
                 "writer_lock": {
                     "registry_max_files": 64,
                     "scope": ["init", "migrate", "import", "web-index", "web-upload-admission", "web-import-job"],
@@ -947,10 +952,10 @@ def create_api_router(
                     "allowed_hosts": list(trust.allowed_hosts),
                     "trusted_proxies": list(trust.trusted_proxies),
                     "missing_origin_write_allowed": trust.allow_missing_origin_for_writes,
-                    "origin": "after trusted-proxy Host/scheme normalization, every unsafe HTTP method on every current or future route requires a single syntactically valid same-origin Origin in remote mode; loopback permits non-browser clients without Origin. Cross-site and malformed Fetch Metadata are rejected. Upload Content-Length/body/multipart controls remain upload-only.",
+                    "origin": "after trusted-proxy Host/scheme normalization, every unsafe HTTP method on every current or future route requires a single syntactically valid same-origin Origin in remote mode; loopback permits non-browser clients without Origin. Malformed or duplicate Fetch Metadata is rejected on all methods. Sec-Fetch-Site=cross-site is rejected for every API read except shallow /api/health; static UI files and that shallow liveness probe remain fetchable. Missing metadata and Sec-Fetch-Site=none remain compatible with direct navigation and non-browser clients. Upload Content-Length/body/multipart controls remain upload-only.",
                     "unsafe_methods": ["POST", "PUT", "PATCH", "DELETE", "CONNECT"],
                     "single_value_headers": ["Origin", "Content-Length", "Sec-Fetch-Site"],
-                    "content_length": "canonical nonnegative ASCII decimal with at most 20 digits; duplicates and alternate numeric syntax are rejected before multipart parsing",
+                    "content_length": "every local or remote upload requires one canonical nonnegative ASCII decimal with at most 20 digits; missing, duplicate, and alternate numeric syntax are rejected before multipart parsing",
                     "forwarded_headers": "strict edge-proxy model: ignored from untrusted peers; a trusted direct edge must overwrite client values and provide at most one Forwarded element or one X-Forwarded-Host/Proto value; duplicates, chains, malformed syntax, and conflicts are rejected",
                 },
                 "limits_note": "ZIP size checks run before import; JSON parsing and SQLite writes still consume memory, disk, and CPU proportional to decoded conversation JSON size; one top-level JSON element is independently capped at 32 MiB of UTF-8 input, 32 Mi decoded characters, and 5000 mapping nodes.",
@@ -972,17 +977,17 @@ def create_api_router(
                 "web_index_progress": ["status", "build_stage", "processed", "total", "complete", "batch_size", "processed_input_bytes", "processed_normalized_bytes", "current_batch_input_bytes", "current_batch_normalized_bytes", "current_batch_derived_bytes", "peak_batch_input_bytes", "peak_batch_normalized_bytes", "peak_batch_derived_bytes", "oversized_rows"],
                 "web_index_cancellation": "the cancel endpoint is accepted only while the import job is in web-index or web-index-recovery; cancellation rolls back staging objects and keeps the previous optional index readable",
                 "failure_codes": ["import_job_start_failed", "upload_preflight_failed", "upload_disk_space_insufficient", "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "source_member_limit_exceeded", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read", "encrypted_zip_member_not_supported", "zip_member_not_found", "zip_member_crc_failed", "zip_member_read_failed", "invalid_conversation_encoding", "json_integer_too_large", "json_nesting_limit_exceeded", "json_scalar_limit_exceeded", "json_mapping_entry_limit_exceeded", "json_array_item_limit_exceeded", "json_estimated_heap_limit_exceeded", "conversation_json_element_too_large", "conversation_node_limit_exceeded", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_empty", "import_disk_space_insufficient", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_disk_space_insufficient", "web_index_failed"],
-                "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete", "web_index_staging_cleanup_failed"]},
+                "cleanup_warnings": {"item_fields": ["code", "error_type", "path_kind"], "codes": ["summary_update_after_commit_failed", "import_connection_close_failed", "summary_update_after_close_failed", "upload_file_unlink_failed", "upload_directory_cleanup_failed", "upload_directory_cleanup_incomplete", "web_index_staging_cleanup_failed", "writer_process_lock_cleanup_failed"]},
                 "preflight_cleanup_error": ["code", "cleanup_warning", "cleanup_error_type", "cleanup_warnings"],
             },
             "disk_capacity": {
-                "preflight_stages": ["upload", "canonical_import", "schema_migration", "optional_web_index"],
+                "preflight_stages": ["upload_before_multipart_on_parser_temp_filesystem", "upload_after_multipart_on_pipeline_filesystem", "canonical_import_on_database_filesystem", "schema_migration", "optional_web_index"],
                 "runtime_checks": True,
                 "reserve_bytes": 268435456,
                 "cleanup_reserve_bytes": 268435456,
                 "planner_components": ["compressed_source", "multipart_parser_spool", "pipeline_owned_zip", "canonical_database_growth", "wal_or_journal", "core_fts", "optional_old_live", "optional_staging", "sqlite_temp", "cleanup_reserve", "filesystem_emergency_reserve"],
                 "error_codes": ["upload_disk_space_insufficient", "import_disk_space_insufficient", "migration_disk_space_insufficient", "web_index_disk_space_insufficient"],
-                "contract": "capacity estimates include an emergency reserve but are not guarantees; filesystem quotas, concurrent writers, WAL, temporary pages, and actual SQLite amplification may still exhaust space, in which case the active transaction or private index build is rolled back",
+                "contract": "a known Content-Length is checked against the multipart parser spool filesystem before the first body receive. After parsing, the project-owned upload directory and database filesystem are checked for their remaining copies and growth; those filesystems may differ. Capacity estimates include an emergency reserve but are not guarantees; filesystem quotas, concurrent writers, WAL, temporary pages, and actual SQLite amplification may still exhaust space, in which case the active transaction or private index build is rolled back",
             },
             "import_contract": {
                 "top_level": "conversation JSON must be one array. A bounded hybrid fast probe lets complete ordinary elements use the C decoder directly; spanning or uncertain elements fall into one persistent single-pass lexical framer without repeated prefix probes. Mapping-entry, array-item, nesting, scalar, and conservative decoded-heap limits are enforced while framing before object materialization and verified exactly after decode. One element is capped at 32 MiB of UTF-8 input and 32 Mi decoded characters.",
@@ -1023,11 +1028,11 @@ def create_api_router(
                 "readonly_contract": "health and read endpoints inspect schema but never execute migration DDL",
                 "migration": {
                     "command": "python chatgpt_archive.py migrate --db <archive.db>",
-                    "contract": "after an external backup, an explicit writer performs a fast conservative filesystem-capacity preflight before BEGIN IMMEDIATE, then recomputes authoritative page/sidecar size, rewrite row count, and free-space capacity under the same write lock before its first mutation. It reports content-free row progress and rolls back schema/data/user objects on cooperative cancellation, KeyboardInterrupt/SystemExit, ENOSPC, or SQLite failure. Repeating migrate on a current clean database performs no DDL/DML and reports every changed field false.",
-                    "stages": ["preflight", "locked_preflight", "backfill_display_revisions"],
+                    "contract": "after an external backup, an explicit writer computes a predecessor-specific capacity plan before BEGIN IMMEDIATE, then recomputes authoritative page/sidecar size, relevant row count, planned steps, and free-space capacity under the same write lock before its first mutation. Table-rewrite/backfill edges reserve rewrite and journal space; the v5 metadata/query-generation edge does not pretend to rewrite every node. Exact compatibility scans use bounded keyset batches plus a cancellable SQLite progress handler. Cancellation rolls back schema/data/user objects and restores the progress handler. Repeating migrate on a current clean database performs no DDL/DML and reports every changed field false.",
+                    "stages": ["preflight", "locked_preflight", "backfill_display_revisions", "compatibility_scan"],
                     "progress_fields": ["stage", "processed", "total"],
                     "error_codes": ["migration_disk_space_insufficient", "database_migration_cancelled", "database_migration_failed"],
-                    "capacity_fields": ["required_bytes", "free_bytes", "estimated_peak_bytes"],
+                    "capacity_fields": ["migration_from", "migration_to", "planned_steps", "required_bytes", "free_bytes", "estimated_peak_bytes", "estimated_peak_category"],
                     "result_fields": ["schema_changed", "compatibility_refreshed", "compatibility_changed", "migration_changed"],
                 },
                 "health_fields": ["integrity_mode", "readiness", "database_error_code", "schema_compatible", "migration_required", "current_database_schema_version", "required_database_schema_version", "foreign_key_violations", "foreign_key_violations_exact", "foreign_key_check_complete", "foreign_key_check_last_completed_at", "foreign_key_check_connection_data_version", "result_stale", "reader_resource_contract_checked", "reader_resource_contract_exact", "reader_resource_contract_violations", "reader_resource_contract_limit_nodes_per_conversation"],
@@ -1066,17 +1071,17 @@ def create_api_router(
             "stable_error_codes": [
                 "database_not_ready", "database_migration_required", "database_schema_newer", "database_schema_incompatible", "database_foreign_key_violation", "invalid_job_id", "job_not_found",
                 "database_malformed", "database_locked", "database_readonly", "database_io_error", "database_runtime_failure",
-                "conversation_not_found", "message_not_found", "invalid_export_format", "invalid_display_cursor", "display_cursor_stale", "display_cursor_required",
+                "conversation_not_found", "message_not_found", "invalid_export_format", "invalid_display_cursor", "display_cursor_stale", "display_cursor_required", "invalid_copy_selection", "copy_selection_too_large", "copy_selection_stale",
                 "export_node_count_limit_exceeded", "export_node_input_limit_exceeded", "export_input_byte_limit_exceeded", "export_header_input_limit_exceeded", "export_output_byte_limit_exceeded", "effective_current_node_limit_exceeded", "effective_current_input_limit_exceeded",
                 "invalid_request", "invalid_integer", "numeric_parameter_out_of_range", "invalid_offset", "invalid_limit", "string_parameter_too_long", "invalid_identifier_token", "missing_parameter", "invalid_enum_value", "invalid_body", "invalid_upload_metadata",
                 "invalid_sort", "invalid_scope", "invalid_role", "invalid_path",
                 "invalid_match_mode", "invalid_message_order", "invalid_query",
-                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "writer_process_lock_busy", "writer_process_lock_unsupported", "web_index_process_lock_failed", "write_origin_required", "write_origin_not_allowed", "write_duplicate_origin_header", "write_duplicate_sec_fetch_site", "upload_preflight_failed", "upload_disk_space_insufficient", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required", "upload_duplicate_origin_header", "upload_duplicate_content_length", "upload_duplicate_sec_fetch_site",
+                "host_not_allowed", "invalid_host_header", "invalid_forwarded_headers", "import_job_active", "import_job_start_failed", "writer_process_lock_busy", "writer_process_lock_unsupported", "writer_process_lock_cleanup_failed", "web_index_process_lock_failed", "write_origin_required", "write_origin_not_allowed", "write_duplicate_origin_header", "write_duplicate_sec_fetch_site", "read_cross_site_not_allowed", "read_invalid_sec_fetch_site", "upload_preflight_failed", "upload_disk_space_insufficient", "upload_origin_required", "upload_origin_not_allowed", "upload_content_length_required", "upload_duplicate_origin_header", "upload_duplicate_content_length", "upload_duplicate_sec_fetch_site",
                 "upload_invalid_content_length", "upload_multipart_body_too_large", "upload_too_large",
                 "uploaded_file_not_zip", "uploaded_file_invalid_zip", "upload_zip_no_conversation_sources",
                 "upload_zip_ambiguous_conversation_sources", "upload_zip_too_many_members",
                 "upload_zip_too_many_json_members", "upload_zip_member_too_large",
-                "upload_zip_uncompressed_too_large", "upload_zip_compression_ratio_too_high",
+                "upload_zip_uncompressed_too_large", "upload_zip_compression_ratio_too_high", "upload_zip_metadata_too_large",
                 "no_conversation_sources", "ambiguous_conversation_sources", "source_scan_failed", "input_source_open_failed", "input_source_not_regular_file", "source_read_failed", "source_changed_during_read",
                 "invalid_conversation_encoding", "json_integer_too_large", "conversation_json_element_too_large", "conversation_node_limit_exceeded", "invalid_conversation_json", "non_finite_json_number", "conversation_json_top_level_not_list", "canonical_id_invalid_unicode", "delete_input_secure_identity_unsupported",
                 "import_disk_space_insufficient", "migration_disk_space_insufficient", "database_migration_cancelled", "import_transaction_failed", "verify_failed", "stats_failed", "web_index_disk_space_insufficient", "web_index_failed", "web_index_cancelled", "web_index_not_cancellable",
@@ -1160,10 +1165,12 @@ def create_api_router(
             if not filename.lower().endswith(".zip"):
                 raise HTTPException(status_code=400, detail="uploaded_file_not_zip")
             upload_dir, upload_path = make_upload_path()
-            announced_length = int(request.headers.get("content-length", "0"))
+            announced_length = int(
+                getattr(request.state, "upload_content_length", 0)
+            )
             require_free_space(
                 upload_dir,
-                upload_required_bytes(announced_length),
+                upload_pipeline_copy_required_bytes(announced_length),
                 "upload_disk_space_insufficient",
             )
             disk_guard = DiskSpaceGuard(upload_dir, "upload_disk_space_insufficient")
@@ -1193,9 +1200,23 @@ def create_api_router(
                     upload_seconds=time.perf_counter() - upload_started,
                 )
             except ImportJobStartError as exc:
+                detail: dict[str, Any] = {
+                    "code": exc.code,
+                    "error_type": exc.error_type,
+                }
+                if exc.cleanup_warnings:
+                    detail.update(
+                        {
+                            "cleanup_warning": exc.cleanup_warnings[0]["code"],
+                            "cleanup_error_type": exc.cleanup_warnings[0]["error_type"],
+                            "cleanup_warnings": [
+                                dict(item) for item in exc.cleanup_warnings
+                            ],
+                        }
+                    )
                 raise HTTPException(
                     status_code=503,
-                    detail={"code": exc.code, "error_type": exc.error_type},
+                    detail=detail,
                 ) from exc
             except RuntimeError as exc:
                 detail = "import_job_active" if manager.has_running_job() else "import_job_start_failed"
@@ -1223,7 +1244,25 @@ def create_api_router(
             raise primary_http_error from exc
         finally:
             if not transferred:
-                manager.release_pending_upload_slot()
+                lock_cleanup_warnings = manager.release_pending_upload_slot()
+                if primary_http_error is not None and lock_cleanup_warnings:
+                    detail = (
+                        dict(primary_http_error.detail)
+                        if isinstance(primary_http_error.detail, dict)
+                        else {"code": str(primary_http_error.detail)}
+                    )
+                    existing = list(detail.get("cleanup_warnings", []))
+                    detail.update(
+                        {
+                            "cleanup_warning": lock_cleanup_warnings[0]["code"],
+                            "cleanup_error_type": lock_cleanup_warnings[0]["error_type"],
+                            "cleanup_warnings": [
+                                *existing,
+                                *[dict(item) for item in lock_cleanup_warnings],
+                            ],
+                        }
+                    )
+                    primary_http_error.detail = detail
                 if not upload_file_closed:
                     try:
                         await file.close()
@@ -1239,6 +1278,7 @@ def create_api_router(
                                     "cleanup_warning": "upload_file_close_failed",
                                     "cleanup_error_type": type(exc).__name__,
                                     "cleanup_warnings": [
+                                        *list(detail.get("cleanup_warnings", [])),
                                         {
                                             "code": "upload_file_close_failed",
                                             "error_type": type(exc).__name__,
@@ -1608,6 +1648,91 @@ def create_api_router(
     ):
         return conversation_copy(conversation_id, path, include_internal, conn)
 
+    @router.post("/by-id/copy-visible")
+    async def conversation_visible_copy_by_id(
+        request: Request,
+        conversation_id: Annotated[str, Query(max_length=MAX_LEGACY_ID_PARAM_LENGTH)],
+        conn=Depends(get_conn),
+    ):
+        """Stream an explicit bounded reader selection from one read snapshot."""
+
+        _validate_identifier_parameter(conversation_id)
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_VISIBLE_COPY_REQUEST_BYTES:
+                raise HTTPException(status_code=413, detail="copy_selection_too_large")
+        try:
+            payload = json.loads(body or b"null")
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise HTTPException(status_code=400, detail="invalid_copy_selection") from None
+        if not isinstance(payload, dict) or set(payload) != {"node_ids"}:
+            raise HTTPException(status_code=400, detail="invalid_copy_selection")
+        raw_node_ids = payload.get("node_ids")
+        if not isinstance(raw_node_ids, list) or not raw_node_ids:
+            raise HTTPException(status_code=400, detail="invalid_copy_selection")
+        if len(raw_node_ids) > MAX_VISIBLE_COPY_NODES:
+            raise HTTPException(status_code=413, detail="copy_selection_too_large")
+        node_ids: list[str] = []
+        identifier_bytes = len(conversation_id.encode("utf-8"))
+        seen: set[str] = set()
+        for value in raw_node_ids:
+            if not isinstance(value, str):
+                raise HTTPException(status_code=400, detail="invalid_copy_selection")
+            _validate_identifier_parameter(value)
+            if value in seen:
+                raise HTTPException(status_code=400, detail="invalid_copy_selection")
+            seen.add(value)
+            node_ids.append(value)
+            identifier_bytes += len(value.encode("utf-8"))
+            if identifier_bytes > MAX_VISIBLE_COPY_IDENTIFIER_BYTES:
+                raise HTTPException(status_code=413, detail="copy_selection_too_large")
+
+        if conn.execute(
+            "SELECT 1 FROM conversations WHERE conversation_id = ?", (conversation_id,)
+        ).fetchone() is None:
+            raise HTTPException(status_code=404, detail="conversation_not_found")
+
+        # Validate the complete bounded selection before response headers are
+        # sent.  The dependency keeps one explicit read transaction open, so
+        # this check and every later streamed row share the same snapshot.
+        # Selecting identities only avoids materializing potentially large
+        # message bodies twice.
+        selected_count = 0
+        for start in range(0, len(node_ids), VISIBLE_COPY_QUERY_BATCH):
+            requested = node_ids[start : start + VISIBLE_COPY_QUERY_BATCH]
+            placeholders = ",".join("?" for _ in requested)
+            selected_count += sum(
+                1
+                for _row in conn.execute(
+                    f"""SELECT node_id FROM conversation_nodes
+                        WHERE conversation_id = ? AND node_id IN ({placeholders})""",
+                    [conversation_id, *requested],
+                )
+            )
+        if selected_count != len(node_ids):
+            raise HTTPException(status_code=409, detail="copy_selection_stale")
+
+        def selected_nodes() -> Iterator[sqlite3.Row]:
+            for start in range(0, len(node_ids), VISIBLE_COPY_QUERY_BATCH):
+                requested = node_ids[start : start + VISIBLE_COPY_QUERY_BATCH]
+                placeholders = ",".join("?" for _ in requested)
+                rows = {
+                    str(row["node_id"]): row
+                    for row in conn.execute(
+                        f"""SELECT * FROM conversation_nodes
+                            WHERE conversation_id = ? AND node_id IN ({placeholders})""",
+                        [conversation_id, *requested],
+                    )
+                }
+                for node_id in requested:
+                    yield rows[node_id]
+
+        return StreamingResponse(
+            iter_copy_conversation(selected_nodes()),
+            media_type="text/plain; charset=utf-8",
+        )
+
     @router.get("/search")
     def search(
         q: Annotated[str, Query(max_length=500)] = "",
@@ -1761,8 +1886,15 @@ def _validate_upload_zip_members(path: Path, policy: UploadPolicy) -> None:
             total_members = len(all_infos)
             source_infos = [info for info in file_infos if not is_metadata_path(info.filename)]
     except ValueError as exc:
-        if str(exc) == "source_member_limit_exceeded":
+        code = str(exc)
+        if code == "source_member_limit_exceeded":
             raise HTTPException(status_code=413, detail="upload_zip_too_many_members") from exc
+        if code in {
+            "source_zip_central_directory_limit_exceeded",
+            "source_zip_metadata_limit_exceeded",
+            "source_relative_path_limit_exceeded",
+        }:
+            raise HTTPException(status_code=413, detail="upload_zip_metadata_too_large") from exc
         raise HTTPException(status_code=400, detail="uploaded_file_invalid_zip") from exc
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=400, detail="uploaded_file_invalid_zip") from exc

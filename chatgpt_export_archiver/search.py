@@ -493,6 +493,9 @@ def _decode_search_continuation(value: str) -> dict[str, Any]:
         packed = base64.b64decode(
             value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
         )
+        canonical = base64.urlsafe_b64encode(packed).rstrip(b"=").decode("ascii")
+        if not hmac.compare_digest(canonical, value):
+            raise ValueError("non-canonical token")
         if len(packed) <= 32:
             raise ValueError("short token")
         raw, signature = packed[:-32], packed[-32:]

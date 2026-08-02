@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Opt-in synthetic Round 11 resource and performance benchmark.
+"""Opt-in synthetic resource and performance benchmark.
 
 The parent process starts each sample in a fresh Python subprocess so peak RSS
 and SQLite state do not leak between samples. Output is JSON and contains no
@@ -311,7 +311,7 @@ def _migration_worker(rows: int, journal_mode: str) -> dict[str, Any]:
         separators=(",", ":"),
     ).encode("ascii")
     metrics = _base_metrics("migration-v4-v5", hashlib.sha256(spec).hexdigest())
-    temporary = tempfile.TemporaryDirectory(prefix="chatgpt-archive-round11-bench-")
+    temporary = tempfile.TemporaryDirectory(prefix="chatgpt-archive-resource-bench-")
     root = Path(temporary.name)
     database = root / "synthetic.db"
     _prepare_v4_database(database, max(1, rows))
@@ -487,7 +487,7 @@ def _display_insert_worker(rows: int, journal_mode: str) -> dict[str, Any]:
         "display-revision-insert", hashlib.sha256(spec).hexdigest()
     )
     temporary = tempfile.TemporaryDirectory(
-        prefix="chatgpt-archive-round11-display-bench-"
+        prefix="chatgpt-archive-display-bench-"
     )
     root = Path(temporary.name)
     direct = _display_insert_case(
@@ -653,7 +653,7 @@ def main() -> int:
         )
         samples.append(json.loads(completed.stdout))
     output = {
-        "schema": "chatgpt-sqlite-webui-round12-benchmark-v2",
+        "schema": "chatgpt-sqlite-webui-resource-benchmark-v3",
         "scenario": args.scenario,
         "runs": len(samples),
         "aggregate": _aggregate(samples),

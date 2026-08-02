@@ -446,6 +446,7 @@ export default function App() {
   const listControllerRef = useRef<AbortController | null>(null);
   const listContinuationRef = useRef<string | null>(null);
   const listHadProvisionalOrderRef = useRef(false);
+  const loadConversationPageRef = useRef<(offset: number, append: boolean, staleRetried?: boolean) => AbortController>(() => new AbortController());
   const selectedIdRef = useRef<string | null>(null);
   const selectedRef = useRef<ConversationSummary | null>(null);
   const importPollGenerationRef = useRef(0);
@@ -564,7 +565,7 @@ export default function App() {
       });
   }, [t]);
 
-  const loadConversationPage = useCallback((offset: number, append: boolean) => {
+  const loadConversationPage = useCallback((offset: number, append: boolean, staleRetried = false) => {
     if (!append) listControllerRef.current?.abort();
     const controller = new AbortController();
     if (health?.db_ready === false) {
@@ -655,7 +656,23 @@ export default function App() {
         }
       })
       .catch((err: Error) => {
-        if (err.name !== "AbortError" && requestId === listRequestRef.current) setError(t("requestFailed"));
+        if (err.name === "AbortError" || requestId !== listRequestRef.current || searchContextRef.current !== requestedContextKey) return;
+        if ((append || staleRetried) && err instanceof ApiError && err.code === "search_continuation_stale") {
+          setConversations([]);
+          setTotal(0);
+          setHasMore(false);
+          setNextOffset(null);
+          setDiagnostics(null);
+          listContinuationRef.current = null;
+          listHadProvisionalOrderRef.current = false;
+          if (append && !staleRetried) {
+            loadConversationPageRef.current(0, false, true);
+            return;
+          }
+          setError(t("dataChangedRetry"));
+          return;
+        }
+        setError(t("requestFailed"));
       })
       .finally(() => {
         if (requestId === listRequestRef.current) {
@@ -665,6 +682,7 @@ export default function App() {
       });
     return controller;
   }, [debouncedQuery, sort, path, matchMode, filtersKey, health?.db_ready, loadConversationDetail, settings.listPageSize, searchContextKey, t]);
+  loadConversationPageRef.current = loadConversationPage;
 
   useEffect(() => {
     const controller = loadConversationPage(0, false);

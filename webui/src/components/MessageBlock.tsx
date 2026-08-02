@@ -139,6 +139,7 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
   const mountedRef = useRef(true);
   const measureFrameRef = useRef<number | null>(null);
   const focusFrameRef = useRef<number | null>(null);
+  const highlightFrameRef = useRef<number | null>(null);
   const rawControllerRef = useRef<AbortController | null>(null);
   const displayControllerRef = useRef<AbortController | null>(null);
   const rawRequestIdRef = useRef(0);
@@ -263,6 +264,10 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
         window.cancelAnimationFrame(focusFrameRef.current);
         focusFrameRef.current = null;
       }
+      if (highlightFrameRef.current !== null) {
+        window.cancelAnimationFrame(highlightFrameRef.current);
+        highlightFrameRef.current = null;
+      }
     };
   }, [preservedStateKey]);
   useEffect(() => {
@@ -329,7 +334,15 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
       setDisplayNextOffset(null);
       setDisplayNextCursor(null);
       setActiveWindowRange({ start, end });
-      requestAnimationFrame(() => bodyRef.current?.querySelector("mark.search-highlight-active")?.scrollIntoView({ block: "center" }));
+      if (highlightFrameRef.current !== null) {
+        window.cancelAnimationFrame(highlightFrameRef.current);
+      }
+      highlightFrameRef.current = window.requestAnimationFrame(() => {
+        highlightFrameRef.current = null;
+        if (mountedRef.current) {
+          bodyRef.current?.querySelector("mark.search-highlight-active")?.scrollIntoView({ block: "center" });
+        }
+      });
     }).catch((error: unknown) => {
       if (!(error instanceof Error && error.name === "AbortError")) setDisplayError(t("displayTextFailed"));
     }).finally(() => {
@@ -339,7 +352,13 @@ export default function MessageBlock({ message, conversationId, stateContextKey,
         notifySizeMayChange();
       }
     });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (highlightFrameRef.current !== null) {
+        window.cancelAnimationFrame(highlightFrameRef.current);
+        highlightFrameRef.current = null;
+      }
+    };
   }, [active, activeAnchorCursor, activeMatchLength, activeRevision, activeTargetOffset, conversationId, message.node_id, messageIdentity, previewCodePointLength, t]);
   const openFullRaw = async () => {
     if (fullRaw) {

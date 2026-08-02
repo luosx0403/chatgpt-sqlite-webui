@@ -497,23 +497,18 @@ def ensure_effective_current_views(
     conn.execute("DELETE FROM effective_current_nodes")
     conn.execute("DELETE FROM effective_current_scope")
     if global_scope:
-        conn.execute("INSERT INTO effective_current_scope SELECT conversation_id FROM conversations")
-    else:
-        conn.execute(
-            "INSERT INTO effective_current_scope "
-            "SELECT conversation_id FROM effective_current_requested_scope"
-        )
-
-    if global_scope:
+        # Refuse an oversized global request before copying every identity into
+        # TEMP.  Node and graph-byte limits are checked in the same main-schema
+        # aggregate, so the rejection path creates no large scope table.
         scope_totals = conn.execute(
-            """SELECT COUNT(DISTINCT scope.conversation_id), COUNT(n.node_id),
+            """SELECT COUNT(DISTINCT c.conversation_id), COUNT(n.node_id),
                       COALESCE(SUM(
                           length(CAST(COALESCE(n.node_id, '') AS BLOB)) +
                           length(CAST(COALESCE(n.parent_node_id, '') AS BLOB))
                       ), 0)
-               FROM effective_current_scope scope
+               FROM conversations c
                LEFT JOIN conversation_nodes n
-                 ON n.conversation_id = scope.conversation_id"""
+                 ON n.conversation_id = c.conversation_id"""
         ).fetchone()
         scope_conversations = int(scope_totals[0] or 0)
         scope_nodes = int(scope_totals[1] or 0)
@@ -526,6 +521,14 @@ def ensure_effective_current_views(
             or estimated_temp_bytes > MAX_EFFECTIVE_CURRENT_TEMP_BYTES
         ):
             raise EffectiveCurrentResourceLimitError("effective_current_scope_too_large")
+        conn.execute("INSERT INTO effective_current_scope SELECT conversation_id FROM conversations")
+    else:
+        conn.execute(
+            "INSERT INTO effective_current_scope "
+            "SELECT conversation_id FROM effective_current_requested_scope"
+        )
+
+    if global_scope:
         _materialize_global_effective_current(conn)
         return
 

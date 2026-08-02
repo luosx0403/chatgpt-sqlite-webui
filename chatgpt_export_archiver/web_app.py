@@ -4,9 +4,10 @@ import ipaddress
 import json
 import re
 import sqlite3
+import tempfile
 import unicodedata
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -22,6 +23,11 @@ from .exporter import ExportResourceLimitError
 from .json_safety import JsonSafetyLimitError, sanitize_json_value
 from .schema_contract import API_SCHEMA_VERSION, OPTIONAL_WEB_INDEX_FORMAT_VERSION
 from .web_db import WebIndexBuildError
+from .disk_resources import (
+    DiskSpaceInsufficientError,
+    require_free_space,
+    upload_spool_required_bytes,
+)
 
 
 class _UploadBodyTooLarge(Exception):
@@ -309,7 +315,7 @@ class UploadIngressMiddleware:
             return
         length_values = headers.get("content-length", [])
         raw_length = length_values[0] if length_values else None
-        if raw_length is None and self.trust_policy.remote:
+        if raw_length is None:
             await self._error(send, 411, "upload_content_length_required")
             return
         if raw_length is not None:
@@ -320,6 +326,15 @@ class UploadIngressMiddleware:
             if content_length > self.body_limit:
                 await self._error(send, 413, "upload_multipart_body_too_large")
                 return
+        try:
+            require_free_space(
+                Path(tempfile.gettempdir()),
+                upload_spool_required_bytes(content_length),
+                "upload_disk_space_insufficient",
+            )
+        except DiskSpaceInsufficientError:
+            await self._error(send, 507, "upload_disk_space_insufficient")
+            return
         try:
             admitted = self.manager.acquire_pending_upload_slot()
         except WebIndexBuildError as exc:
@@ -332,6 +347,7 @@ class UploadIngressMiddleware:
         state = scope.setdefault("state", {})
         state["upload_slot_reserved"] = True
         state["upload_slot_transferred"] = False
+        state["upload_content_length"] = content_length
         received = 0
         response_started = False
 
@@ -357,7 +373,13 @@ class UploadIngressMiddleware:
                 await self._error(send, 413, "upload_multipart_body_too_large")
         finally:
             if not state.get("upload_slot_transferred"):
-                self.manager.release_pending_upload_slot()
+                cleanup_warnings = self.manager.release_pending_upload_slot()
+                for warning in cleanup_warnings:
+                    LOGGER.warning(
+                        "upload_admission_cleanup_failed code=%s error_type=%s",
+                        warning["code"],
+                        warning["error_type"],
+                    )
 
 
 class WriteAccessMiddleware:
@@ -425,21 +447,60 @@ class WriteAccessMiddleware:
         )
         return allowed, None if allowed else self._code(scope, "origin_not_allowed")
 
+    @staticmethod
+    def _protected_read(scope) -> bool:
+        path = str(scope.get("path") or "")
+        if not path.startswith("/api/"):
+            return False
+        if path == "/api/health":
+            try:
+                query = parse_qs(
+                    bytes(scope.get("query_string") or b"").decode("ascii"),
+                    keep_blank_values=True,
+                )
+            except (UnicodeDecodeError, ValueError):
+                return True
+            return any(value.casefold() == "true" for value in query.get("deep", []))
+        return True
+
     async def __call__(self, scope, receive, send) -> None:
-        if (
-            scope.get("type") != "http"
-            or str(scope.get("method", "GET")).upper() in self.SAFE_METHODS
-        ):
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
         headers = self._headers(scope)
-        duplicate_codes = {"origin": "duplicate_origin_header", "sec-fetch-site": "duplicate_sec_fetch_site"}
+        method = str(scope.get("method", "GET")).upper()
+        duplicate_codes = {
+            "origin": "duplicate_origin_header",
+            "sec-fetch-site": "duplicate_sec_fetch_site",
+        }
         for name, code in duplicate_codes.items():
             if len(headers.get(name, [])) > 1:
                 await UploadIngressMiddleware._error(
                     send, 400, self._code(scope, code)
                 )
                 return
+        fetch_values = headers.get("sec-fetch-site", [])
+        fetch_site = fetch_values[0].casefold() if fetch_values else None
+        if fetch_values and (
+            fetch_values[0] != fetch_values[0].strip()
+            or fetch_site not in {"same-origin", "same-site", "none", "cross-site"}
+        ):
+            await UploadIngressMiddleware._error(
+                send,
+                400,
+                "read_invalid_sec_fetch_site"
+                if method in self.SAFE_METHODS
+                else self._code(scope, "origin_not_allowed"),
+            )
+            return
+        if method in self.SAFE_METHODS:
+            if fetch_site == "cross-site" and self._protected_read(scope):
+                await UploadIngressMiddleware._error(
+                    send, 403, "read_cross_site_not_allowed"
+                )
+                return
+            await self.app(scope, receive, send)
+            return
         origin_allowed, origin_error = self._origin_allowed(headers, scope)
         if not origin_allowed:
             await UploadIngressMiddleware._error(
@@ -659,8 +720,13 @@ def create_app(
                 "all unsafe methods are default-deny after trusted Host/proxy "
                 "normalization; remote writes require one valid same-origin Origin"
             ),
+            "protected_read_fetch_metadata_policy": (
+                "Sec-Fetch-Site cross-site is denied for API reads except "
+                "shallow health; missing and none remain client-compatible"
+            ),
             "writer_process_lock": {
                 "registry_max_files": 64,
+                "collision_isolation": "deterministic_sparse_byte_ranges",
                 "windows": "writer_process_lock_unsupported",
                 "upload_admission_before_spool": True,
             },
@@ -686,6 +752,35 @@ def create_app(
                 "scan_complete": True,
                 "provisional_order": True,
                 "continuation_requires_null_next_offset": True,
+            }
+        visible_copy = schema.get("paths", {}).get(
+            "/api/by-id/copy-visible", {}
+        ).get("post")
+        if isinstance(visible_copy, dict):
+            visible_copy["requestBody"] = {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "node_ids": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 1000,
+                                    "items": {"type": "string"},
+                                }
+                            },
+                            "required": ["node_ids"],
+                        }
+                    }
+                },
+            }
+            visible_copy["x-read-snapshot-contract"] = {
+                "single_sqlite_snapshot": True,
+                "request_max_bytes": 1048576,
+                "identifier_bytes_max": 1048576,
             }
         for path in (
             "/api/import/upload",

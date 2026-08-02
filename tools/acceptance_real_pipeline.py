@@ -116,7 +116,7 @@ def _request_json(
 
 
 def _stream_upload(port: int, source: Path) -> tuple[dict[str, Any], float]:
-    boundary = "chatgpt-archive-round12-boundary"
+    boundary = "chatgpt-archive-acceptance-boundary"
     preamble = (
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="file"; filename="archive.zip"\r\n'
@@ -275,8 +275,15 @@ def _bounded_smoke(port: int) -> dict[str, Any]:
     return results
 
 
-def _run_once(source: Path, python: Path, run_number: int) -> dict[str, Any]:
-    workspace = Path(tempfile.mkdtemp(prefix="chatgpt-round12-real-"))
+def _run_once(
+    source: Path,
+    python: Path,
+    run_number: int,
+    *,
+    max_job_seconds: float,
+    force_cleanup_failure: bool = False,
+) -> dict[str, Any]:
+    workspace = Path(tempfile.mkdtemp(prefix="chatgpt-real-pipeline-"))
     database = workspace / "fresh.db"
     temp_root = workspace / "tmp"
     temp_root.mkdir()
@@ -286,6 +293,10 @@ def _run_once(source: Path, python: Path, run_number: int) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "run": run_number,
         "success": False,
+        "pipeline_success": False,
+        "cleanup_success": False,
+        "correctness_pass": False,
+        "performance_pass": False,
         "cleanup": {"attempted": True, "complete": False},
     }
     try:
@@ -429,7 +440,7 @@ def _run_once(source: Path, python: Path, run_number: int) -> dict[str, Any]:
         metrics["peak_rss_bytes"] = peak_rss
         metrics["peak_cpu_percent_sample"] = peak_cpu_percent
         metrics["storage_peaks"] = peaks
-        metrics["success"] = True
+        metrics["pipeline_success"] = True
         return metrics
     except BaseException as exc:
         metrics["error_code"] = (
@@ -453,11 +464,33 @@ def _run_once(source: Path, python: Path, run_number: int) -> dict[str, Any]:
             (after_children.ru_utime + after_children.ru_stime)
             - (before_children.ru_utime + before_children.ru_stime),
         )
+        cleanup_error: str | None = None
         try:
+            if force_cleanup_failure:
+                raise PermissionError("synthetic cleanup fault")
             shutil.rmtree(workspace)
-        except OSError:
-            pass
-        metrics["cleanup"]["complete"] = not workspace.exists()
+        except OSError as exc:
+            cleanup_error = type(exc).__name__
+        metrics["cleanup"]["complete"] = (
+            cleanup_error is None and not workspace.exists()
+        )
+        metrics["cleanup_success"] = bool(metrics["cleanup"]["complete"])
+        if cleanup_error is not None:
+            metrics["cleanup"]["error_type"] = cleanup_error
+        metrics["correctness_pass"] = bool(
+            metrics.get("pipeline_success") and metrics["cleanup_success"]
+        )
+        elapsed = (metrics.get("job") or {}).get("elapsed_seconds")
+        metrics["performance_pass"] = bool(
+            metrics.get("pipeline_success")
+            and isinstance(elapsed, (int, float))
+            and float(elapsed) <= max_job_seconds
+        )
+        metrics["success"] = bool(
+            metrics["correctness_pass"] and metrics["performance_pass"]
+        )
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _aggregate(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -471,6 +504,22 @@ def _aggregate(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "worst": max(values) if values else None,
             "all": values,
         }
+    job_values = [
+        float(sample["job"]["elapsed_seconds"])
+        for sample in samples
+        if isinstance((sample.get("job") or {}).get("elapsed_seconds"), (int, float))
+    ]
+    result["job_elapsed_seconds"] = {
+        "median": statistics.median(job_values) if job_values else None,
+        "worst": max(job_values) if job_values else None,
+        "all": job_values,
+    }
+    result["performance_pass"] = all(
+        bool(sample.get("performance_pass")) for sample in samples
+    )
+    result["correctness_pass"] = all(
+        bool(sample.get("correctness_pass")) for sample in samples
+    )
     return result
 
 
@@ -478,6 +527,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--max-job-seconds",
+        type=float,
+        default=300.0,
+        help="Formal per-job performance threshold; any slower run fails acceptance.",
+    )
     parser.add_argument(
         "--python",
         type=Path,
@@ -493,10 +548,15 @@ def main() -> int:
         action="store_true",
         help="Run one tiny synthetic production pipeline; no real input is used.",
     )
+    parser.add_argument(
+        "--self-test-cleanup-failure",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     synthetic_root: Path | None = None
-    if args.self_test:
-        synthetic_root = Path(tempfile.mkdtemp(prefix="chatgpt-round12-harness-selftest-"))
+    if args.self_test or args.self_test_cleanup_failure:
+        synthetic_root = Path(tempfile.mkdtemp(prefix="chatgpt-harness-selftest-"))
         source = synthetic_root / "synthetic.zip"
         payload = [
             {
@@ -531,9 +591,17 @@ def main() -> int:
         source = args.input.expanduser().resolve()
     if not source.is_file() or source.is_symlink():
         parser.error("--input must be a regular ZIP file")
+    if not isinstance(args.max_job_seconds, float) or args.max_job_seconds < 0:
+        parser.error("--max-job-seconds must be nonnegative")
     try:
         samples = [
-            _run_once(source, args.python.expanduser().resolve(), run_number)
+            _run_once(
+                source,
+                args.python.expanduser().resolve(),
+                run_number,
+                max_job_seconds=args.max_job_seconds,
+                force_cleanup_failure=args.self_test_cleanup_failure,
+            )
             for run_number in range(1, max(1, args.runs) + 1)
         ]
     finally:

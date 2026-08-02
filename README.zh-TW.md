@@ -78,7 +78,7 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
-Python 3.12 constraints 是跨平台 resolved-version profile，本身仍沒有 artifact hash。獨立的 `requirements-web-py312-macos-arm64.lock` 僅針對 CPython 3.12/macOS arm64 提供 wheel hash lock；使用 `--require-hashes --only-binary=:all:` 安裝，並執行 `python tools/verify_web_hash_lock.py`。其他 Python/OS 在其 wheel matrix lock 發布前仍應從可信 index 使用 portable profile，不能把 macOS lock 當成跨平台 lock。
+Python 3.12 constraints 是跨平台 resolved-version profile，本身沒有 artifact hash。`requirements-web-py312-macos-arm64.lock` 僅適用於 CPython 3.12/macOS arm64；以 `pip --require-hashes --only-binary=:all:` 安裝時才會核驗下載 wheel 的實際位元組。`python tools/verify_web_hash_lock.py` 只檢查 lock 結構、目標、版本與 hash 語法。其他平台應使用可信 index 的 portable profile。
 
 ## 快速開始
 
@@ -237,7 +237,7 @@ python chatgpt_archive.py web --port 8787
 
 所有入口共用同一套 `path=current` effective-current 規則：有效且屬於該對話的 `current_node` 與其父鏈優先，即使所有 raw flag 都為 0；否則選擇確定且可用的 `is_on_current_path=1` 葉鏈；兩者皆不存在時，該對話才 fallback 到 all。回應保留 raw flag 原義，並提供 `current_node_exists`、`current_collection_source`、`current_path_fallback_to_all`、`effective_path` 與逐節點 effective visibility。斷裂父鏈和 cycle 會有限且確定地診斷，不會讓遞迴查詢掛起。
 
-閱讀器複製與匯出動作遵守可見閱讀器契約。`複製目前路徑整段對話` 使用專用的完整文字串流處理目前 reader 路徑，遵守「顯示內部訊息」開關並忽略目前搜尋篩選，不會在瀏覽器中累積 reader 分頁。`複製目前可見` 只複製已載入的可見訊息。下載連結使用同樣的目前路徑與「顯示內部訊息」設定。Raw 訊息存取只透過單則訊息 endpoint 提供有上限的較大 raw 預覽；截斷回應必須把 `raw_text` 當作純文字預覽渲染，UI 只顯示這個 capped preview。
+閱讀器複製與匯出遵守可見性設定。`複製目前路徑整段對話` 使用有界完整文字串流並遵守目前 reader 路徑與「顯示內部訊息」。`複製目前可見` 只提交已載入可見訊息的 ID，由伺服器在同一 SQLite 讀取快照中串流回傳，避免混合寫入前後的內容。下載連結使用同樣的路徑與內部訊息設定；訊息 raw 入口是有上限的較大 raw 預覽，截斷時以純文字 `raw_text` 顯示。
 
 reader 使用 `around_node_id` 跳轉到命中時，會使用與 reader 相同的分頁集合：Show internal 關閉時使用 visible-only rows，Show internal 開啟時使用完整 node collection；對沒有 current-path node 的損壞 conversation，使用 effective all-node collection。
 
@@ -271,7 +271,7 @@ Web 上傳會在讀取檔案前先保留 pending slot，因此大型上傳不能
 
 **遠端繫結策略。** 非 loopback 需透過 `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true` 或 `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` 明確 opt-in。remote-safe 預設為 128 MiB 壓縮 ZIP、每個 JSON member 256 MiB、總未壓縮 512 MiB、200.0 壓縮比、200 JSON members、10,000 ZIP members；可信 loopback/local 預設壓縮比是 1000.0。`ALLOW_REMOTE_UPLOADS` 只放寬明確設定的限制，未設定項仍 remote-safe；`REMOTE_UPLOAD_PROFILE=local` 會把所有未設定限制恢復為本機大型預設值，只適合可信 LAN。
 
-`/api/schema` 會回報有效上傳策略，包括 multipart body 上限（ZIP byte 上限加有限 overhead）與 remote profile。writer slot 和 receive-level body cap 在 multipart 解析前生效。parser 可能寫 spool，之後 pipeline 仍擁有伺服器暫存 ZIP，因此暫存磁碟應預留接近兩份壓縮副本再加資料庫成長。ZIP 檢查先執行，但 JSON 解碼、SQLite 寫入與 `web-index` 仍依解碼資料消耗記憶體、磁碟與 CPU。遠端上傳必須提供有效 `Content-Length`；loopback chunked 上傳仍受串流上限限制。
+`/api/schema` 會回報有效上傳策略。所有上傳都必須提供有效 `Content-Length`。伺服器會在第一次接收 body 前檢查 multipart parser 使用的暫存檔案系統；解析後再分別檢查專案上傳目錄與資料庫檔案系統，它們可能位於不同磁碟。請為 parser spool、伺服器 ZIP、資料庫、WAL/TEMP 與索引保留空間。
 
 如需為合法的超大型封存提高本機限制，在啟動 Web UI 前設定相應變數：
 
@@ -429,7 +429,7 @@ source-only delivery 可以省略 `webui/dist`，但之後需要先重新建置�
 
 主資料庫保存 conversations、mapping nodes、import runs 與 warnings。message object 的 raw JSON 欄位按完整物件保留；conversation 與 mapping-node object 會正規化，不做逐位元組保存。輸入 ZIP SHA-256 可選，`source_files`/`file_index` 的逐 entry SHA 欄位目前保留但不填入。CLI FTS 表是 `message_fts`。可選 Web 搜尋輔助表包括 `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram`，以及 SQLite FTS5 shadow tables。
 
-canonical 資料庫以 `PRAGMA user_version` 版本化（目前版本 6）。版本 3 加入 `NOT NULL` identity、版本 4 加入持久 address/graph revision、版本 5 加入逐列 display revision 與 compatibility state、版本 6 加入涵蓋 source 與 conversation/node 時間變更的持久 `query` generation。Migration 先在 write lock 外快速預檢 DB/WAL/journal/TEMP，再於 `BEGIN IMMEDIATE` 內、首次變更之前重新計算權威 row count、size、sidecar 與 free space。取消、中斷、ENOSPC 或 SQLite 失敗會完整回滾。對 current 且乾淨的資料庫重複 migrate 是真正 no-op，並將 `schema_changed`、`compatibility_refreshed`、`compatibility_changed`、`migration_changed` 全部回報為 false。唯讀路徑不執行 migration DDL；舊相容資料庫回傳 `database_migration_required`。
+canonical 資料庫使用 `PRAGMA user_version`（目前版本 6）；舊資料庫的唯讀入口會回傳 `database_migration_required`。Migration 依實際 predecessor step 估算容量：table rewrite/backfill 保留 rewrite 與 journal 空間，v5 metadata/query-generation 升級不會假定重寫全部 node。`BEGIN IMMEDIATE` 內會在首次變更前重新核對 size、row、sidecar、計畫步驟與 free space。compatibility scan 精確、分批且可取消；取消、中斷、ENOSPC 或 SQLite 失敗會完整回滾。current clean DB 的重複 migrate 是 true no-op，唯讀路徑不會遷移。
 
 Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回報 `optional_message_fts_error` 和 `--rebuild-fts` 復原提示；一般 malformed、locked、readonly、I/O 與 SQL 執行期錯誤不會被當成能力缺失，並使用 `database_malformed`、`database_locked`、`database_readonly`、`database_io_error` 或 `database_runtime_failure`。
 
@@ -445,13 +445,13 @@ Health 與 `verify` 會區分可選 `message_fts` 缺失與損壞。損壞時回
 
 上傳入口對 `Origin`、`Content-Length` 與 `Sec-Fetch-Site` 各只接受一個值。Origin 必須是沒有使用者資訊、路徑、查詢、片段、控制字元或逗號鏈的單一 HTTP(S) origin；Content-Length 必須是規範的非負 ASCII 十進位整數。重複或格式錯誤的安全標頭會在 multipart 解析前拒絕；無效或非有限的壓縮比設定會回退到有限的安全 profile 預設值。
 
-Loopback Web 只接受 `localhost`、`127.0.0.1`、`::1`、明確的 loopback bind host 與明確設定的 host。非 loopback bind 還必須透過 `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（或 `--allowed-hosts`）指定實際瀏覽器 hostname/LAN IP，禁止 `*`。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（或 `--trusted-proxies`）採嚴格單 edge 模型：未受信直連的 forwarded header 會被忽略，受信直連 proxy 必須覆寫 client 值；重複 Host/Forwarded、逗號 proxy chain、非法語法及 `Forwarded` 與 `X-Forwarded-Host/Proto` 衝突會被拒絕。靜態 UI、GET API 與全部請求都驗證 Host。遠端寫入必須有同源 `Origin`；只有可信 loopback profile 相容無 Origin 用戶端。上傳永遠拒絕 `Sec-Fetch-Site: cross-site`。
+Web 會驗證所有請求的 Host；非 loopback bind 必須設定 `CHATGPT_ARCHIVE_ALLOWED_HOSTS` 或 CLI `--allowed-hosts`，禁止 `*`；trusted proxy 採嚴格單 edge 合同，透過 `CHATGPT_ARCHIVE_TRUSTED_PROXIES` 或 `--trusted-proxies` 設定。遠端寫入必須有同源 `Origin`，重複或格式錯誤的 Fetch Metadata 會被拒絕。除淺層 `/api/health` 外，API 讀取也拒絕 `Sec-Fetch-Site: cross-site`；靜態 UI、直接導覽的 `none` 與未傳該標頭的命令列 client 維持相容。
 
 匯入失敗使用穩定的 preflight、source scan、source read、JSON decode、top-level 與 transaction 階段。code 包括 `upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large`。清理使用結構化 `cleanup_warnings`；舊 `cleanup_warning` 只代表第一項。
 
-上傳、canonical import、schema migration 與可選 Web index rebuild 都會預檢檔案系統容量並保留 256 MiB 緊急空間。ENOSPC 分別回傳 `upload_disk_space_insufficient`、`import_disk_space_insufficient`、`migration_disk_space_insufficient` 或 `web_index_disk_space_insufficient`；import/migration 完整回滾，舊 Web index 維持可讀。
+上傳會在接收前檢查 parser spool 檔案系統，解析後再檢查伺服器 ZIP 與資料庫檔案系統。Import、migration 與可選 Web index 也會預檢容量並保留緊急空間。ENOSPC 回傳穩定的 `*_disk_space_insufficient` 錯誤；transaction 回滾，舊 Web index 維持可讀。
 
-獨立 JSON、目錄成員與 ZIP 成員使用同一 single-pass 頂層陣列 framer 與單一匯入 transaction。framer 一次掃描到元素邊界後呼叫一次 C decoder；每個元素必須滿足上述聯合 byte/character/token/mapping/array/depth/integer/heap/node/batch profile。query-based `/api/by-id/*` 最多接受 16 Ki 字元 legacy ID，固定小尺寸 search continuation 不嵌入這些 ID。
+獨立 JSON、目錄成員與 ZIP 成員共用有界 hybrid 頂層陣列 parser 與單一匯入 transaction。普通完整元素通常一次 C decoder 即成功；不確定或跨 chunk 元素可能先有一次有界失敗 fast probe，再由持久 lexical framer 處理，不會重複 decode 不斷增長的 prefix。每個元素仍受聯合資源限制。
 
 檔案身分透過 descriptor-bound stat/hash/read 驗證；strict delete 在 staging 前拒絕，recovery 只處理歷史專案自有 journal。Migration 僅接受定義完全相符的已知 predecessor。
 

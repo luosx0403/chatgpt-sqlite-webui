@@ -22,7 +22,7 @@ from .json_safety import (
 from .utils import classify_file
 
 
-SHARD_RE = re.compile(r"(^|.*/)conversations-(\d+)\.json$")
+SHARD_RE = re.compile(r"^conversations-(\d+)\.json$")
 MAX_JSON_INTEGER_DIGITS = 1000
 JSON_STREAM_CHUNK_BYTES = 64 * 1024
 MAX_JSON_STRING_PRIMITIVE_TOKENS = 2_500_000
@@ -83,6 +83,8 @@ JSON_HYBRID_COALESCE_CHARS = 32 * 1024 * 1024
 MAX_SOURCE_TOTAL_MEMBERS = 100_000
 MAX_SOURCE_DIRECTORY_DEPTH = 256
 MAX_SOURCE_RELATIVE_PATH_BYTES = 32 * 1024
+MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 128 * 1024 * 1024
+MAX_ZIP_CENTRAL_METADATA_BYTES = 96 * 1024 * 1024
 _ZIP_EOCD_SEARCH_BYTES = 22 + 65_535
 DELETE_INPUT_RECOVERY_FORMAT_VERSION = 2
 DELETE_INPUT_RECOVERY_PREDECESSOR_VERSIONS = (1,)
@@ -809,7 +811,7 @@ def is_legacy_conversations_source(path: str) -> bool:
 
 
 def is_shard_conversation_source(path: str) -> bool:
-    return bool(SHARD_RE.search(_logical_zip_path(path)))
+    return bool(SHARD_RE.fullmatch(_logical_zip_basename(path)))
 
 
 def is_conversation_json_source(path: str) -> bool:
@@ -817,14 +819,19 @@ def is_conversation_json_source(path: str) -> bool:
 
 
 def _shard_sort_key(entry: SourceEntry) -> tuple[int, str]:
-    logical = _logical_zip_path(entry.source_path)
-    match = SHARD_RE.search(logical)
-    return (int(match.group(2)) if match else -1, entry.source_path)
+    match = SHARD_RE.fullmatch(_logical_zip_basename(entry.source_path))
+    return (int(match.group(1)) if match else -1, entry.source_path)
 
 
 def _logical_zip_path(path: str) -> str:
     """Normalize ZIP member separators for detection while preserving source_path."""
     return path.replace("\\", "/")
+
+
+def _logical_zip_basename(path: str) -> str:
+    """Return a bounded-work basename after normalizing ZIP separators."""
+
+    return _logical_zip_path(path).rsplit("/", 1)[-1]
 
 
 def is_metadata_path(path: str) -> bool:
@@ -908,7 +915,34 @@ def preflight_zip_central_directory(stream: BinaryIO, *, max_members: int) -> in
         central_offset = central_offset64
     if total_entries > max_members:
         raise ValueError("source_member_limit_exceeded")
+    if central_size > MAX_ZIP_CENTRAL_DIRECTORY_BYTES:
+        raise ValueError("source_zip_central_directory_limit_exceeded")
     if central_offset > archive_size or central_size > archive_size or central_offset + central_size > eocd_offset:
+        raise ValueError("source_zip_central_directory_invalid")
+    # Parse only the fixed central headers and skip variable payloads.  This
+    # enforces pathname and aggregate metadata budgets before ZipFile creates
+    # any ZipInfo or decoded filename objects.
+    stream.seek(central_offset)
+    metadata_bytes = 0
+    central_consumed = 0
+    for _index in range(int(total_entries)):
+        header = stream.read(46)
+        if len(header) != 46 or header[:4] != b"PK\x01\x02":
+            raise ValueError("source_zip_central_directory_invalid")
+        filename_bytes, extra_bytes, member_comment_bytes = struct.unpack_from(
+            "<3H", header, 28
+        )
+        if filename_bytes > MAX_SOURCE_RELATIVE_PATH_BYTES:
+            raise ValueError("source_relative_path_limit_exceeded")
+        variable_bytes = int(filename_bytes) + int(extra_bytes) + int(member_comment_bytes)
+        metadata_bytes += variable_bytes
+        central_consumed += 46 + variable_bytes
+        if metadata_bytes > MAX_ZIP_CENTRAL_METADATA_BYTES:
+            raise ValueError("source_zip_metadata_limit_exceeded")
+        if central_consumed > central_size:
+            raise ValueError("source_zip_central_directory_invalid")
+        stream.seek(variable_bytes, os.SEEK_CUR)
+    if central_consumed > central_size:
         raise ValueError("source_zip_central_directory_invalid")
     stream.seek(0)
     return int(total_entries)
@@ -1004,8 +1038,8 @@ def _reject_duplicate_conversation_sources(entries: list[SourceEntry]) -> None:
         if logical in seen:
             duplicates.add(logical)
         seen.add(logical)
-        match = SHARD_RE.search(logical)
-        identity = ("shard", int(match.group(2))) if match else ("legacy", None)
+        match = SHARD_RE.fullmatch(_logical_zip_basename(logical))
+        identity = ("shard", int(match.group(1))) if match else ("legacy", None)
         if identity in seen_identities:
             duplicate_identities.add(identity)
         seen_identities.add(identity)
@@ -1940,25 +1974,42 @@ def _iter_json_array_framed(chunks: Iterable[str]) -> Iterator[Any]:
 
 
 def _coalesce_json_text_chunks(chunks: Iterable[str]) -> Iterator[str]:
-    """Yield bounded decoded-text windows without changing source reads."""
+    """Yield windows bounded by both decoded characters and source bytes.
+
+    Each source chunk is encoded once for accounting.  High-width Unicode is
+    therefore delivered to the framer near the UTF-8 element ceiling instead
+    of being retained until the much larger character window fills.
+    """
 
     parts: list[str] = []
     chars = 0
+    utf8_bytes = 0
     for chunk in chunks:
         if not chunk:
             continue
         parts.append(chunk)
         chars += len(chunk)
-        if chars >= JSON_HYBRID_COALESCE_CHARS:
+        utf8_bytes += len(chunk.encode("utf-8"))
+        if (
+            chars >= JSON_HYBRID_COALESCE_CHARS
+            or utf8_bytes >= MAX_JSON_ELEMENT_BYTES
+        ):
             yield "".join(parts)
             parts = []
             chars = 0
+            utf8_bytes = 0
     if parts:
         yield "".join(parts)
 
 
 def _iter_json_array(chunks: Iterable[str]) -> Iterator[Any]:
-    """Frame each top-level element once, then invoke the C decoder once."""
+    """Decode each bounded element through the hybrid fast-probe/framer path.
+
+    Complete ordinary elements normally succeed in one C-decoder call.  A
+    spanning or uncertain element may first take one bounded failed probe,
+    then the persistent lexical framer finishes it without repeated decoding
+    of a growing prefix.
+    """
 
     yield from _iter_json_array_framed(_coalesce_json_text_chunks(chunks))
 

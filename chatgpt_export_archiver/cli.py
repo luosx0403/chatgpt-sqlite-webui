@@ -109,6 +109,14 @@ from .utils import compact_json, epoch_to_display, sha256_text
 from .web_db import WebIndexBuildError, acquire_writer_process_lock, create_web_indexes
 
 LOGGER = get_logger("cli")
+
+
+def _close_writer_lock_best_effort(writer_lock: Any) -> list[dict[str, str]]:
+    try:
+        writer_lock.close()
+    except WebIndexBuildError as exc:
+        return [dict(item) for item in exc.cleanup_warnings]
+    return []
 REQUIRED_IMPORT_GENERATION_DOMAINS = ("title", "message", "address", "graph", "query")
 
 
@@ -369,7 +377,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         finally:
             conn.close()
     finally:
-        writer_lock.close()
+        cleanup_warnings = _close_writer_lock_best_effort(writer_lock)
+        for warning in cleanup_warnings:
+            print(
+                f"WARNING: {warning['code']} error_type={warning['error_type']}",
+                file=sys.stderr,
+            )
     print("initialized_db true")
     print(f"fts5_available {str(fts).lower()}")
     return 0
@@ -407,7 +420,12 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         finally:
             conn.close()
     finally:
-        writer_lock.close()
+        cleanup_warnings = _close_writer_lock_best_effort(writer_lock)
+        for warning in cleanup_warnings:
+            print(
+                f"WARNING: {warning['code']} error_type={warning['error_type']}",
+                file=sys.stderr,
+            )
     print(f"current_database_schema_version {before['current_database_schema_version']}")
     print(f"required_database_schema_version {before['required_database_schema_version']}")
     print(f"schema_changed {str(bool(result['schema_changed'])).lower()}")
@@ -699,6 +717,7 @@ def run_import_pipeline(
             raise ImportPipelineError(exc.code, stage="input_preflight") from None
     result: dict[str, Any] | None = None
     caught_error: BaseException | None = None
+    writer_cleanup_warnings: list[dict[str, str]] = []
     try:
         writer_lock.bind_database(db_path)
         writer_lock.revalidate(db_path)
@@ -719,9 +738,16 @@ def run_import_pipeline(
         caught_error = exc
     finally:
         if owns_writer_lock:
-            writer_lock.close()
+            writer_cleanup_warnings = _close_writer_lock_best_effort(writer_lock)
     pipeline_seconds = _elapsed(pipeline_started)
     if caught_error is not None:
+        if writer_cleanup_warnings:
+            existing = list(getattr(caught_error, "cleanup_warnings", []))
+            setattr(
+                caught_error,
+                "cleanup_warnings",
+                [*existing, *writer_cleanup_warnings],
+            )
         if isinstance(caught_error, ImportPipelineError):
             caught_error.summary["pipeline_return_seconds"] = pipeline_seconds
             caught_error.summary["wall_total_seconds"] = pipeline_seconds
@@ -729,6 +755,8 @@ def run_import_pipeline(
         raise caught_error
     if result is None:
         raise RuntimeError("import pipeline returned no result")
+    if writer_cleanup_warnings:
+        result["writer_lock_cleanup_warnings"] = writer_cleanup_warnings
     summary = result["summary"]
     summary["pipeline_return_seconds"] = pipeline_seconds
     summary["wall_total_seconds"] = pipeline_seconds

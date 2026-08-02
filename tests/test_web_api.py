@@ -7,6 +7,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -113,6 +115,30 @@ def refresh_test_database_compatibility(db: Path) -> None:
 
 @unittest.skipIf(TestClient is None, "fastapi test client is not installed")
 class WebApiTests(unittest.TestCase):
+    def run_large_acceptance_without_outer_tracemalloc(self) -> bool:
+        """Keep production wall budgets out of the allocation diagnostic."""
+        if not os.environ.get("PYTHONTRACEMALLOC") or not tracemalloc.is_tracing():
+            return False
+        root = Path(__file__).resolve().parents[1]
+        child_env = os.environ.copy()
+        child_env.pop("PYTHONTRACEMALLOC", None)
+        python_path = child_env.get("PYTHONPATH")
+        child_env["PYTHONPATH"] = str(root) if not python_path else os.pathsep.join((str(root), python_path))
+        completed = subprocess.run(
+            [sys.executable, "-m", "unittest", self.id(), "-v"],
+            cwd=root / "tests",
+            capture_output=True,
+            text=True,
+            env=child_env,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"untraced acceptance subprocess failed\n{completed.stdout}\n{completed.stderr}",
+        )
+        self.assertTrue(tracemalloc.is_tracing(), "outer allocation trace was not preserved")
+        return True
+
     def make_build_dir(self, base: Path) -> Path:
         build = base / "dist"
         build.mkdir(exist_ok=True)
@@ -2571,6 +2597,8 @@ class WebApiTests(unittest.TestCase):
             conn.close()
 
     def test_conversation_search_late_page_uses_sql_level_pagination(self):
+        if self.run_large_acceptance_without_outer_tracemalloc():
+            return
         from chatgpt_export_archiver.search import parse_query, search_conversations
 
         td = tempfile.TemporaryDirectory()
@@ -4092,7 +4120,7 @@ class WebApiTests(unittest.TestCase):
         td, client, _db = self.make_client()
         self.addCleanup(td.cleanup)
         schema = client.get("/api/schema").json()
-        self.assertEqual(schema["version"], 8)
+        self.assertEqual(schema["version"], 9)
         self.assertEqual(schema["versions"]["required_database_schema_version"], 6)
         self.assertEqual(schema["versions"]["optional_web_index_format_version"], "6")
         self.assertIn("include_internal", json.dumps(schema))
@@ -4760,6 +4788,7 @@ class WebApiTests(unittest.TestCase):
         manager.release_pending_upload_slot()
 
     def test_upload_ingress_rejects_before_multipart_and_caps_chunked_body(self):
+        from chatgpt_export_archiver.disk_resources import DiskSpaceInsufficientError
         from chatgpt_export_archiver.web_api import _get_web_trust_policy
         from chatgpt_export_archiver.web_app import (
             UploadIngressMiddleware,
@@ -4831,9 +4860,18 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response[0]["status"], 403)
         self.assertEqual(app_calls, 0)
         response = asyncio.run(invoke(headers=[], chunks=[b"123456", b"78901"]))
-        self.assertEqual(response[0]["status"], 413)
-        self.assertEqual(app_calls, 1)
-        self.assertFalse(manager.has_running_job(), "oversized chunked upload must release its reserved slot")
+        self.assertEqual(response[0]["status"], 411)
+        self.assertEqual(app_calls, 0)
+        self.assertFalse(manager.has_running_job(), "lengthless upload must not reach multipart parsing")
+        with mock.patch(
+            "chatgpt_export_archiver.web_app.require_free_space",
+            side_effect=DiskSpaceInsufficientError(
+                "upload_disk_space_insufficient", required_bytes=10, free_bytes=0
+            ),
+        ):
+            response = asyncio.run(invoke(headers=[(b"content-length", b"4")], chunks=[b"safe"]))
+        self.assertEqual(response[0]["status"], 507)
+        self.assertEqual(app_calls, 0, "disk refusal must happen before the first body receive")
         response = asyncio.run(invoke(headers=[(b"content-length", b"4")], chunks=[b"safe"]))
         self.assertEqual(response[0]["status"], 200)
         self.assertFalse(manager.has_running_job())
@@ -4912,6 +4950,48 @@ class WebApiTests(unittest.TestCase):
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(invoke_cancelled())
         self.assertFalse(manager.has_running_job(), "client cancellation must release the pre-parser writer slot")
+
+    def test_fetch_metadata_isolates_sensitive_reads_without_breaking_clients(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name)
+        client = TestClient(
+            create_app(base / "archive.db", static_dir=self.make_build_dir(base))
+        )
+        self.addCleanup(client.close)
+        protected = (
+            "/api/stats",
+            "/api/schema",
+            "/api/conversations?limit=1",
+            "/api/search?q=synthetic&limit=1",
+            "/api/search/messages?q=synthetic&limit=1",
+            "/api/search/suggest?q=synthetic&limit=1",
+            "/api/by-id/raw?conversation_id=c&node_id=n",
+            "/api/by-id/display?conversation_id=c&node_id=n",
+            "/api/by-id/export?conversation_id=c&format=txt",
+        )
+        for path in protected:
+            with self.subTest(path=path):
+                denied = client.get(path, headers={"Sec-Fetch-Site": "cross-site"})
+                self.assertEqual(denied.status_code, 403)
+                self.assertEqual(denied.json()["code"], "read_cross_site_not_allowed")
+                same_origin = client.get(path, headers={"Sec-Fetch-Site": "same-origin"})
+                self.assertNotEqual(same_origin.json().get("code"), "read_cross_site_not_allowed")
+                direct = client.get(path, headers={"Sec-Fetch-Site": "none"})
+                self.assertNotEqual(direct.json().get("code"), "read_cross_site_not_allowed")
+                without_header = client.get(path)
+                self.assertNotEqual(without_header.json().get("code"), "read_cross_site_not_allowed")
+        health = client.get("/api/health", headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertNotEqual(health.json().get("code"), "read_cross_site_not_allowed")
+        deep_health = client.get(
+            "/api/health?deep=true", headers={"Sec-Fetch-Site": "cross-site"}
+        )
+        self.assertEqual(deep_health.status_code, 403)
+        duplicate = client.get(
+            "/api/stats",
+            headers=[("Sec-Fetch-Site", "same-origin"), ("Sec-Fetch-Site", "cross-site")],
+        )
+        self.assertEqual(duplicate.status_code, 400)
 
     def test_upload_compression_ratio_config_rejects_nonfinite_and_nonpositive_values(self):
         from chatgpt_export_archiver.web_api import (
@@ -6346,6 +6426,8 @@ class WebApiTests(unittest.TestCase):
             self.assertLessEqual(max(len(scope or ()) for scope in scopes), 21)
 
     def test_global_current_search_materializes_only_path_independent_candidates(self):
+        if self.run_large_acceptance_without_outer_tracemalloc():
+            return
         from chatgpt_export_archiver import current_path as current_path_module
         from chatgpt_export_archiver import search as search_module
         from chatgpt_export_archiver.db import connect, init_db

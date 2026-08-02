@@ -22,6 +22,7 @@ INCLUDE_PATHS = [
     "README.zh-TW.md", "README.ja-JP.md", "README.es-ES.md", "LICENSE",
     "AGENTS.md", ".gitignore", "requirements-web.txt", "constraints-web-py312.txt",
     "requirements-web-py312-macos-arm64.lock",
+    "chatgpt-sqlite-webui-audit-report.md",
 ]
 
 AUTHORITATIVE_REQUIRED_FILES = (
@@ -47,9 +48,9 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "chatgpt_export_archiver/web_db.py",
     "chatgpt_export_archiver/web_jobs.py",
     "tools/benchmark_effective_current.py",
-    "tools/benchmark_round11.py",
+    "tools/benchmark_resources.py",
     "tools/acceptance_real_pipeline.py",
-    "tools/acceptance_scale_round12.py",
+    "tools/acceptance_scale.py",
     "tools/check_delivery_clean.py",
     "tools/clean_generated_artifacts.py",
     "tools/make_release_zip.py",
@@ -91,6 +92,7 @@ AUTHORITATIVE_REQUIRED_FILES = (
     "AGENTS.md",
     "LICENSE",
     ".gitignore",
+    "chatgpt-sqlite-webui-audit-report.md",
     "webui/dist/index.html",
 )
 

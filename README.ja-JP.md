@@ -78,7 +78,7 @@ python -m pip install -U pip
 python -m pip install -r requirements-web.txt -c constraints-web-py312.txt
 ```
 
-Python 3.12 constraints は cross-platform resolved-version profile で、artifact hash はありません。別の `requirements-web-py312-macos-arm64.lock` は CPython 3.12/macOS arm64 専用 wheel hash lock です。`--require-hashes --only-binary=:all:` で install し、`python tools/verify_web_hash_lock.py` で検証します。他の Python/OS は各 wheel matrix lock が出るまで trusted index の portable profile を使用し、macOS lock を cross-platform と扱ってはいけません。
+Python 3.12 constraints は cross-platform resolved-version profile で、artifact hash はありません。`requirements-web-py312-macos-arm64.lock` は CPython 3.12/macOS arm64 専用です。download した wheel の実 byte を検証するのは `pip --require-hashes --only-binary=:all:` による install です。`python tools/verify_web_hash_lock.py` は lock の構造、target、version、hash 構文だけを検査します。他の platform は trusted index の portable profile を使用してください。
 
 ## クイックスタート
 
@@ -237,7 +237,7 @@ python chatgpt_archive.py web --port 8787
 
 すべての経路で同じ `path=current` effective-current 規則を使います。conversation に属する有効な `current_node` とその親 chain が raw flag 全ゼロでも最優先です。次に決定的な利用可能 `is_on_current_path=1` leaf chain を選び、どちらもなければその conversation だけ all に fallback します。raw flag は変更せず、応答は `current_node_exists`、`current_collection_source`、`current_path_fallback_to_all`、`effective_path`、各 node の effective visibility を返します。壊れた親や cycle は有限かつ決定的に診断されます。
 
-リーダーのコピーとエクスポートは、表示中のリーダー契約に従います。`現在のパスの会話をコピー` は現在の reader パス専用の完全テキストストリームを使い、Show internal messages の切り替えを尊重し、現在の検索フィルターは無視します。ブラウザーに reader ページを蓄積しません。`表示中をコピー` は、すでに読み込まれている表示メッセージだけをコピーします。ダウンロードリンクも同じ現在のパスと Show internal 設定を使います。Raw メッセージアクセスは、メッセージ単位 endpoint による上限付きの大きな raw プレビューです。切り詰められた応答では `raw_text` をプレーンなプレビューテキストとして描画し、UI はその capped preview だけを表示します。
+コピーと export は reader の表示設定に従います。`現在のパスの会話をコピー` は現在の reader パスに対する上限付き complete-text stream を使います。`表示中をコピー` は読み込み済みの表示 message ID だけを送り、server が一つの SQLite read snapshot から stream するため、writer の前後を混在させません。download も同じ path と Show internal 設定を使います。message raw entry は上限付きの大きな raw プレビューで、truncated response は plain `raw_text` を表示します。
 
 reader が `around_node_id` でヒットへ移動する場合は、reader と同じページング集合を使います。Show internal がオフなら visible-only rows、Show internal がオンなら完全な node collection、current-path node がない壊れた conversation では effective all-node collection です。
 
@@ -271,7 +271,7 @@ Web UI が loopback アドレス（`127.0.0.1`、`localhost`、`::1`）にバイ
 
 **リモートバインドポリシー。** 非 loopback は `CHATGPT_ARCHIVE_ALLOW_REMOTE_ACCESS=true`、`CHATGPT_ARCHIVE_ALLOW_REMOTE_UPLOADS=true`、または `CHATGPT_ARCHIVE_REMOTE_UPLOAD_PROFILE=local` による明示的 opt-in が必要です。remote-safe 既定値は 128 MiB ZIP、256 MiB/JSON member、512 MiB 総非圧縮、圧縮比 200.0、200 JSON members、10,000 ZIP members です。信頼済み loopback/local の圧縮比既定値は 1000.0 です。`ALLOW_REMOTE_UPLOADS` は明示設定した制限だけを緩和し、未設定値は remote-safe のままです。`REMOTE_UPLOAD_PROFILE=local` は未設定の全制限を local の大容量既定値へ戻すため、信頼済み LAN だけで使ってください。
 
-`/api/schema` は multipart body 上限（ZIP byte 上限と有限の overhead）を含む有効な policy を報告します。writer slot と receive-level body cap は multipart parse 前に動作します。parser の spool と pipeline の server-side temporary ZIP が重なるため、圧縮コピー約 2 個分と DB 増加分の一時 disk を見込んでください。JSON decode、SQLite write、`web-index` は展開サイズに比例して RAM/disk/CPU を使います。remote upload は有効な `Content-Length` が必須で、loopback chunked upload も streaming cap で制限されます。
+`/api/schema` は有効な upload policy を報告します。すべての upload に有効な `Content-Length` が必要です。最初の body receive 前に multipart parser の temporary filesystem を検査し、parse 後に project upload directory と database filesystem を別々に検査します。これらは別 disk の場合があります。parser spool、server ZIP、DB、WAL/TEMP、index 用の空き容量を確保してください。
 
 正規の大規模アーカイブのためにローカル制限を引き上げるには、Web UI 起動前に対応する変数を設定します：
 
@@ -429,7 +429,7 @@ source-only delivery では `webui/dist` を省略できますが、その場合
 
 メインデータベースは conversations、mapping nodes、import runs、warnings を保存します。message object だけが raw message JSON object を保持し、conversation と mapping-node object は正規化され、byte-for-byte 保存ではありません。入力 ZIP SHA-256 は任意で、`source_files`/`file_index` の entry SHA 列は予約済みですが現在は未設定です。CLI FTS テーブルは `message_fts` です。任意 Web 検索用の補助テーブルには `web_message_norm`、`web_title_norm`、`web_message_trigram`、`web_title_trigram` と SQLite FTS5 shadow tables が含まれます。
 
-canonical DB は `PRAGMA user_version` の version 6 です。version 3 は `NOT NULL` identity、version 4 は durable address/graph revision、version 5 は row-local display revision と compatibility state、version 6 は source と conversation/node time 変更を覆う durable `query` generation を追加します。Migration は write lock 外で高速 preflight を行い、`BEGIN IMMEDIATE` 内の最初の mutation 前に authoritative row count、size、sidecar、free space を再計算します。cancel、interrupt、ENOSPC、SQLite failure は完全 rollback します。current clean DB での反復 migrate は true no-op で、4 つの changed field はすべて false です。readonly path は migration DDL を実行せず、旧 compatible DB は `database_migration_required` を返します。
+canonical DB は `PRAGMA user_version` version 6 です。旧 DB の read-only entry は `database_migration_required` を返します。Migration capacity は predecessor step ごとに計算し、table rewrite/backfill だけが rewrite と journal space を予約します。v5 metadata/query-generation step は全 node rewrite を仮定しません。`BEGIN IMMEDIATE` 内で mutation 前に size、row、sidecar、planned steps、free space を再確認します。exact compatibility scan は batch 化され cancel 可能です。cancel、ENOSPC、SQLite failure は rollback し、current clean DB の migrate は true no-op です。
 
 Health と `verify` は任意の `message_fts` の欠落と破損を区別します。破損時は `optional_message_fts_error` と `--rebuild-fts` の復旧ヒントを返します。一般的な malformed、locked、readonly、I/O、SQL runtime failure は能力欠落として扱わず、`database_malformed`、`database_locked`、`database_readonly`、`database_io_error`、`database_runtime_failure` を使います。
 
@@ -445,13 +445,13 @@ Health と `verify` は任意の `message_fts` の欠落と破損を区別しま
 
 アップロード入口は `Origin`、`Content-Length`、`Sec-Fetch-Site` をそれぞれ 1 値だけ受け付けます。Origin は userinfo、path、query、fragment、制御文字、カンマチェーンを含まない単一の HTTP(S) origin、Content-Length は正規形の非負 ASCII 10 進整数でなければなりません。重複または不正な安全ヘッダーは multipart 解析前に拒否し、無効または非有限の圧縮率設定は有限な安全 profile 既定値へ戻します。
 
-Loopback Web が受け入れる Host は `localhost`、`127.0.0.1`、`::1`、明示した loopback bind host、および明示設定した Host だけです。非 loopback bind では実際の browser hostname/LAN IP を `CHATGPT_ARCHIVE_ALLOWED_HOSTS`（または `--allowed-hosts`）で指定し、`*` は拒否されます。`CHATGPT_ARCHIVE_TRUSTED_PROXIES`（または `--trusted-proxies`）は厳格な単一 edge proxy モデルです。未信頼 peer の forwarded header は無視し、信頼済み direct edge は client 値を上書きする必要があります。重複 Host/Forwarded、カンマ区切り chain、不正構文、`Forwarded` と `X-Forwarded-Host/Proto` の競合は拒否されます。全リクエストで Host を検証し、remote write は same-origin `Origin` が必要です。Origin のない client を許容するのは信頼済み loopback profile だけで、upload は常に `Sec-Fetch-Site: cross-site` を拒否します。
+全 request で Host を検証し、non-loopback bind は `CHATGPT_ARCHIVE_ALLOWED_HOSTS` または CLI `--allowed-hosts` が必要で `*` は拒否します。trusted proxy は `CHATGPT_ARCHIVE_TRUSTED_PROXIES` または `--trusted-proxies` で設定する strict single-edge contract です。remote write は same-origin `Origin` が必要です。重複・不正な Fetch Metadata は拒否し、shallow `/api/health` を除く API read でも `Sec-Fetch-Site: cross-site` を拒否します。static UI、`none` の直接 navigation、header を送らない CLI client は互換です。
 
 失敗 stage には source read も含み、`upload_preflight_failed`、`input_source_open_failed`、`input_source_not_regular_file`、`source_read_failed`、`source_changed_during_read`、`invalid_conversation_encoding`、`json_integer_too_large` を安定 code として返します。cleanup は構造化 `cleanup_warnings` 配列で、旧 `cleanup_warning` は先頭項です。
 
-upload、canonical import、schema migration、optional Web index rebuild は capacity preflight と 256 MiB reserve を使います。ENOSPC は `upload_disk_space_insufficient`、`import_disk_space_insufficient`、`migration_disk_space_insufficient`、`web_index_disk_space_insufficient` を返し、import/migration は rollback します。
+upload は receive 前に parser spool filesystem、parse 後に server ZIP と DB filesystem を検査します。Import、migration、optional Web index も capacity preflight と reserve を使います。ENOSPC は安定した `*_disk_space_insufficient` code を返し、transaction は rollback します。
 
-単独 JSON、directory、ZIP は同じ single-pass framer と一つの transaction を使います。framer は element boundary を一度走査して C decoder を一度呼び、上記 joint profile を適用します。query-based `/api/by-id/*` は legacy ID を 16 Ki characters まで扱い、固定小サイズ continuation は ID を埋め込みません。
+単独 JSON、directory、ZIP は同じ bounded hybrid array parser と一つの transaction を使います。普通の complete element は通常 C decoder 一回で成功します。uncertain/spanning element は bounded failed fast probe を一回行う場合がありますが、その後は persistent lexical framer を使い、増える prefix を繰り返し decode しません。
 
 descriptor-bound stat/hash/read で file identity を検証します。strict delete は staging 前に拒否し、recovery は historical project-owned journal のみ扱います。Migration は定義が完全一致する既知 predecessor のみ受け入れます。
 
