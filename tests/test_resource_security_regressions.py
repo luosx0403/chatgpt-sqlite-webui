@@ -324,6 +324,37 @@ class ResourceSecurityRegressions(unittest.TestCase):
             self.assertEqual(stale.status_code, 409)
             self.assertEqual(stale.json()["detail"], "copy_selection_stale")
 
+    def test_display_chunk_unclassifiable_large_canonical_is_never_exact(self):
+        from chatgpt_export_archiver.utils import sha256_text
+
+        with tempfile.TemporaryDirectory() as td:
+            database = Path(td) / "display-budget.db"
+            conn = connect(database)
+            init_db(conn)
+            big = "[non-text content: " + "x" * (40 * 1024 * 1024)
+            conn.execute(
+                "INSERT INTO conversations(conversation_id,title,aggregate_hash) "
+                "VALUES ('c','synthetic','h')"
+            )
+            conn.execute(
+                "INSERT INTO conversation_nodes("
+                "conversation_id,node_id,content_type,content_text,content_hash,"
+                "is_on_current_path,display_revision) VALUES ("
+                "'c','n','text',?,?,1,'deadbeefdeadbeefdeadbeefdeadbeef')",
+                (big, sha256_text("synthetic")),
+            )
+            conn.commit()
+            chunk = search.get_message_display_chunk(
+                conn, "c", "n", offset=0, limit=65536
+            )
+            self.assertIsNotNone(chunk)
+            self.assertTrue(chunk["resolver_input_truncated"])
+            self.assertFalse(chunk["total_chars_exact"])
+            self.assertTrue(chunk["has_more"])
+            self.assertIsNone(chunk["next_offset"])
+            self.assertLess(chunk["returned_chars"], 40 * 1024 * 1024)
+            conn.close()
+
     def test_migration_capacity_is_step_specific(self):
         light = migration_capacity_plan(5, 8 * 1024 * 1024, 1_000_000)
         rewrite = migration_capacity_plan(4, 8 * 1024 * 1024, 1_000_000)

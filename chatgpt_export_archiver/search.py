@@ -2577,6 +2577,7 @@ def get_message_display_chunk(
         canonical_has_more = has_more
         total_chars = offset + len(chunk)
         total_exact = not has_more
+        canonical_unclassifiable = False
         if has_more and not invalid_utf8:
             next_cursor = _encode_display_cursor(
                 database_token_identity,
@@ -2617,14 +2618,21 @@ def get_message_display_chunk(
             canonical,
             raw_bounded[:200_000] if not resolver_input_truncated else "",
         )
+        # A canonical body beyond the bounded classifier budget cannot be
+        # trusted to end at the recovered prefix.  Only a complete raw
+        # recovery may claim an exact total; otherwise the prefix is a lower
+        # bound and the row continues beyond the returned window.
+        canonical_unclassifiable = bool(content_storage_bytes) and (
+            not raw_bounded or resolver_input_truncated
+        )
+        if placeholder_exact is None:
+            resolver_input_truncated = True
         total_chars = len(recovered)
-        total_exact = not resolver_input_truncated
+        total_exact = (not resolver_input_truncated) and not canonical_unclassifiable
         if anchor_char_offset is not None:
             offset = max(0, anchor_char_offset - min(limit // 2, 4096))
         chunk = recovered[offset : offset + limit]
         source = "raw_fallback" if recovered != canonical else "canonical_placeholder"
-        if placeholder_exact is None:
-            resolver_input_truncated = True
     return {
         "conversation_id": conversation_id,
         "node_id": node_id,
@@ -2633,8 +2641,20 @@ def get_message_display_chunk(
         "returned_chars": len(chunk),
         "total_chars": total_chars,
         "total_chars_exact": total_exact,
-        "has_more": canonical_has_more if source == "canonical" else offset + len(chunk) < total_chars,
-        "next_offset": total_chars if canonical_has_more else (offset + len(chunk) if offset + len(chunk) < total_chars else None),
+        "has_more": (
+            canonical_has_more
+            if source == "canonical"
+            else canonical_unclassifiable or offset + len(chunk) < total_chars
+        ),
+        "next_offset": (
+            total_chars
+            if canonical_has_more
+            else None
+            if canonical_unclassifiable
+            else offset + len(chunk)
+            if offset + len(chunk) < total_chars
+            else None
+        ),
         "next_cursor": next_cursor,
         "content_revision": revision,
         "max_chunk_chars": budget.display_chunk_chars,

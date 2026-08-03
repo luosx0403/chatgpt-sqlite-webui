@@ -11,6 +11,8 @@ import { isInteractiveTarget } from "../utils/interaction";
 const MAX_NAVIGABLE_HIT_MESSAGES = 1000;
 const HIT_NAVIGATION_PAGE_SIZE = 100;
 const HIT_PREFETCH_THRESHOLD = 10;
+// Mirrors the server-side bounded visible-copy selection contract.
+const MAX_VISIBLE_COPY_SELECTION = 1000;
 
 interface Props {
   conversation: ConversationSummary | null;
@@ -580,11 +582,13 @@ export default function ConversationPane({ conversation, query, filters, matchMo
     try {
       const copyValue = mode === "conversation"
         ? await getConversationCopyText(conversation!.conversation_id, effectivePath, showInternal, controller.signal)
-        : await getVisibleMessagesCopyText(
-          conversation!.conversation_id,
-          visibleMessages.filter((message) => !message.is_empty_mapping_node).map((message) => message.node_id),
-          controller.signal,
-        );
+        : await (() => {
+          const nodeIds = visibleMessages
+            .filter((message) => !message.is_empty_mapping_node)
+            .map((message) => message.node_id);
+          if (nodeIds.length > MAX_VISIBLE_COPY_SELECTION) throw new CopyLimitError();
+          return getVisibleMessagesCopyText(conversation!.conversation_id, nodeIds, controller.signal);
+        })();
       if (readerDataContextRef.current !== requestedContextKey || requestId !== copyRequestRef.current) return;
       await copyText(copyValue, requestedContextKey, requestId);
     } catch (error) {

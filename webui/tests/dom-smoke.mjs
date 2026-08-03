@@ -89,6 +89,8 @@ function assertStaticFrontendContracts() {
   assert.ok(messageBlockSource.includes("getMessageDisplayChunk"), "truncated reader messages should have an explicit bounded expansion path");
   assert.ok(messageBlockSource.includes("chunk.resolver_input_truncated || (!chunk.has_more && !chunk.total_chars_exact)"), "single-message expansion/copy must distinguish normal intermediate chunks from terminal incomplete raw recovery");
   assert.ok(paneSource.includes("getVisibleMessagesCopyText"), "Copy visible must bind loaded message IDs to one server snapshot");
+  assert.ok(paneSource.includes("MAX_VISIBLE_COPY_SELECTION"), "visible copy must cap the server selection contract locally");
+  assert.ok(paneSource.includes("nodeIds.length > MAX_VISIBLE_COPY_SELECTION"), "an oversized visible selection must be rejected before the request");
   assert.ok(messageBlockSource.includes("message.display_text_resolver_input_truncated"), "initial reader metadata must expose resolver incompleteness separately from unknown total length");
   assert.ok(i18nSource.includes("displayRecoveryIncomplete"), "incomplete raw recovery should have an accessible localized warning");
   assert.ok(messageBlockSource.includes("JSON.stringify([conversationId, message.node_id"), "message state keys should use collision-free tuple serialization");

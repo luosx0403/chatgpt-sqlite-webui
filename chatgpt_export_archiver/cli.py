@@ -635,6 +635,12 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"import_connection_close_failed {result['import_connection_close_failed']}")
     if result.get("summary_update_after_close_failed"):
         print(f"summary_update_after_close_failed {result['summary_update_after_close_failed']}")
+    for warning in result.get("writer_lock_cleanup_warnings", []):
+        print(
+            f"cleanup_warning code={warning['code']} "
+            f"error_type={warning['error_type']} path_kind={warning['path_kind']}",
+            file=sys.stderr,
+        )
     if summary.get("rebuild_fts"):
         print(f"rebuild_fts {str(bool(summary.get('rebuild_fts'))).lower()}")
         print(f"optimize_fts_after_import {str(bool(summary.get('optimize_fts_after_import'))).lower()}")
